@@ -1,4 +1,4 @@
-/*	$OpenBSD: malo.c,v 1.117 2018/01/03 23:11:06 dlg Exp $ */
+/*	$OpenBSD: malo.c,v 1.121 2020/07/10 13:26:37 patrick Exp $ */
 
 /*
  * Copyright (c) 2006 Claudio Jeker <claudio@openbsd.org>
@@ -347,7 +347,7 @@ malo_attach(struct malo_softc *sc)
 	ifp->if_watchdog = malo_watchdog;
 	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST | IFF_MULTICAST;
 	strlcpy(ifp->if_xname, sc->sc_dev.dv_xname, IFNAMSIZ);
-	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
+	ifq_set_maxlen(&ifp->if_snd, IFQ_MAXLEN);
 
 	/* set supported rates */
 	ic->ic_sup_rates[IEEE80211_MODE_11B] = ieee80211_std_rateset_11b;
@@ -1015,7 +1015,7 @@ malo_start(struct ifnet *ifp)
 			if (ic->ic_state != IEEE80211_S_RUN)
 				break;
 
-			IFQ_DEQUEUE(&ifp->if_snd, m0);
+			m0 = ifq_dequeue(&ifp->if_snd);
 			if (m0 == NULL)
 				break;
 #if NBPFILTER > 0
@@ -1411,8 +1411,8 @@ malo_tx_mgt(struct malo_softc *sc, struct mbuf *m0, struct ieee80211_node *ni)
 	 *  6 bytes addr4 (inject)
 	 *  n bytes 802.11 frame body
 	 */
-	if (M_LEADINGSPACE(m0) < 8) {
-		if (M_TRAILINGSPACE(m0) < 8)
+	if (m_leadingspace(m0) < 8) {
+		if (m_trailingspace(m0) < 8)
 			panic("%s: not enough space for mbuf dance",
 			    sc->sc_dev.dv_xname);
 		bcopy(m0->m_data, m0->m_data + 8, m0->m_len);
@@ -1593,6 +1593,7 @@ malo_tx_setup_desc(struct malo_softc *sc, struct malo_tx_desc *desc,
 void
 malo_rx_intr(struct malo_softc *sc)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
 	struct malo_rx_desc *desc;
@@ -1711,7 +1712,7 @@ malo_rx_intr(struct malo_softc *sc)
 		rxi.rxi_flags = 0;
 		rxi.rxi_rssi = desc->rssi;
 		rxi.rxi_tstamp = 0;	/* unused */
-		ieee80211_input(ifp, m, ni, &rxi);
+		ieee80211_inputm(ifp, m, ni, &rxi, &ml);
 
 		/* node is no longer needed */
 		ieee80211_release_node(ic, ni);
@@ -1727,6 +1728,7 @@ skip:
 		sc->sc_rxring.cur = (sc->sc_rxring.cur + 1) %
 		    MALO_RX_RING_COUNT;
 	}
+	if_input(ifp, &ml);
 
 	malo_mem_write4(sc, sc->sc_RxPdRdPtr, rxRdPtr);
 }

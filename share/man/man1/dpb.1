@@ -1,4 +1,4 @@
-.\"	$OpenBSD: dpb.1,v 1.6 2018/07/16 13:14:06 espie Exp $
+.\"	$OpenBSD: dpb.1,v 1.20 2020/04/04 08:41:54 espie Exp $
 .\"
 .\" Copyright (c) 2010-2013 Marc Espie <espie@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: July 16 2018 $
+.Dd $Mdocdate: April 4 2020 $
 .Dt DPB 1
 .Os
 .Sh NAME
@@ -22,14 +22,14 @@
 .Nd distributed ports builder
 .Sh SYNOPSIS
 .Nm dpb
-.Op Fl acemqrRsuUvx
+.Op Fl acemqRrsUuvx
 .Op Fl A Ar arch
-.Op Fl b Ar logfile
 .Op Fl B Ar chroot
+.Op Fl b Ar logfile
 .Op Fl C Ar pathlist
 .Op Fl D Ar PARAM Ns = Ns Ar value
-.Op Fl f Ar m
 .Op Fl F Ar m
+.Op Fl f Ar m
 .Op Fl h Ar hosts
 .Op Fl I Ar pathlist
 .Op Fl J Ar p
@@ -145,7 +145,7 @@ GMtime, formatted as yyyy-mm-dd@hh:mm:ss.
 .It Cm %f
 fetch distfiles location (DISTDIR).
 .It Cm %h
-hostname running
+short hostname running
 .Nm .
 .It Cm %L
 logdir location.
@@ -154,6 +154,10 @@ portsdir location.
 .It Cm %t
 timestamp (number of seconds since January 1 1970) at start of
 .Nm .
+.It Cm %$
+Pid of the main
+.Nm
+process .
 .El
 .Pp
 Options are as follows:
@@ -166,12 +170,6 @@ By default, the current host's architecture will be used.
 Walk the whole tree and builds all packages (default if no
 .Ar pathlist
 is given).
-.It Fl b Ar logfile
-Explicitly prime the heuristics module with a previous build log,
-so that packages that take a long time to build will happen earlier.
-The rolling log under
-.Pa %f/build-stats/%a
-is automatically used.
 .It Fl B Ar chroot
 chroot to
 .Ar chroot
@@ -179,14 +177,20 @@ before building.
 See
 .Xr proot 1
 for preparing such an environment.
-.It Fl c
-Clean port working directory and log before each build.
+.It Fl b Ar logfile
+Explicitly prime the heuristics module with a previous build log,
+so that packages that take a long time to build will happen earlier.
+The rolling log under
+.Pa %f/build-stats/%a
+is automatically used.
 .It Fl C Ar pathlist
 Don't clean port working directories after build.
 Only use simple
 .Xr pkgpath 7
 in the list,
 as this does not take subpackages and flavors into account.
+.It Fl c
+Clean port working directory and log before each build.
 .It Fl D Ar PARAM Ns = Ns Ar value
 Set defined parameter to value.
 Known parameters are as follows:
@@ -202,17 +206,20 @@ if you want to specify it on the command line, and want to ensure even
 the small "discover PORTSDIR" activity at the beginning of
 .Nm
 is not run as root.
-.It Ar CDROM_ONLY
-Don't fetch distfiles that are not allowed for cdrom.
 .It Ar COLOR
 Set to 1 to have the normal display in color.
+.It Ar CONNECTION_TIMEOUT
+Connection timeout for ssh.
+Defaults to 10 seconds (but ssh will retry 3 times).
 .It Ar CONTROL
 Let
 .Nm
 create a unix socket of the given name for external control.
-.It Ar CONNECTION_TIMEOUT
-Connection timeout for ssh.
-Defaults to 60 seconds.
+Defaults to
+.Sq %L/control-%h-%$ .
+If no socket is wanted, explicitly set
+.Ar CONTROL
+to empty.
 .It Ar DISPLAY_TIMEOUT
 Display timeout (in seconds) while waiting for jobs to finish, so that the
 display is updated even if jobs didn't finish.
@@ -244,11 +251,6 @@ abruptly.
 Sometimes, one may want manual control over which locks to remove.
 .It Ar FETCH_JOBS
 Alternate way to specify the number of fetch jobs.
-.It Ar FETCH_USER
-User for all fetch activities if possible
-.Po defaults to
-.Ar _pfetch
-.Pc .
 .It Ar FETCH_TIMEOUT
 Timeout (in seconds) after which fetches that don't show
 any progress will be killed.
@@ -259,14 +261,24 @@ or
 as the
 .Sq fetch_timeout
 property.
+.It Ar FETCH_USER
+User for all fetch activities if possible
+.Po defaults to
+.Ar _pfetch
+.Pc .
 .It Ar FTP_ONLY
-Don't fetch distfiles that are not allowed for ftp.
+Don't fetch distfiles/don't build packages that are not allowed for ftp.
 .It Ar HISTORY_ONLY
 Don't fetch or build anything.
 Only run
 .Nm
 to figure out old distfiles and update
 .Pa %f/history .
+.It Ar LISTING_EXTRA
+Alternate way to specify
+.Fl e .
+.It Ar LOCKDIR
+Alternate way to specify the locking directory.
 .It Ar LOGDIR
 Alternate way to specify the logging directory.
 .It Ar LOG_USER
@@ -275,8 +287,6 @@ for all log files if possible
 .Po defaults to
 .Ar build_user
 .Pc .
-.It Ar LOCKDIR
-Alternate way to specify the locking directory.
 .It Ar MIRROR
 Applicable to fetch modes.
 If 0, will only fetch normal
@@ -291,6 +301,9 @@ If 1, will also fetch extra
 default for
 .Nm Fl F
 .Pc .
+.It Ar NO_BUILD_STATS
+Disable reading/saving of default build stats under
+.Pa ${DISTDIR}/build-stats/${ARCH} .
 .It Ar NO_CHECKSUM
 Do not run
 .Ar checksum
@@ -298,14 +311,15 @@ again for files already fetched.
 .It Ar NO_CURSOR
 Make the terminal cursor invisible if possible.
 Avoids flickering on slow graphics cards.
-.It Ar NO_BUILD_STATS
-Disable reading/saving of default build stats under
-.Pa ${DISTDIR}/build-stats/${ARCH} .
 .It Ar NO_HISTORY
 Do not update the distfiles history.
 For instance, if
 .Nm
 is run a second time after a problem during the first run.
+.It Ar NO_QUICK_SCAN
+Disable the quick scan default heuristic,
+where full bulks will start by scanning the most prominent ports
+in former builds.
 .It Ar PORT_USER
 User that can write to the ports tree.
 Not really used for anything yet.
@@ -341,6 +355,16 @@ Alternate way to specify
 .It Fl e
 The listing job is extra and won't be given back to the pool when it's
 finished.
+.It Fl F Ar m
+Fetch-only mode, for mirroring hosts.
+Do not build any package but fetch everything, disregarding
+.Ev BROKEN
+and
+.Ev ONLY_FOR_ARCHS
+information.
+Create
+.Ar m
+localhost jobs for fetching files.
 .It Fl f Ar m
 Create
 .Ar m
@@ -352,16 +376,6 @@ Can be set to 0 to bypass fetching jobs entirely,
 and reduce
 .Nm
 memory footprint by a lot.
-.It Fl F Ar m
-Fetch-only mode, for mirroring hosts.
-Do not build any package but fetch everything, disregarding
-.Ev BROKEN
-and
-.Ev ONLY_FOR_ARCHS
-information.
-Create
-.Ar m
-localhost jobs for fetching files.
 .It Fl h Ar hosts
 File with hosts to use for building.
 One host per line, plus properties, such as:
@@ -395,15 +409,15 @@ to connect.
 .Pp
 Properties are as follows:
 .Bl -tag -width memory=150
-.It arch=value
-Architecture of the concerned host.
-(there should be a startup task to check consistency, but
-currently this has to be set manually on heterogeneous networks.)
 .It always_clean=n
 Set to 0 or 1 on per-host basis.
 See
 .Ar ALWAYS_CLEAN
 parameter.
+.It arch=value
+Architecture of the concerned host.
+(there should be a startup task to check consistency, but
+currently this has to be set manually on heterogeneous networks.)
 .It build_user=user
 Use
 .Ar user
@@ -459,6 +473,10 @@ Run big ports on several cores.
 See
 .Fl p
 option.
+.It parallel2=p
+Run largest ports on many cores.
+Defaults to the same value as the parallel option, but can be increased for,
+say, chromium.
 .It repair=0/1
 Defaults to 1.
 Run
@@ -609,7 +627,7 @@ Override value for the
 property.
 .Pp
 Run big jobs on several cores on the same host, by using
-MAKE_JOBS=k .
+MAKE_JOBS=k.
 .Pp
 Once such a job has started,
 .Nm
@@ -633,10 +651,6 @@ Defaults to
 .Sq /2 .
 .It Fl q
 Don't quit while errors/locks are around.
-.It Fl r
-Random build order.
-Disregard any kind of smart heuristics.
-Useful to try to find missing build dependencies.
 .It Fl R
 Rebuild existing packages based on discrepancies between the package
 signature and what the port says it should be.
@@ -647,6 +661,10 @@ Note that
 won't always work, as rebuilding a package when another version is already
 installed is not supported.
 Building in a chroot is strongly recommended.
+.It Fl r
+Random build order.
+Disregard any kind of smart heuristics.
+Useful to try to find missing build dependencies.
 .It Fl S Ar logfile
 Read
 .Ar logfile
@@ -660,17 +678,14 @@ In order to save time,
 .Nm
 will actually not always compute new sizes for known directories, but mostly
 for new ones, or when the package name changes.
+.It Fl U
+Insist on updating existing packages during dependency solving,
+even if the new package apparently didn't change.
 .It Fl u
 Update existing packages during dependency solving.
 Can be used to run a bulk-build on a machine with installed packages,
 but might break a bit, since some packages only build on a clean machine
 right now.
-.It Fl U
-Insist on updating existing packages during dependency solving,
-even if the new package apparently didn't change.
-.It Fl x
-No tty report, only report really important things, like hosts going down
-and coming back up, build errors, or builds not progressing.
 .It Fl X Ar pathlist
 Read a list of
 .Xr pkgpath 7
@@ -680,6 +695,9 @@ installed by a dependency.
 Can be used to avoid endlessly removing/reinstalling the most common
 packages, e.g.,
 .Pa devel/gmake .
+.It Fl x
+No tty report, only report really important things, like hosts going down
+and coming back up, build errors, or builds not progressing.
 .El
 .Pp
 .Nm
@@ -850,6 +868,10 @@ from running while port is building.
 Port that can be built in parallel, uses
 .Ev MAKE_JOBS
 and several build slots.
+.It Ar parallel2
+Very large port that should be built in parallel, uses
+.Ev MAKE_JOBS
+and lots of build slots.
 .It Ar tag:kde3
 kde3 port that conflicts with kde4 ports.
 Prevent scheduling ports with
@@ -1057,15 +1079,17 @@ may vanish before human intervention addresses the problem.
 This is supposed to be a temporary hack, as kde4 is large and
 having official packages helps a great deal in debugging it.
 .Sh EXTERNAL CONTROL
-If
-.Fl D Ar CONTROL Ns = Ns Ar path
-if used,
+By default
+.Po
+see
+.Ar CONTROL
+.Pc ,
 .Nm
-will create a Unix socket at the given
-.Pa path ,
+will create a Unix socket at
+.Pa %L/control-%h-%$ ,
 only accessible by
 .Ar LOG_USER ,
-that can accept a few commands, .e.g.,
+that can accept a few commands, e.g.,
 usable as
 .Li nc -U path
 .Pp
@@ -1074,15 +1098,38 @@ Currents commands are as follows:
 .It Cm addhost Ar hostline
 Add a new host
 .It Cm addpath Ar fullpkgpath ...
-Add new fullpkgpath to scan
+Add fullpkgpath to scan
 .It Cm bye
 close the socket connection.
 .It Cm dontclean Ar pkgpath ...
 Add new pkgpath to list of paths that should not be cleaned after build
 .It Cm help
 Self explanatory
+.It Cm info Ar cores
+Debug info for cores (to be extended to other data)
+.It Cm rescan
+Force
+.Nm
+to rescan all ignored paths (for various errors, including bogus dependencies)
 .It Cm stats
 Show the current stats line
+.It Cm status Ar fullpkgpath ...
+Show the current status of fullpkgpath, whether it's built, installable,
+ready to build, to build later, along with current dependencies if
+applicable.
+.It Cm stub Ar fullpkgpath ...
+Stub out
+.Ar fullpkgpath
+and unlock it if needed.
+.It Cm wipe Ar fullpkgpath ...
+Wipe out an existing lock: clean up the corresponding
+.Ar fullpkgpath
+on the appropriate host, then remove all lock and affinity info pertaining
+to the port.
+.It Cm wipehost Ar hostname ...
+Remove all information relevant to a given host from
+.Nm ,
+including running jobs, locks, and affinity information.
 .El
 .Sh SHUTTING DOWN GRACEFULLY
 .Nm
@@ -1255,6 +1302,8 @@ Note that the actual build time starts at
 .Sq extract
 and finishes at
 .Sq package .
+.It Pa built-packages.log
+The actual list of fullpkgname.tgz as they get built.
 .It Pa concurrent.log
 Shows the actual concurrency achieved as a result of job starvation /
 parallel handling.
@@ -1265,10 +1314,14 @@ figured that one yet) along with the more useful warning and die traces that
 happen when something wrong occurs.
 Especially useful for the warning messages that tend to be overwritten by
 subsequent displays.
+Will also contain error messages pertaining to failure at parsing existing
+lock files.
 .It Pa dist/<distfile>.log
 Log of the
 .Xr ftp 1
 process(es) that attempted to fetch the distfile.
+.It Pa control-%h-%$
+Default name for the external control socket.
 .It Pa dump.log
 A long log file generated at the end of build that yields any information
 pertinent to ports still in the
@@ -1573,6 +1626,13 @@ can't start a new fetch job.
 Printed in
 .Ar path/pkgpath.log
 when a port exceeds its timeout.
+.It !: <path> tried and didn't get it
+Printed in
+.Ar engine.log
+Scanning the port didn't give us useful information.
+See
+.Ar vars.log
+for gory details.
 .El
 .Sh BUGS AND LIMITATIONS
 .Nm

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_atu.c,v 1.126 2018/04/28 16:05:56 phessler Exp $ */
+/*	$OpenBSD: if_atu.c,v 1.132 2020/07/31 10:49:32 mglocker Exp $ */
 /*
  * Copyright (c) 2003, 2004
  *	Daan Vreeken <Danovitsch@Vitsch.net>.  All rights reserved.
@@ -178,8 +178,6 @@ struct atu_type atu_devs[] = {
 	  RadioRFMD,		ATU_NO_QUIRK },
 	{ USB_VENDOR_LINKSYS,	USB_PRODUCT_LINKSYS_WUSB11,
 	  RadioIntersil,	ATU_NO_QUIRK },
-	{ USB_VENDOR_LINKSYS2,	USB_PRODUCT_LINKSYS2_WUSB11,
-	  RadioRFMD,		ATU_NO_QUIRK },
 	{ USB_VENDOR_LINKSYS2,	USB_PRODUCT_LINKSYS2_NWU11B,
 	  RadioRFMD,		ATU_NO_QUIRK },
 	{ USB_VENDOR_LINKSYS3,	USB_PRODUCT_LINKSYS3_WUSB11V28,
@@ -1210,7 +1208,7 @@ atu_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	case IEEE80211_S_SCAN:
 		memcpy(ic->ic_chan_scan, ic->ic_chan_active,
 		    sizeof(ic->ic_chan_active));
-		ieee80211_free_allnodes(ic, 1);
+		ieee80211_node_cleanup(ic, ic->ic_bss);
 
 		/* tell the event thread that we want a scan */
 		sc->sc_cmd = ATU_C_SCAN;
@@ -1744,8 +1742,8 @@ atu_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	rxi.rxi_tstamp = UGETDW(h->rx_time);
 	ieee80211_input(ifp, m, ni, &rxi);
 
-	ieee80211_release_node(ic, ni);
 done1:
+	ieee80211_release_node(ic, ni);
 	splx(s);
 done:
 	/* Setup new transfer. */
@@ -1959,7 +1957,7 @@ atu_start(struct ifnet *ifp)
 				break;
 			}
 
-			IFQ_DEQUEUE(&ifp->if_snd, m);
+			m = ifq_dequeue(&ifp->if_snd);
 			if (m == NULL) {
 				DPRINTFN(25, ("%s: nothing to send\n",
 				    sc->atu_dev.dv_xname));
@@ -2228,7 +2226,7 @@ atu_watchdog(struct ifnet *ifp)
 		}
 	}
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		atu_start(ifp);
 	splx(s);
 
@@ -2254,7 +2252,6 @@ atu_stop(struct ifnet *ifp, int disable)
 
 	/* Stop transfers. */
 	if (sc->atu_ep[ATU_ENDPT_RX] != NULL) {
-		usbd_abort_pipe(sc->atu_ep[ATU_ENDPT_RX]);
 		err = usbd_close_pipe(sc->atu_ep[ATU_ENDPT_RX]);
 		if (err) {
 			DPRINTF(("%s: close rx pipe failed: %s\n",
@@ -2264,7 +2261,6 @@ atu_stop(struct ifnet *ifp, int disable)
 	}
 
 	if (sc->atu_ep[ATU_ENDPT_TX] != NULL) {
-		usbd_abort_pipe(sc->atu_ep[ATU_ENDPT_TX]);
 		err = usbd_close_pipe(sc->atu_ep[ATU_ENDPT_TX]);
 		if (err) {
 			DPRINTF(("%s: close tx pipe failed: %s\n",

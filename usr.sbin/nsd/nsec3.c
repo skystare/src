@@ -88,14 +88,6 @@ void nsec3_zone_trees_create(struct region* region, zone_type* zone)
 		zone->dshashtree = rbtree_create(region, cmp_dshash_tree);
 }
 
-void nsec3_hash_tree_clear(struct zone* zone)
-{
-	hash_tree_clear(zone->nsec3tree);
-	hash_tree_clear(zone->hashtree);
-	hash_tree_clear(zone->wchashtree);
-	hash_tree_clear(zone->dshashtree);
-}
-
 static void
 detect_nsec3_params(rr_type* nsec3_apex,
 	const unsigned char** salt, int* salt_len, int* iter)
@@ -127,6 +119,7 @@ nsec3_hash_and_store(zone_type* zone, const dname_type* dname, uint8_t* store)
 
 	detect_nsec3_params(zone->nsec3_param, &nsec3_salt,
 		&nsec3_saltlength, &nsec3_iterations);
+	assert(nsec3_iterations >= 0 && nsec3_iterations <= 65536);
 	iterated_hash((unsigned char*)store, nsec3_salt, nsec3_saltlength,
 		dname_name(dname), dname->name_size, nsec3_iterations);
 }
@@ -403,6 +396,31 @@ nsec3_chain_find_prev(struct zone* zone, struct domain* domain)
 	return NULL;
 }
 
+
+/** clear hash tree. Called from nsec3_clear_precompile() only. */
+static void
+hash_tree_clear(rbtree_type* tree)
+{
+	if(!tree) return;
+
+	/* Previously (before commit 4ca61188b3f7a0e077476875810d18a5d439871f
+	 * and/or svn commit 4776) prehashes and corresponding rbtree nodes
+	 * were part of struct nsec3_domain_data. Clearing the hash_tree would
+	 * then mean setting the key value of the nodes to NULL to indicate
+	 * absence of the prehash.
+	 * But since prehash structs are separatly allocated, this is no longer
+	 * necessary as currently the prehash structs are simply recycled and 
+	 * NULLed.
+	 *
+	 * rbnode_type* n;
+	 * for(n=rbtree_first(tree); n!=RBTREE_NULL; n=rbtree_next(n)) {
+	 *	n->key = NULL;
+	 * }
+	 */
+	tree->count = 0;
+	tree->root = RBTREE_NULL;
+}
+
 void
 nsec3_clear_precompile(struct namedb* db, zone_type* zone)
 {
@@ -675,6 +693,7 @@ prehash_zone_complete(struct namedb* db, struct zone* zone)
 	/* find zone settings */
 
 	assert(db && zone);
+	udbz.data = 0;
 	if(db->udb) {
 		if(!udb_zone_search(db->udb, &udbz, dname_name(domain_dname(
 			zone->apex)), domain_dname(zone->apex)->name_size)) {
@@ -685,11 +704,11 @@ prehash_zone_complete(struct namedb* db, struct zone* zone)
 	if(!zone->nsec3_param || !check_apex_soa(db, zone, 0)) {
 		zone->nsec3_param = NULL;
 		zone->nsec3_last = NULL;
-		if(db->udb)
+		if(udbz.data)
 			udb_ptr_unlink(&udbz, db->udb);
 		return;
 	}
-	if(db->udb)
+	if(udbz.data)
 		udb_ptr_unlink(&udbz, db->udb);
 	nsec3_precompile_newparam(db, zone);
 }

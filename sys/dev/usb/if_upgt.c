@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_upgt.c,v 1.82 2018/08/25 17:07:20 mestre Exp $ */
+/*	$OpenBSD: if_upgt.c,v 1.87 2020/07/31 10:49:32 mglocker Exp $ */
 
 /*
  * Copyright (c) 2007 Marcus Glocker <mglocker@openbsd.org>
@@ -447,14 +447,10 @@ upgt_detach(struct device *self, int flags)
 	s = splusb();
 
 	/* abort and close TX / RX pipes */
-	if (sc->sc_tx_pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_tx_pipeh);
+	if (sc->sc_tx_pipeh != NULL)
 		usbd_close_pipe(sc->sc_tx_pipeh);
-	}
-	if (sc->sc_rx_pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_rx_pipeh);
+	if (sc->sc_rx_pipeh != NULL)
 		usbd_close_pipe(sc->sc_rx_pipeh);
-	}
 
 	/* remove tasks and timeouts */
 	usb_rem_task(sc->sc_udev, &sc->sc_task_newstate);
@@ -906,7 +902,8 @@ upgt_eeprom_read(struct upgt_softc *sc)
 			    sc->sc_dev.dv_xname);
 			return (EIO);
 		}
-		if (tsleep(sc, 0, "eeprom_request", UPGT_USB_TIMEOUT)) {
+		if (tsleep_nsec(sc, 0, "eeprom_request",
+		    MSEC_TO_NSEC(UPGT_USB_TIMEOUT))) {
 			printf("%s: timeout while waiting for EEPROM data!\n",
 			    sc->sc_dev.dv_xname);
 			return (EIO);
@@ -1242,7 +1239,7 @@ upgt_media_change(struct ifnet *ifp)
 		upgt_init(ifp);
 	}
 
-	return (0);
+	return (error);
 }
 
 void
@@ -1376,7 +1373,7 @@ upgt_start(struct ifnet *ifp)
 			if (ic->ic_state != IEEE80211_S_RUN)
 				break;
 
-			IFQ_DEQUEUE(&ifp->if_snd, m);
+			m = ifq_dequeue(&ifp->if_snd);
 			if (m == NULL)
 				break;
 
@@ -2014,7 +2011,6 @@ upgt_set_led(struct upgt_softc *sc, int action)
 	struct upgt_data *data_cmd = &sc->cmd_data;
 	struct upgt_lmac_mem *mem;
 	struct upgt_lmac_led *led;
-	struct timeval t;
 	int len;
 
 	/*
@@ -2063,9 +2059,7 @@ upgt_set_led(struct upgt_softc *sc, int action)
 		led->action_tmp_dur = htole16(UPGT_LED_ACTION_TMP_DUR);
 		/* lock blink */
 		sc->sc_led_blink = 1;
-		t.tv_sec = 0;
-		t.tv_usec = UPGT_LED_ACTION_TMP_DUR * 1000L;
-		timeout_add(&sc->led_to, tvtohz(&t));
+		timeout_add_msec(&sc->led_to, UPGT_LED_ACTION_TMP_DUR);
 		break;
 	default:
 		return;

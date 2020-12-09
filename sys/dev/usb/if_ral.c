@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ral.c,v 1.144 2017/10/26 15:00:28 mpi Exp $	*/
+/*	$OpenBSD: if_ral.c,v 1.148 2020/07/31 10:49:32 mglocker Exp $	*/
 
 /*-
  * Copyright (c) 2005, 2006
@@ -196,7 +196,7 @@ ural_match(struct device *parent, void *match, void *aux)
 {
 	struct usb_attach_arg *uaa = aux;
 
-	if (uaa->iface == NULL || uaa->configno != RAL_CONFIG_NO)
+	if (uaa->configno != RAL_CONFIG_NO || uaa->ifaceno != RAL_IFACE_NO)
 		return UMATCH_NONE;
 
 	return (usb_lookup(ural_devs, uaa->vendor, uaa->product) != NULL) ?
@@ -212,19 +212,10 @@ ural_attach(struct device *parent, struct device *self, void *aux)
 	struct ifnet *ifp = &ic->ic_if;
 	usb_interface_descriptor_t *id;
 	usb_endpoint_descriptor_t *ed;
-	usbd_status error;
 	int i;
 
 	sc->sc_udev = uaa->device;
-
-	/* get the first interface handle */
-	error = usbd_device2interface_handle(sc->sc_udev, RAL_IFACE_INDEX,
-	    &sc->sc_iface);
-	if (error != 0) {
-		printf("%s: could not get interface handle\n",
-		    sc->sc_dev.dv_xname);
-		return;
-	}
+	sc->sc_iface = uaa->iface;
 
 	/*
 	 * Find endpoints.
@@ -357,15 +348,11 @@ ural_detach(struct device *self, int flags)
 		sc->amrr_xfer = NULL;
 	}
 
-	if (sc->sc_rx_pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_rx_pipeh);
+	if (sc->sc_rx_pipeh != NULL)
 		usbd_close_pipe(sc->sc_rx_pipeh);
-	}
 
-	if (sc->sc_tx_pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_tx_pipeh);
+	if (sc->sc_tx_pipeh != NULL)
 		usbd_close_pipe(sc->sc_tx_pipeh);
-	}
 
 	ural_free_rx_list(sc);
 	ural_free_tx_list(sc);
@@ -506,9 +493,9 @@ ural_media_change(struct ifnet *ifp)
 		return error;
 
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING))
-		ural_init(ifp);
+		error = ural_init(ifp);
 
-	return 0;
+	return error;
 }
 
 /*
@@ -1247,7 +1234,7 @@ ural_start(struct ifnet *ifp)
 			if (ic->ic_state != IEEE80211_S_RUN)
 				break;
 
-			IFQ_DEQUEUE(&ifp->if_snd, m0);
+			m0 = ifq_dequeue(&ifp->if_snd);
 			if (m0 == NULL)
 				break;
 #if NBPFILTER > 0
@@ -2076,12 +2063,10 @@ ural_stop(struct ifnet *ifp, int disable)
 		sc->amrr_xfer = NULL;
 	}
 	if (sc->sc_rx_pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_rx_pipeh);
 		usbd_close_pipe(sc->sc_rx_pipeh);
 		sc->sc_rx_pipeh = NULL;
 	}
 	if (sc->sc_tx_pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_tx_pipeh);
 		usbd_close_pipe(sc->sc_tx_pipeh);
 		sc->sc_tx_pipeh = NULL;
 	}

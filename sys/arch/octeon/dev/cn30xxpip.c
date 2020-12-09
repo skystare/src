@@ -1,4 +1,4 @@
-/*	$OpenBSD: cn30xxpip.c,v 1.7 2017/11/05 04:57:28 visa Exp $	*/
+/*	$OpenBSD: cn30xxpip.c,v 1.10 2020/09/04 15:18:05 visa Exp $	*/
 
 /*
  * Copyright (c) 2007 Internet Initiative Japan, Inc.
@@ -41,64 +41,6 @@
 #include <octeon/dev/cn30xxpipreg.h>
 #include <octeon/dev/cn30xxpipvar.h>
 
-/*
- * register definitions
- */
-#define	_ENTRY(x)	{ #x, x##_OFFSET }
-#define	_ENTRY_0_3(x) \
-	_ENTRY(x## 0), _ENTRY(x## 1), _ENTRY(x## 2), _ENTRY(x## 3)
-#define	_ENTRY_0_7(x) \
-	_ENTRY(x## 0), _ENTRY(x## 1), _ENTRY(x## 2), _ENTRY(x## 3), \
-	_ENTRY(x## 4), _ENTRY(x## 5), _ENTRY(x## 6), _ENTRY(x## 7)
-#define	_ENTRY_0_1_2_32(x) \
-	_ENTRY(x## 0), _ENTRY(x## 1), _ENTRY(x## 2), _ENTRY(x##32)
-
-struct cn30xxpip_dump_reg_ {
-	const char *name;
-	size_t	offset;
-};
-
-const struct cn30xxpip_dump_reg_ cn30xxpip_dump_stats_[] = {
-/* PIP_QOS_DIFF[0-63] */
-	_ENTRY_0_1_2_32	(PIP_STAT0_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT1_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT2_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT3_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT4_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT5_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT6_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT7_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT8_PRT),
-	_ENTRY_0_1_2_32	(PIP_STAT9_PRT),
-/* PIP_TAG_INC[0-63] */
-	_ENTRY_0_1_2_32	(PIP_STAT_INB_PKTS),
-	_ENTRY_0_1_2_32	(PIP_STAT_INB_OCTS),
-	_ENTRY_0_1_2_32	(PIP_STAT_INB_ERRS),
-};
-
-const struct cn30xxpip_dump_reg_ cn30xxpip_dump_regs_[] = {
-	_ENTRY		(PIP_BIST_STATUS),
-	_ENTRY		(PIP_INT_REG),
-	_ENTRY		(PIP_INT_EN),
-	_ENTRY		(PIP_STAT_CTL),
-	_ENTRY		(PIP_GBL_CTL),
-	_ENTRY		(PIP_GBL_CFG),
-	_ENTRY		(PIP_SOFT_RST),
-	_ENTRY		(PIP_IP_OFFSET),
-	_ENTRY		(PIP_TAG_SECRET),
-	_ENTRY		(PIP_TAG_MASK),
-	_ENTRY_0_3	(PIP_DEC_IPSEC),
-	_ENTRY		(PIP_RAW_WORD),
-	_ENTRY_0_7	(PIP_QOS_VLAN),
-	_ENTRY_0_3	(PIP_QOS_WATCH),
-	_ENTRY_0_1_2_32	(PIP_PRT_CFG),
-	_ENTRY_0_1_2_32	(PIP_PRT_TAG),
-};
-#undef	_ENTRY
-#undef	_ENTRY_0_3
-#undef	_ENTRY_0_7
-#undef	_ENTRY_0_1_2_32
-
 /* XXX */
 void
 cn30xxpip_init(struct cn30xxpip_attach_args *aa,
@@ -122,6 +64,11 @@ cn30xxpip_init(struct cn30xxpip_attach_args *aa,
 	if (status != 0)
 		panic("can't map %s space", "pip register");
 
+	status = bus_space_subregion(sc->sc_regt, sc->sc_regh,
+	    PIP_STAT_BASE(sc->sc_port), PIP_STAT_SIZE, &sc->sc_regh_stat);
+	if (status != 0)
+		panic("can't map stat register space");
+
 	*rsc = sc;
 }
 
@@ -129,6 +76,11 @@ cn30xxpip_init(struct cn30xxpip_attach_args *aa,
 	bus_space_read_8((sc)->sc_regt, (sc)->sc_regh, (off))
 #define	_PIP_WR8(sc, off, v) \
 	bus_space_write_8((sc)->sc_regt, (sc)->sc_regh, (off), (v))
+
+#define	_PIP_STAT_RD8(sc, off) \
+	bus_space_read_8((sc)->sc_regt, (sc)->sc_regh_stat, (off))
+#define	_PIP_STAT_WR8(sc, off, v) \
+	bus_space_write_8((sc)->sc_regt, (sc)->sc_regh_stat, (off), (v))
 
 int
 cn30xxpip_port_config(struct cn30xxpip_softc *sc)
@@ -199,28 +151,66 @@ cn30xxpip_prt_cfg_enable(struct cn30xxpip_softc *sc, uint64_t prt_cfg,
 }
 
 void
-cn30xxpip_stats(struct cn30xxpip_softc *sc, struct ifnet *ifp, int gmx_port)
+cn30xxpip_stats_init(struct cn30xxpip_softc *sc)
 {
-	const struct cn30xxpip_dump_reg_ *reg;
-	uint64_t tmp, pkts, octs;
-	uint64_t pip_stat_ctl;
+	/* XXX */
+	_PIP_WR8(sc, PIP_STAT_CTL_OFFSET, 1);
 
-	if (sc == NULL || ifp == NULL)
-		panic("%s: invalid argument. sc=%p, ifp=%p\n", __func__,
-			sc, ifp);
-
-	if (gmx_port < 0 || gmx_port >= GMX_PORT_NUNITS) {
-		printf("%s: invalid gmx_port %d\n", __func__, gmx_port);
-		return;
-	}
-
-	pip_stat_ctl = _PIP_RD8(sc, PIP_STAT_CTL_OFFSET);
-	_PIP_WR8(sc, PIP_STAT_CTL_OFFSET, pip_stat_ctl | PIP_STAT_CTL_RDCLR);
-	reg = &cn30xxpip_dump_stats_[gmx_port];
-	tmp = _PIP_RD8(sc, reg->offset);
-	octs = (tmp & 0x00000000ffffffffULL); /* XXX: no counter in ifp?? */
-	pkts = (tmp & 0xffffffff00000000ULL) >> 32;
-	ifp->if_iqdrops += pkts;
-
-	_PIP_WR8(sc, PIP_STAT_CTL_OFFSET, pip_stat_ctl);
+	_PIP_STAT_WR8(sc, PIP_STAT0_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT1_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT2_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT3_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT4_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT5_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT6_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT7_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT8_PRT, 0);
+	_PIP_STAT_WR8(sc, PIP_STAT9_PRT, 0);
 }
+
+#if NKSTAT > 0
+void
+cn30xxpip_kstat_read(struct cn30xxpip_softc *sc, struct kstat_kv *kvs)
+{
+	uint64_t val;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT0_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_qdpo]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_qdpp]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT1_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_toto_pip]) += (uint32_t)val;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT2_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_raw]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_totp_pip]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT3_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_mcast]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_bcast]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT4_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_h64]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_h127]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT5_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_h255]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_h511]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT6_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_h1023]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_h1518]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT7_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_hmax]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_fcs]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT8_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_undersz]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_frag]) += val >> 32;
+
+	val = _PIP_STAT_RD8(sc, PIP_STAT9_PRT);
+	kstat_kv_u64(&kvs[cnmac_stat_rx_oversz]) += (uint32_t)val;
+	kstat_kv_u64(&kvs[cnmac_stat_rx_jabber]) += val >> 32;
+}
+#endif

@@ -1,4 +1,4 @@
-.\"	$OpenBSD: httpd.conf.5,v 1.101 2018/06/20 16:43:05 reyk Exp $
+.\"	$OpenBSD: httpd.conf.5,v 1.114 2020/10/29 12:30:52 denis Exp $
 .\"
 .\" Copyright (c) 2014, 2015 Reyk Floeter <reyk@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 20 2018 $
+.Dd $Mdocdate: October 29 2020 $
 .Dt HTTPD.CONF 5
 .Os
 .Sh NAME
@@ -208,13 +208,17 @@ may contain predefined macros that will be expanded at runtime:
 .It Ic $DOCUMENT_URI
 The request path.
 .It Ic $QUERY_STRING
-The URL encoded query string of the request.
+The query string of the request.
+.It Ic $QUERY_STRING_ENC
+The URL-encoded query string of the request.
 .It Ic $REMOTE_ADDR
 The IP address of the connected client.
 .It Ic $REMOTE_PORT
 The TCP source port of the connected client.
 .It Ic $REMOTE_USER
 The remote user for HTTP authentication.
+.It Ic $REQUEST_SCHEME
+The request scheme (http or https).
 .It Ic $REQUEST_URI
 The request path and optional query string.
 .It Ic $SERVER_ADDR
@@ -234,6 +238,7 @@ option.
 .El
 .It Ic connection Ar option
 Set the specified options and limits for HTTP connections.
+Multiple options may be specified within curly braces.
 Valid options are:
 .Bl -tag -width Ds
 .It Ic max request body Ar number
@@ -260,6 +265,7 @@ Set the default media type for the specified location,
 overwriting the global setting.
 .It Ic directory Ar option
 Set the specified options when serving or accessing directories.
+Multiple options may be specified within curly braces.
 Valid options are:
 .Bl -tag -width Ds
 .It Oo Ic no Oc Ic auto index
@@ -274,9 +280,18 @@ Disable the directory index.
 .Xr httpd 8
 will neither display nor generate a directory index.
 .El
-.It Oo Ic no Oc Ic fastcgi Op Ic socket Ar socket
+.It Oo Ic no Oc Ic fastcgi Oo Ar option Oc
 Enable FastCGI instead of serving files.
+Valid options are:
+.Bl -tag -width Ds
+.It Ic socket Oo Cm tcp Oc Ar socket Oo Ar port Oc
+.Nm httpd
+passes HTTP requests to a FastCGI handler listening on the socket
+.Ar socket .
 The
+.Ar socket
+can either be a UNIX domain socket or a TCP socket.
+If the FastCGI handler is listening on a UNIX domain socket,
 .Ar socket
 is a local path name within the
 .Xr chroot 2
@@ -284,8 +299,25 @@ root directory of
 .Xr httpd 8
 and defaults to
 .Pa /run/slowcgi.sock .
+Alternatively if
+the FastCGI handler is listening on a TCP socket,
+.Ar socket
+is a hostname or an IP address.
+If the
+.Ar port
+is not specified, it defaults to port 9000.
+.It Ic strip Ar number
+Strip
+.Ar number
+path components from the beginning of DOCUMENT_ROOT and
+SCRIPT_FILENAME before sending them to the FastCGI server.
+This allows FastCGI server chroot to be a directory under httpd chroot.
+.It Ic param Ar variable value
+Sets a variable that will be sent to the FastCGI server.
+Each statement defines one variable.
+.El
 .Pp
-The FastCGI handler will be given the following variables:
+The FastCGI handler will be given the following variables by default:
 .Pp
 .Bl -tag -width GATEWAY_INTERFACE -offset indent -compact
 .It Ic DOCUMENT_ROOT
@@ -367,11 +399,16 @@ of the host's domain should be considered HSTS hosts.
 .It Ic listen on Ar address Oo Ic tls Oc Ic port Ar number
 Set the listen address and port.
 This statement can be specified multiple times.
-.It Ic location Ar path Brq ...
+.It Ic location Oo Oo Ic not Oc Ic found Oc Ar path Brq ...
 Specify server configuration rules for a specific location.
 The
 .Ar path
 argument will be matched against the request path with shell globbing rules.
+Optionally, it is also possible to match for
+.Ic found
+(i.e. accessible) or
+.Ic not found
+request paths only.
 In case of multiple location statements in the same context, the
 first matching location statement will be put into effect, while all
 later ones will be ignored.
@@ -387,7 +424,7 @@ except
 .Ic tcp
 and
 .Ic tls .
-.It Ic location match Ar path Brq ...
+.It Ic location Oo Oo Ic not Oc Ic found Oc Ic match Ar path Brq ...
 Like the
 .Ic location
 option,
@@ -414,6 +451,7 @@ but can be changed per server or location.
 Use the
 .Ic no log
 directive to disable logging of any requests.
+Multiple options may be specified within curly braces.
 Valid options are:
 .Bl -tag -width Ds
 .It Ic access Ar name
@@ -434,7 +472,8 @@ The
 .Ar style
 can be
 .Cm common ,
-.Cm combined
+.Cm combined ,
+.Cm forwarded
 or
 .Cm connection .
 The styles
@@ -443,6 +482,14 @@ and
 .Cm combined
 write a log entry after each request similar to the standard Apache
 and nginx access log formats.
+The style
+.Cm forwarded
+extends the style
+.Cm combined
+by appending two fields containing the values of the headers
+.Ar X-Forwarded-For
+and
+.Ar X-Forwarded-Port .
 The style
 .Cm connection
 writes a summarized log entry after each connection,
@@ -462,6 +509,7 @@ Disable any previous
 in a location.
 .It Ic request Ar option
 Configure the options for the request path.
+Multiple options may be specified within curly braces.
 Valid options are:
 .Bl -tag -width Ds
 .It Oo Ic no Oc Ic rewrite Ar path
@@ -499,6 +547,7 @@ Enable or disable the specified TCP/IP options; see
 and
 .Xr ip 4
 for more information about the options.
+Multiple options may be specified within curly braces.
 Valid options are:
 .Bl -tag -width Ds
 .It Ic backlog Ar number
@@ -528,6 +577,7 @@ This will affect the TCP window size.
 .It Ic tls Ar option
 Set the TLS configuration for the server.
 These options are only used if TLS has been enabled via the listen directive.
+Multiple options may be specified within curly braces.
 Valid options are:
 .Bl -tag -width Ds
 .It Ic certificate Ar file
@@ -604,13 +654,11 @@ is empty, OCSP stapling will not be used.
 The default is to not use OCSP stapling.
 .It Ic protocols Ar string
 Specify the TLS protocols to enable for this server.
-If not specified, the value
-.Qq default
-will be used (secure protocols; TLSv1.2-only).
 Refer to the
 .Xr tls_config_parse_protocols 3
-function for other valid protocol string values.
-.It Ic ticket Ic lifetime Ar seconds
+function for valid protocol string values.
+By default, TLSv1.3 and TLSv1.2 will be used.
+.It Ic ticket lifetime Ar seconds
 Enable TLS session tickets with a
 .Ar seconds
 session lifetime.
@@ -642,7 +690,8 @@ and
 .Pp
 The
 .Ic types
-section must include one or more lines of the following syntax:
+section must include one or more lines of the following syntax,
+enclosed in curly braces:
 .Bl -tag -width Ds
 .It Ar type/subtype Ar name Op Ar name ...
 Set the media
@@ -657,7 +706,21 @@ Each line may end with an optional semicolon.
 Include types definitions from an external file, for example
 .Pa /usr/share/misc/mime.types .
 .El
+.Sh FILES
+.Bl -tag -width /etc/examples/httpd.conf -compact
+.It Pa /etc/examples/httpd.conf
+Example configuration file.
+.El
 .Sh EXAMPLES
+Example configuration files for
+.Nm
+and
+.Xr acme-client 1
+are provided in
+.Pa /etc/examples/httpd.conf
+and
+.Pa /etc/examples/acme-client.conf .
+.Pp
 The following example will start one server that is pre-forked two
 times and is listening on all local IP addresses.
 It additionally defines some media types overriding the defaults.
@@ -725,11 +788,13 @@ directive:
 .Bd -literal -offset indent
 server "example.com" {
 	listen on 10.0.0.1 port 80
-	block return 301 "http://www.example.com$REQUEST_URI"
+	listen on 10.0.0.1 tls port 443
+	block return 301 "$REQUEST_SCHEME://www.example.com$REQUEST_URI"
 }
 
 server "www.example.com" {
 	listen on 10.0.0.1 port 80
+	listen on 10.0.0.1 tls port 443
 }
 .Ed
 The request can also be rewritten with the

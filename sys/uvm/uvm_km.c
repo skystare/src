@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_km.c,v 1.130 2017/05/11 06:55:47 dlg Exp $	*/
+/*	$OpenBSD: uvm_km.c,v 1.137 2020/05/23 06:15:09 jan Exp $	*/
 /*	$NetBSD: uvm_km.c,v 1.42 2001/01/14 02:10:01 thorpej Exp $	*/
 
 /* 
@@ -131,6 +131,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 #include <sys/kthread.h>
 #include <uvm/uvm.h>
 
@@ -168,14 +169,13 @@ uvm_km_init(vaddr_t base, vaddr_t start, vaddr_t end)
 	 * before installing.
 	 */
 
-	uvm_map_setup(&kernel_map_store, base, end,
+	uvm_map_setup(&kernel_map_store, pmap_kernel(), base, end,
 #ifdef KVA_GUARDPAGES
 	    VM_MAP_PAGEABLE | VM_MAP_GUARDPAGES
 #else
 	    VM_MAP_PAGEABLE
 #endif
 	    );
-	kernel_map_store.pmap = pmap_kernel();
 	if (base != start && uvm_map(&kernel_map_store, &base, start - base,
 	    NULL, UVM_UNKNOWN_OFFSET, 0,
 	    UVM_MAPFLAG(PROT_READ | PROT_WRITE, PROT_READ | PROT_WRITE,
@@ -220,8 +220,7 @@ uvm_km_suballoc(struct vm_map *map, vaddr_t *min, vaddr_t *max, vsize_t size,
 		if (submap == NULL)
 			panic("uvm_km_suballoc: unable to create submap");
 	} else {
-		uvm_map_setup(submap, *min, *max, flags);
-		submap->pmap = vm_map_pmap(map);
+		uvm_map_setup(submap, vm_map_pmap(map), *min, *max, flags);
 	}
 
 	/* now let uvm_map_submap plug in it...  */
@@ -250,7 +249,7 @@ uvm_km_pgremove(struct uvm_object *uobj, vaddr_t start, vaddr_t end)
 		pp = uvm_pagelookup(uobj, curoff);
 		if (pp && pp->pg_flags & PG_BUSY) {
 			atomic_setbits_int(&pp->pg_flags, PG_WANTED);
-			UVM_WAIT(pp, 0, "km_pgrm", 0);
+			tsleep_nsec(pp, PVM, "km_pgrm", INFSLP);
 			curoff -= PAGE_SIZE; /* loop back to us */
 			continue;
 		}
@@ -581,7 +580,7 @@ uvm_km_valloc_prefer_wait(struct vm_map *map, vsize_t size, voff_t prefer)
 		}
 
 		/* failed.  sleep for a while (on map) */
-		tsleep(map, PVM, "vallocwait", 0);
+		tsleep_nsec(map, PVM, "vallocwait", INFSLP);
 	}
 	/*NOTREACHED*/
 }
@@ -700,9 +699,7 @@ uvm_km_createthread(void *arg)
 
 /*
  * Endless loop.  We grab pages in increments of 16 pages, then
- * quickly swap them into the list.  At some point we can consider
- * returning memory to the system if we have too many free pages,
- * but that's not implemented yet.
+ * quickly swap them into the list.
  */
 void
 uvm_km_thread(void *arg)
@@ -719,8 +716,8 @@ uvm_km_thread(void *arg)
 		mtx_enter(&uvm_km_pages.mtx);
 		if (uvm_km_pages.free >= uvm_km_pages.lowat &&
 		    uvm_km_pages.freelist == NULL) {
-			msleep(&uvm_km_pages.km_proc, &uvm_km_pages.mtx,
-			    PVM, "kmalloc", 0);
+			msleep_nsec(&uvm_km_pages.km_proc, &uvm_km_pages.mtx,
+			    PVM, "kmalloc", INFSLP);
 		}
 		allocmore = uvm_km_pages.free < uvm_km_pages.lowat;
 		fp = uvm_km_pages.freelist;
@@ -819,7 +816,7 @@ km_alloc(size_t sz, const struct kmem_va_mode *kv,
 	paddr_t pla_align;
 	int pla_flags;
 	int pla_maxseg;
-	vaddr_t va, sva;
+	vaddr_t va, sva = 0;
 
 	KASSERT(sz == round_page(sz));
 
@@ -884,8 +881,8 @@ alloc_va:
 				uvm_pglistfree(&pgl);
 				return NULL;
 			}
-			msleep(&uvm_km_pages.free, &uvm_km_pages.mtx, PVM,
-			    "getpage", 0);
+			msleep_nsec(&uvm_km_pages.free, &uvm_km_pages.mtx,
+			    PVM, "getpage", INFSLP);
 		}
 		va = uvm_km_pages.page[--uvm_km_pages.free];
 		if (uvm_km_pages.free < uvm_km_pages.lowat &&
@@ -911,7 +908,7 @@ try_map:
 		    kv->kv_align, UVM_MAPFLAG(prot, prot, MAP_INHERIT_NONE,
 		    MADV_RANDOM, mapflags))) {
 			if (kv->kv_wait && kd->kd_waitok) {
-				tsleep(map, PVM, "km_allocva", 0);
+				tsleep_nsec(map, PVM, "km_allocva", INFSLP);
 				goto try_map;
 			}
 			uvm_pglistfree(&pgl);

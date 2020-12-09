@@ -1,4 +1,4 @@
-/*	$OpenBSD: umsm.c,v 1.114 2018/08/15 14:13:07 mpi Exp $	*/
+/*	$OpenBSD: umsm.c,v 1.118 2020/07/31 10:49:33 mglocker Exp $	*/
 
 /*
  * Copyright (c) 2008 Yojiro UO <yuo@nui.org>
@@ -139,7 +139,7 @@ static const struct umsm_type umsm_devs[] = {
 	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_E618 }, DEV_HUAWEI},
 	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_E392_INIT }, DEV_UMASS5},
 	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_EM770W }, 0},
-	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_Mobile }, DEV_HUAWEI},
+	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_MOBILE }, DEV_HUAWEI},
 	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_K3765_INIT }, DEV_UMASS5},
 	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_K3765 }, 0},
 	{{ USB_VENDOR_HUAWEI,	USB_PRODUCT_HUAWEI_K3772_INIT }, DEV_UMASS5},
@@ -440,7 +440,6 @@ umsm_detach(struct device *self, int flags)
 
 	/* close the interrupt endpoint if that is opened */
 	if (sc->sc_intr_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_intr_pipe);
 		usbd_close_pipe(sc->sc_intr_pipe);
 		free(sc->sc_intr_buf, M_USBDEV, sc->sc_isize);
 		sc->sc_intr_pipe = NULL;
@@ -496,7 +495,6 @@ umsm_close(void *addr, int portno)
 		return;
 
 	if (sc->sc_intr_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_intr_pipe);
 		err = usbd_close_pipe(sc->sc_intr_pipe);
 		if (err)
 			printf("%s: close interrupt pipe failed: %s\n",

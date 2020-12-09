@@ -1,4 +1,4 @@
-/*	$OpenBSD: aic79xx.c,v 1.64 2018/02/06 00:18:38 tedu Exp $	*/
+/*	$OpenBSD: aic79xx.c,v 1.66 2020/07/24 12:43:31 krw Exp $	*/
 
 /*
  * Copyright (c) 2004 Milos Urbanek, Kenneth R. Westerback & Marco Peereboom
@@ -269,11 +269,10 @@ int ahd_createdmamem(struct ahd_softc *, size_t, struct map_node *,
 void ahd_freedmamem(struct ahd_softc *, struct map_node *);
 
 /******************************** Private Inlines *****************************/
-__inline void	ahd_assert_atn(struct ahd_softc *ahd);
 int	ahd_currently_packetized(struct ahd_softc *ahd);
 int	ahd_set_active_fifo(struct ahd_softc *ahd);
 
-__inline void
+static inline void
 ahd_assert_atn(struct ahd_softc *ahd)
 {
 	ahd_outb(ahd, SCSISIGO, ATNO);
@@ -1377,7 +1376,7 @@ ahd_handle_seqint(struct ahd_softc *ahd, u_int intstat)
 			       ahd_lookup_phase_entry(lastphase)->phasemsg,
 			       SCB_GET_TAG(scb));
 			ahd_print_path(ahd, scb);
-			printf("%s seen Data Phase.  Length = %ld.  "
+			printf("%s seen Data Phase.  Length = %d.  "
 			       "NumSGs = %d.\n",
 			       ahd_inb(ahd, SEQ_FLAGS) & DPHASE
 			       ? "Have" : "Haven't",

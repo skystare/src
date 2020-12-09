@@ -1,4 +1,4 @@
-/*	$OpenBSD: misc.c,v 1.70 2018/04/09 17:53:36 tobias Exp $	*/
+/*	$OpenBSD: misc.c,v 1.76 2020/10/26 18:16:51 tb Exp $	*/
 
 /*
  * Miscellaneous functions
@@ -16,6 +16,7 @@
 #include "charclass.h"
 
 short ctypes [UCHAR_MAX+1];	/* type bits for unsigned char */
+static int dropped_privileges;
 
 static int	do_gmatch(const unsigned char *, const unsigned char *,
 		    const unsigned char *, const unsigned char *);
@@ -146,6 +147,7 @@ const struct option sh_options[] = {
 	{ "notify",	'b',		OF_ANY },
 	{ "nounset",	'u',		OF_ANY },
 	{ "physical",	  0,		OF_ANY }, /* non-standard */
+	{ "pipefail",	  0,		OF_ANY }, /* non-standard */
 	{ "posix",	  0,		OF_ANY }, /* non-standard */
 	{ "privileged",	'p',		OF_ANY },
 	{ "restricted",	'r',	    OF_CMDLINE },
@@ -290,12 +292,18 @@ change_flag(enum sh_flag f,
 		}
 	} else
 	/* Turning off -p? */
-	if (f == FPRIVILEGED && oldval && !newval) {
+	if (f == FPRIVILEGED && oldval && !newval && issetugid() &&
+	    !dropped_privileges) {
 		gid_t gid = getgid();
 
 		setresgid(gid, gid, gid);
 		setgroups(1, &gid);
 		setresuid(ksheuid, ksheuid, ksheuid);
+
+		if (pledge("stdio rpath wpath cpath fattr flock getpw proc "
+		    "exec tty", NULL) == -1)
+			bi_errorf("pledge fail");
+		dropped_privileges = 1;
 	} else if (f == FPOSIX && newval) {
 		Flag(FBRACEEXPAND) = 0;
 	}
@@ -607,6 +615,9 @@ do_gmatch(const unsigned char *s, const unsigned char *se,
 			break;
 
 		case '*':
+			/* collapse consecutive stars */
+			while (ISMAGIC(p[0]) && p[1] == '*')
+				p += 2;
 			if (p == pe)
 				return 1;
 			s--;
@@ -702,7 +713,7 @@ do_gmatch(const unsigned char *s, const unsigned char *se,
 static int
 posix_cclass(const unsigned char *pattern, int test, const unsigned char **ep)
 {
-	struct cclass *cc;
+	const struct cclass *cc;
 	const unsigned char *colon;
 	size_t len;
 	int rval = 0;
@@ -1078,7 +1089,7 @@ blocking_read(int fd, char *buf, int nbytes)
 	int ret;
 	int tried_reset = 0;
 
-	while ((ret = read(fd, buf, nbytes)) < 0) {
+	while ((ret = read(fd, buf, nbytes)) == -1) {
 		if (!tried_reset && errno == EAGAIN) {
 			int oerrno = errno;
 			if (reset_nonblock(fd) > 0) {
@@ -1101,12 +1112,12 @@ reset_nonblock(int fd)
 {
 	int flags;
 
-	if ((flags = fcntl(fd, F_GETFL)) < 0)
+	if ((flags = fcntl(fd, F_GETFL)) == -1)
 		return -1;
 	if (!(flags & O_NONBLOCK))
 		return 0;
 	flags &= ~O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) < 0)
+	if (fcntl(fd, F_SETFL, flags) == -1)
 		return -1;
 	return 1;
 }

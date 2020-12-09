@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.c,v 1.51 2018/01/22 09:08:43 mpi Exp $	*/
+/*	$OpenBSD: intr.c,v 1.54 2020/06/17 06:14:52 dlg Exp $	*/
 /*	$NetBSD: intr.c,v 1.3 2003/03/03 22:16:20 fvdl Exp $	*/
 
 /*
@@ -282,13 +282,21 @@ duplicate:
 	} else {
 other:
 		/*
-		 * Otherwise, look for a free slot elsewhere. Do the primary
-		 * CPU first.
+		 * Otherwise, look for a free slot elsewhere. If cip is null, it
+		 * means try primary cpu but accept secondary, otherwise we need
+		 * a slot on the requested cpu.
 		 */
-		ci = &cpu_info_primary;
+		if (*cip == NULL)
+			ci = &cpu_info_primary;
+		else
+			ci = *cip;
+
 		error = intr_allocate_slot_cpu(ci, pic, pin, &slot);
 		if (error == 0)
 			goto found;
+		/* Can't alloc on the requested cpu, fail. */
+		if (*cip != NULL)
+			return EBUSY;
 
 		/*
 		 * ..now try the others.
@@ -323,10 +331,9 @@ int	intr_shared_edge;
 
 void *
 intr_establish(int legacy_irq, struct pic *pic, int pin, int type, int level,
-    int (*handler)(void *), void *arg, const char *what)
+    struct cpu_info *ci, int (*handler)(void *), void *arg, const char *what)
 {
 	struct intrhand **p, *q, *ih;
-	struct cpu_info *ci;
 	int slot, error, idt_vec;
 	struct intrsource *source;
 	struct intrstub *stubp;
@@ -553,10 +560,6 @@ struct intrhand fake_xen_intrhand;
 struct intrhand fake_hyperv_intrhand;
 #endif
 
-#if NLAPIC > 0 && defined(MULTIPROCESSOR) && 0
-static char *x86_ipi_names[X86_NIPI] = X86_IPI_NAMES;
-#endif
-
 /*
  * Initialize all handlers that aren't dynamically allocated, and exist
  * for each CPU.
@@ -678,9 +681,10 @@ intr_printconfig(void)
 }
 
 void
-intr_barrier(void *ih)
+intr_barrier(void *cookie)
 {
-	sched_barrier(NULL);
+	struct intrhand *ih = cookie;
+	sched_barrier(ih->ih_cpu);
 }
 
 /*

@@ -1,4 +1,4 @@
-/*	$OpenBSD: newfs.c,v 1.110 2018/03/10 07:55:49 otto Exp $	*/
+/*	$OpenBSD: newfs.c,v 1.114 2020/05/19 12:49:51 sthen Exp $	*/
 /*	$NetBSD: newfs.c,v 1.20 1996/05/16 07:13:03 thorpej Exp $	*/
 
 /*
@@ -121,7 +121,7 @@ u_short	dkcksum(struct disklabel *);
 
 int	mfs;			/* run as the memory based filesystem */
 int	Nflag;			/* run without writing file system */
-int	Oflag = 1;		/* 0 = 4.3BSD ffs, 1 = 4.4BSD ffs, 2 = ffs2 */
+int	Oflag = 2;		/* 0 = 4.3BSD ffs, 1 = 4.4BSD ffs, 2 = ffs2 */
 daddr_t	fssize;			/* file system size in 512-byte blocks */
 long long	sectorsize;		/* bytes/sector */
 int	fsize = 0;		/* fragment size */
@@ -194,7 +194,7 @@ main(int argc, char *argv[])
 	u_int64_t nsecs;
 
 	if (strstr(__progname, "mfs"))
-		mfs = Nflag = quiet = 1;
+		mfs = Nflag = quiet = Oflag = 1;
 
 	getphysmem();
 	maxpartitions = getmaxpartitions();
@@ -380,7 +380,7 @@ main(int argc, char *argv[])
 		fso = -1;
 	} else {
 		fso = opendev(special, O_WRONLY, 0, &realdev);
-		if (fso < 0)
+		if (fso == -1)
 			fatal("%s: %s", special, strerror(errno));
 		special = realdev;
 
@@ -413,9 +413,9 @@ main(int argc, char *argv[])
 		pp = &lp->d_partitions[1];
 	} else {
 		fsi = opendev(special, O_RDONLY, 0, NULL);
-		if (fsi < 0)
+		if (fsi == -1)
 			fatal("%s: %s", special, strerror(errno));
-		if (fstat(fsi, &st) < 0)
+		if (fstat(fsi, &st) == -1)
 			fatal("%s: %s", special, strerror(errno));
 		if (!mfs) {
 			if (S_ISBLK(st.st_mode))
@@ -443,9 +443,6 @@ main(int argc, char *argv[])
 		if (DL_GETPSIZE(pp) == 0)
 			fatal("%s: `%c' partition is unavailable",
 			    argv[0], *cp);
-		if (pp->p_fstype == FS_BOOT)
-			fatal("%s: `%c' partition overlaps boot program",
-			      argv[0], *cp);
 	}
 havelabel:
 	if (sectorsize == 0) {
@@ -499,7 +496,7 @@ havelabel:
 	if (mfs) {
 		if (realpath(argv[1], node) == NULL)
 			err(1, "realpath %s", argv[1]);
-		if (stat(node, &mountpoint) < 0)
+		if (stat(node, &mountpoint) == -1)
 			err(ECANCELED, "stat %s", node);
 		mfsuid = mountpoint.st_uid;
 		mfsgid = mountpoint.st_gid;
@@ -558,10 +555,10 @@ havelabel:
 		args.fspec = mountfromname;
 		if (pop != NULL) {
 			int tmpflags = mntflags & ~MNT_RDONLY;
-			if (mount(MOUNT_MFS, tmpnode, tmpflags, &args) < 0)
+			if (mount(MOUNT_MFS, tmpnode, tmpflags, &args) == -1)
 				exit(errno); /* parent prints message */
 		}
-		if (mount(MOUNT_MFS, node, mntflags, &args) < 0)
+		if (mount(MOUNT_MFS, node, mntflags, &args) == -1)
 			exit(errno); /* parent prints message */
 	}
 #endif
@@ -573,7 +570,7 @@ getdisklabel(char *s, int fd)
 {
 	static struct disklabel lab;
 
-	if (ioctl(fd, DIOCGDINFO, (char *)&lab) < 0) {
+	if (ioctl(fd, DIOCGDINFO, (char *)&lab) == -1) {
 		if (disktype != NULL) {
 			struct disklabel *lp;
 
@@ -598,7 +595,7 @@ rewritelabel(char *s, int fd, struct disklabel *lp)
 
 	lp->d_checksum = 0;
 	lp->d_checksum = dkcksum(lp);
-	if (ioctl(fd, DIOCWDINFO, (char *)lp) < 0) {
+	if (ioctl(fd, DIOCWDINFO, (char *)lp) == -1) {
 		warn("ioctl (WDINFO)");
 		fatal("%s: can't rewrite disk label", s);
 	}
@@ -610,7 +607,7 @@ fatal(const char *fmt, ...)
 	va_list ap;
 
 	va_start(ap, fmt);
-	if (fcntl(STDERR_FILENO, F_GETFL) < 0) {
+	if (fcntl(STDERR_FILENO, F_GETFL) == -1) {
 		openlog(__progname, LOG_CONS, LOG_DAEMON);
 		vsyslog(LOG_ERR, fmt, ap);
 		closelog();
@@ -672,7 +669,7 @@ waitformount(char *node, pid_t pid)
 		 * can mount a filesystem which hides our
 		 * ramdisk before we see the success.
 		 */
-		if (statfs(node, &sf) < 0)
+		if (statfs(node, &sf) == -1)
 			err(ECANCELED, "statfs %s", node);
 		if (!strcmp(sf.f_mntfromname, mountfromname) &&
 		    !strncmp(sf.f_mntonname, node,

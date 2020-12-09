@@ -1,4 +1,4 @@
-/*	$OpenBSD: tipmic.c,v 1.3 2018/05/23 23:08:21 kettenis Exp $	*/
+/*	$OpenBSD: tipmic.c,v 1.5 2020/01/09 14:35:19 mpi Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -272,6 +272,7 @@ struct tipmic_regmap {
 };
 
 struct tipmic_regmap tipmic_thermal_regmap[] = {
+	{ 0x00, TIPMIC_SYSTEMP_HI, TIPMIC_SYSTEMP_LO },
 	{ 0x18, TIPMIC_SYSTEMP_HI, TIPMIC_SYSTEMP_LO }
 };
 
@@ -332,7 +333,8 @@ tipmic_thermal_opreg_handler(void *cookie, int iodir, uint64_t address,
 	splx(s);
 
 	while (sc->sc_stat_adc == 0) {
-		if (tsleep(&sc->sc_stat_adc, PRIBIO, "tipmic", hz)) {
+		if (tsleep_nsec(&sc->sc_stat_adc, PRIBIO, "tipmic",
+		    SEC_TO_NSEC(1))) {
 			printf("%s: ADC timeout\n", sc->sc_dev.dv_xname);
 			break;
 		}

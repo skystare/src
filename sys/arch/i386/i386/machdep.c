@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.627 2018/08/24 06:25:40 jsg Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.641 2020/11/08 20:37:23 mpi Exp $	*/
 /*	$NetBSD: machdep.c,v 1.214 1996/11/10 03:16:17 thorpej Exp $	*/
 
 /*-
@@ -115,7 +115,6 @@
 #include <machine/mpbiosvar.h>
 #endif /* MULTIPROCESSOR */
 
-#include <dev/rndvar.h>
 #include <dev/isa/isareg.h>
 #include <dev/isa/isavar.h>
 #include <dev/ic/i8042reg.h>
@@ -173,8 +172,6 @@ extern struct proc *npxproc;
 #else
 #define DPRINTF(x...)
 #endif	/* MACHDEP_DEBUG */
-
-#include "vmm.h"
 
 void	replacesmap(void);
 int     intr_handler(struct intrframe *, struct intrhand *);
@@ -235,6 +232,7 @@ void	via_update_sensor(void *args);
 #endif
 int kbd_reset;
 int lid_action = 1;
+int pwr_action = 1;
 int forceukbd;
 
 /*
@@ -320,9 +318,6 @@ void	p4_update_cpuspeed(void);
 void	p3_update_cpuspeed(void);
 int	pentium_cpuspeed(int *);
 void	enter_shared_special_pages(void);
-#if NVMM > 0
-void	cpu_check_vmm_cap(struct cpu_info *);
-#endif /* NVMM > 0 */
 
 static __inline u_char
 cyrix_read_reg(u_char reg)
@@ -382,6 +377,7 @@ cpu_startup(void)
 
 	printf("%s", version);
 	startclocks();
+	rtcinit();
 
 	printf("real mem  = %llu (%lluMB)\n",
 	    (unsigned long long)ptoa((psize_t)physmem),
@@ -1063,6 +1059,7 @@ const struct cpu_cpuid_feature i386_ecpuid_ecxfeatures[] = {
 
 const struct cpu_cpuid_feature cpu_seff0_ebxfeatures[] = {
 	{ SEFF0EBX_FSGSBASE,	"FSGSBASE" },
+	{ SEFF0EBX_TSC_ADJUST,	"TSC_ADJUST" },
 	{ SEFF0EBX_SGX,		"SGX" },
 	{ SEFF0EBX_BMI1,	"BMI1" },
 	{ SEFF0EBX_HLE,		"HLE" },
@@ -1102,6 +1099,9 @@ const struct cpu_cpuid_feature cpu_seff0_ecxfeatures[] = {
 const struct cpu_cpuid_feature cpu_seff0_edxfeatures[] = {
 	{ SEFF0EDX_AVX512_4FNNIW, "AVX512FNNIW" },
 	{ SEFF0EDX_AVX512_4FMAPS, "AVX512FMAPS" },
+	{ SEFF0EDX_SRBDS_CTRL,	"SRBDS_CTRL" },
+	{ SEFF0EDX_MD_CLEAR,	"MD_CLEAR" },
+	{ SEFF0EDX_TSXFA,	"TSXFA" },
 	{ SEFF0EDX_IBRS,	"IBRS,IBPB" },
 	{ SEFF0EDX_STIBP,	"STIBP" },
 	{ SEFF0EDX_L1DF,	"L1DF" },
@@ -1849,6 +1849,17 @@ identifycpu(struct cpu_info *ci)
 		}
 	}
 
+	if (ci->ci_feature_flags & CPUID_CFLUSH) {
+		u_int regs[4];
+
+		/* to get the cacheline size you must do cpuid
+		 * with eax 0x01
+		 */
+
+		cpuid(0x01, regs); 
+		ci->ci_cflushsz = ((regs[1] >> 8) & 0xff) * 8;
+	}
+
 	if (vendor == CPUVENDOR_INTEL) {
 		u_int regs[4];
 		/*
@@ -1861,15 +1872,6 @@ identifycpu(struct cpu_info *ci)
 		 */
 		if (ci->ci_family == 6 && ci->ci_model < 15)
 		    ci->ci_feature_flags &= ~CPUID_PAT;
-
-		if (ci->ci_feature_flags & CPUID_CFLUSH) {
-			/* to get the cacheline size you must do cpuid
-			 * with eax 0x01
-			 */
-
-			cpuid(0x01, regs); 
-			ci->ci_cflushsz = ((regs[1] >> 8) & 0xff) * 8;
-		}
 
 		if (cpuid_level >= 0x1) {
 			cpuid(0x80000000, regs);
@@ -2107,7 +2109,7 @@ identifycpu(struct cpu_info *ci)
 			    cpu_device);
 	}
 
-	if (ci->ci_flags & CPUF_PRIMARY) {
+	if (CPU_IS_PRIMARY(ci)) {
 		if (cpu_ecxfeature & CPUIDECX_RDRAND)
 			has_rdrand = 1;
 		if (ci->ci_feature_sefflags_ebx & SEFF0EBX_RDSEED)
@@ -2159,10 +2161,6 @@ identifycpu(struct cpu_info *ci)
 		}
 	} else
 		i386_use_fxsave = 0;
-
-#if NVMM > 0
-	cpu_check_vmm_cap(ci);
-#endif /* NVMM > 0 */
 
 }
 
@@ -2445,7 +2443,7 @@ pentium_cpuspeed(int *freq)
  * frame pointer, it returns to the user
  * specified pc, psl.
  */
-void
+int
 sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 {
 	struct proc *p = curproc;
@@ -2477,7 +2475,7 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 		frame.sf_sc.sc_fpstate = (void *)sp;
 		if (copyout(&p->p_addr->u_pcb.pcb_savefpu,
 		    (void *)sp, sizeof(union savefpu)))
-			sigexit(p, SIGILL);
+		    	return 1;
 
 		/* Signal handlers get a completely clean FP state */
 		p->p_md.md_flags &= ~MDP_USEDFPU;
@@ -2518,14 +2516,8 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 
 	/* XXX don't copyout siginfo if not needed? */
 	frame.sf_sc.sc_cookie = (long)&fp->sf_sc ^ p->p_p->ps_sigcookie;
-	if (copyout(&frame, fp, sizeof(frame)) != 0) {
-		/*
-		 * Process has trashed its stack; give it an illegal
-		 * instruction to halt it in its tracks.
-		 */
-		sigexit(p, SIGILL);
-		/* NOTREACHED */
-	}
+	if (copyout(&frame, fp, sizeof(frame)) != 0)
+		return 1;
 
 	/*
 	 * Build context to run handler in.
@@ -2539,6 +2531,8 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 	tf->tf_eflags &= ~(PSL_T|PSL_D|PSL_VM|PSL_AC);
 	tf->tf_esp = (int)fp;
 	tf->tf_ss = GSEL(GUDATA_SEL, SEL_UPL);
+
+	return 0;
 }
 
 /*
@@ -2690,6 +2684,9 @@ boot(int howto)
 	if ((howto & RB_POWERDOWN) != 0)
 		lid_action = 0;
 
+	if ((howto & RB_RESET) != 0)
+		goto doreset;
+
 	if (cold) {
 		if ((howto & RB_USERREQ) == 0)
 			howto |= RB_HALT;
@@ -2766,6 +2763,7 @@ haltsys:
 		cnpollc(0);
 	}
 
+doreset:
 	printf("rebooting...\n");
 	cpu_reset();
 	for (;;)
@@ -2953,15 +2951,7 @@ setregs(struct proc *p, struct exec_package *pack, u_long stack,
 	p->p_md.md_flags &= ~MDP_USEDFPU;
 #endif
 
-	/*
-	 * Reset the code segment limit to I386_MAX_EXE_ADDR in the pmap;
-	 * this gets copied into the GDT for GUCODE_SEL by pmap_activate().
-	 * Similarly, reset the base of each of the two thread data
-	 * segments to zero in the pcb; they'll get copied into the
-	 * GDT for GUFS_SEL and GUGS_SEL.
-	 */
-	setsegment(&pmap->pm_codeseg, 0, atop(I386_MAX_EXE_ADDR) - 1,
-	    SDT_MEMERA, SEL_UPL, 1, 1);
+	initcodesegment(&pmap->pm_codeseg);
 	setsegment(&pcb->pcb_threadsegs[TSEG_FS], 0,
 	    atop(VM_MAXUSER_ADDRESS) - 1, SDT_MEMRWA, SEL_UPL, 1, 1);
 	setsegment(&pcb->pcb_threadsegs[TSEG_GS], 0,
@@ -3047,6 +3037,30 @@ setregion(struct region_descriptor *rd, void *base, size_t limit)
 {
 	rd->rd_limit = (int)limit;
 	rd->rd_base = (int)base;
+}
+
+void
+initcodesegment(struct segment_descriptor *cs)
+{
+	if (cpu_pae) {
+		/*
+		 * When code execution is managed using NX feature
+		 * in pmapae.c, GUCODE_SEL should cover userland.
+		 */
+		setsegment(cs, 0, atop(VM_MAXUSER_ADDRESS - 1),
+		    SDT_MEMERA, SEL_UPL, 1, 1);
+	} else {
+		/*
+		 * For pmap.c's non-PAE/NX line-in-the-sand execution, reset
+		 * the code segment limit to I386_MAX_EXE_ADDR in the pmap;
+		 * this gets copied into the GDT for GUCODE_SEL by
+		 * pmap_activate().  Similarly, reset the base of each of
+		 * the two thread data segments to zero in the pcb; they'll
+		 * get copied into the GDT for GUFS_SEL and GUGS_SEL.
+		 */
+		setsegment(cs, 0, atop(I386_MAX_EXE_ADDR - 1),
+		    SDT_MEMERA, SEL_UPL, 1, 1);
+	}
 }
 
 void
@@ -3544,6 +3558,10 @@ idt_vec_free(int vec)
 	unsetgate(&idt[vec]);
 }
 
+const struct sysctl_bounded_args cpuctl_vars[] = {
+	{ CPU_LIDACTION, &lid_action, 0, 2 },
+};
+
 /*
  * machine dependent system variables.
  */
@@ -3552,7 +3570,6 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen, struct proc *p)
 {
 	dev_t dev;
-	int val, error;
 
 	switch (name[0]) {
 	case CPU_CONSDEV:
@@ -3611,18 +3628,11 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdint(oldp, oldlenp, newp, i386_has_sse2));
 	case CPU_XCRYPT:
 		return (sysctl_rdint(oldp, oldlenp, newp, i386_has_xcrypt));
-	case CPU_LIDACTION:
-		val = lid_action;
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &val);
-		if (!error) {
-			if (val < 0 || val > 2)
-				error = EINVAL;
-			else
-				lid_action = val;
-		}
-		return (error);
 #if NPCKBC > 0 && NUKBD > 0
 	case CPU_FORCEUKBD:
+		{
+		int error;
+
 		if (forceukbd)
 			return (sysctl_rdint(oldp, oldlenp, newp, forceukbd));
 
@@ -3630,9 +3640,11 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		if (forceukbd)
 			pckbc_release_console();
 		return (error);
+		}
 #endif
 	default:
-		return (EOPNOTSUPP);
+		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
+		    name, namelen, oldp, oldlenp, newp, newlen));
 	}
 	/* NOTREACHED */
 }
@@ -4040,108 +4052,11 @@ intr_barrier(void *ih)
 	sched_barrier(NULL);
 }
 
-#if NVMM > 0
-/*
- * cpu_check_vmm_cap
- *
- * Checks for VMM capabilities for 'ci'. Initializes certain per-cpu VMM
- * state in 'ci' if virtualization extensions are found.
- *
- * Parameters:
- *  ci: the cpu being checked
- */
-void
-cpu_check_vmm_cap(struct cpu_info *ci)
+unsigned int
+cpu_rnd_messybits(void)
 {
-	uint64_t msr;
-	uint32_t cap, dummy;
+	struct timespec ts;
 
-	/*
-	 * Check for workable VMX
-	 */
-	if (cpu_ecxfeature & CPUIDECX_VMX) {
-		msr = rdmsr(MSR_IA32_FEATURE_CONTROL);
-
-		if (!(msr & IA32_FEATURE_CONTROL_LOCK))
-			ci->ci_vmm_flags |= CI_VMM_VMX;
-		else {
-			if (msr & IA32_FEATURE_CONTROL_VMX_EN)
-				ci->ci_vmm_flags |= CI_VMM_VMX;
-			else
-				ci->ci_vmm_flags |= CI_VMM_DIS;
-		}
-	}
-
-	/*
-	 * Check for EPT (Intel Nested Paging) and other secondary
-	 * controls
-	 */
-	if (ci->ci_vmm_flags & CI_VMM_VMX) {
-		/* Secondary controls available? */
-		/* XXX should we check true procbased ctls here if avail? */
-		msr = rdmsr(IA32_VMX_PROCBASED_CTLS);
-		if (msr & (IA32_VMX_ACTIVATE_SECONDARY_CONTROLS) << 32) {
-			msr = rdmsr(IA32_VMX_PROCBASED2_CTLS);
-			/* EPT available? */
-			if (msr & (IA32_VMX_ENABLE_EPT) << 32)
-				ci->ci_vmm_flags |= CI_VMM_EPT;
-			/* VM Functions available? */
-			if (msr & (IA32_VMX_ENABLE_VM_FUNCTIONS) << 32) {
-				ci->ci_vmm_cap.vcc_vmx.vmx_vm_func =
-				    rdmsr(IA32_VMX_VMFUNC);	
-			}
-		}
-	}
-
-	/*
-	 * Check startup config (VMX)
-	 */
-	if (ci->ci_vmm_flags & CI_VMM_VMX) {
-		/* CR0 fixed and flexible bits */
-		msr = rdmsr(IA32_VMX_CR0_FIXED0);
-		ci->ci_vmm_cap.vcc_vmx.vmx_cr0_fixed0 = msr;
-		msr = rdmsr(IA32_VMX_CR0_FIXED1);
-		ci->ci_vmm_cap.vcc_vmx.vmx_cr0_fixed1 = msr;
-
-		/* CR4 fixed and flexible bits */
-		msr = rdmsr(IA32_VMX_CR4_FIXED0);
-		ci->ci_vmm_cap.vcc_vmx.vmx_cr4_fixed0 = msr;
-		msr = rdmsr(IA32_VMX_CR4_FIXED1);
-		ci->ci_vmm_cap.vcc_vmx.vmx_cr4_fixed1 = msr;
-
-		/* VMXON region revision ID (bits 30:0 of IA32_VMX_BASIC) */
-		msr = rdmsr(IA32_VMX_BASIC);
-		ci->ci_vmm_cap.vcc_vmx.vmx_vmxon_revision =
-			(uint32_t)(msr & 0x7FFFFFFF);
-
-		/* MSR save / load table size */
-		msr = rdmsr(IA32_VMX_MISC);
-		ci->ci_vmm_cap.vcc_vmx.vmx_msr_table_size =
-			(uint32_t)(msr & IA32_VMX_MSR_LIST_SIZE_MASK) >> 25;
-
-		/* CR3 target count size */
-		ci->ci_vmm_cap.vcc_vmx.vmx_cr3_tgt_count =
-			(uint32_t)(msr & IA32_VMX_CR3_TGT_SIZE_MASK) >> 16;
-	}
-
-	/*
-	 * Check for workable SVM
-	 */
-	if (ecpu_ecxfeature & CPUIDECX_SVM) {
-		msr = rdmsr(MSR_AMD_VM_CR);
-
-		if (!(msr & AMD_SVMDIS))
-			ci->ci_vmm_flags |= CI_VMM_SVM;
-	}
-
-	/*
-	 * Check for SVM Nested Paging
-	 */
-	if (ci->ci_vmm_flags & CI_VMM_SVM) {
-		CPUID(CPUID_AMD_SVM_CAP, dummy, dummy, dummy, cap);
-		if (cap & AMD_SVM_NESTED_PAGING_CAP)
-			ci->ci_vmm_flags |= CI_VMM_RVI;
-	}
+	nanotime(&ts);
+	return (ts.tv_nsec ^ (ts.tv_sec << 20));
 }
-#endif /* NVMM > 0 */
-

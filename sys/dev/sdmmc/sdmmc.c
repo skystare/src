@@ -1,4 +1,4 @@
-/*	$OpenBSD: sdmmc.c,v 1.51 2018/08/09 13:52:36 patrick Exp $	*/
+/*	$OpenBSD: sdmmc.c,v 1.58 2020/08/24 15:06:10 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2006 Uwe Stuehler <uwe@openbsd.org>
@@ -29,6 +29,11 @@
 #include <sys/malloc.h>
 #include <sys/rwlock.h>
 #include <sys/systm.h>
+#include <sys/time.h>
+
+#ifdef SDMMC_DEBUG
+#include <sys/proc.h>
+#endif
 
 #include <scsi/scsi_all.h>
 #include <scsi/scsiconf.h>
@@ -106,8 +111,16 @@ sdmmc_attach(struct device *parent, struct device *self, void *aux)
 		printf(": 1-bit");
 	if (ISSET(saa->caps, SMC_CAPS_SD_HIGHSPEED))
 		printf(", sd high-speed");
+	if (ISSET(saa->caps, SMC_CAPS_UHS_SDR50))
+		printf(", sdr50");
+	if (ISSET(saa->caps, SMC_CAPS_UHS_SDR104))
+		printf(", sdr104");
 	if (ISSET(saa->caps, SMC_CAPS_MMC_HIGHSPEED))
 		printf(", mmc high-speed");
+	if (ISSET(saa->caps, SMC_CAPS_MMC_DDR52))
+		printf(", ddr52");
+	if (ISSET(saa->caps, SMC_CAPS_MMC_HS200))
+		printf(", hs200");
 	if (ISSET(saa->caps, SMC_CAPS_DMA))
 		printf(", dma");
 	printf("\n");
@@ -118,12 +131,14 @@ sdmmc_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_dmap = saa->dmap;
 	sc->sc_flags = saa->flags;
 	sc->sc_caps = saa->caps;
+	sc->sc_max_seg = saa->max_seg ? saa->max_seg : MAXPHYS;
 	sc->sc_max_xfer = saa->max_xfer;
 	memcpy(&sc->sc_cookies, &saa->cookies, sizeof(sc->sc_cookies));
 
 	if (ISSET(sc->sc_caps, SMC_CAPS_DMA) && sc->sc_dmap == NULL) {
 		error = bus_dmamap_create(sc->sc_dmat, MAXPHYS, SDMMC_MAXNSEGS,
-		    MAXPHYS, 0, BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW, &sc->sc_dmap);
+		    sc->sc_max_seg, 0, BUS_DMA_NOWAIT|BUS_DMA_ALLOCNOW,
+		    &sc->sc_dmap);
 		if (error) {
 			printf("%s: can't create DMA map\n", DEVNAME(sc));
 			return;
@@ -160,7 +175,7 @@ sdmmc_detach(struct device *self, int flags)
 	sc->sc_dying = 1;
 	while (sc->sc_task_thread != NULL) {
 		wakeup(&sc->sc_tskq);
-		tsleep(sc, PWAIT, "mmcdie", 0);
+		tsleep_nsec(sc, PWAIT, "mmcdie", INFSLP);
 	}
 
 	if (sc->sc_dmap)
@@ -179,7 +194,8 @@ sdmmc_activate(struct device *self, int act)
 	case DVACT_SUSPEND:
 		rv = config_activate_children(self, act);
 		/* If card in slot, cause a detach/re-attach */
-		if (ISSET(sc->sc_flags, SMF_CARD_PRESENT))
+		if (ISSET(sc->sc_flags, SMF_CARD_PRESENT) &&
+		    !ISSET(sc->sc_caps, SMC_CAPS_NONREMOVABLE))
 			sc->sc_dying = -1;
 		break;
 	case DVACT_RESUME:
@@ -223,7 +239,7 @@ restart:
 			task->func(task->arg);
 			s = splsdmmc();
 		}
-		tsleep(&sc->sc_tskq, PWAIT, "mmctsk", 0);
+		tsleep_nsec(&sc->sc_tskq, PWAIT, "mmctsk", INFSLP);
 	}
 	splx(s);
 
@@ -574,10 +590,8 @@ sdmmc_init(struct sdmmc_softc *sc)
 void
 sdmmc_delay(u_int usecs)
 {
-	int nticks = usecs / (1000000 / hz);
-
-	if (!cold && nticks > 0)
-		tsleep(&sdmmc_delay, PWAIT, "mmcdly", nticks);
+	if (!cold && usecs > tick)
+		tsleep_nsec(&sdmmc_delay, PWAIT, "mmcdly", USEC_TO_NSEC(usecs));
 	else
 		delay(usecs);
 }

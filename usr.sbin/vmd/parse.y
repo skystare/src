@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.44 2018/09/09 04:09:32 ccardenas Exp $	*/
+/*	$OpenBSD: parse.y,v 1.56 2020/09/23 19:18:18 martijn Exp $	*/
 
 /*
  * Copyright (c) 2007-2016 Reyk Floeter <reyk@openbsd.org>
@@ -39,11 +39,13 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <string.h>
+#include <unistd.h>
 #include <ctype.h>
 #include <netdb.h>
 #include <util.h>
 #include <errno.h>
 #include <err.h>
+#include <fcntl.h>
 #include <pwd.h>
 #include <grp.h>
 
@@ -89,6 +91,7 @@ char		*symget(const char *);
 
 ssize_t		 parse_size(char *, int64_t);
 int		 parse_disk(char *, int);
+unsigned int	 parse_format(const char *);
 
 static struct vmop_create_params vmc;
 static struct vm_create_params	*vcp;
@@ -117,12 +120,14 @@ typedef struct {
 
 
 %token	INCLUDE ERROR
-%token	ADD ALLOW BOOT CDROM DISABLE DISK DOWN ENABLE FORMAT GROUP INSTANCE
-%token	INTERFACE LLADDR LOCAL LOCKED MEMORY NIFS OWNER PATH PREFIX RDOMAIN
-%token	SIZE SOCKET SWITCH UP VM VMID
+%token	ADD ALLOW BOOT CDROM DEVICE DISABLE DISK DOWN ENABLE FORMAT GROUP
+%token	INET6 INSTANCE INTERFACE LLADDR LOCAL LOCKED MEMORY NET NIFS OWNER
+%token	PATH PREFIX RDOMAIN SIZE SOCKET SWITCH UP VM VMID STAGGERED START
+%token  PARALLEL DELAY
 %token	<v.number>	NUMBER
 %token	<v.string>	STRING
 %type	<v.lladdr>	lladdr
+%type	<v.number>	bootdevice
 %type	<v.number>	disable
 %type	<v.number>	image_format
 %type	<v.number>	local
@@ -178,10 +183,27 @@ varset		: STRING '=' STRING		{
 		}
 		;
 
-main		: LOCAL PREFIX STRING {
+main		: LOCAL INET6 {
+			env->vmd_cfg.cfg_flags |= VMD_CFG_INET6;
+		}
+		| LOCAL INET6 PREFIX STRING {
 			struct address	 h;
 
-			/* The local prefix is IPv4-only */
+			if (host($4, &h) == -1 ||
+			    h.ss.ss_family != AF_INET6 ||
+			    h.prefixlen > 64 || h.prefixlen < 0) {
+				yyerror("invalid local inet6 prefix: %s", $4);
+				free($4);
+				YYERROR;
+			}
+
+			env->vmd_cfg.cfg_flags |= VMD_CFG_INET6;
+			env->vmd_cfg.cfg_flags &= ~VMD_CFG_AUTOINET6;
+			memcpy(&env->vmd_cfg.cfg_localprefix6, &h, sizeof(h));
+		}
+		| LOCAL PREFIX STRING {
+			struct address	 h;
+
 			if (host($3, &h) == -1 ||
 			    h.ss.ss_family != AF_INET ||
 			    h.prefixlen > 32 || h.prefixlen < 0) {
@@ -195,6 +217,11 @@ main		: LOCAL PREFIX STRING {
 		| SOCKET OWNER owner_id {
 			env->vmd_ps.ps_csock.cs_uid = $3.uid;
 			env->vmd_ps.ps_csock.cs_gid = $3.gid == -1 ? 0 : $3.gid;
+		}
+		| STAGGERED START PARALLEL NUMBER DELAY NUMBER {
+			env->vmd_cfg.cfg_flags |= VMD_CFG_STAGGERED_START;
+			env->vmd_cfg.delay.tv_sec = $6;
+			env->vmd_cfg.parallelism = $4;
 		}
 		;
 
@@ -337,7 +364,8 @@ vm		: VM string vm_instance		{
 					log_debug("%s:%d: vm \"%s\""
 					    " skipped (%s)",
 					    file->name, yylval.lineno,
-					    vcp->vcp_name, vm->vm_running ?
+					    vcp->vcp_name,
+					    (vm->vm_state & VM_STATE_RUNNING) ?
 					    "running" : "already exists");
 				} else if (ret == -1) {
 					yyerror("vm \"%s\" failed: %s",
@@ -345,7 +373,9 @@ vm		: VM string vm_instance		{
 					YYERROR;
 				} else {
 					if (vcp_disable)
-						vm->vm_disabled = 1;
+						vm->vm_state |= VM_STATE_DISABLED;
+					else
+						vm->vm_state |= VM_STATE_WAITING;
 					log_debug("%s:%d: vm \"%s\" "
 					    "registered (%s)",
 					    file->name, yylval.lineno,
@@ -413,21 +443,31 @@ vm_opts		: disable			{
 			vmc.vmc_flags |= VMOP_CREATE_NETWORK;
 		}
 		| BOOT string			{
+			char	 path[PATH_MAX];
+
 			if (vcp->vcp_kernel[0] != '\0') {
 				yyerror("kernel specified more than once");
 				free($2);
 				YYERROR;
 
 			}
-			if (strlcpy(vcp->vcp_kernel, $2,
-			    sizeof(vcp->vcp_kernel)) >=
-			    sizeof(vcp->vcp_kernel)) {
-				yyerror("kernel name too long");
+			if (realpath($2, path) == NULL) {
+				yyerror("kernel path not found: %s",
+				    strerror(errno));
 				free($2);
 				YYERROR;
 			}
 			free($2);
+			if (strlcpy(vcp->vcp_kernel, path,
+			    sizeof(vcp->vcp_kernel)) >=
+			    sizeof(vcp->vcp_kernel)) {
+				yyerror("kernel name too long");
+				YYERROR;
+			}
 			vmc.vmc_flags |= VMOP_CREATE_KERNEL;
+		}
+		| BOOT DEVICE bootdevice	{
+			vmc.vmc_bootdevice = $3;
 		}
 		| CDROM string			{
 			if (vcp->vcp_cdrom[0] != '\0') {
@@ -513,11 +553,7 @@ instance_flags	: BOOT		{ vmc.vmc_insflags |= VMOP_CREATE_KERNEL; }
 		}
 		;
 
-owner_id	: /* none */		{
-			$$.uid = 0;
-			$$.gid = -1;
-		}
-		| NUMBER		{
+owner_id	: NUMBER		{
 			$$.uid = $1;
 			$$.gid = -1;
 		}
@@ -561,14 +597,10 @@ owner_id	: /* none */		{
 		;
 
 image_format	: /* none 	*/	{
-			$$ = VMDF_RAW;
+			$$ = 0;
 		}
 	     	| FORMAT string		{
-			if (strcmp($2, "raw") == 0)
-				$$ = VMDF_RAW;
-			else if (strcmp($2, "qcow2") == 0)
-				$$ = VMDF_QCOW2;
-			else {
+			if (($$ = parse_format($2)) == 0) {
 				yyerror("unrecognized disk format %s", $2);
 				free($2);
 				YYERROR;
@@ -680,6 +712,11 @@ disable		: ENABLE			{ $$ = 0; }
 		| DISABLE			{ $$ = 1; }
 		;
 
+bootdevice	: CDROM				{ $$ = VMBOOTDEV_CDROM; }
+		| DISK				{ $$ = VMBOOTDEV_DISK; }
+		| NET				{ $$ = VMBOOTDEV_NET; }
+		;
+
 optcomma	: ','
 		|
 		;
@@ -733,6 +770,8 @@ lookup(char *s)
 		{ "allow",		ALLOW },
 		{ "boot",		BOOT },
 		{ "cdrom",		CDROM },
+		{ "delay",		DELAY },
+		{ "device",		DEVICE },
 		{ "disable",		DISABLE },
 		{ "disk",		DISK },
 		{ "down",		DOWN },
@@ -741,6 +780,7 @@ lookup(char *s)
 		{ "group",		GROUP },
 		{ "id",			VMID },
 		{ "include",		INCLUDE },
+		{ "inet6",		INET6 },
 		{ "instance",		INSTANCE },
 		{ "interface",		INTERFACE },
 		{ "interfaces",		NIFS },
@@ -748,11 +788,15 @@ lookup(char *s)
 		{ "local",		LOCAL },
 		{ "locked",		LOCKED },
 		{ "memory",		MEMORY },
+		{ "net",		NET },
 		{ "owner",		OWNER },
+		{ "parallel",		PARALLEL },
 		{ "prefix",		PREFIX },
 		{ "rdomain",		RDOMAIN },
 		{ "size",		SIZE },
 		{ "socket",		SOCKET },
+		{ "staggered",		STAGGERED },
+		{ "start",		START  },
 		{ "switch",		SWITCH },
 		{ "up",			UP },
 		{ "vm",			VM }
@@ -943,7 +987,8 @@ top:
 			} else if (c == '\\') {
 				if ((next = lgetc(quotec)) == EOF)
 					return (0);
-				if (next == quotec || c == ' ' || c == '\t')
+				if (next == quotec || next == ' ' ||
+				    next == '\t')
 					c = next;
 				else if (next == '\n') {
 					file->lineno++;
@@ -975,7 +1020,7 @@ top:
 	if (c == '-' || isdigit(c)) {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -1014,7 +1059,7 @@ nodigits:
 	if (isalnum(c) || c == ':' || c == '_' || c == '/') {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -1227,7 +1272,9 @@ parse_size(char *word, int64_t val)
 int
 parse_disk(char *word, int type)
 {
-	char	path[PATH_MAX];
+	char	 buf[BUFSIZ], path[PATH_MAX];
+	int	 fd;
+	ssize_t	 len;
 
 	if (vcp->vcp_ndisks >= VMM_MAX_DISKS_PER_VM) {
 		log_warnx("too many disks");
@@ -1239,6 +1286,23 @@ parse_disk(char *word, int type)
 		return (-1);
 	}
 
+	if (!type) {
+		/* Use raw as the default format */
+		type = VMDF_RAW;
+
+		/* Try to derive the format from the file signature */
+		if ((fd = open(path, O_RDONLY)) != -1) {
+			len = read(fd, buf, sizeof(buf));
+			close(fd);
+			if (len >= (ssize_t)strlen(VM_MAGIC_QCOW) &&
+			    strncmp(buf, VM_MAGIC_QCOW,
+			    strlen(VM_MAGIC_QCOW)) == 0) {
+				/* The qcow version will be checked later */
+				type = VMDF_QCOW2;
+			}
+		}
+	}
+
 	if (strlcpy(vcp->vcp_disks[vcp->vcp_ndisks], path,
 	    VMM_MAX_PATH_DISK) >= VMM_MAX_PATH_DISK) {
 		log_warnx("disk path too long");
@@ -1248,6 +1312,16 @@ parse_disk(char *word, int type)
 
 	vcp->vcp_ndisks++;
 
+	return (0);
+}
+
+unsigned int
+parse_format(const char *word)
+{
+	if (strcasecmp(word, "raw") == 0)
+		return (VMDF_RAW);
+	else if (strcasecmp(word, "qcow2") == 0)
+		return (VMDF_QCOW2);
 	return (0);
 }
 

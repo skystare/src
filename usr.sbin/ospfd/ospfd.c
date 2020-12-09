@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfd.c,v 1.100 2018/08/29 08:43:17 remi Exp $ */
+/*	$OpenBSD: ospfd.c,v 1.114 2020/09/16 20:50:10 remi Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -185,6 +185,8 @@ main(int argc, char *argv[])
 		kif_clear();
 		exit(1);
 	}
+	if (ospfd_conf->rtr_id.s_addr == 0)
+		ospfd_conf->rtr_id.s_addr = get_rtr_id();
 
 	if (sockname == NULL) {
 		if (asprintf(&sockname, "%s.%d", OSPFD_SOCKET,
@@ -215,7 +217,7 @@ main(int argc, char *argv[])
 	log_setverbose(ospfd_conf->opts & OSPFD_OPT_VERBOSE);
 
 	if ((control_check(ospfd_conf->csock)) == -1)
-		fatalx("control socket check failed");
+		fatalx("ospfd already running");
 
 	if (!debug)
 		daemon(1, 0);
@@ -278,8 +280,14 @@ main(int argc, char *argv[])
 		fatalx("control socket setup failed");
 	main_imsg_compose_ospfe_fd(IMSG_CONTROLFD, 0, control_fd);
 
+	if (unveil("/", "r") == -1)
+		fatal("unveil");
+	if (unveil(NULL, NULL) == -1)
+		fatal("unveil");
+
 	if (kr_init(!(ospfd_conf->flags & OSPFD_FLAG_NO_FIB_UPDATE),
-	    ospfd_conf->rdomain, ospfd_conf->redist_label_or_prefix) == -1)
+	    ospfd_conf->rdomain, ospfd_conf->redist_label_or_prefix,
+	    ospfd_conf->fib_priority) == -1)
 		fatalx("kr_init failed");
 
 	/* remove unneeded stuff from config */
@@ -308,7 +316,7 @@ ospfd_shutdown(void)
 	msgbuf_clear(&iev_rde->ibuf.w);
 	close(iev_rde->ibuf.fd);
 
-	control_cleanup(ospfd_conf->csock);
+	control_cleanup();
 	while ((r = SIMPLEQ_FIRST(&ospfd_conf->redist_list)) != NULL) {
 		SIMPLEQ_REMOVE_HEAD(&ospfd_conf->redist_list, entry);
 		free(r);
@@ -556,7 +564,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 		switch (r->type & ~REDIST_NO) {
 		case REDIST_LABEL:
 			if (kr->rtlabel == r->label) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -571,7 +580,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (kr->flags & F_DYNAMIC)
 				continue;
 			if (kr->flags & F_STATIC) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -581,7 +591,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (kr->flags & F_DYNAMIC)
 				continue;
 			if (kr->flags & F_CONNECTED) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -593,7 +604,7 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			    r->mask.s_addr == INADDR_ANY) {
 				if (is_default) {
 					*metric = depend_ok ? r->metric :
-					    MAX_METRIC;
+					    r->metric | MAX_METRIC;
 					return (r->type & REDIST_NO ? 0 : 1);
 				} else
 					return (0);
@@ -602,13 +613,15 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if ((kr->prefix.s_addr & r->mask.s_addr) ==
 			    (r->addr.s_addr & r->mask.s_addr) &&
 			    kr->prefixlen >= mask2prefixlen(r->mask.s_addr)) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
 		case REDIST_DEFAULT:
 			if (is_default) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -628,6 +641,16 @@ ospf_reload(void)
 
 	if ((xconf = parse_config(conffile, ospfd_conf->opts)) == NULL)
 		return (-1);
+
+	/* No router-id was specified, keep existing value */
+        if (xconf->rtr_id.s_addr == 0)
+                xconf->rtr_id.s_addr = ospfd_conf->rtr_id.s_addr;
+
+	/* Abort the reload if rtr_id changed */
+	if (ospfd_conf->rtr_id.s_addr != xconf->rtr_id.s_addr) {
+		log_warnx("router-id changed: restart required");
+		return (-1);
+	}
 
 	/* send config to childs */
 	if (ospf_sendboth(IMSG_RECONF_CONF, xconf, sizeof(*xconf)) == -1)
@@ -680,7 +703,6 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 	struct redistribute	*r;
 	int			 rchange = 0;
 
-	/* change of rtr_id needs a restart */
 	conf->flags = xconf->flags;
 	conf->spf_delay = xconf->spf_delay;
 	conf->spf_hold_time = xconf->spf_hold_time;
@@ -696,10 +718,16 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 			SIMPLEQ_REMOVE_HEAD(&conf->redist_list, entry);
 			free(r);
 		}
-		while ((r = SIMPLEQ_FIRST(&xconf->redist_list)) != NULL) {
-			SIMPLEQ_REMOVE_HEAD(&xconf->redist_list, entry);
-			SIMPLEQ_INSERT_TAIL(&conf->redist_list, r, entry);
+		SIMPLEQ_CONCAT(&conf->redist_list, &xconf->redist_list);
+
+		/* adjust FIB priority if changed */
+		if (conf->fib_priority != xconf->fib_priority) {
+			kr_fib_decouple();
+			kr_fib_update_prio(xconf->fib_priority);
+			conf->fib_priority = xconf->fib_priority;
+			kr_fib_couple();
 		}
+
 		goto done;
 	}
 
@@ -749,10 +777,7 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 				free(r);
 			}
 
-			while ((r = SIMPLEQ_FIRST(&xa->redist_list)) != NULL) {
-				SIMPLEQ_REMOVE_HEAD(&xa->redist_list, entry);
-				SIMPLEQ_INSERT_TAIL(&a->redist_list, r, entry);
-			}
+			SIMPLEQ_CONCAT(&a->redist_list, &xa->redist_list);
 		}
 
 		a->stub = xa->stub;
@@ -810,7 +835,7 @@ merge_interfaces(struct area *a, struct area *xa)
 
 	/* problems:
 	 * - new interfaces (easy)
-	 * - deleted interfaces (needs to be done via fsm?)
+	 * - deleted interfaces
 	 * - changing passive (painful?)
 	 */
 	for (i = LIST_FIRST(&a->iface_list); i != NULL; i = ni) {
@@ -825,6 +850,7 @@ merge_interfaces(struct area *a, struct area *xa)
 				rde_nbr_iface_del(i);
 			LIST_REMOVE(i, entry);
 			if_del(i);
+			dirty = 1; /* force rtr LSA update */
 		}
 	}
 
@@ -859,7 +885,6 @@ merge_interfaces(struct area *a, struct area *xa)
 		if (i->self)
 			i->self->priority = i->priority;
 		i->flags = xi->flags; /* needed? */
-		i->type = xi->type; /* needed? */
 		i->if_type = xi->if_type; /* needed? */
 		i->linkstate = xi->linkstate; /* needed? */
 
@@ -867,6 +892,10 @@ merge_interfaces(struct area *a, struct area *xa)
 		strncpy(i->auth_key, xi->auth_key, MAX_SIMPLE_AUTH_LEN);
 		md_list_clr(&i->auth_md_list);
 		md_list_copy(&i->auth_md_list, &xi->auth_md_list);
+
+		strlcpy(i->dependon, xi->dependon,
+		        sizeof(i->dependon));
+		i->depend_ok = xi->depend_ok;
 
 		if (i->passive != xi->passive) {
 			/* need to restart interface to cope with this change */
@@ -877,9 +906,14 @@ merge_interfaces(struct area *a, struct area *xa)
 				if_fsm(i, IF_EVT_UP);
 		}
 
-		strlcpy(i->dependon, xi->dependon,
-		        sizeof(i->dependon));
-		i->depend_ok = xi->depend_ok;
+		if (i->type != xi->type) {
+			/* restart interface to enable or disable DR election */
+			if (ospfd_process == PROC_OSPF_ENGINE)
+				if_fsm(i, IF_EVT_DOWN);
+			i->type = xi->type;
+			if (ospfd_process == PROC_OSPF_ENGINE)
+				if_fsm(i, IF_EVT_UP);
+		}
 	}
 	return (dirty);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mib.c,v 1.91 2018/08/31 05:20:36 jsg Exp $	*/
+/*	$OpenBSD: mib.c,v 1.101 2020/09/06 16:12:23 jan Exp $	*/
 
 /*
  * Copyright (c) 2012 Joel Knight <joel@openbsd.org>
@@ -71,8 +71,6 @@ int	 mib_setsnmp(struct oid *, struct ber_oid *, struct ber_element **);
 static struct oid mib_tree[] = MIB_TREE;
 static struct ber_oid zerodotzero = { { 0, 0 }, 2 };
 
-#define sizeofa(_a) (sizeof(_a) / sizeof((_a)[0]))
-
 /* base MIB tree */
 static struct oid base_mib[] = {
 	{ MIB(mib_2),			OID_MIB },
@@ -144,18 +142,18 @@ mib_getsys(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			oid->o_data = s;
 			oid->o_val = strlen(s);
 		}
-		*elm = ber_add_string(*elm, s);
+		*elm = ober_add_string(*elm, s);
 		break;
 	case 2:
 		if (so == NULL)
 			so = &sysoid;
 		smi_oidlen(so);
-		*elm = ber_add_oid(*elm, so);
+		*elm = ober_add_oid(*elm, so);
 		break;
 	case 3:
 		ticks = smi_getticks();
-		*elm = ber_add_integer(*elm, ticks);
-		ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+		*elm = ober_add_integer(*elm, ticks);
+		ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	case 4:
 		if (s == NULL) {
@@ -164,7 +162,7 @@ mib_getsys(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			oid->o_data = s;
 			oid->o_val = strlen(s);
 		}
-		*elm = ber_add_string(*elm, s);
+		*elm = ober_add_string(*elm, s);
 		break;
 	case 5:
 		if (s == NULL) {
@@ -173,15 +171,15 @@ mib_getsys(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			oid->o_data = s;
 			oid->o_val = strlen(s);
 		}
-		*elm = ber_add_string(*elm, s);
+		*elm = ober_add_string(*elm, s);
 		break;
 	case 6:
 		if (s == NULL)
 			s = "";
-		*elm = ber_add_string(*elm, s);
+		*elm = ober_add_string(*elm, s);
 		break;
 	case 7:
-		*elm = ber_add_integer(*elm, oid->o_val);
+		*elm = ober_add_integer(*elm, oid->o_val);
 		break;
 	default:
 		return (-1);
@@ -216,14 +214,14 @@ mib_sysor(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		return (-1);
 
 	/* Tables need to prepend the OID on their own */
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_sysOR]) {
 	case 1:
-		ber = ber_add_integer(ber, idx);
+		ber = ober_add_integer(ber, idx);
 		break;
 	case 2:
-		ber = ber_add_oid(ber, &miboid->o_id);
+		ber = ober_add_oid(ber, &miboid->o_id);
 		break;
 	case 3:
 		/*
@@ -232,7 +230,7 @@ mib_sysor(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		 * help to display names of internal OIDs.
 		 */
 		smi_oid2string(&miboid->o_id, buf, sizeof(buf), 0);
-		ber = ber_add_string(ber, buf);
+		ber = ober_add_string(ber, buf);
 		break;
 	case 4:
 		/*
@@ -240,8 +238,8 @@ mib_sysor(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		 * the sysORUpTime value of 0 will indicate "loaded at
 		 * startup".
 		 */
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber,
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber,
 		    BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	default:
@@ -294,14 +292,14 @@ mib_getsnmp(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	switch (oid->o_oid[OIDIDX_snmp]) {
 	case 30:
 		i = stats->snmp_enableauthentraps == 1 ? 1 : 2;
-		*elm = ber_add_integer(*elm, i);
+		*elm = ober_add_integer(*elm, i);
 		break;
 	default:
 		for (i = 0;
 		    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 			if (oid->o_oid[OIDIDX_snmp] == mapping[i].m_id) {
-				*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-				ber_set_header(*elm,
+				*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+				ober_set_header(*elm,
 				    BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 				return (0);
 			}
@@ -318,7 +316,7 @@ mib_setsnmp(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	struct snmp_stats	*stats = &snmpd_env->sc_stats;
 	long long		 i;
 
-	if (ber_get_integer(*elm, &i) == -1)
+	if (ober_get_integer(*elm, &i) == -1)
 		return (-1);
 
 	stats->snmp_enableauthentraps = i == 1 ? 1 : 0;
@@ -353,17 +351,17 @@ mib_engine(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 {
 	switch (oid->o_oid[OIDIDX_snmpEngine]) {
 	case 1:
-		*elm = ber_add_nstring(*elm, snmpd_env->sc_engineid,
+		*elm = ober_add_nstring(*elm, snmpd_env->sc_engineid,
 		    snmpd_env->sc_engineid_len);
 		break;
 	case 2:
-		*elm = ber_add_integer(*elm, snmpd_env->sc_engine_boots);
+		*elm = ober_add_integer(*elm, snmpd_env->sc_engine_boots);
 		break;
 	case 3:
-		*elm = ber_add_integer(*elm, snmpd_engine_time());
+		*elm = ober_add_integer(*elm, snmpd_engine_time());
 		break;
 	case 4:
-		*elm = ber_add_integer(*elm, READ_BUF_SIZE);
+		*elm = ober_add_integer(*elm, READ_BUF_SIZE);
 		break;
 	default:
 		return -1;
@@ -390,8 +388,8 @@ mib_usmstats(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	for (i = 0; (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 		if (oid->o_oid[OIDIDX_usmStats] == mapping[i].m_id) {
-			*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-			ber_set_header(*elm, BER_CLASS_APPLICATION,
+			*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+			ober_set_header(*elm, BER_CLASS_APPLICATION,
 			    SNMP_T_COUNTER32);
 			return (0);
 		}
@@ -459,8 +457,8 @@ mib_hrsystemuptime(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (clock_gettime(CLOCK_BOOTTIME, &uptime) == -1)
 		return (-1);
 	ticks = uptime.tv_sec * 100 + uptime.tv_nsec / 10000000;
-	*elm = ber_add_integer(*elm, ticks);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+	*elm = ober_add_integer(*elm, ticks);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 
 	return (0);
 }
@@ -495,7 +493,7 @@ mib_hrsystemdate(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	s[9] = abs(tzoffset) / 3600;
 	s[10] = (abs(tzoffset) - (s[9] * 3600)) / 60;
 
-	*elm = ber_add_nstring(*elm, s, sizeof(s));
+	*elm = ober_add_nstring(*elm, s, sizeof(s));
 
 	return (0);
 }
@@ -521,8 +519,8 @@ mib_hrsystemprocs(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			return (-1);
 		}
 
-		*elm = ber_add_integer(*elm, val);
-		ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+		*elm = ober_add_integer(*elm, val);
+		ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 
 		kvm_close(kd);
 		break;
@@ -531,7 +529,7 @@ mib_hrsystemprocs(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		if (sysctl(mib, 2, &val, &len, NULL, 0) == -1)
 			return (-1);
 
-		*elm = ber_add_integer(*elm, val);
+		*elm = ober_add_integer(*elm, val);
 		break;
 	default:
 		return (-1);
@@ -548,10 +546,10 @@ mib_hrmemory(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	u_int64_t		 physmem;
 	size_t			 len = sizeof(physmem);
 
-	if (sysctl(mib, sizeofa(mib), &physmem, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &physmem, &len, NULL, 0) == -1)
 		return (-1);
 
-	ber = ber_add_integer(ber, physmem / 1024);
+	ber = ober_add_integer(ber, physmem / 1024);
 
 	return (0);
 }
@@ -563,7 +561,7 @@ mib_hrstorage(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	u_int32_t		 idx;
 	struct statfs		*mntbuf, *mnt;
 	int			 mntsize, maxsize;
-	u_int32_t		 units, size, used, fail = 0;
+	u_int64_t		 units, size, used, fail = 0;
 	const char		*descr = NULL;
 	int			 mib[] = { CTL_HW, 0 };
 	u_int64_t		 physmem, realmem;
@@ -579,16 +577,16 @@ mib_hrstorage(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	/* Physical memory, real memory, swap */
 	mib[1] = HW_PHYSMEM64;
 	len = sizeof(physmem);
-	if (sysctl(mib, sizeofa(mib), &physmem, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &physmem, &len, NULL, 0) == -1)
 		return (-1);
 	mib[1] = HW_USERMEM64;
 	len = sizeof(realmem);
-	if (sysctl(mib, sizeofa(mib), &realmem, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &realmem, &len, NULL, 0) == -1)
 		return (-1);
 	mib[0] = CTL_VM;
 	mib[1] = VM_UVMEXP;
 	len = sizeof(uvm);
-	if (sysctl(mib, sizeofa(mib), &uvm, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &uvm, &len, NULL, 0) == -1)
 		return (-1);
 	maxsize = 10;
 
@@ -614,6 +612,8 @@ mib_hrstorage(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	sop = &so[0];
 	switch (idx) {
+	case 0:
+		return (-1);
 	case 1:
 		descr = "Physical memory";
 		units = uvm.pagesize;
@@ -645,33 +645,39 @@ mib_hrstorage(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		break;
 	}
 
+	while (size > INT32_MAX) {
+		units *= 2;
+		size /= 2;
+		used /= 2;
+	}
+
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_hrStorageEntry] = idx;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_hrStorage]) {
 	case 1: /* hrStorageIndex */
-		ber = ber_add_integer(ber, idx);
+		ber = ober_add_integer(ber, idx);
 		break;
 	case 2: /* hrStorageType */
 		smi_oidlen(sop);
-		ber = ber_add_oid(ber, sop);
+		ber = ober_add_oid(ber, sop);
 		break;
 	case 3: /* hrStorageDescr */
-		ber = ber_add_string(ber, descr);
+		ber = ober_add_string(ber, descr);
 		break;
 	case 4: /* hrStorageAllocationUnits */
-		ber = ber_add_integer(ber, units);
+		ber = ober_add_integer(ber, units);
 		break;
 	case 5: /* hrStorageSize */
-		ber = ber_add_integer(ber, size);
+		ber = ober_add_integer(ber, size);
 		break;
 	case 6: /* hrStorageUsed */
-		ber = ber_add_integer(ber, used);
+		ber = ober_add_integer(ber, used);
 		break;
 	case 7: /* hrStorageAllocationFailures */
-		ber = ber_add_integer(ber, fail);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, fail);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	default:
 		return (-1);
@@ -700,10 +706,10 @@ mib_hrdevice(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_hrDeviceEntry] = idx;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	len = sizeof(descr);
-	if (sysctl(mib, sizeofa(mib), &descr, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &descr, &len, NULL, 0) == -1)
 		return (-1);
 	/* unknown(1), running(2), warning(3), testing(4), down(5) */
 	status = 2;
@@ -711,24 +717,24 @@ mib_hrdevice(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	switch (o->bo_id[OIDIDX_hrDevice]) {
 	case 1: /* hrDeviceIndex */
-		ber = ber_add_integer(ber, idx);
+		ber = ober_add_integer(ber, idx);
 		break;
 	case 2: /* hrDeviceType */
 		smi_oidlen(sop);
-		ber = ber_add_oid(ber, sop);
+		ber = ober_add_oid(ber, sop);
 		break;
 	case 3: /* hrDeviceDescr */
-		ber = ber_add_string(ber, descr);
+		ber = ober_add_string(ber, descr);
 		break;
 	case 4: /* hrDeviceID */
-		ber = ber_add_oid(ber, &zerodotzero);
+		ber = ober_add_oid(ber, &zerodotzero);
 		break;
 	case 5: /* hrDeviceStatus */
-		ber = ber_add_integer(ber, status);
+		ber = ober_add_integer(ber, status);
 		break;
 	case 6: /* hrDeviceErrors */
-		ber = ber_add_integer(ber, fail);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, fail);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	default:
 		return (-1);
@@ -753,11 +759,11 @@ mib_hrprocessor(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_hrDeviceEntry] = idx;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_hrDevice]) {
 	case 1: /* hrProcessorFrwID */
-		ber = ber_add_oid(ber, &zerodotzero);
+		ber = ober_add_oid(ber, &zerodotzero);
 		break;
 	case 2: /* hrProcessorLoad */
 		/*
@@ -769,7 +775,7 @@ mib_hrprocessor(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		cptime2 = snmpd_env->sc_cpustates + (CPUSTATES * (idx - 1));
 		val = 100 -
 		    (cptime2[CP_IDLE] > 1000 ? 1000 : (cptime2[CP_IDLE] / 10));
-		ber = ber_add_integer(ber, val);
+		ber = ober_add_integer(ber, val);
 		break;
 	default:
 		return (-1);
@@ -794,54 +800,54 @@ mib_hrswrun(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_hrSWRunEntry] = kinfo->p_pid;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_hrSWRun]) {
 	case 1: /* hrSWRunIndex */
-		ber = ber_add_integer(ber, kinfo->p_pid);
+		ber = ober_add_integer(ber, kinfo->p_pid);
 		break;
 	case 2: /* hrSWRunName */
 	case 4: /* hrSWRunPath */
-		ber = ber_add_string(ber, kinfo->p_comm);
+		ber = ober_add_string(ber, kinfo->p_comm);
 		break;
 	case 3: /* hrSWRunID */
-		ber = ber_add_oid(ber, &zerodotzero);
+		ber = ober_add_oid(ber, &zerodotzero);
 		break;
 	case 5: /* hrSWRunParameters */
 		if (kinfo_args(kinfo, &s) == -1)
 			return (-1);
 
-		ber = ber_add_string(ber, s);
+		ber = ober_add_string(ber, s);
 		break;
 	case 6: /* hrSWRunType */
 		if (kinfo->p_flag & P_SYSTEM) {
 			/* operatingSystem(2) */
-			ber = ber_add_integer(ber, 2);
+			ber = ober_add_integer(ber, 2);
 		} else {
 			/* application(4) */
-			ber = ber_add_integer(ber, 4);
+			ber = ober_add_integer(ber, 4);
 		}
 		break;
 	case 7: /* hrSWRunStatus */
 		switch (kinfo->p_stat) {
 		case SONPROC:
 			/* running(1) */
-			ber = ber_add_integer(ber, 1);
+			ber = ober_add_integer(ber, 1);
 			break;
 		case SIDL:
 		case SRUN:
 		case SSLEEP:
 			/* runnable(2) */
-			ber = ber_add_integer(ber, 2);
+			ber = ober_add_integer(ber, 2);
 			break;
 		case SSTOP:
 			/* notRunnable(3) */
-			ber = ber_add_integer(ber, 3);
+			ber = ober_add_integer(ber, 3);
 			break;
 		case SDEAD:
 		default:
 			/* invalid(4) */
-			ber = ber_add_integer(ber, 4);
+			ber = ober_add_integer(ber, 4);
 			break;
 		}
 		break;
@@ -881,7 +887,7 @@ kinfo_proc(u_int32_t idx, struct kinfo_proc **kinfo)
 	for (;;) {
 		size = nkp * sizeof(*kp);
 		mib[5] = nkp;
-		if (sysctl(mib, sizeofa(mib), kp, &size, NULL, 0) == -1) {
+		if (sysctl(mib, nitems(mib), kp, &size, NULL, 0) == -1) {
 			if (errno == ENOMEM) {
 				kinfo_proc_free();
 				continue;
@@ -967,7 +973,7 @@ kinfo_args(struct kinfo_proc *kinfo, char **s)
 	str[0] = '\0';
 	*s = str;
 
-	while (sysctl(mib, sizeofa(mib), buf, &buflen, NULL, 0) == -1) {
+	while (sysctl(mib, nitems(mib), buf, &buflen, NULL, 0) == -1) {
 		if (errno != ENOMEM) {
 			/* some errors are expected, dont get too upset */
 			return (0);
@@ -1063,7 +1069,7 @@ static struct oid if_mib[] = {
 int
 mib_ifnumber(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 {
-	*elm = ber_add_integer(*elm, kr_ifnumber());
+	*elm = ober_add_integer(*elm, kr_ifnumber());
 	return (0);
 }
 
@@ -1104,9 +1110,6 @@ mib_iftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	u_int32_t		 idx = 0;
 	struct kif		*kif;
 	long long		 i;
-	size_t			 len;
-	int			 ifq;
-	int			 mib[] = { CTL_NET, PF_INET, IPPROTO_IP, 0, 0 };
 
 	/* Get and verify the current row index */
 	idx = o->bo_id[OIDIDX_ifEntry];
@@ -1115,11 +1118,11 @@ mib_iftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_ifEntry] = kif->if_index;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_if]) {
 	case 1:
-		ber = ber_add_integer(ber, kif->if_index);
+		ber = ober_add_integer(ber, kif->if_index);
 		break;
 	case 2:
 		/*
@@ -1127,7 +1130,7 @@ mib_iftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		 * but we just use the interface name (like ifName).
 		 * The interface name includes the driver name on OpenBSD.
 		 */
-		ber = ber_add_string(ber, kif->if_name);
+		ber = ober_add_string(ber, kif->if_name);
 		break;
 	case 3:
 		if (kif->if_type >= 0xf0) {
@@ -1135,34 +1138,34 @@ mib_iftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			 * It does not make sense to announce the private
 			 * interface types for CARP, ENC, PFSYNC, etc.
 			 */
-			ber = ber_add_integer(ber, IFT_OTHER);
+			ber = ober_add_integer(ber, IFT_OTHER);
 		} else
-			ber = ber_add_integer(ber, kif->if_type);
+			ber = ober_add_integer(ber, kif->if_type);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, kif->if_mtu);
+		ber = ober_add_integer(ber, kif->if_mtu);
 		break;
 	case 5:
 		if (kif->if_baudrate > UINT32_MAX) {
 			/* speed should be obtained from ifHighSpeed instead */
-			ber = ber_add_integer(ber, UINT32_MAX);
+			ber = ober_add_integer(ber, UINT32_MAX);
 		} else
-			ber = ber_add_integer(ber, kif->if_baudrate);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+			ber = ober_add_integer(ber, kif->if_baudrate);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 		break;
 	case 6:
 		if (bcmp(kif->if_lladdr, ether_zeroaddr,
 		    sizeof(kif->if_lladdr)) == 0) {
-			ber = ber_add_string(ber, "");
+			ber = ober_add_string(ber, "");
 		} else {
-			ber = ber_add_nstring(ber, kif->if_lladdr,
+			ber = ober_add_nstring(ber, kif->if_lladdr,
 			    sizeof(kif->if_lladdr));
 		}
 		break;
 	case 7:
 		/* ifAdminStatus up(1), down(2), testing(3) */
 		i = (kif->if_flags & IFF_UP) ? 1 : 2;
-		ber = ber_add_integer(ber, i);
+		ber = ober_add_integer(ber, i);
 		break;
 	case 8:
 		/* ifOperStatus */
@@ -1174,78 +1177,62 @@ mib_iftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			i = 1;	/* up(1) */
 		else
 			i = 7;	/* lowerLayerDown(7) or dormant(5)? */
-		ber = ber_add_integer(ber, i);
+		ber = ober_add_integer(ber, i);
 		break;
 	case 9:
-		ber = ber_add_integer(ber, kif->if_ticks);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+		ber = ober_add_integer(ber, kif->if_ticks);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	case 10:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_ibytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_ibytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 11:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_ipackets);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_ipackets);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 12:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_imcasts);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_imcasts);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 13:
-		mib[3] = IPCTL_IFQUEUE;
-		mib[4] = IFQCTL_DROPS;
-		len = sizeof(ifq);
-		if (sysctl(mib, sizeofa(mib), &ifq, &len, 0, 0) == -1) {
-			log_info("mib_iftable: %s: invalid ifq: %s",
-			    kif->if_name, strerror(errno));
-			return (-1);
-		}
-		ber = ber_add_integer(ber, ifq);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_iqdrops);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 14:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_ierrors);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_ierrors);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 15:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_noproto);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_noproto);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 16:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_obytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_obytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 17:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_opackets);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_opackets);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 18:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_omcasts);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_omcasts);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 19:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_oqdrops);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_oqdrops);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 20:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_oerrors);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_oerrors);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 21:
-		mib[3] = IPCTL_IFQUEUE;
-		mib[4] = IFQCTL_LEN;
-		len = sizeof(ifq);
-		if (sysctl(mib, sizeofa(mib), &ifq, &len, 0, 0) == -1) {
-			log_info("mib_iftable: %s: invalid ifq: %s",
-			    kif->if_name, strerror(errno));
-			return (-1);
-		}
-		ber = ber_add_integer(ber, ifq);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 		break;
 	case 22:
-		ber = ber_add_oid(ber, &zerodotzero);
+		ber = ober_add_oid(ber, &zerodotzero);
 		break;
 	default:
 		return (-1);
@@ -1269,85 +1256,85 @@ mib_ifxtable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_ifXEntry] = kif->if_index;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_ifX]) {
 	case 1:
-		ber = ber_add_string(ber, kif->if_name);
+		ber = ober_add_string(ber, kif->if_name);
 		break;
 	case 2:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_imcasts);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_imcasts);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 3:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, (u_int32_t)kif->if_omcasts);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)kif->if_omcasts);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 5:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 6:
-		ber = ber_add_integer(ber, (u_int64_t)kif->if_ibytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, (u_int64_t)kif->if_ibytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 7:
-		ber = ber_add_integer(ber, (u_int64_t)kif->if_ipackets);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, (u_int64_t)kif->if_ipackets);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 8:
-		ber = ber_add_integer(ber, (u_int64_t)kif->if_imcasts);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, (u_int64_t)kif->if_imcasts);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 9:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 10:
-		ber = ber_add_integer(ber, (u_int64_t)kif->if_obytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, (u_int64_t)kif->if_obytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 11:
-		ber = ber_add_integer(ber, (u_int64_t)kif->if_opackets);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, (u_int64_t)kif->if_opackets);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 12:
-		ber = ber_add_integer(ber, (u_int64_t)kif->if_omcasts);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, (u_int64_t)kif->if_omcasts);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 13:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 14:
-		ber = ber_add_integer(ber, 0);	/* enabled(1), disabled(2) */
+		ber = ober_add_integer(ber, 0);	/* enabled(1), disabled(2) */
 		break;
 	case 15:
 		i = kif->if_baudrate >= 1000000 ?
 		    kif->if_baudrate / 1000000 : 0;
-		ber = ber_add_integer(ber, i);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+		ber = ober_add_integer(ber, i);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 		break;
 	case 16:
 		/* ifPromiscuousMode: true(1), false(2) */
 		i = kif->if_flags & IFF_PROMISC ? 1 : 2;
-		ber = ber_add_integer(ber, i);
+		ber = ober_add_integer(ber, i);
 		break;
 	case 17:
 		/* ifConnectorPresent: false(2), true(1) */
 		i = kif->if_type == IFT_ETHER ? 1 : 2;
-		ber = ber_add_integer(ber, i);
+		ber = ober_add_integer(ber, i);
 		break;
 	case 18:
-		ber = ber_add_string(ber, kif->if_descr);
+		ber = ober_add_string(ber, kif->if_descr);
 		break;
 	case 19:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	default:
 		return (-1);
@@ -1360,8 +1347,8 @@ int
 mib_ifstacklast(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 {
 	struct ber_element	*ber = *elm;
-	ber = ber_add_integer(ber, kr_iflastchange());
-	ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+	ber = ober_add_integer(ber, kr_iflastchange());
+	ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 	return (0);
 }
 
@@ -1398,17 +1385,17 @@ mib_ifrcvtable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		o->bo_id[OIDIDX_ifRcvAddressEntry + idx++] = kif->if_lladdr[i];
 
 	/* write OID */
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_ifRcvAddress]) {
 	case 2:
 		/* ifRcvAddressStatus: RowStatus active(1), notInService(2) */
 		i = kif->if_flags & IFF_UP ? 1 : 2;
-		ber = ber_add_integer(ber, i);
+		ber = ober_add_integer(ber, i);
 		break;
 	case 3:
 		/* ifRcvAddressType: other(1), volatile(2), nonVolatile(3) */
-		ber = ber_add_integer(ber, 1);
+		ber = ober_add_integer(ber, 1);
 		break;
 	default:
 		return (-1);
@@ -1695,21 +1682,21 @@ mib_pfinfo(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	switch (oid->o_oid[OIDIDX_pfstatus]) {
 	case 1:
-		*elm = ber_add_integer(*elm, s.running);
+		*elm = ober_add_integer(*elm, s.running);
 		break;
 	case 2:
-		if (!clock_gettime(CLOCK_UPTIME, &uptime))
+		if (!clock_gettime(CLOCK_BOOTTIME, &uptime))
 			runtime = uptime.tv_sec - s.since;
 		runtime *= 100;
-		*elm = ber_add_integer(*elm, runtime);
-		ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+		*elm = ober_add_integer(*elm, runtime);
+		ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	case 3:
-		*elm = ber_add_integer(*elm, s.debug);
+		*elm = ober_add_integer(*elm, s.debug);
 		break;
 	case 4:
 		snprintf(str, sizeof(str), "0x%08x", ntohl(s.hostid));
-		*elm = ber_add_string(*elm, str);
+		*elm = ober_add_string(*elm, str);
 		break;
 	default:
 		return (-1);
@@ -1752,8 +1739,8 @@ mib_pfcounters(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	for (i = 0;
 	    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 		if (oid->o_oid[OIDIDX_pfstatus] == mapping[i].m_id) {
-			*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-			ber_set_header(*elm, BER_CLASS_APPLICATION,
+			*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+			ober_set_header(*elm, BER_CLASS_APPLICATION,
 			    SNMP_T_COUNTER64);
 			return (0);
 		}
@@ -1780,15 +1767,15 @@ mib_pfscounters(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	switch (oid->o_oid[OIDIDX_pfstatus]) {
 	case 1:
-		*elm = ber_add_integer(*elm, s.states);
-		ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
+		*elm = ober_add_integer(*elm, s.states);
+		ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
 		break;
 	default:
 		for (i = 0;
 		    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 			if (oid->o_oid[OIDIDX_pfstatus] == mapping[i].m_id) {
-				*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-				ber_set_header(*elm, BER_CLASS_APPLICATION,
+				*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+				ober_set_header(*elm, BER_CLASS_APPLICATION,
 				    SNMP_T_COUNTER64);
 				return (0);
 			}
@@ -1827,14 +1814,14 @@ mib_pflogif(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	switch (oid->o_oid[OIDIDX_pfstatus]) {
 	case 1:
-		*elm = ber_add_string(*elm, s.ifname);
+		*elm = ober_add_string(*elm, s.ifname);
 		break;
 	default:
 		for (i = 0;
 		    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 			if (oid->o_oid[OIDIDX_pfstatus] == mapping[i].m_id) {
-				*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-				ber_set_header(*elm, BER_CLASS_APPLICATION,
+				*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+				ober_set_header(*elm, BER_CLASS_APPLICATION,
 				    SNMP_T_COUNTER64);
 				return (0);
 			}
@@ -1864,15 +1851,15 @@ mib_pfsrctrack(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	switch (oid->o_oid[OIDIDX_pfstatus]) {
 	case 1:
-		*elm = ber_add_integer(*elm, s.src_nodes);
-		ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
+		*elm = ober_add_integer(*elm, s.src_nodes);
+		ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
 		break;
 	default:
 		for (i = 0;
 		    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 			if (oid->o_oid[OIDIDX_pfstatus] == mapping[i].m_id) {
-				*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-				ber_set_header(*elm, BER_CLASS_APPLICATION,
+				*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+				ober_set_header(*elm, BER_CLASS_APPLICATION,
 				    SNMP_T_COUNTER64);
 				return (0);
 			}
@@ -1914,13 +1901,13 @@ mib_pflimits(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (pl.index == PF_LIMIT_MAX)
 		return (-1);
 
-	if (ioctl(devpf, DIOCGETLIMIT, &pl)) {
+	if (ioctl(devpf, DIOCGETLIMIT, &pl) == -1) {
 		log_warn("DIOCGETLIMIT");
 		return (-1);
 	}
 
-	*elm = ber_add_integer(*elm, pl.limit);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
+	*elm = ober_add_integer(*elm, pl.limit);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
 
 	return (0);
 }
@@ -1970,12 +1957,12 @@ mib_pftimeouts(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (pt.timeout == PFTM_MAX)
 		return (-1);
 
-	if (ioctl(devpf, DIOCGETTIMEOUT, &pt)) {
+	if (ioctl(devpf, DIOCGETTIMEOUT, &pt) == -1) {
 		log_warn("DIOCGETTIMEOUT");
 		return (-1);
 	}
 
-	*elm = ber_add_integer(*elm, pt.seconds);
+	*elm = ober_add_integer(*elm, pt.seconds);
 
 	return (0);
 }
@@ -1988,7 +1975,7 @@ mib_pfifnum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if ((c = pfi_count()) == -1)
 		return (-1);
 
-	*elm = ber_add_integer(*elm, c);
+	*elm = ober_add_integer(*elm, c);
 
 	return (0);
 }
@@ -2006,91 +1993,91 @@ mib_pfiftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (pfi_get_if(&pif, idx))
 		return (1);
 
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_pfInterface]) {
 	case 1:
-		ber = ber_add_integer(ber, idx);
+		ber = ober_add_integer(ber, idx);
 		break;
 	case 2:
-		ber = ber_add_string(ber, pif.pfik_name);
+		ber = ober_add_string(ber, pif.pfik_name);
 		break;
 	case 3:
 		iftype = (pif.pfik_ifp == NULL ? PFI_IFTYPE_GROUP
 		    : PFI_IFTYPE_INSTANCE);
-		ber = ber_add_integer(ber, iftype);
+		ber = ober_add_integer(ber, iftype);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, pif.pfik_states);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
+		ber = ober_add_integer(ber, pif.pfik_states);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
 		break;
 	case 5:
-		ber = ber_add_integer(ber, pif.pfik_rules);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
+		ber = ober_add_integer(ber, pif.pfik_rules);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_UNSIGNED32);
 		break;
 	case 6:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV4][IN][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV4][IN][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 7:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV4][IN][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV4][IN][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 8:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV4][IN][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV4][IN][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 9:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV4][IN][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV4][IN][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 10:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV4][OUT][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV4][OUT][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 11:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV4][OUT][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV4][OUT][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 12:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV4][OUT][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV4][OUT][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 13:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV4][OUT][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV4][OUT][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 14:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV6][IN][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV6][IN][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 15:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV6][IN][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV6][IN][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 16:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV6][IN][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV6][IN][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 17:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV6][IN][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV6][IN][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 18:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV6][OUT][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV6][OUT][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 19:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV6][OUT][PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV6][OUT][PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 20:
-		ber = ber_add_integer(ber, pif.pfik_packets[IPV6][OUT][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_packets[IPV6][OUT][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 21:
-		ber = ber_add_integer(ber, pif.pfik_bytes[IPV6][OUT][BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, pif.pfik_bytes[IPV6][OUT][BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	default:
 		return (1);
@@ -2107,7 +2094,7 @@ mib_pftablenum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if ((c = pft_count()) == -1)
 		return (-1);
 
-	*elm = ber_add_integer(*elm, c);
+	*elm = ober_add_integer(*elm, c);
 
 	return (0);
 }
@@ -2126,100 +2113,100 @@ mib_pftables(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (pft_get_table(&ts, idx))
 		return (1);
 
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_pfTable]) {
 	case 1:
-		ber = ber_add_integer(ber, idx);
+		ber = ober_add_integer(ber, idx);
 		break;
 	case 2:
-		ber = ber_add_string(ber, ts.pfrts_name);
+		ber = ober_add_string(ber, ts.pfrts_name);
 		break;
 	case 3:
-		ber = ber_add_integer(ber, ts.pfrts_cnt);
+		ber = ober_add_integer(ber, ts.pfrts_cnt);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, ts.pfrts_refcnt[PFR_REFCNT_ANCHOR]);
+		ber = ober_add_integer(ber, ts.pfrts_refcnt[PFR_REFCNT_ANCHOR]);
 		break;
 	case 5:
-		ber = ber_add_integer(ber, ts.pfrts_refcnt[PFR_REFCNT_RULE]);
+		ber = ober_add_integer(ber, ts.pfrts_refcnt[PFR_REFCNT_RULE]);
 		break;
 	case 6:
-		ber = ber_add_integer(ber, ts.pfrts_match);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_match);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 7:
-		ber = ber_add_integer(ber, ts.pfrts_nomatch);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_nomatch);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 8:
-		ber = ber_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 9:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 10:
-		ber = ber_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 11:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 12:
-		ber = ber_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_XPASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_XPASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 13:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_XPASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_XPASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 14:
-		ber = ber_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 15:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 16:
-		ber = ber_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 17:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 18:
-		ber = ber_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_XPASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_XPASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 19:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_XPASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_XPASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 20:
 		tzero = (time(NULL) - ts.pfrts_tzero) * 100;
-		ber = ber_add_integer(ber, tzero);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+		ber = ober_add_integer(ber, tzero);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	case 21:
-		ber = ber_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[IN][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 22:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[IN][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 23:
-		ber = ber_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_packets[OUT][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 24:
-		ber = ber_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, ts.pfrts_bytes[OUT][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	default:
 		return (1);
@@ -2235,6 +2222,9 @@ mib_pftableaddrs(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	struct pfr_astats	 as;
 	int			 tblidx;
 
+	if (snmpd_env->sc_pfaddrfilter)
+		return (-1);
+
 	tblidx = o->bo_id[OIDIDX_pfTblAddr + 1];
 	mps_decodeinaddr(o, &as.pfras_a.pfra_ip4addr, OIDIDX_pfTblAddr + 2);
 	as.pfras_a.pfra_net = o->bo_id[OIDIDX_pfTblAddr + 6];
@@ -2243,71 +2233,71 @@ mib_pftableaddrs(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		return (-1);
 
 	/* write OID */
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_pfTblAddr]) {
 	case 1:
-		ber = ber_add_integer(ber, tblidx);
+		ber = ober_add_integer(ber, tblidx);
 		break;
 	case 2:
-		ber = ber_add_nstring(ber, (char *)&as.pfras_a.pfra_ip4addr,
+		ber = ober_add_nstring(ber, (char *)&as.pfras_a.pfra_ip4addr,
 		    sizeof(u_int32_t));
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
 		break;
 	case 3:
-		ber = ber_add_integer(ber, as.pfras_a.pfra_net);
+		ber = ober_add_integer(ber, as.pfras_a.pfra_net);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, (time(NULL) - as.pfras_tzero) * 100);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
+		ber = ober_add_integer(ber, (time(NULL) - as.pfras_tzero) * 100);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_TIMETICKS);
 		break;
 	case 5:
-		ber = ber_add_integer(ber, as.pfras_packets[IN][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_packets[IN][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 6:
-		ber = ber_add_integer(ber, as.pfras_bytes[IN][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_bytes[IN][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 7:
-		ber = ber_add_integer(ber, as.pfras_packets[IN][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_packets[IN][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 8:
-		ber = ber_add_integer(ber, as.pfras_bytes[IN][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_bytes[IN][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 9:
-		ber = ber_add_integer(ber, as.pfras_packets[OUT][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_packets[OUT][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 10:
-		ber = ber_add_integer(ber, as.pfras_bytes[OUT][PFR_OP_BLOCK]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_bytes[OUT][PFR_OP_BLOCK]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 11:
-		ber = ber_add_integer(ber, as.pfras_packets[OUT][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_packets[OUT][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 12:
-		ber = ber_add_integer(ber, as.pfras_bytes[OUT][PFR_OP_PASS]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_bytes[OUT][PFR_OP_PASS]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 13:
-		ber = ber_add_integer(ber, as.pfras_packets[IN][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_packets[IN][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 14:
-		ber = ber_add_integer(ber, as.pfras_bytes[IN][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_bytes[IN][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 15:
-		ber = ber_add_integer(ber, as.pfras_packets[OUT][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_packets[OUT][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 16:
-		ber = ber_add_integer(ber, as.pfras_bytes[OUT][PFR_OP_MATCH]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, as.pfras_bytes[OUT][PFR_OP_MATCH]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	default:
 		return (-1);
@@ -2322,6 +2312,9 @@ mib_pftableaddrstable(struct oid *oid, struct ber_oid *o, struct ber_oid *no)
 	struct pfr_astats	 as;
 	struct oid		 a, b;
 	u_int32_t		 id, tblidx;
+
+	if (snmpd_env->sc_pfaddrfilter)
+		return (NULL);
 
 	bcopy(&oid->o_id, no, sizeof(*no));
 	id = oid->o_oidlen - 1;
@@ -2381,7 +2374,7 @@ mib_pflabelnum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	extern int		 devpf;
 
 	memset(&pr, 0, sizeof(pr));
-	if (ioctl(devpf, DIOCGETRULES, &pr)) {
+	if (ioctl(devpf, DIOCGETRULES, &pr) == -1) {
 		log_warn("DIOCGETRULES");
 		return (-1);
 	}
@@ -2390,7 +2383,7 @@ mib_pflabelnum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	lnr = 0;
 	for (nr = 0; nr < mnr; ++nr) {
 		pr.nr = nr;
-		if (ioctl(devpf, DIOCGETRULE, &pr)) {
+		if (ioctl(devpf, DIOCGETRULE, &pr) == -1) {
 			log_warn("DIOCGETRULE");
 			return (-1);
 		}
@@ -2399,7 +2392,7 @@ mib_pflabelnum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			lnr++;
 	}
 
-	*elm = ber_add_integer(*elm, lnr);
+	*elm = ober_add_integer(*elm, lnr);
 
 	return (0);
 }
@@ -2418,7 +2411,7 @@ mib_pflabels(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	idx = o->bo_id[OIDIDX_pfLabelEntry];
 
 	memset(&pr, 0, sizeof(pr));
-	if (ioctl(devpf, DIOCGETRULES, &pr)) {
+	if (ioctl(devpf, DIOCGETRULES, &pr) == -1) {
 		log_warn("DIOCGETRULES");
 		return (-1);
 	}
@@ -2427,7 +2420,7 @@ mib_pflabels(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	lnr = 0;
 	for (nr = 0; nr < mnr; ++nr) {
 		pr.nr = nr;
-		if (ioctl(devpf, DIOCGETRULE, &pr)) {
+		if (ioctl(devpf, DIOCGETRULE, &pr) == -1) {
 			log_warn("DIOCGETRULE");
 			return (-1);
 		}
@@ -2441,46 +2434,46 @@ mib_pflabels(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (r == NULL)
 		return (1);
 
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_pfLabel]) {
 	case 1:
-		ber = ber_add_integer(ber, lnr);
+		ber = ober_add_integer(ber, lnr);
 		break;
 	case 2:
-		ber = ber_add_string(ber, r->label);
+		ber = ober_add_string(ber, r->label);
 		break;
 	case 3:
-		ber = ber_add_integer(ber, r->evaluations);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->evaluations);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, r->packets[IN] + r->packets[OUT]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->packets[IN] + r->packets[OUT]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 5:
-		ber = ber_add_integer(ber, r->bytes[IN] + r->bytes[OUT]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->bytes[IN] + r->bytes[OUT]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 6:
-		ber = ber_add_integer(ber, r->packets[IN]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->packets[IN]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 7:
-		ber = ber_add_integer(ber, r->bytes[IN]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->bytes[IN]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 8:
-		ber = ber_add_integer(ber, r->packets[OUT]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->packets[OUT]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 9:
-		ber = ber_add_integer(ber, r->bytes[OUT]);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, r->bytes[OUT]);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 10:
-		ber = ber_add_integer(ber, r->states_tot);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, r->states_tot);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	default:
 		return (1);
@@ -2527,8 +2520,8 @@ mib_pfsyncstats(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	for (i = 0;
 	    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 		if (oid->o_oid[OIDIDX_pfstatus] == mapping[i].m_id) {
-			*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-			ber_set_header(*elm, BER_CLASS_APPLICATION,
+			*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+			ober_set_header(*elm, BER_CLASS_APPLICATION,
 			    SNMP_T_COUNTER64);
 			return (0);
 		}
@@ -2547,7 +2540,7 @@ mib_sensornum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	for (i = c = 0; ; i++) {
 		mib[2] = i;
-		if (sysctl(mib, sizeofa(mib),
+		if (sysctl(mib, nitems(mib),
 		    &sensordev, &len, NULL, 0) == -1) {
 			if (errno == ENXIO)
 				continue;
@@ -2558,7 +2551,7 @@ mib_sensornum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		c += sensordev.sensors_count;
 	}
 
-	*elm = ber_add_integer(*elm, c);
+	*elm = ober_add_integer(*elm, c);
 	return (0);
 }
 
@@ -2611,38 +2604,38 @@ mib_sensors(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	return (1);
 
  found:
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_sensor]) {
 	case 1:
-		ber = ber_add_integer(ber, (int32_t)n);
+		ber = ober_add_integer(ber, (int32_t)n);
 		break;
 	case 2:
 		if (sensor.desc[0] == '\0') {
 			snprintf(desc, sizeof(desc), "%s%d",
 			    sensor_type_s[sensor.type],
 			    sensor.numt);
-			ber = ber_add_string(ber, desc);
+			ber = ober_add_string(ber, desc);
 		} else
-			ber = ber_add_string(ber, sensor.desc);
+			ber = ober_add_string(ber, sensor.desc);
 		break;
 	case 3:
-		ber = ber_add_integer(ber, sensor.type);
+		ber = ober_add_integer(ber, sensor.type);
 		break;
 	case 4:
-		ber = ber_add_string(ber, sensordev.xname);
+		ber = ober_add_string(ber, sensordev.xname);
 		break;
 	case 5:
 		if ((s = mib_sensorvalue(&sensor)) == NULL)
 			return (-1);
-		ber = ber_add_string(ber, s);
+		ber = ober_add_string(ber, s);
 		free(s);
 		break;
 	case 6:
-		ber = ber_add_string(ber, mib_sensorunit(&sensor));
+		ber = ober_add_string(ber, mib_sensorunit(&sensor));
 		break;
 	case 7:
-		ber = ber_add_integer(ber, sensor.status);
+		ber = ober_add_integer(ber, sensor.status);
 		break;
 	}
 
@@ -2658,7 +2651,7 @@ static const char * const sensor_drive_s[SENSOR_DRIVE_STATES] = {
 static const char * const sensor_unit_s[SENSOR_MAX_TYPES + 1] = {
 	"degC",	"RPM", "V DC", "V AC", "Ohm", "W", "A", "Wh", "Ah",
 	"", "", "%", "lx", "", "sec", "%RH", "Hz", "degree", 
-	"mm", "Pa", "m/s^2", ""
+	"m", "Pa", "m/s^2", "m/s", ""
 };
 
 const char *
@@ -2690,6 +2683,8 @@ mib_sensorvalue(struct sensor *s)
 	case SENSOR_LUX:
 	case SENSOR_FREQ:
 	case SENSOR_ACCEL:
+	case SENSOR_VELOCITY:
+	case SENSOR_DISTANCE:
 		ret = asprintf(&v, "%.2f", s->value / 1000000.0);
 		break;
 	case SENSOR_INDICATOR:
@@ -2699,7 +2694,6 @@ mib_sensorvalue(struct sensor *s)
 	case SENSOR_HUMIDITY:
 		ret = asprintf(&v, "%.2f", s->value / 1000.0);
 		break;
-	case SENSOR_DISTANCE:
 	case SENSOR_PRESSURE:
 		ret = asprintf(&v, "%.2f", s->value / 1000.0);
 		break;
@@ -2738,7 +2732,7 @@ mib_carpsysctl(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	if (sysctl(mib, 4, &v, &len, NULL, 0) == -1)
 		return (1);
 
-	*elm = ber_add_integer(*elm, v);
+	*elm = ober_add_integer(*elm, v);
 	return (0);
 }
 
@@ -2779,8 +2773,8 @@ mib_carpstats(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	for (i = 0;
 	    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 		if (oid->o_oid[OIDIDX_carpstats] == mapping[i].m_id) {
-			*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-			ber_set_header(*elm, BER_CLASS_APPLICATION,
+			*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+			ober_set_header(*elm, BER_CLASS_APPLICATION,
 			    SNMP_T_COUNTER64);
 			return (0);
 		}
@@ -2800,7 +2794,7 @@ mib_carpifnum(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		if (kif->if_type == IFT_CARP)
 			c++;
 
-	*elm = ber_add_integer(*elm, c);
+	*elm = ober_add_integer(*elm, c);
 	return (0);
 }
 
@@ -2878,29 +2872,29 @@ mib_carpiftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_carpIfEntry] = cif->kif.if_index;
-	*elm = ber_add_oid(*elm, o);
+	*elm = ober_add_oid(*elm, o);
 
 	switch (o->bo_id[OIDIDX_carpIf]) {
 	case 1:
-		*elm = ber_add_integer(*elm, cif->kif.if_index);
+		*elm = ober_add_integer(*elm, cif->kif.if_index);
 		break;
 	case 2:
-		*elm = ber_add_string(*elm, cif->kif.if_name);
+		*elm = ober_add_string(*elm, cif->kif.if_name);
 		break;
 	case 3:
-		*elm = ber_add_integer(*elm, cif->carpr.carpr_vhids[0]);
+		*elm = ober_add_integer(*elm, cif->carpr.carpr_vhids[0]);
 		break;
 	case 4:
-		*elm = ber_add_string(*elm, cif->carpr.carpr_carpdev);
+		*elm = ober_add_string(*elm, cif->carpr.carpr_carpdev);
 		break;
 	case 5:
-		*elm = ber_add_integer(*elm, cif->carpr.carpr_advbase);
+		*elm = ober_add_integer(*elm, cif->carpr.carpr_advbase);
 		break;
 	case 6:
-		*elm = ber_add_integer(*elm, cif->carpr.carpr_advskews[0]);
+		*elm = ober_add_integer(*elm, cif->carpr.carpr_advskews[0]);
 		break;
 	case 7:
-		*elm = ber_add_integer(*elm, cif->carpr.carpr_states[0]);
+		*elm = ober_add_integer(*elm, cif->carpr.carpr_states[0]);
 		break;
 	default:
 		free(cif);
@@ -2975,11 +2969,11 @@ mib_carpgrouptable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_carpGroupIndex] = idx;
-	*elm = ber_add_oid(*elm, o);
+	*elm = ober_add_oid(*elm, o);
 
 	switch (o->bo_id[OIDIDX_carpGroupEntry]) {
 	case 2:
-		*elm = ber_add_string(*elm, ifg->ifgrq_group);
+		*elm = ober_add_string(*elm, ifg->ifgrq_group);
 		break;
 	case 3:
 		if ((s = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
@@ -2998,7 +2992,7 @@ mib_carpgrouptable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		}
 
 		close(s);
-		*elm = ber_add_integer(*elm, ifgr.ifgr_attrib.ifg_carp_demoted);
+		*elm = ober_add_integer(*elm, ifgr.ifgr_attrib.ifg_carp_demoted);
 		break;
 	default:
 		free(ifg);
@@ -3021,15 +3015,15 @@ mib_memiftable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		return (1);
 
 	o->bo_id[OIDIDX_memIfEntry] = kif->if_index;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_memIf]) {
 	case 1:
-		ber = ber_add_string(ber, kif->if_name);
+		ber = ober_add_string(ber, kif->if_name);
 		break;
 	case 2:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	default:
 		return (-1);
@@ -3116,11 +3110,11 @@ mib_ipforwarding(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	int	v;
 	size_t	len = sizeof(v);
 
-	if (sysctl(mib, sizeofa(mib), &v, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &v, &len, NULL, 0) == -1)
 		return (-1);
 
 	/* ipForwarding: forwarding(1), notForwarding(2) */
-	*elm = ber_add_integer(*elm, (v == 0) ? 2 : 1);
+	*elm = ober_add_integer(*elm, (v == 0) ? 2 : 1);
 
 	return (0);
 }
@@ -3132,10 +3126,10 @@ mib_ipdefaultttl(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	int	v;
 	size_t	len = sizeof(v);
 
-	if (sysctl(mib, sizeofa(mib), &v, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &v, &len, NULL, 0) == -1)
 		return (-1);
 
-	*elm = ber_add_integer(*elm, v);
+	*elm = ober_add_integer(*elm, v);
 
 	return (0);
 }
@@ -3146,7 +3140,7 @@ mib_getipstat(struct ipstat *ipstat)
 	int	 mib[] = { CTL_NET, PF_INET, IPPROTO_IP, IPCTL_STATS };
 	size_t	 len = sizeof(*ipstat);
 
-	return (sysctl(mib, sizeofa(mib), ipstat, &len, NULL, 0));
+	return (sysctl(mib, nitems(mib), ipstat, &len, NULL, 0));
 }
 
 int
@@ -3176,8 +3170,8 @@ mib_ipstat(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	for (i = 0;
 	    (u_int)i < (sizeof(mapping) / sizeof(mapping[0])); i++) {
 		if (oid->o_oid[OIDIDX_ip] == mapping[i].m_id) {
-			*elm = ber_add_integer(*elm, *mapping[i].m_ptr);
-			ber_set_header(*elm,
+			*elm = ober_add_integer(*elm, *mapping[i].m_ptr);
+			ober_set_header(*elm,
 			    BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 			return (0);
 		}
@@ -3201,8 +3195,8 @@ mib_ipinhdrerrs(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	    ipstat.ips_badoptions + ipstat.ips_toolong +
 	    ipstat.ips_badaddr;
 
-	*elm = ber_add_integer(*elm, errors);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+	*elm = ober_add_integer(*elm, errors);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 
 	return (0);
 }
@@ -3218,8 +3212,8 @@ mib_ipinaddrerrs(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	errors = ipstat.ips_cantforward + ipstat.ips_badaddr;
 
-	*elm = ber_add_integer(*elm, errors);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+	*elm = ober_add_integer(*elm, errors);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 
 	return (0);
 }
@@ -3235,8 +3229,8 @@ mib_ipforwdgrams(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	counter = ipstat.ips_forward + ipstat.ips_redirectsent;
 
-	*elm = ber_add_integer(*elm, counter);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+	*elm = ober_add_integer(*elm, counter);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 
 	return (0);
 }
@@ -3258,8 +3252,8 @@ mib_ipreasmfails(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	counter = ipstat.ips_fragdropped + ipstat.ips_fragtimeout;
 
-	*elm = ber_add_integer(*elm, counter);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+	*elm = ober_add_integer(*elm, counter);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 
 	return (0);
 }
@@ -3274,8 +3268,8 @@ mib_ipfragfails(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		return (-1);
 
 	counter = ipstat.ips_badfrags + ipstat.ips_cantfrag;
-	*elm = ber_add_integer(*elm, counter);
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+	*elm = ober_add_integer(*elm, counter);
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 
 	return (0);
 }
@@ -3364,27 +3358,27 @@ mib_ipaddr(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		return (1);
 
 	/* write OID */
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_ipAddr]) {
 	case 1:
 		val = addr.sin_addr.s_addr;
-		ber = ber_add_nstring(ber, (char *)&val, sizeof(u_int32_t));
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
+		ber = ober_add_nstring(ber, (char *)&val, sizeof(u_int32_t));
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
 		break;
 	case 2:
-		ber = ber_add_integer(ber, ka->if_index);
+		ber = ober_add_integer(ber, ka->if_index);
 		break;
 	case 3:
 		val = ka->mask.sin.sin_addr.s_addr;
-		ber = ber_add_nstring(ber, (char *)&val, sizeof(u_int32_t));
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
+		ber = ober_add_nstring(ber, (char *)&val, sizeof(u_int32_t));
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
 		break;
 	case 4:
-		ber = ber_add_integer(ber, ka->dstbrd.sa.sa_len ? 1 : 0);
+		ber = ober_add_integer(ber, ka->dstbrd.sa.sa_len ? 1 : 0);
 		break;
 	case 5:
-		ber = ber_add_integer(ber, IP_MAXPACKET);
+		ber = ober_add_integer(ber, IP_MAXPACKET);
 		break;
 	default:
 		return (-1);
@@ -3504,31 +3498,31 @@ mib_physaddr(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 		return (1);
 
 	/* write OID */
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_ipNetToMedia]) {
 	case 1: /* ipNetToMediaIfIndex */
-		ber = ber_add_integer(ber, ka->if_index);
+		ber = ober_add_integer(ber, ka->if_index);
 		break;
 	case 2: /* ipNetToMediaPhysAddress */
 		if (bcmp(LLADDR(&ka->target.sdl), ether_zeroaddr,
 		    sizeof(ether_zeroaddr)) == 0)
-			ber = ber_add_nstring(ber, ether_zeroaddr,
+			ber = ober_add_nstring(ber, ether_zeroaddr,
 			    sizeof(ether_zeroaddr));
 		else
-			ber = ber_add_nstring(ber, LLADDR(&ka->target.sdl),
+			ber = ober_add_nstring(ber, LLADDR(&ka->target.sdl),
 			    ka->target.sdl.sdl_alen);
 		break;
 	case 3:	/* ipNetToMediaNetAddress */
 		val = addr.sin_addr.s_addr;
-		ber = ber_add_nstring(ber, (char *)&val, sizeof(u_int32_t));
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
+		ber = ober_add_nstring(ber, (char *)&val, sizeof(u_int32_t));
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_IPADDR);
 		break;
 	case 4: /* ipNetToMediaType */
 		if (ka->flags & F_STATIC)
-			ber = ber_add_integer(ber, 4); /* static */
+			ber = ober_add_integer(ber, 4); /* static */
 		else
-			ber = ber_add_integer(ber, 3); /* dynamic */
+			ber = ober_add_integer(ber, 3); /* dynamic */
 		break;
 	default:
 		return (-1);
@@ -3577,8 +3571,8 @@ static struct oid ipf_mib[] = {
 int
 mib_ipfnroutes(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 {
-	*elm = ber_add_integer(*elm, kr_routenumber());
-	ber_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+	*elm = ober_add_integer(*elm, kr_routenumber());
+	ober_set_header(*elm, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 
 	return (0);
 }
@@ -3700,11 +3694,11 @@ mib_ipfroute(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	}
 
 	/* write OID */
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (idx) {
 	case 7: /* IfIndex */
-		ber = ber_add_integer(ber, kr->if_index);
+		ber = ober_add_integer(ber, kr->if_index);
 		break;
 	case 8: /* Type */
 		if (kr->flags & F_REJECT)
@@ -3715,7 +3709,7 @@ mib_ipfroute(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 			type = 3;
 		else
 			type = 4;
-		ber = ber_add_integer(ber, type);
+		ber = ober_add_integer(ber, type);
 		break;
 	case 9: /* Proto */
 		switch (kr->priority) {
@@ -3744,33 +3738,33 @@ mib_ipfroute(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 				proto = 1; /* not specified */
 			break;
 		}
-		ber = ber_add_integer(ber, proto);
+		ber = ober_add_integer(ber, proto);
 		break;
 	case 10: /* Age */
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 		break;
 	case 11: /* NextHopAS */
-		ber = ber_add_integer(ber, 0);	/* unknown */
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
+		ber = ober_add_integer(ber, 0);	/* unknown */
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_GAUGE32);
 		break;
 	case 12: /* Metric1 */
-		ber = ber_add_integer(ber, -1);	/* XXX */
+		ber = ober_add_integer(ber, -1);	/* XXX */
 		break;
 	case 13: /* Metric2 */
-		ber = ber_add_integer(ber, -1);	/* XXX */
+		ber = ober_add_integer(ber, -1);	/* XXX */
 		break;
 	case 14: /* Metric3 */
-		ber = ber_add_integer(ber, -1);	/* XXX */
+		ber = ober_add_integer(ber, -1);	/* XXX */
 		break;
 	case 15: /* Metric4 */
-		ber = ber_add_integer(ber, -1);	/* XXX */
+		ber = ober_add_integer(ber, -1);	/* XXX */
 		break;
 	case 16: /* Metric5 */
-		ber = ber_add_integer(ber, -1);	/* XXX */
+		ber = ober_add_integer(ber, -1);	/* XXX */
 		break;
 	case 17: /* Status */
-		ber = ber_add_integer(ber, 1);	/* XXX */
+		ber = ober_add_integer(ber, 1);	/* XXX */
 		break;
 	default:
 		return (-1);
@@ -3810,7 +3804,7 @@ mib_diskio(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	len = sizeof(diskcount);
 	mib[1] = HW_DISKCOUNT;
-	if (sysctl(mib, sizeofa(mib), &diskcount, &len, NULL, 0) == -1)
+	if (sysctl(mib, nitems(mib), &diskcount, &len, NULL, 0) == -1)
 		return (-1);
 
 	/* Get and verify the current row index */
@@ -3820,7 +3814,7 @@ mib_diskio(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_diskIOEntry] = idx;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	stats = calloc(diskcount, sizeof(*stats));
 	if (stats == NULL)
@@ -3828,41 +3822,41 @@ mib_diskio(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 	/* We know len won't overflow, otherwise calloc() would have failed. */
 	len = diskcount * sizeof(*stats);
 	mib[1] = HW_DISKSTATS;
-	if (sysctl(mib, sizeofa(mib), stats, &len, NULL, 0) == -1) {
+	if (sysctl(mib, nitems(mib), stats, &len, NULL, 0) == -1) {
 		free(stats);
 		return (-1);
 	}
 
 	switch (o->bo_id[OIDIDX_diskIO]) {
 	case 1: /* diskIOIndex */
-		ber = ber_add_integer(ber, idx);
+		ber = ober_add_integer(ber, idx);
 		break;
 	case 2: /* diskIODevice */
-		ber = ber_add_string(ber, stats[idx - 1].ds_name);
+		ber = ober_add_string(ber, stats[idx - 1].ds_name);
 		break;
 	case 3: /* diskIONRead */
-		ber = ber_add_integer(ber, (u_int32_t)stats[idx - 1].ds_rbytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)stats[idx - 1].ds_rbytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 4: /* diskIONWritten */
-		ber = ber_add_integer(ber, (u_int32_t)stats[idx - 1].ds_wbytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)stats[idx - 1].ds_wbytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 5: /* diskIOReads */
-		ber = ber_add_integer(ber, (u_int32_t)stats[idx - 1].ds_rxfer);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)stats[idx - 1].ds_rxfer);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 6: /* diskIOWrites */
-		ber = ber_add_integer(ber, (u_int32_t)stats[idx - 1].ds_wxfer);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, (u_int32_t)stats[idx - 1].ds_wxfer);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	case 12: /* diskIONReadX */
-		ber = ber_add_integer(ber, stats[idx - 1].ds_rbytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, stats[idx - 1].ds_rbytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	case 13: /* diskIONWrittenX */
-		ber = ber_add_integer(ber, stats[idx - 1].ds_wbytes);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
+		ber = ober_add_integer(ber, stats[idx - 1].ds_wbytes);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER64);
 		break;
 	default:
 		free(stats);
@@ -3910,20 +3904,20 @@ mib_dot1dtable(struct oid *oid, struct ber_oid *o, struct ber_element **elm)
 
 	/* Tables need to prepend the OID on their own */
 	o->bo_id[OIDIDX_dot1dEntry] = kif->if_index;
-	ber = ber_add_oid(ber, o);
+	ber = ober_add_oid(ber, o);
 
 	switch (o->bo_id[OIDIDX_dot1d]) {
 	case 1:
 	case 2:
-		ber = ber_add_integer(ber, kif->if_index);
+		ber = ober_add_integer(ber, kif->if_index);
 		break;
 	case 3:
-		ber = ber_add_oid(ber, &zerodotzero);
+		ber = ober_add_oid(ber, &zerodotzero);
 		break;
 	case 4:
 	case 5:
-		ber = ber_add_integer(ber, 0);
-		ber_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
+		ber = ober_add_integer(ber, 0);
+		ober_set_header(ber, BER_CLASS_APPLICATION, SNMP_T_COUNTER32);
 		break;
 	}
 

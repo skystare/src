@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_pool.c,v 1.223 2018/06/08 15:38:15 guenther Exp $	*/
+/*	$OpenBSD: subr_pool.c,v 1.230 2020/01/24 06:31:17 cheloha Exp $	*/
 /*	$NetBSD: subr_pool.c,v 1.61 2001/09/26 07:14:56 chs Exp $	*/
 
 /*-
@@ -78,12 +78,12 @@ struct pool phpool;
 struct pool_lock_ops {
 	void	(*pl_init)(struct pool *, union pool_lock *,
 		    const struct lock_type *);
-	void	(*pl_enter)(union pool_lock * LOCK_FL_VARS);
-	int	(*pl_enter_try)(union pool_lock * LOCK_FL_VARS);
-	void	(*pl_leave)(union pool_lock * LOCK_FL_VARS);
+	void	(*pl_enter)(union pool_lock *);
+	int	(*pl_enter_try)(union pool_lock *);
+	void	(*pl_leave)(union pool_lock *);
 	void	(*pl_assert_locked)(union pool_lock *);
 	void	(*pl_assert_unlocked)(union pool_lock *);
-	int	(*pl_sleep)(void *, union pool_lock *, int, const char *, int);
+	int	(*pl_sleep)(void *, union pool_lock *, int, const char *);
 };
 
 static const struct pool_lock_ops pool_lock_ops_mtx;
@@ -99,19 +99,19 @@ static const struct pool_lock_ops pool_lock_ops_rw;
 #endif /* WITNESS */
 
 static inline void
-pl_enter(struct pool *pp, union pool_lock *pl LOCK_FL_VARS)
+pl_enter(struct pool *pp, union pool_lock *pl)
 {
-	pp->pr_lock_ops->pl_enter(pl LOCK_FL_ARGS);
+	pp->pr_lock_ops->pl_enter(pl);
 }
 static inline int
-pl_enter_try(struct pool *pp, union pool_lock *pl LOCK_FL_VARS)
+pl_enter_try(struct pool *pp, union pool_lock *pl)
 {
-	return pp->pr_lock_ops->pl_enter_try(pl LOCK_FL_ARGS);
+	return pp->pr_lock_ops->pl_enter_try(pl);
 }
 static inline void
-pl_leave(struct pool *pp, union pool_lock *pl LOCK_FL_VARS)
+pl_leave(struct pool *pp, union pool_lock *pl)
 {
-	pp->pr_lock_ops->pl_leave(pl LOCK_FL_ARGS);
+	pp->pr_lock_ops->pl_leave(pl);
 }
 static inline void
 pl_assert_locked(struct pool *pp, union pool_lock *pl)
@@ -125,16 +125,10 @@ pl_assert_unlocked(struct pool *pp, union pool_lock *pl)
 }
 static inline int
 pl_sleep(struct pool *pp, void *ident, union pool_lock *lock, int priority,
-    const char *wmesg, int timo)
+    const char *wmesg)
 {
-	return pp->pr_lock_ops->pl_sleep(ident, lock, priority, wmesg, timo);
+	return pp->pr_lock_ops->pl_sleep(ident, lock, priority, wmesg);
 }
-
-#ifdef WITNESS
-# define pl_enter(pp,pl)	pl_enter(pp,pl LOCK_FILE_LINE)
-# define pl_enter_try(pp,pl)	pl_enter_try(pp,pl LOCK_FILE_LINE)
-# define pl_leave(pp,pl)	pl_leave(pp,pl LOCK_FILE_LINE)
-#endif
 
 struct pool_item {
 	u_long				pi_magic;
@@ -608,7 +602,7 @@ pool_get(struct pool *pp, int flags)
 
 		pl_enter(pp, &mem.lock);
 		while (mem.v == NULL)
-			pl_sleep(pp, &mem, &mem.lock, PSWP, pp->pr_wchan, 0);
+			pl_sleep(pp, &mem, &mem.lock, PSWP, pp->pr_wchan);
 		pl_leave(pp, &mem.lock);
 
 		v = mem.v;
@@ -655,11 +649,7 @@ pool_runqueue(struct pool *pp, int flags)
 	do {
 		pp->pr_requesting = 1;
 
-		/* no TAILQ_JOIN? :( */
-		while ((pr = TAILQ_FIRST(&pp->pr_requests)) != NULL) {
-			TAILQ_REMOVE(&pp->pr_requests, pr, pr_entry);
-			TAILQ_INSERT_TAIL(&prl, pr, pr_entry);
-		}
+		TAILQ_CONCAT(&prl, &pp->pr_requests, pr_entry);
 		if (TAILQ_EMPTY(&prl))
 			continue;
 
@@ -690,11 +680,7 @@ pool_runqueue(struct pool *pp, int flags)
 		pl_enter(pp, &pp->pr_requests_lock);
 	} while (--pp->pr_requesting);
 
-	/* no TAILQ_JOIN :( */
-	while ((pr = TAILQ_FIRST(&prl)) != NULL) {
-		TAILQ_REMOVE(&prl, pr, pr_entry);
-		TAILQ_INSERT_TAIL(&pp->pr_requests, pr, pr_entry);
-	}
+	TAILQ_CONCAT(&pp->pr_requests, &prl, pr_entry);
 }
 
 void *
@@ -821,6 +807,12 @@ pool_put(struct pool *pp, void *v)
 	if (freeph != NULL)
 		pool_p_free(pp, freeph);
 
+	pool_wakeup(pp);
+}
+
+void
+pool_wakeup(struct pool *pp)
+{
 	if (!TAILQ_EMPTY(&pp->pr_requests)) {
 		pl_enter(pp, &pp->pr_requests_lock);
 		pool_runqueue(pp, PR_NOWAIT);
@@ -2196,21 +2188,21 @@ pool_lock_mtx_init(struct pool *pp, union pool_lock *lock,
 }
 
 void
-pool_lock_mtx_enter(union pool_lock *lock LOCK_FL_VARS)
+pool_lock_mtx_enter(union pool_lock *lock)
 {
-	_mtx_enter(&lock->prl_mtx LOCK_FL_ARGS);
+	mtx_enter(&lock->prl_mtx);
 }
 
 int
-pool_lock_mtx_enter_try(union pool_lock *lock LOCK_FL_VARS)
+pool_lock_mtx_enter_try(union pool_lock *lock)
 {
-	return (_mtx_enter_try(&lock->prl_mtx LOCK_FL_ARGS));
+	return (mtx_enter_try(&lock->prl_mtx));
 }
 
 void
-pool_lock_mtx_leave(union pool_lock *lock LOCK_FL_VARS)
+pool_lock_mtx_leave(union pool_lock *lock)
 {
-	_mtx_leave(&lock->prl_mtx LOCK_FL_ARGS);
+	mtx_leave(&lock->prl_mtx);
 }
 
 void
@@ -2227,9 +2219,9 @@ pool_lock_mtx_assert_unlocked(union pool_lock *lock)
 
 int
 pool_lock_mtx_sleep(void *ident, union pool_lock *lock, int priority,
-    const char *wmesg, int timo)
+    const char *wmesg)
 {
-	return msleep(ident, &lock->prl_mtx, priority, wmesg, timo);
+	return msleep_nsec(ident, &lock->prl_mtx, priority, wmesg, INFSLP);
 }
 
 static const struct pool_lock_ops pool_lock_ops_mtx = {
@@ -2250,22 +2242,21 @@ pool_lock_rw_init(struct pool *pp, union pool_lock *lock,
 }
 
 void
-pool_lock_rw_enter(union pool_lock *lock LOCK_FL_VARS)
+pool_lock_rw_enter(union pool_lock *lock)
 {
-	_rw_enter_write(&lock->prl_rwlock LOCK_FL_ARGS);
+	rw_enter_write(&lock->prl_rwlock);
 }
 
 int
-pool_lock_rw_enter_try(union pool_lock *lock LOCK_FL_VARS)
+pool_lock_rw_enter_try(union pool_lock *lock)
 {
-	return (_rw_enter(&lock->prl_rwlock, RW_WRITE | RW_NOSLEEP
-	    LOCK_FL_ARGS) == 0);
+	return (rw_enter(&lock->prl_rwlock, RW_WRITE | RW_NOSLEEP) == 0);
 }
 
 void
-pool_lock_rw_leave(union pool_lock *lock LOCK_FL_VARS)
+pool_lock_rw_leave(union pool_lock *lock)
 {
-	_rw_exit_write(&lock->prl_rwlock LOCK_FL_ARGS);
+	rw_exit_write(&lock->prl_rwlock);
 }
 
 void
@@ -2282,9 +2273,9 @@ pool_lock_rw_assert_unlocked(union pool_lock *lock)
 
 int
 pool_lock_rw_sleep(void *ident, union pool_lock *lock, int priority,
-    const char *wmesg, int timo)
+    const char *wmesg)
 {
-	return rwsleep(ident, &lock->prl_rwlock, priority, wmesg, timo);
+	return rwsleep_nsec(ident, &lock->prl_rwlock, priority, wmesg, INFSLP);
 }
 
 static const struct pool_lock_ops pool_lock_ops_rw = {

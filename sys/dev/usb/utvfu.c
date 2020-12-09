@@ -1,4 +1,4 @@
-/*	$OpenBSD: utvfu.c,v 1.9 2016/09/19 06:46:44 ratchov Exp $ */
+/*	$OpenBSD: utvfu.c,v 1.11 2020/07/31 10:49:33 mglocker Exp $ */
 /*
  * Copyright (c) 2013 Lubomir Rintel
  * Copyright (c) 2013 Federico Simoncelli
@@ -1164,7 +1164,6 @@ void
 utvfu_vs_close(struct utvfu_softc *sc)
 {
 	if (sc->sc_iface.pipeh != NULL) {
-		usbd_abort_pipe(sc->sc_iface.pipeh);
 		usbd_close_pipe(sc->sc_iface.pipeh);
 		sc->sc_iface.pipeh = NULL;
 	}
@@ -1746,7 +1745,7 @@ utvfu_dqbuf(void *v, struct v4l2_buffer *dqb)
 
 	if (SIMPLEQ_EMPTY(&sc->sc_mmap_q)) {
 		/* mmap queue is empty, block until first frame is queued */
-		error = tsleep(sc, 0, "vid_mmap", 10 * hz);
+		error = tsleep_nsec(sc, 0, "vid_mmap", SEC_TO_NSEC(10));
 		if (error)
 			return (EINVAL);
 	}

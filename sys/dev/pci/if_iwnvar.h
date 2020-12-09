@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_iwnvar.h,v 1.34 2018/02/25 12:40:06 stsp Exp $	*/
+/*	$OpenBSD: if_iwnvar.h,v 1.39 2020/10/11 07:05:28 mpi Exp $	*/
 
 /*-
  * Copyright (c) 2007, 2008
@@ -42,14 +42,12 @@ struct iwn_tx_radiotap_header {
 	uint8_t		wt_rate;
 	uint16_t	wt_chan_freq;
 	uint16_t	wt_chan_flags;
-	uint8_t		wt_hwqueue;
 } __packed;
 
 #define IWN_TX_RADIOTAP_PRESENT						\
 	((1 << IEEE80211_RADIOTAP_FLAGS) |				\
 	 (1 << IEEE80211_RADIOTAP_RATE) |				\
-	 (1 << IEEE80211_RADIOTAP_CHANNEL) |				\
-	 (1 << IEEE80211_RADIOTAP_HWQUEUE))
+	 (1 << IEEE80211_RADIOTAP_CHANNEL))
 
 struct iwn_dma_info {
 	bus_dma_tag_t		tag;
@@ -67,6 +65,16 @@ struct iwn_tx_data {
 	struct mbuf		*m;
 	struct ieee80211_node	*ni;
 	int totlen;
+	int retries;
+	int txfail;
+	int txmcs;
+	int txrate;
+
+	/* A-MPDU subframes */
+	int ampdu_id;
+	int ampdu_txmcs;
+	int ampdu_nframes;
+	int ampdu_size;
 };
 
 struct iwn_tx_ring {
@@ -78,6 +86,7 @@ struct iwn_tx_ring {
 	int			qid;
 	int			queued;
 	int			cur;
+	int			read;
 };
 
 struct iwn_softc;
@@ -103,6 +112,7 @@ struct iwn_node {
 	uint16_t			disable_tid;
 	uint8_t				id;
 	uint8_t				ridx[IEEE80211_RATE_MAXSIZE];
+	uint32_t			next_ampdu_id;
 };
 
 struct iwn_calib_state {
@@ -163,6 +173,7 @@ struct iwn_ops {
 	void		(*read_eeprom)(struct iwn_softc *);
 	int		(*post_alive)(struct iwn_softc *);
 	int		(*nic_config)(struct iwn_softc *);
+	void		(*reset_sched)(struct iwn_softc *, int, int);
 	void		(*update_sched)(struct iwn_softc *, int, int, uint8_t,
 			    uint16_t);
 	int		(*get_temperature)(struct iwn_softc *);
@@ -178,6 +189,10 @@ struct iwn_ops {
 			    struct ieee80211_node *, uint8_t, uint16_t);
 	void		(*ampdu_tx_stop)(struct iwn_softc *, uint8_t,
 			    uint16_t);
+};
+
+struct iwn_tx_ba {
+	struct iwn_node *	wn;
 };
 
 struct iwn_softc {
@@ -212,6 +227,8 @@ struct iwn_softc {
 	const struct iwn_sensitivity_limits
 				*limits;
 	int			ntxqs;
+	int			first_agg_txq;
+	int			agg_queue_mask;
 	int			ndmachnls;
 	uint8_t			broadcast_id;
 	int			rxonsz;
@@ -301,6 +318,8 @@ struct iwn_softc {
 	uint8_t			chainmask;
 
 	int			sc_tx_timer;
+
+	struct iwn_tx_ba	sc_tx_ba[IEEE80211_NUM_TID];
 
 #if NBPFILTER > 0
 	caddr_t			sc_drvbpf;

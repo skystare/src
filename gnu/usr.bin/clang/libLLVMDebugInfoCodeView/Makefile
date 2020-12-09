@@ -1,35 +1,54 @@
-# $OpenBSD: Makefile,v 1.5 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.10 2020/08/03 14:45:25 patrick Exp $
 
 LIB=	LLVMDebugInfoCodeView
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/DebugInfo/CodeView
 
-.include <bsd.own.mk>
-SRCS=	CVTypeVisitor.cpp \
+SRCS+=	AppendingTypeTableBuilder.cpp \
 	CodeViewError.cpp \
 	CodeViewRecordIO.cpp \
 	ContinuationRecordBuilder.cpp \
+	CVSymbolVisitor.cpp \
+	CVTypeVisitor.cpp \
+	DebugChecksumsSubsection.cpp \
+	DebugCrossExSubsection.cpp \
+	DebugCrossImpSubsection.cpp \
+	DebugFrameDataSubsection.cpp \
+	DebugInlineeLinesSubsection.cpp \
+	DebugLinesSubsection.cpp \
+	DebugStringTableSubsection.cpp \
+	DebugSubsection.cpp \
+	DebugSubsectionRecord.cpp \
+	DebugSubsectionVisitor.cpp \
+	DebugSymbolRVASubsection.cpp \
+	DebugSymbolsSubsection.cpp \
+	DebugInfoCodeViewEnumTables.cpp \
 	Formatters.cpp \
 	GlobalTypeTableBuilder.cpp \
+	LazyRandomTypeCollection.cpp \
 	Line.cpp \
+	MergingTypeTableBuilder.cpp \
 	RecordName.cpp \
 	RecordSerialization.cpp \
 	SimpleTypeSerializer.cpp \
+	StringsAndChecksums.cpp \
 	SymbolDumper.cpp \
+	SymbolRecordHelpers.cpp \
 	SymbolRecordMapping.cpp \
+	SymbolSerializer.cpp \
 	TypeDumpVisitor.cpp \
-	TypeHashing.cpp \
 	TypeIndex.cpp \
 	TypeIndexDiscovery.cpp \
+	TypeHashing.cpp \
+	TypeRecordHelpers.cpp \
 	TypeRecordMapping.cpp \
 	TypeStreamMerger.cpp \
 	TypeTableCollection.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/DebugInfo/CodeView
+DebugInfoCodeViewEnumTables.cpp:
+	ln -s ${LLVM_SRCS}/lib/DebugInfo/CodeView/EnumTables.cpp $@
 
-install:
-	@# Nothing here so far ...
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/DebugInfo/CodeView
 
-.include <bsd.lib.mk>
+CLEANFILES+= DebugInfoCodeViewEnumTables.cpp

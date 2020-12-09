@@ -1,6 +1,6 @@
-#	$OpenBSD: Syslogd.pm,v 1.23 2018/04/11 19:00:54 bluhm Exp $
+#	$OpenBSD: Syslogd.pm,v 1.25 2020/07/24 22:12:00 bluhm Exp $
 
-# Copyright (c) 2010-2015 Alexander Bluhm <bluhm@openbsd.org>
+# Copyright (c) 2010-2020 Alexander Bluhm <bluhm@openbsd.org>
 # Copyright (c) 2014 Florian Riehm <mail@friehm.de>
 #
 # Permission to use, copy, modify, and distribute this software for any
@@ -31,6 +31,8 @@ use Time::HiRes qw(time alarm sleep);
 sub new {
 	my $class = shift;
 	my %args = @_;
+	$args{ktraceexec} = "ktrace" if $args{ktrace};
+	$args{ktraceexec} = $ENV{KTRACE} if $ENV{KTRACE};
 	$args{ktracefile} ||= "syslogd.ktrace";
 	$args{fstatfile} ||= "syslogd.fstat";
 	$args{logfile} ||= "syslogd.log";
@@ -100,7 +102,10 @@ sub new {
 
 sub create_out {
 	my $self = shift;
+	my $timeout = shift || 10;
 	my @sudo = $ENV{SUDO} ? $ENV{SUDO} : ();
+
+	my $end = time() + $timeout;
 
 	open(my $fh, '>', $self->{outfile})
 	    or die ref($self), " create log file $self->{outfile} failed: $!";
@@ -128,6 +133,19 @@ sub create_out {
 		    or die ref($self), " pipe to @cmd failed: $!";
 		# remember until object is destroyed, autoclose will send EOF
 		$self->{"ctl$dev"} = $ctl;
+	}
+
+	foreach my $dev (qw(console user)) {
+		my $file = $self->{"out$dev"};
+		while ($self->{"ctl$dev"}) {
+			open(my $fh, '<', $file) or die ref($self),
+			    " open $file for reading failed: $!";
+			last if grep { /ttylog: started/ } <$fh>;
+			time() < $end
+			    or croak ref($self), " no 'started' in $file ".
+			    "after $timeout seconds";
+			sleep .1;
+		}
 	}
 
 	return $self;
@@ -175,9 +193,9 @@ sub child {
 		push @libevent, "$_=1" if delete $ENV{$_};
 	}
 	push @libevent, "EVENT_SHOW_METHOD=1" if @libevent;
-	my @ktrace = $ENV{KTRACE} || ();
-	@ktrace = "ktrace" if $self->{ktrace} && !@ktrace;
-	push @ktrace, "-i", "-f", $self->{ktracefile} if @ktrace;
+	my @ktrace;
+	@ktrace = ($self->{ktraceexec}, "-i", "-f", $self->{ktracefile})
+	    if $self->{ktraceexec};
 	my @cmd = (@sudo, @libevent, @ktrace, $self->{execfile},
 	    "-f", $self->{conffile});
 	push @cmd, "-d" if !$self->{foreground} && !$self->{daemon};
@@ -211,19 +229,6 @@ sub up {
 		    or croak ref($self), " no 'kqueue' in $self->{fstatfile} ".
 		    "after $timeout seconds";
 		sleep .1;
-	}
-
-	foreach my $dev (qw(console user)) {
-		my $file = $self->{"out$dev"};
-		while ($self->{"ctl$dev"}) {
-			open(my $fh, '<', $file) or die ref($self),
-			    " open $file for reading failed: $!";
-			last if grep { /ttylog: started/ } <$fh>;
-			time() < $end
-			    or croak ref($self), " no 'started' in $file ".
-			    "after $timeout seconds";
-			sleep .1;
-		}
 	}
 
 	return $self;

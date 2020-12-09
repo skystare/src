@@ -1,4 +1,4 @@
-/*	$OpenBSD: control.c,v 1.27 2018/09/01 19:21:10 remi Exp $ */
+/*	$OpenBSD: control.c,v 1.29 2020/09/16 20:50:10 remi Exp $ */
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -64,7 +64,6 @@ control_check(char *path)
 	return (0);
 }
 
-
 int
 control_init(char *path)
 {
@@ -125,12 +124,10 @@ control_listen(void)
 }
 
 void
-control_cleanup(char *path)
+control_cleanup(void)
 {
 	event_del(&control_state.ev);
 	event_del(&control_state.evt);
-	if (path)
-		unlink(path);
 }
 
 /* ARGSUSED */
@@ -237,7 +234,7 @@ control_dispatch_imsg(int fd, short event, void *bula)
 {
 	struct ctl_conn	*c;
 	struct imsg	 imsg;
-	int		 n;
+	ssize_t		 n;
 	unsigned int	 ifidx;
 	int		 verbose;
 
@@ -289,7 +286,7 @@ control_dispatch_imsg(int fd, short event, void *bula)
 			    sizeof(ifidx)) {
 				memcpy(&ifidx, imsg.data, sizeof(ifidx));
 				ospfe_iface_ctl(c, ifidx);
-				imsg_compose(&c->iev.ibuf, IMSG_CTL_END, 0,
+				imsg_compose_event(&c->iev, IMSG_CTL_END, 0,
 				    0, -1, NULL, 0);
 			}
 			break;

@@ -1,8 +1,8 @@
-/*	$OpenBSD: getopt_long.c,v 1.29 2015/10/01 02:32:07 guenther Exp $	*/
+/*	$OpenBSD: getopt_long.c,v 1.32 2020/05/27 22:25:09 schwarze Exp $	*/
 /*	$NetBSD: getopt_long.c,v 1.15 2002/01/31 22:43:40 tv Exp $	*/
 
 /*
- * Copyright (c) 2002 Todd C. Miller <Todd.Miller@courtesan.com>
+ * Copyright (c) 2002 Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -418,15 +418,7 @@ start:
 	}
 
 	if ((optchar = (int)*place++) == (int)':' ||
-	    (optchar == (int)'-' && *place != '\0') ||
 	    (oli = strchr(options, optchar)) == NULL) {
-		/*
-		 * If the user specified "-" and  '-' isn't listed in
-		 * options, return -1 (non-option) as per POSIX.
-		 * Otherwise, it is an unknown option character (or ':').
-		 */
-		if (optchar == (int)'-' && *place == '\0')
-			return (-1);
 		if (!*place)
 			++optind;
 		if (PRINT_ERROR)
@@ -478,8 +470,6 @@ start:
 /*
  * getopt --
  *	Parse argc/argv argument vector.
- *
- * [eventually this will replace the BSD getopt]
  */
 int
 getopt(int nargc, char * const *nargv, const char *options)

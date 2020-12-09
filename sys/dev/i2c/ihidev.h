@@ -1,4 +1,4 @@
-/* $OpenBSD: ihidev.h,v 1.6 2018/08/25 18:32:05 jcs Exp $ */
+/* $OpenBSD: ihidev.h,v 1.8 2020/07/09 21:01:56 jcs Exp $ */
 /*
  * HID-over-i2c driver
  *
@@ -89,8 +89,10 @@ struct ihidev_softc {
 	int		sc_refcnt;
 
 	int		sc_poll;
+	int		sc_frompoll;
 	int		sc_fastpoll;
 	struct timeout	sc_timer;
+	int		sc_dying;
 };
 
 struct ihidev {
@@ -110,7 +112,9 @@ struct ihidev_attach_arg {
 	struct i2c_attach_args	*iaa;
 	struct ihidev_softc	*parent;
 	uint8_t			 reportid;
-#define	IHIDEV_CLAIM_ALLREPORTID	255
+	uint8_t			 claims[16];
+	uint8_t			 nclaims;
+#define	IHIDEV_CLAIM_MULTIPLEID	255
 };
 
 struct i2c_hid_report_request {

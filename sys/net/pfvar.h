@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfvar.h,v 1.486 2018/09/13 19:53:58 bluhm Exp $ */
+/*	$OpenBSD: pfvar.h,v 1.497 2020/10/14 19:22:14 naddy Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -39,6 +39,7 @@
 #include <sys/rwlock.h>
 #include <sys/syslimits.h>
 #include <sys/refcnt.h>
+#include <sys/timeout.h>
 
 #include <netinet/in.h>
 
@@ -278,19 +279,6 @@ struct pfi_dynaddr {
 	!(a)->addr32[0] && !(a)->addr32[1] && \
 	!(a)->addr32[2] && !(a)->addr32[3] )) \
 
-#define PF_MATCHA(n, a, m, b, f) \
-	pf_match_addr(n, a, m, b, f)
-
-#define PF_ACPY(a, b, f) \
-	pf_addrcpy(a, b, f)
-
-#define PF_AINC(a, f) \
-	pf_addr_inc(a, f)
-
-#define PF_POOLMASK(a, b, c, d, f) \
-	pf_poolmask(a, b, c, d, f)
-
-
 #define	PF_MISMATCHAW(aw, x, af, neg, ifp, rtid)			\
 	(								\
 		(((aw)->type == PF_ADDR_NOROUTE &&			\
@@ -308,7 +296,7 @@ struct pfi_dynaddr {
 		    &(aw)->v.a.mask, (x), (af))) ||			\
 		((aw)->type == PF_ADDR_ADDRMASK &&			\
 		    !PF_AZERO(&(aw)->v.a.mask, (af)) &&			\
-		    !PF_MATCHA(0, &(aw)->v.a.addr,			\
+		    !pf_match_addr(0, &(aw)->v.a.addr,			\
 		    &(aw)->v.a.mask, (x), (af))))) !=			\
 		(neg)							\
 	)
@@ -487,7 +475,8 @@ union pf_rule_ptr {
 };
 
 #define	PF_ANCHOR_NAME_SIZE	 64
-#define	PF_ANCHOR_MAXPATH	(MAXPATHLEN - PF_ANCHOR_NAME_SIZE - 1)
+#define	PF_ANCHOR_MAXPATH	(PATH_MAX - PF_ANCHOR_NAME_SIZE - 1)
+#define	PF_OPTIMIZER_TABLE_PFX	"__automatic_"
 
 struct pf_rule {
 	struct pf_rule_addr	 src;
@@ -935,7 +924,6 @@ struct pf_ruleset {
 		struct pf_rulequeue	 queues[2];
 		struct {
 			struct pf_rulequeue	*ptr;
-			struct pf_rule		**ptr_array;
 			u_int32_t		 rcount;
 			u_int32_t		 ticket;
 			int			 open;
@@ -1175,6 +1163,7 @@ struct pfi_kif {
 	int				 pfik_states;
 	int				 pfik_rules;
 	int				 pfik_routes;
+	int				 pfik_srcnodes;
 	TAILQ_HEAD(, pfi_dynaddr)	 pfik_dynaddrs;
 };
 
@@ -1182,7 +1171,8 @@ enum pfi_kif_refs {
 	PFI_KIF_REF_NONE,
 	PFI_KIF_REF_STATE,
 	PFI_KIF_REF_RULE,
-	PFI_KIF_REF_ROUTE
+	PFI_KIF_REF_ROUTE,
+	PFI_KIF_REF_SRCNODE
 };
 
 #define PFI_IFLAG_SKIP		0x0100	/* skip filtering on interface */
@@ -1443,7 +1433,7 @@ enum pf_divert_types {
 };
 
 struct pf_pktdelay {
-	struct timeout	*to;
+	struct timeout	 to;
 	struct mbuf	*m;
 	u_int		 ifidx;
 };
@@ -1509,7 +1499,7 @@ struct pfioc_state_kill {
 };
 
 struct pfioc_states {
-	int	ps_len;
+	size_t	ps_len;
 	union {
 		caddr_t			 psu_buf;
 		struct pfsync_state	*psu_states;
@@ -1519,7 +1509,7 @@ struct pfioc_states {
 };
 
 struct pfioc_src_nodes {
-	int	psn_len;
+	size_t	psn_len;
 	union {
 		caddr_t		 psu_buf;
 		struct pf_src_node	*psu_src_nodes;
@@ -1725,7 +1715,7 @@ extern int			 pf_state_insert(struct pfi_kif *,
 int				 pf_insert_src_node(struct pf_src_node **,
 				    struct pf_rule *, enum pf_sn_types,
 				    sa_family_t, struct pf_addr *,
-				    struct pf_addr *);
+				    struct pf_addr *, struct pfi_kif *);
 void				 pf_remove_src_node(struct pf_src_node *);
 struct pf_src_node		*pf_get_src_node(struct pf_state *,
 				    enum pf_sn_types);
@@ -1854,6 +1844,8 @@ int	pfr_ina_rollback(struct pfr_table *, u_int32_t, int *, int);
 int	pfr_ina_commit(struct pfr_table *, u_int32_t, int *, int *, int);
 int	pfr_ina_define(struct pfr_table *, struct pfr_addr *, int, int *,
 	    int *, u_int32_t, int);
+struct pfr_ktable
+	*pfr_ktable_select_active(struct pfr_ktable *);
 
 extern struct pfi_kif		*pfi_all;
 
@@ -1916,7 +1908,7 @@ int			 pf_anchor_setup(struct pf_rule *,
 			    const struct pf_ruleset *, const char *);
 int			 pf_anchor_copyout(const struct pf_ruleset *,
 			    const struct pf_rule *, struct pfioc_rule *);
-void			 pf_anchor_remove(struct pf_rule *);
+void			 pf_remove_anchor(struct pf_rule *);
 void			 pf_remove_if_empty_ruleset(struct pf_ruleset *);
 struct pf_anchor	*pf_find_anchor(const char *);
 struct pf_ruleset	*pf_find_ruleset(const char *);
@@ -1924,12 +1916,6 @@ struct pf_ruleset 	*pf_get_leaf_ruleset(char *, char **);
 struct pf_anchor 	*pf_create_anchor(struct pf_anchor *, const char *);
 struct pf_ruleset	*pf_find_or_create_ruleset(const char *);
 void			 pf_rs_initialize(void);
-
-#ifdef _KERNEL
-int			 pf_anchor_copyout(const struct pf_ruleset *,
-			    const struct pf_rule *, struct pfioc_rule *);
-void			 pf_anchor_remove(struct pf_rule *);
-#endif /* _KERNEL */
 
 /* The fingerprint functions can be linked into userland programs (tcpdump) */
 int	pf_osfp_add(struct pf_osfp_ioctl *);

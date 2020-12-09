@@ -1,4 +1,4 @@
-/*      $OpenBSD: if_malo.c,v 1.93 2017/10/26 15:00:28 mpi Exp $ */
+/*      $OpenBSD: if_malo.c,v 1.96 2020/07/10 13:22:21 patrick Exp $ */
 
 /*
  * Copyright (c) 2007 Marcus Glocker <mglocker@openbsd.org>
@@ -271,7 +271,7 @@ malo_pcmcia_wakeup(struct malo_softc *sc)
 	
 	s = splnet();
 	while (sc->sc_flags & MALO_BUSY)
-		tsleep(&sc->sc_flags, 0, "malopwr", 0);
+		tsleep_nsec(&sc->sc_flags, 0, "malopwr", INFSLP);
 	sc->sc_flags |= MALO_BUSY;
 
 	cmalo_init(ifp);
@@ -372,7 +372,7 @@ cmalo_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	 * process is tsleep'ing in it.
 	 */
 	while ((sc->sc_flags & MALO_BUSY) && error == 0)
-		error = tsleep(&sc->sc_flags, PCATCH, "maloioc", 0);
+		error = tsleep_nsec(&sc->sc_flags, PCATCH, "maloioc", INFSLP);
 	if (error != 0) {
 		splx(s);
 		return error;
@@ -977,7 +977,7 @@ cmalo_start(struct ifnet *ifp)
 	if (!(ifp->if_flags & IFF_RUNNING) || ifq_is_oactive(&ifp->if_snd))
 		return;
 
-	IFQ_DEQUEUE(&ifp->if_snd, m);
+	m = ifq_dequeue(&ifp->if_snd);
 	if (m == NULL)
 		return;
 
@@ -2026,7 +2026,7 @@ cmalo_cmd_request(struct malo_softc *sc, uint16_t psize, int no_response)
 		return (0);
 
 	/* wait for the command response */
-	if (tsleep(sc, 0, "malocmd", 500)) {
+	if (tsleep_nsec(sc, 0, "malocmd", SEC_TO_NSEC(5))) {
 		printf("%s: timeout while waiting for cmd response\n",
 		    sc->sc_dev.dv_xname);
 		return (EIO);

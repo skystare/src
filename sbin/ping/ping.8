@@ -1,4 +1,4 @@
-.\"	$OpenBSD: ping.8,v 1.59 2016/10/26 16:18:45 jmc Exp $
+.\"	$OpenBSD: ping.8,v 1.63 2020/02/11 18:41:39 deraadt Exp $
 .\"	$NetBSD: ping.8,v 1.10 1995/12/31 04:55:35 ghudson Exp $
 .\"
 .\" Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
@@ -57,7 +57,7 @@
 .\"
 .\"     @(#)ping.8	8.2 (Berkeley) 12/11/93
 .\"
-.Dd $Mdocdate: October 26 2016 $
+.Dd $Mdocdate: February 11 2020 $
 .Dt PING 8
 .Os
 .Sh NAME
@@ -68,8 +68,8 @@
 .Nm ping
 .Op Fl DdEefHLnqRv
 .Op Fl c Ar count
-.Op Fl I Ar ifaddr
-.Op Fl i Ar wait
+.Op Fl I Ar sourceaddr
+.Op Fl i Ar interval
 .Op Fl l Ar preload
 .Op Fl p Ar pattern
 .Op Fl s Ar packetsize
@@ -79,14 +79,15 @@
 .Op Fl w Ar maxwait
 .Ar host
 .Nm ping6
-.Op Fl dEefHLmnqv
+.Op Fl DdEefHLmnqv
 .Op Fl c Ar count
 .Op Fl h Ar hoplimit
 .Op Fl I Ar sourceaddr
-.Op Fl i Ar wait
+.Op Fl i Ar interval
 .Op Fl l Ar preload
 .Op Fl p Ar pattern
 .Op Fl s Ar packetsize
+.Op Fl T Ar toskeyword
 .Op Fl V Ar rtable
 .Op Fl w Ar maxwait
 .Ar host
@@ -115,10 +116,7 @@ If
 .Ar count
 is 0, send an unlimited number of packets.
 .It Fl D
-.Pq IPv4 only
-Set the
-.Dv Don't Fragment
-bit.
+Don't fragment IP packets.
 .It Fl d
 Set the
 .Dv SO_DEBUG
@@ -158,17 +156,19 @@ Try reverse lookups for addresses.
 .It Fl h Ar hoplimit
 .Pq IPv6 only
 Set the hoplimit.
-.It Fl I Ar ifaddr
-Specify the interface address to transmit from
-on machines with multiple interfaces.
+.It Fl I Ar sourceaddr
+Set the source address to transmit from, which is useful on machines
+with multiple interfaces.
 For unicast and multicast pings.
-.It Fl i Ar wait
-Wait
-.Ar wait
-seconds between sending each packet.
-The default is to wait for one second between each packet.
-The wait time may be fractional, but only the superuser may specify
-a value less than one second.
+.It Fl i Ar interval
+Send one packet every
+.Ar interval
+seconds.
+The default is one second.
+The
+.Ar interval
+may contain a fractional portion.
+Only the superuser may specify a value less than one second.
 This option is incompatible with the
 .Fl f
 option.
@@ -221,8 +221,7 @@ which translates into 64 ICMP data bytes
 when combined with the 8 bytes of ICMP header data.
 The maximum packet size is 65467 for IPv4 and 65527 for IPv6.
 .It Fl T Ar toskeyword
-.Pq IPv4 only
-Change the TOS value.
+Change the IPv4 TOS or IPv6 Traffic Class value.
 .Ar toskeyword
 may be one of
 .Cm critical ,

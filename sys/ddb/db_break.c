@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_break.c,v 1.20 2016/04/19 12:23:25 mpi Exp $	*/
+/*	$OpenBSD: db_break.c,v 1.22 2020/10/15 03:13:59 deraadt Exp $	*/
 /*	$NetBSD: db_break.c,v 1.7 1996/03/30 22:30:03 christos Exp $	*/
 
 /*
@@ -51,8 +51,8 @@ db_breakpoint_t		db_breakpoint_list = 0;
 
 db_breakpoint_t db_breakpoint_alloc(void);
 void db_breakpoint_free(db_breakpoint_t);
-void db_set_breakpoint(db_addr_t, int);
-void db_delete_breakpoint(db_addr_t);
+void db_set_breakpoint(vaddr_t, int);
+void db_delete_breakpoint(vaddr_t);
 void db_list_breakpoints(void);
 
 db_breakpoint_t
@@ -61,12 +61,12 @@ db_breakpoint_alloc(void)
 	db_breakpoint_t	bkpt;
 
 	if ((bkpt = db_free_breakpoints) != 0) {
-	    db_free_breakpoints = bkpt->link;
-	    return (bkpt);
+		db_free_breakpoints = bkpt->link;
+		return (bkpt);
 	}
 	if (db_next_free_breakpoint == &db_break_table[NBREAKPOINTS]) {
-	    db_printf("All breakpoints used.\n");
-	    return (0);
+		db_printf("All breakpoints used.\n");
+		return (0);
 	}
 	bkpt = db_next_free_breakpoint;
 	db_next_free_breakpoint++;
@@ -82,7 +82,7 @@ db_breakpoint_free(db_breakpoint_t bkpt)
 }
 
 void
-db_set_breakpoint(db_addr_t addr, int count)
+db_set_breakpoint(vaddr_t addr, int count)
 {
 	db_breakpoint_t	bkpt;
 
@@ -114,7 +114,7 @@ db_set_breakpoint(db_addr_t addr, int count)
 }
 
 void
-db_delete_breakpoint(db_addr_t addr)
+db_delete_breakpoint(vaddr_t addr)
 {
 	db_breakpoint_t	bkpt;
 	db_breakpoint_t	*prev;
@@ -135,7 +135,7 @@ db_delete_breakpoint(db_addr_t addr)
 }
 
 db_breakpoint_t
-db_find_breakpoint(db_addr_t addr)
+db_find_breakpoint(vaddr_t addr)
 {
 	db_breakpoint_t	bkpt;
 
@@ -182,7 +182,7 @@ db_clear_breakpoints(void)
  * so the breakpoint does not have to be on the breakpoint list.
  */
 db_breakpoint_t
-db_set_temp_breakpoint(db_addr_t addr)
+db_set_temp_breakpoint(vaddr_t addr)
 {
 	db_breakpoint_t	bkpt;
 
@@ -195,8 +195,8 @@ db_set_temp_breakpoint(db_addr_t addr)
 
 	bkpt = db_breakpoint_alloc();
 	if (bkpt == 0) {
-	    db_printf("Too many breakpoints.\n");
-	    return (0);
+		db_printf("Too many breakpoints.\n");
+		return (0);
 	}
 
 	bkpt->address = addr;
@@ -242,7 +242,7 @@ db_list_breakpoints(void)
 void
 db_delete_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
 {
-	db_delete_breakpoint((db_addr_t)addr);
+	db_delete_breakpoint((vaddr_t)addr);
 }
 
 /* Set breakpoint with skip count */
@@ -253,7 +253,7 @@ db_breakpoint_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
 	if (count == -1)
 		count = 1;
 
-	db_set_breakpoint((db_addr_t)addr, count);
+	db_set_breakpoint((vaddr_t)addr, count);
 }
 
 /* list breakpoints */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: elink3.c,v 1.95 2017/01/22 10:17:38 dlg Exp $	*/
+/*	$OpenBSD: elink3.c,v 1.97 2020/07/10 13:26:37 patrick Exp $	*/
 /*	$NetBSD: elink3.c,v 1.32 1997/05/14 00:22:00 thorpej Exp $	*/
 
 /*
@@ -334,7 +334,7 @@ epconfig(struct ep_softc *sc, u_short chipset, u_int8_t *enaddr)
 	ifp->if_flags =
 	    IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
 	/* 64 packets are around 100ms on 10Mbps */
-	IFQ_SET_MAXLEN(&ifp->if_snd, 64);
+	ifq_set_maxlen(&ifp->if_snd, 64);
 
 	if_attach(ifp);
 	ether_ifattach(ifp);
@@ -1371,7 +1371,7 @@ epget(struct ep_softc *sc, int totlen)
 
 	off = 0;
 	while (totlen) {
-		len = min(totlen, M_TRAILINGSPACE(m));
+		len = min(totlen, m_trailingspace(m));
 		if (len == 0)
 			panic("ep_get: packet does not fit in MCLBYTES");
 

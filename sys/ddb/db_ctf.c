@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_ctf.c,v 1.27 2018/08/31 11:57:04 bluhm Exp $	*/
+/*	$OpenBSD: db_ctf.c,v 1.30 2020/10/15 03:14:00 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2016-2017 Martin Pieuchot
@@ -40,13 +40,13 @@
 extern db_symtab_t		db_symtab;
 
 struct ddb_ctf {
-	struct ctf_header 	*cth;
+	struct ctf_header	*cth;
 	const char		*rawctf;	/* raw .SUNW_ctf section */
-        size_t			 rawctflen;	/* raw .SUNW_ctf section size */
-	const char 		*data;		/* decompressed CTF data */
+	size_t			 rawctflen;	/* raw .SUNW_ctf section size */
+	const char		*data;		/* decompressed CTF data */
 	size_t			 dlen;		/* decompressed CTF data size */
 	char			*strtab;	/* ELF string table */
-	uint32_t 		 ctf_found;
+	uint32_t		 ctf_found;
 };
 
 struct ddb_ctf db_ctf;
@@ -171,7 +171,7 @@ db_ctf_func_numargs(Elf_Sym *st)
 			return vlen;
 	}
 
-	return -1;
+	return 0;
 }
 
 /*
@@ -343,7 +343,7 @@ db_ctf_type_by_index(uint16_t index)
 void
 db_ctf_pprint(const struct ctf_type *ctt, vaddr_t addr)
 {
-	db_addr_t		 taddr = (db_addr_t)ctt;
+	vaddr_t			 taddr = (vaddr_t)ctt;
 	const struct ctf_type	*ref;
 	uint16_t		 kind;
 	uint32_t		 eob, toff;
@@ -588,7 +588,7 @@ db_ctf_pprint_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
 	}
 
 	if ((ctt = db_ctf_type_by_symbol(st)) == NULL) {
-	        modif[0] = '\0';
+		modif[0] = '\0';
 		db_print_cmd(addr, 0, 0, modif);
 		db_flush_lex();
 		return;
@@ -635,7 +635,7 @@ db_ctf_show_struct(db_expr_t addr, int have_addr, db_expr_t count,
 	 * In that case, update `dot' value.
 	 */
 	if (db_expression(&addr)) {
-		db_dot = (db_addr_t)addr;
+		db_dot = (vaddr_t)addr;
 		db_last_addr = db_dot;
 	} else
 		addr = (db_expr_t)db_dot;

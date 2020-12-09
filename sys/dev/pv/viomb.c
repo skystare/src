@@ -1,4 +1,4 @@
-/* $OpenBSD: viomb.c,v 1.1 2017/01/21 11:22:43 reyk Exp $	 */
+/* $OpenBSD: viomb.c,v 1.7 2020/09/04 13:10:16 bket Exp $	 */
 /* $NetBSD: viomb.c,v 1.1 2011/10/30 12:12:21 hannken Exp $	 */
 
 /*
@@ -68,12 +68,14 @@
 #define VIRTIO_BALLOON_CONFIG_ACTUAL	4	/* 32bit */
 
 /* Feature bits */
-#define VIRTIO_BALLOON_F_MUST_TELL_HOST (1<<0)
-#define VIRTIO_BALLOON_F_STATS_VQ	(1<<1)
+#define VIRTIO_BALLOON_F_MUST_TELL_HOST (1ULL<<0)
+#define VIRTIO_BALLOON_F_STATS_VQ	(1ULL<<1)
 
 static const struct virtio_feature_name viomb_feature_names[] = {
+#if VIRTIO_DEBUG
 	{VIRTIO_BALLOON_F_MUST_TELL_HOST, "TellHost"},
 	{VIRTIO_BALLOON_F_STATS_VQ, "StatVQ"},
+#endif
 	{0, NULL}
 };
 #define PGS_PER_REQ		256	/* 1MB, 4KB/page */
@@ -134,7 +136,6 @@ viomb_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct viomb_softc *sc = (struct viomb_softc *)self;
 	struct virtio_softc *vsc = (struct virtio_softc *)parent;
-	u_int32_t features;
 	int i;
 
 	if (vsc->sc_child != NULL) {
@@ -157,10 +158,9 @@ viomb_attach(struct device *parent, struct device *self, void *aux)
 	vsc->sc_ipl = IPL_BIO;
 	vsc->sc_config_change = viomb_config_change;
 
-	/* negotiate features */
-	features = VIRTIO_F_RING_INDIRECT_DESC;
-	features = virtio_negotiate_features(vsc, features,
-					     viomb_feature_names);
+	vsc->sc_driver_features = VIRTIO_BALLOON_F_MUST_TELL_HOST;
+	if (virtio_negotiate_features(vsc, viomb_feature_names) != 0)
+		goto err;
 
 	if ((virtio_alloc_vq(vsc, &sc->sc_vq[VQ_INFLATE], VQ_INFLATE,
 	     sizeof(u_int32_t) * PGS_PER_REQ, 1, "inflate") != 0))
@@ -366,15 +366,12 @@ viomb_deflate(struct viomb_softc *sc)
 	virtio_enqueue_p(vq, slot, b->bl_dmamap, 0,
 			 sizeof(u_int32_t) * nvpages, VRING_READ);
 
-	if (!(vsc->sc_features & VIRTIO_BALLOON_F_MUST_TELL_HOST))
+	if (!virtio_has_feature(vsc, VIRTIO_BALLOON_F_MUST_TELL_HOST))
 		uvm_pglistfree(&b->bl_pglist);
 	virtio_enqueue_commit(vsc, vq, slot, VRING_NOTIFY);
 	return;
 err:
-	while ((p = TAILQ_LAST(&b->bl_pglist, pglist))) {
-		TAILQ_REMOVE(&b->bl_pglist, p, pageq);
-		TAILQ_INSERT_HEAD(&sc->sc_balloon_pages, p, pageq);
-	}
+	TAILQ_CONCAT(&sc->sc_balloon_pages, &b->bl_pglist, pageq);
 	return;
 }
 
@@ -418,7 +415,6 @@ viomb_inflate_intr(struct virtqueue *vq)
 	struct virtio_softc *vsc = vq->vq_owner;
 	struct viomb_softc *sc = (struct viomb_softc *)vsc->sc_child;
 	struct balloon_req *b;
-	struct vm_page *p;
 	u_int64_t nvpages;
 
 	if (viomb_vq_dequeue(vq))
@@ -429,11 +425,7 @@ viomb_inflate_intr(struct virtqueue *vq)
 	bus_dmamap_sync(vsc->sc_dmat, b->bl_dmamap, 0,
 			sizeof(u_int32_t) * nvpages,
 			BUS_DMASYNC_POSTWRITE);
-	while (!TAILQ_EMPTY(&b->bl_pglist)) {
-		p = TAILQ_FIRST(&b->bl_pglist);
-		TAILQ_REMOVE(&b->bl_pglist, p, pageq);
-		TAILQ_INSERT_TAIL(&sc->sc_balloon_pages, p, pageq);
-	}
+	TAILQ_CONCAT(&sc->sc_balloon_pages, &b->bl_pglist, pageq);
 	VIOMBDEBUG(sc, "updating sc->sc_actual from %u to %llu\n",
 		   sc->sc_actual, sc->sc_actual + nvpages);
 	virtio_write_device_config_4(vsc, VIRTIO_BALLOON_CONFIG_ACTUAL,
@@ -464,7 +456,7 @@ viomb_deflate_intr(struct virtqueue *vq)
 			sizeof(u_int32_t) * nvpages,
 			BUS_DMASYNC_POSTWRITE);
 
-	if (vsc->sc_features & VIRTIO_BALLOON_F_MUST_TELL_HOST)
+	if (virtio_has_feature(vsc, VIRTIO_BALLOON_F_MUST_TELL_HOST))
 		uvm_pglistfree(&b->bl_pglist);
 
 	VIOMBDEBUG(sc, "updating sc->sc_actual from %u to %llu\n",

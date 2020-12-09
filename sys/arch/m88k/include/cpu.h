@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.65 2017/03/19 10:57:29 miod Exp $ */
+/*	$OpenBSD: cpu.h,v 1.68 2020/05/31 06:23:57 dlg Exp $ */
 /*
  * Copyright (c) 1996 Nivas Madhur
  * Copyright (c) 1992, 1993
@@ -62,6 +62,7 @@
 #include <machine/intr.h>
 #include <sys/queue.h>
 #include <sys/sched.h>
+#include <sys/srp.h>
 
 #if defined(MULTIPROCESSOR)
 #if !defined(MAX_CPUS) || MAX_CPUS > 4
@@ -95,10 +96,6 @@ struct cpu_info {
 	struct pmap	*ci_curpmap;		/* ...and its pmap */
 
 	u_int		 ci_cpuid;		/* cpu number */
-
-#if defined(MULTIPROCESSOR)
-	struct srp_hazard ci_srp_hazards[SRP_HAZARD_NUM];
-#endif
 
 	/*
 	 * Function pointers used within mplock to ensure
@@ -171,6 +168,9 @@ struct cpu_info {
 #define	CI_IPI_DMA_CACHECTL	0x00000100
 	void		(*ci_softipi_cb)(void);	/* 88110 softipi callback */
 
+#if defined(MULTIPROCESSOR)
+	struct srp_hazard ci_srp_hazards[SRP_HAZARD_NUM];
+#endif
 #ifdef DIAGNOSTIC
 	int	ci_mutex_level;
 #endif
@@ -228,6 +228,8 @@ struct cpu_info *set_cpu_number(cpuid_t);
 #endif
 
 #define	curpcb			curcpu()->ci_curpcb
+
+unsigned int cpu_rnd_messybits(void);
 
 #endif /* _LOCORE */
 

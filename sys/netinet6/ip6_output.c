@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip6_output.c,v 1.239 2018/08/28 15:15:02 mpi Exp $	*/
+/*	$OpenBSD: ip6_output.c,v 1.247 2020/07/17 15:21:36 kn Exp $	*/
 /*	$KAME: ip6_output.c,v 1.172 2001/03/25 09:55:56 itojun Exp $	*/
 
 /*
@@ -174,7 +174,7 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt, struct route_in6 *ro,
 
 #ifdef IPSEC
 	if (inp && (inp->inp_flags & INP_IPV6) == 0)
-		panic("ip6_output: IPv4 pcb is passed");
+		panic("%s: IPv4 pcb is passed", __func__);
 #endif /* IPSEC */
 
 	ip6 = mtod(m, struct ip6_hdr *);
@@ -295,7 +295,7 @@ ip6_output(struct mbuf *m0, struct ip6_pktopts *opt, struct route_in6 *ro,
 		 */
 		if (exthdrs.ip6e_dest2) {
 			if (!hdrsplit)
-				panic("assumption failed: hdr not split");
+				panic("%s: assumption failed: hdr not split", __func__);
 			exthdrs.ip6e_dest2->m_next = m->m_next;
 			m->m_next = exthdrs.ip6e_dest2;
 			*mtod(exthdrs.ip6e_dest2, u_char *) = ip6->ip6_nxt;
@@ -600,13 +600,13 @@ reroute:
 	 */
 	if (exthdrs.ip6e_hbh) {
 		struct ip6_hbh *hbh = mtod(exthdrs.ip6e_hbh, struct ip6_hbh *);
-		u_int32_t dummy1; /* XXX unused */
-		u_int32_t dummy2; /* XXX unused */
+		u_int32_t rtalert; /* returned value is ignored */
+		u_int32_t plen = 0; /* no more than 1 jumbo payload option! */
 
 		m->m_pkthdr.ph_ifidx = ifp->if_index;
 		if (ip6_process_hopopts(m, (u_int8_t *)(hbh + 1),
 		    ((hbh->ip6h_len + 1) << 3) - sizeof(struct ip6_hbh),
-		    &dummy1, &dummy2) < 0) {
+		    &rtalert, &plen) < 0) {
 			/* m was already freed at this point */
 			error = EINVAL;/* better error? */
 			goto done;
@@ -897,7 +897,7 @@ ip6_insert_jumboopt(struct ip6_exthdrs *exthdrs, u_int32_t plen)
 		struct ip6_hbh *hbh;
 
 		mopt = exthdrs->ip6e_hbh;
-		if (M_TRAILINGSPACE(mopt) < JUMBOOPTLEN) {
+		if (m_trailingspace(mopt) < JUMBOOPTLEN) {
 			/*
 			 * XXX assumption:
 			 * - exthdrs->ip6e_hbh is not referenced from places
@@ -985,7 +985,7 @@ ip6_insertfraghdr(struct mbuf *m0, struct mbuf *m, int hlen,
 		;
 
 	if ((mlast->m_flags & M_EXT) == 0 &&
-	    M_TRAILINGSPACE(mlast) >= sizeof(struct ip6_frag)) {
+	    m_trailingspace(mlast) >= sizeof(struct ip6_frag)) {
 		/* use the trailing space of the last mbuf for the fragment hdr */
 		*frghdrp = (struct ip6_frag *)(mtod(mlast, caddr_t) +
 		    mlast->m_len);
@@ -1576,11 +1576,11 @@ do { \
 			break;
 		case SO_RTABLE:
 			m->m_len = sizeof(u_int);
-			*mtod(m, u_int *) = optval;
+			*mtod(m, u_int *) = inp->inp_rtableid;
 			break;
 		case IPV6_PIPEX:
 			m->m_len = sizeof(int);
-			*mtod(m, int *) = optval;
+			*mtod(m, int *) = inp->inp_pipex;
 			break;
 
 		default:
@@ -1620,8 +1620,12 @@ ip6_raw_ctloutput(int op, struct socket *so, int level, int optname,
 				break;
 			}
 			optval = *mtod(m, int *);
-			if ((optval % 2) != 0) {
-				/* the API assumes even offset values */
+			if (optval < -1 ||
+			    (optval > 0 && (optval % 2) != 0)) {
+				/*
+				 * The API assumes non-negative even offset
+				 * values or -1 as a special value.
+				 */
 				error = EINVAL;
 			} else if (so->so_proto->pr_protocol == IPPROTO_ICMPV6) {
 				if (optval != icmp6off)
@@ -1757,7 +1761,7 @@ ip6_getpcbopt(struct ip6_pktopts *pktopt, int optname, struct mbuf *m)
 		break;
 	default:		/* should not happen */
 #ifdef DIAGNOSTIC
-		panic("ip6_getpcbopt: unexpected option");
+		panic("%s: unexpected option", __func__);
 #endif
 		return (ENOPROTOOPT);
 	}
@@ -1878,9 +1882,7 @@ ip6_setmoptions(int optname, struct ip6_moptions **im6op, struct mbuf *m,
 		 * No multicast option buffer attached to the pcb;
 		 * allocate one and initialize to default values.
 		 */
-		im6o = (struct ip6_moptions *)
-			malloc(sizeof(*im6o), M_IPMOPTS, M_WAITOK);
-
+		im6o = malloc(sizeof(*im6o), M_IPMOPTS, M_WAITOK);
 		if (im6o == NULL)
 			return (ENOBUFS);
 		*im6op = im6o;
@@ -2134,7 +2136,7 @@ ip6_setmoptions(int optname, struct ip6_moptions **im6op, struct mbuf *m,
 	    im6o->im6o_hlim == ip6_defmcasthlim &&
 	    im6o->im6o_loop == IPV6_DEFAULT_MULTICAST_LOOP &&
 	    LIST_EMPTY(&im6o->im6o_memberships)) {
-		free(*im6op, M_IPMOPTS, 0);
+		free(*im6op, M_IPMOPTS, sizeof(**im6op));
 		*im6op = NULL;
 	}
 
@@ -2198,7 +2200,7 @@ ip6_freemoptions(struct ip6_moptions *im6o)
 		LIST_REMOVE(imm, i6mm_chain);
 		in6_leavegroup(imm);
 	}
-	free(im6o, M_IPMOPTS, 0);
+	free(im6o, M_IPMOPTS, sizeof(*im6o));
 }
 
 /*
@@ -2571,13 +2573,13 @@ ip6_splithdr(struct mbuf *m, struct ip6_exthdrs *exthdrs)
 
 	ip6 = mtod(m, struct ip6_hdr *);
 	if (m->m_len > sizeof(*ip6)) {
-		MGETHDR(mh, M_DONTWAIT, MT_HEADER);
+		MGET(mh, M_DONTWAIT, MT_HEADER);
 		if (mh == NULL) {
 			m_freem(m);
 			return ENOBUFS;
 		}
 		M_MOVE_PKTHDR(mh, m);
-		MH_ALIGN(mh, sizeof(*ip6));
+		m_align(mh, sizeof(*ip6));
 		m->m_len -= sizeof(*ip6);
 		m->m_data += sizeof(*ip6);
 		mh->m_next = m;
@@ -2704,7 +2706,7 @@ in6_proto_cksum_out(struct mbuf *m, struct ifnet *ifp)
 	if (m->m_pkthdr.csum_flags & M_TCP_CSUM_OUT) {
 		if (!ifp || !(ifp->if_capabilities & IFCAP_CSUM_TCPv6) ||
 		    ip6->ip6_nxt != IPPROTO_TCP ||
-		    ifp->if_bridgeport != NULL) {
+		    ifp->if_bridgeidx != 0) {
 			tcpstat_inc(tcps_outswcsum);
 			in6_delayed_cksum(m, IPPROTO_TCP);
 			m->m_pkthdr.csum_flags &= ~M_TCP_CSUM_OUT; /* Clear */
@@ -2712,7 +2714,7 @@ in6_proto_cksum_out(struct mbuf *m, struct ifnet *ifp)
 	} else if (m->m_pkthdr.csum_flags & M_UDP_CSUM_OUT) {
 		if (!ifp || !(ifp->if_capabilities & IFCAP_CSUM_UDPv6) ||
 		    ip6->ip6_nxt != IPPROTO_UDP ||
-		    ifp->if_bridgeport != NULL) {
+		    ifp->if_bridgeidx != 0) {
 			udpstat_inc(udps_outswcsum);
 			in6_delayed_cksum(m, IPPROTO_UDP);
 			m->m_pkthdr.csum_flags &= ~M_UDP_CSUM_OUT; /* Clear */

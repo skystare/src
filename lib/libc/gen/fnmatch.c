@@ -1,4 +1,4 @@
-/*	$OpenBSD: fnmatch.c,v 1.21 2016/03/01 20:29:03 millert Exp $	*/
+/*	$OpenBSD: fnmatch.c,v 1.23 2020/10/13 04:42:28 guenther Exp $	*/
 
 /* Copyright (c) 2011, VMware, Inc.
  * All rights reserved.
@@ -100,7 +100,7 @@ classmatch(const char *pattern, char test, int foldcase, const char **ep)
 {
 	const char * const mismatch = pattern;
 	const char *colon;
-	struct cclass *cc;
+	const struct cclass *cc;
 	int rval = RANGE_NOMATCH;
 	size_t len;
 
@@ -289,7 +289,7 @@ int fnmatch(const char *pattern, const char *string, int flags)
 	const int leading_dir = !!(flags & FNM_LEADING_DIR);
 	const char *dummyptr, *matchptr, *strendseg;
 	int wild;
-	/* For '*' wild processing only; surpress 'used before initialization'
+	/* For '*' wild processing only; suppress 'used before initialization'
 	 * warnings with dummy initialization values;
 	 */
 	const char *strstartseg = NULL;

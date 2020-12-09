@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.2 2015/12/02 11:51:22 yasuoka Exp $
+#	$OpenBSD: Makefile,v 1.4 2020/06/14 16:00:11 deraadt Exp $
 
 .include <bsd.own.mk>
 
@@ -6,7 +6,7 @@ PROG=		BOOTIA32.EFI
 NOMAN=		#
 OBJFMT=		efi-app-ia32
 SOFTRAID=	yes
-SRCS+=		start_i386.S random_i386.S
+SRCS+=		start_i386.S mdrandom.c
 LDSCRIPT=	ldscript.i386
 
 COPTS=		-I${EFIDIR}/include/i386
@@ -15,3 +15,4 @@ COPTS=		-I${EFIDIR}/include/i386
 
 CFLAGS+=	-m32
 AFLAGS+=	-m32
+LDFLAGS+=	-N

@@ -1,4 +1,4 @@
-/*	$OpenBSD: efidev.h,v 1.1 2016/05/14 17:55:15 kettenis Exp $	*/
+/*	$OpenBSD: efidev.h,v 1.3 2020/01/13 10:17:09 kettenis Exp $	*/
 
 /*
  * Copyright (c) 1996 Michael Shalayeff
@@ -14,7 +14,7 @@
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
  *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR 
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED 
  * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
  * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
@@ -29,6 +29,7 @@
  */
 
 /* efidev.c */
+void		 efid_init(struct diskinfo *, void *handle);
 int		 efiopen(struct open_file *, ...);
 int		 efistrategy(void *, int, daddr32_t, size_t, void *, size_t *);
 int		 eficlose(struct open_file *);

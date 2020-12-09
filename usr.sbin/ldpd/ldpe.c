@@ -1,4 +1,4 @@
-/*	$OpenBSD: ldpe.c,v 1.74 2017/03/04 00:21:48 renato Exp $ */
+/*	$OpenBSD: ldpe.c,v 1.77 2020/06/22 15:09:34 mestre Exp $ */
 
 /*
  * Copyright (c) 2013, 2016 Renato Westphal <renato@openbsd.org>
@@ -107,7 +107,7 @@ ldpe(int debug, int verbose, char *sockname)
 	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
 		fatal("can't drop privileges");
 
-	if (pledge("stdio cpath inet mcast recvfd", NULL) == -1)
+	if (pledge("stdio inet mcast recvfd", NULL) == -1)
 		fatal("pledge");
 
 	event_init();
@@ -171,7 +171,7 @@ ldpe_shutdown(void)
 	msgbuf_clear(&iev_main->ibuf.w);
 	close(iev_main->ibuf.fd);
 
-	control_cleanup(global.csock);
+	control_cleanup();
 	config_clear(leconf);
 
 	if (sysdep.no_pfkey == 0) {
@@ -235,7 +235,6 @@ ldpe_dispatch_main(int fd, short event, void *bula)
 	static int		 edisc_socket = -1;
 	static int		 session_socket = -1;
 	struct nbr		*nbr;
-	struct nbr_params	*nbrp;
 	int			 n, shut = 0;
 
 	if (event & EV_READ) {
@@ -380,8 +379,7 @@ ldpe_dispatch_main(int fd, short event, void *bula)
 					continue;
 				nbr->laddr = (ldp_af_conf_get(leconf,
 				    af))->trans_addr;
-				nbrp = nbr_params_find(leconf, nbr->id);
-				if (nbrp && pfkey_establish(nbr, nbrp) == -1)
+				if (pfkey_establish(nconf, nbr) == -1)
 					fatalx("pfkey setup failed");
 				if (nbr_session_active_role(nbr))
 					nbr_establish_connection(nbr);
@@ -397,6 +395,7 @@ ldpe_dispatch_main(int fd, short event, void *bula)
 			LIST_INIT(&nconf->tnbr_list);
 			LIST_INIT(&nconf->nbrp_list);
 			LIST_INIT(&nconf->l2vpn_list);
+			LIST_INIT(&nconf->auth_list);
 			break;
 		case IMSG_RECONF_IFACE:
 			if ((niface = malloc(sizeof(struct iface))) == NULL)
@@ -451,6 +450,19 @@ ldpe_dispatch_main(int fd, short event, void *bula)
 			npw->l2vpn = nl2vpn;
 			LIST_INSERT_HEAD(&nl2vpn->pw_list, npw, entry);
 			break;
+		case IMSG_RECONF_CONF_AUTH: {
+			struct ldp_auth *auth;
+
+			auth = malloc(sizeof(*auth));
+			if (auth == NULL)
+				fatal(NULL);
+
+			memcpy(auth, imsg.data, sizeof(*auth));
+
+			LIST_INSERT_HEAD(&nconf->auth_list, auth, entry);
+			break;
+		}
+
 		case IMSG_RECONF_END:
 			merge_config(leconf, nconf);
 			nconf = NULL;

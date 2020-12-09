@@ -1,7 +1,7 @@
-/*	$OpenBSD: editor.c,v 1.349 2018/09/11 09:13:19 krw Exp $	*/
+/*	$OpenBSD: editor.c,v 1.363 2019/11/19 06:20:37 otto Exp $	*/
 
 /*
- * Copyright (c) 1997-2000 Todd C. Miller <Todd.Miller@courtesan.com>
+ * Copyright (c) 1997-2000 Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -80,25 +80,31 @@ struct space_allocation {
 	char	       *mp;
 };
 
+/*
+ * NOTE! Changing partition sizes in the space_allocation tables
+ *       requires corresponding updates to the *.ok files in
+ *	 /usr/src/regress/sbin/disklabel.
+ */
+
 /* entries for swap and var are changed by editor_allocspace() */
 struct space_allocation alloc_big[] = {
 	{  MEG(150),         GIG(1),   5, "/"		},
 	{   MEG(80),       MEG(256),  10, "swap"	},
 	{  MEG(120),         GIG(4),   8, "/tmp"	},
 	{   MEG(80),         GIG(4),  13, "/var"	},
-	{  MEG(900),         GIG(2),   5, "/usr"	},
+	{ MEG(1500),         GIG(6),  10, "/usr"	},
 	{  MEG(384),         GIG(1),   3, "/usr/X11R6"	},
-	{    GIG(1),        GIG(10),  15, "/usr/local"	},
+	{    GIG(1),        GIG(20),  15, "/usr/local"	},
 	{ MEG(1300),         GIG(2),   2, "/usr/src"	},
-	{    GIG(3),         GIG(6),   4, "/usr/obj"	},
-	{    GIG(1),       GIG(300),  35, "/home"	}
+	{    GIG(5),         GIG(6),   4, "/usr/obj"	},
+	{    GIG(1),       GIG(300),  30, "/home"	}
 	/* Anything beyond this leave for the user to decide */
 };
 
 struct space_allocation alloc_medium[] = {
 	{  MEG(800),         GIG(2),   5, "/"		},
 	{   MEG(80),       MEG(256),  10, "swap"	},
-	{  MEG(900),         GIG(3),  78, "/usr"	},
+	{ MEG(1300),         GIG(3),  78, "/usr"	},
 	{  MEG(256),         GIG(2),   7, "/home"	}
 };
 
@@ -247,7 +253,9 @@ editor(int f)
 
 	puts("Label editor (enter '?' for help at any prompt)");
 	for (;;) {
-		fputs("> ", stdout);
+		fprintf(stdout, "%s%s%c ", dkname,
+		    (memcmp(&lab, &newlab, sizeof(newlab)) == 0) ? "" : "*",
+		    (expert == 0) ? '>' : '#');
 		if (fgets(buf, sizeof(buf), stdin) == NULL) {
 			putchar('\n');
 			buf[0] = 'q';
@@ -275,15 +283,17 @@ editor(int f)
 			break;
 
 		case 'A':
-			if (ioctl(f, DIOCGPDINFO, &newlab) == 0) {
+			if (ioctl(f, DIOCGPDINFO, &newlab) == -1) {
+				warn("DIOCGPDINFO");
+				newlab = lastlabel;
+			} else {
 				int oquiet = quiet, oexpert = expert;
 				aflag = 1;
 				quiet = expert = 0;
 				editor_allocspace(&newlab);
 				quiet = oquiet;
 				expert = oexpert;
-			} else
-				newlab = lastlabel;
+			}
 			break;
 		case 'a':
 			editor_add(&newlab, arg);
@@ -298,14 +308,15 @@ editor(int f)
 			break;
 
 		case 'D':
-			if (ioctl(f, DIOCGPDINFO, &newlab) == 0) {
+			if (ioctl(f, DIOCGPDINFO, &newlab) == -1)
+				warn("DIOCGPDINFO");
+			else {
 				dflag = 1;
-				for (i=0; i<MAXPARTITIONS; i++) {
+				for (i = 0; i < MAXPARTITIONS; i++) {
 					free(mountpoints[i]);
 					mountpoints[i] = NULL;
 				}
-			} else
-				warn("unable to get default partition table");
+			}
 			break;
 
 		case 'd':
@@ -331,7 +342,7 @@ editor(int f)
 		case 'n':
 			if (!fstabfile) {
 				fputs("This option is not valid when run "
-				    "without the -f flag.\n", stderr);
+				    "without the -F or -f flags.\n", stderr);
 				break;
 			}
 			editor_name(&newlab, arg);
@@ -795,10 +806,10 @@ editor_resize(struct disklabel *lp, char *p)
 			DL_SETPOFFSET(pp, off);
 			if (off + DL_GETPSIZE(pp) > ending_sector) {
 				DL_SETPSIZE(pp, ending_sector - off);
-				pp->p_fragblock = 0;
-				if (get_fsize(&label, partno) == 1 ||
-				    get_bsize(&label, partno) == 1 ||
-				    get_cpg(&label, partno) == 1)
+				pp->p_fragblock = DISKLABELV1_FFS_FRAGBLOCK(0, 0);
+				if (get_fsize(&label, i) == 1 ||
+				    get_bsize(&label, i) == 1 ||
+				    get_cpg(&label, i) == 1)
 					return;
 				shrunk = i;
 			}
@@ -1130,7 +1141,7 @@ getnumber(char *prompt, char *helpstring, u_int32_t oval, u_int32_t maxval)
 	const char *errstr;
 
 	rslt = snprintf(buf, sizeof(buf), "%u", oval);
-	if (rslt == -1 || (unsigned int)rslt >= sizeof(buf))
+	if (rslt < 0 || (unsigned int)rslt >= sizeof(buf))
 		return (CMD_BADVALUE);
 
 	p = getstring(prompt, helpstring, buf);
@@ -1165,7 +1176,7 @@ getuint64(struct disklabel *lp, char *prompt, char *helpstring,
 	int rslt;
 
 	rslt = snprintf(buf, sizeof(buf), "%llu", oval);
-	if (rslt == -1 || (unsigned int)rslt >= sizeof(buf))
+	if (rslt < 0 || (unsigned int)rslt >= sizeof(buf))
 		goto invalid;
 
 	p = getstring(prompt, helpstring, buf);
@@ -1443,7 +1454,6 @@ sort_partitions(struct disklabel *lp)
 
 	for (npartitions = 0, i = 0; i < lp->d_npartitions; i++) {
 		if (lp->d_partitions[i].p_fstype != FS_UNUSED &&
-		    lp->d_partitions[i].p_fstype != FS_BOOT &&
 		    DL_GETPSIZE(&lp->d_partitions[i]) != 0)
 			spp[npartitions++] = &lp->d_partitions[i];
 	}
@@ -2188,8 +2198,8 @@ get_geometry(int f, struct disklabel **dgpp)
 	/* Get disk geometry */
 	if ((disk_geop = calloc(1, sizeof(struct disklabel))) == NULL)
 		errx(4, "out of memory");
-	if (ioctl(f, DIOCGPDINFO, disk_geop) < 0)
-		err(4, "ioctl DIOCGPDINFO");
+	if (ioctl(f, DIOCGPDINFO, disk_geop) == -1)
+		err(4, "DIOCGPDINFO");
 	*dgpp = disk_geop;
 }
 

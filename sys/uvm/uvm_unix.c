@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_unix.c,v 1.64 2017/03/09 20:27:41 guenther Exp $	*/
+/*	$OpenBSD: uvm_unix.c,v 1.71 2020/10/21 21:24:57 deraadt Exp $	*/
 /*	$NetBSD: uvm_unix.c,v 1.18 2000/09/13 15:00:25 thorpej Exp $	*/
 
 /*
@@ -72,7 +72,7 @@ sys_obreak(struct proc *p, void *v, register_t *retval)
 
 	base = (vaddr_t)vm->vm_daddr;
 	new = round_page((vaddr_t)SCARG(uap, nsize));
-	if (new < base || (new - base) > p->p_rlimit[RLIMIT_DATA].rlim_cur)
+	if (new < base || (new - base) > lim_cur(RLIMIT_DATA))
 		return (ENOMEM);
 
 	old = round_page(base + ptoa(vm->vm_dsize));
@@ -94,7 +94,7 @@ sys_obreak(struct proc *p, void *v, register_t *retval)
 		}
 		vm->vm_dsize += atop(new - old);
 	} else {
-		uvm_deallocate(&vm->vm_map, new, old - new);
+		uvm_unmap(&vm->vm_map, new, old);
 		vm->vm_dsize -= atop(old - new);
 	}
 
@@ -108,11 +108,18 @@ void
 uvm_grow(struct proc *p, vaddr_t sp)
 {
 	struct vmspace *vm = p->p_vmspace;
+	vm_map_t map = &vm->vm_map;
 	int si;
 
 	/* For user defined stacks (from sendsig). */
 	if (sp < (vaddr_t)vm->vm_maxsaddr)
 		return;
+#ifdef MACHINE_STACK_GROWS_UP
+	if (sp >= (vaddr_t)vm->vm_minsaddr)
+		return;
+#endif
+
+	vm_map_lock(map);
 
 	/* For common case of already allocated (from trap). */
 #ifdef MACHINE_STACK_GROWS_UP
@@ -120,7 +127,7 @@ uvm_grow(struct proc *p, vaddr_t sp)
 #else
 	if (sp >= (vaddr_t)vm->vm_minsaddr - ptoa(vm->vm_ssize))
 #endif
-		return;
+		goto out;
 
 	/* Really need to check vs limit and increment stack size if ok. */
 #ifdef MACHINE_STACK_GROWS_UP
@@ -128,8 +135,10 @@ uvm_grow(struct proc *p, vaddr_t sp)
 #else
 	si = atop((vaddr_t)vm->vm_minsaddr - sp) - vm->vm_ssize;
 #endif
-	if (vm->vm_ssize + si <= atop(p->p_rlimit[RLIMIT_STACK].rlim_cur))
+	if (vm->vm_ssize + si <= atop(lim_cur(RLIMIT_STACK)))
 		vm->vm_ssize += si;
+out:
+	vm_map_unlock(map);
 }
 
 #ifndef SMALL_KERNEL
@@ -148,7 +157,7 @@ uvm_grow(struct proc *p, vaddr_t sp)
  * When then pass that range to the walk callback with 'start'
  * pointing to the start of the present range, 'realend' pointing
  * to the first absent page (or the end of the entry), and 'end'
- * pointing to the page page the last absent page (or the end of
+ * pointing to the page past the last absent page (or the end of
  * the entry).
  *
  * Note that if the first page of the amap is empty then the callback
@@ -214,7 +223,8 @@ uvm_should_coredump(struct proc *p, struct vm_map_entry *entry)
 {
 	if (!(entry->protection & PROT_WRITE) &&
 	    entry->aref.ar_amap == NULL &&
-	    entry->start != p->p_p->ps_sigcode)
+	    entry->start != p->p_p->ps_sigcode &&
+	    entry->start != p->p_p->ps_timekeep)
 		return 0;
 
 	/*
@@ -225,6 +235,10 @@ uvm_should_coredump(struct proc *p, struct vm_map_entry *entry)
 	 * on each such page would suck.
 	 */
 	if ((entry->protection & PROT_READ) == 0)
+		return 0;
+
+	/* Skip ranges excluded from coredumps. */
+	if (UVM_ET_ISCONCEAL(entry))
 		return 0;
 
 	/* Don't dump mmaped devices. */

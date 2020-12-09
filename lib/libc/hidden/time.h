@@ -1,4 +1,4 @@
-/*	$OpenBSD: time.h,v 1.5 2017/09/05 03:16:13 schwarze Exp $	*/
+/*	$OpenBSD: time.h,v 1.7 2020/07/06 13:33:06 pirofti Exp $	*/
 /*
  * Copyright (c) 2015 Philip Guenther <guenther@openbsd.org>
  *
@@ -29,7 +29,7 @@ PROTO_NORMAL(asctime_r);
 PROTO_STD_DEPRECATED(clock);
 PROTO_DEPRECATED(clock_getcpuclockid);
 PROTO_NORMAL(clock_getres);
-PROTO_NORMAL(clock_gettime);
+PROTO_WRAP(clock_gettime);
 PROTO_NORMAL(clock_settime);
 PROTO_STD_DEPRECATED(ctime);
 PROTO_DEPRECATED(ctime_r);
@@ -47,6 +47,7 @@ PROTO_NORMAL(time);
 PROTO_DEPRECATED(timegm);
 PROTO_DEPRECATED(timelocal);
 PROTO_DEPRECATED(timeoff);
+PROTO_STD_DEPRECATED(timespec_get);
 PROTO_NORMAL(tzset);
 PROTO_DEPRECATED(tzsetwall);
 

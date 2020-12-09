@@ -1,6 +1,7 @@
-/*	$OpenBSD: iked.c,v 1.36 2017/11/27 18:39:35 patrick Exp $	*/
+/*	$OpenBSD: iked.c,v 1.50 2020/11/20 13:03:00 jmc Exp $	*/
 
 /*
+ * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
  * Copyright (c) 2010-2013 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -55,8 +56,8 @@ usage(void)
 {
 	extern char	*__progname;
 
-	fprintf(stderr, "usage: %s [-6dnSTtv] [-D macro=value] "
-	    "[-f file]\n", __progname);
+	fprintf(stderr, "usage: %s [-dnSTtv] [-D macro=value] "
+	    "[-f file] [-p udpencap_port] [-s socket]\n", __progname);
 	exit(1);
 }
 
@@ -66,16 +67,20 @@ main(int argc, char *argv[])
 	int		 c;
 	int		 debug = 0, verbose = 0;
 	int		 opts = 0;
+	enum natt_mode	 natt_mode = NATT_DEFAULT;
+	in_port_t	 port = IKED_NATT_PORT;
 	const char	*conffile = IKED_CONFIG;
+	const char	*sock = IKED_SOCKET;
 	struct iked	*env = NULL;
 	struct privsep	*ps;
 
 	log_init(1, LOG_DAEMON);
 
-	while ((c = getopt(argc, argv, "6dD:nf:vSTt")) != -1) {
+	while ((c = getopt(argc, argv, "6dD:nf:p:s:vSTt")) != -1) {
 		switch (c) {
 		case '6':
-			opts |= IKED_OPT_NOIPV6BLOCKING;
+			log_warnx("the -6 option is ignored and will be "
+			    "removed in the future.");
 			break;
 		case 'd':
 			debug++;
@@ -92,6 +97,9 @@ main(int argc, char *argv[])
 		case 'f':
 			conffile = optarg;
 			break;
+		case 's':
+			sock = optarg;
+			break;
 		case 'v':
 			verbose++;
 			opts |= IKED_OPT_VERBOSE;
@@ -100,10 +108,20 @@ main(int argc, char *argv[])
 			opts |= IKED_OPT_PASSIVE;
 			break;
 		case 'T':
-			opts |= IKED_OPT_NONATT;
+			if (natt_mode == NATT_FORCE)
+				errx(1, "-T and -t/-p are mutually exclusive");
+			natt_mode = NATT_DISABLE;
 			break;
 		case 't':
-			opts |= IKED_OPT_NATT;
+			if (natt_mode == NATT_DISABLE)
+				errx(1, "-T and -t are mutually exclusive");
+			natt_mode = NATT_FORCE;
+			break;
+		case 'p':
+			if (natt_mode == NATT_DISABLE)
+				errx(1, "-T and -p are mutually exclusive");
+			port = atoi(optarg);
+			natt_mode = NATT_FORCE;
 			break;
 		default:
 			usage();
@@ -119,14 +137,12 @@ main(int argc, char *argv[])
 		fatal("calloc: env");
 
 	env->sc_opts = opts;
+	env->sc_nattmode = natt_mode;
+	env->sc_nattport = port;
 
 	ps = &env->sc_ps;
 	ps->ps_env = env;
 	TAILQ_INIT(&ps->ps_rcsocks);
-
-	if ((opts & (IKED_OPT_NONATT|IKED_OPT_NATT)) ==
-	    (IKED_OPT_NONATT|IKED_OPT_NATT))
-		errx(1, "conflicting NAT-T options");
 
 	if (strlcpy(env->sc_conffile, conffile, PATH_MAX) >= PATH_MAX)
 		errx(1, "config file exceeds PATH_MAX");
@@ -142,7 +158,7 @@ main(int argc, char *argv[])
 		errx(1, "unknown user %s", IKED_USER);
 
 	/* Configure the control socket */
-	ps->ps_csock.cs_name = IKED_SOCKET;
+	ps->ps_csock.cs_name = sock;
 
 	log_init(debug, LOG_DAEMON);
 	log_setverbose(verbose);
@@ -219,18 +235,19 @@ parent_configure(struct iked *env)
 	bzero(&ss, sizeof(ss));
 	ss.ss_family = AF_INET;
 
-	if ((env->sc_opts & IKED_OPT_NATT) == 0)
-		config_setsocket(env, &ss, ntohs(IKED_IKE_PORT), PROC_IKEV2);
-	if ((env->sc_opts & IKED_OPT_NONATT) == 0)
-		config_setsocket(env, &ss, ntohs(IKED_NATT_PORT), PROC_IKEV2);
+	/* see comment on config_setsocket() */
+	if (env->sc_nattmode != NATT_FORCE)
+		config_setsocket(env, &ss, htons(IKED_IKE_PORT), PROC_IKEV2);
+	if (env->sc_nattmode != NATT_DISABLE)
+		config_setsocket(env, &ss, htons(env->sc_nattport), PROC_IKEV2);
 
 	bzero(&ss, sizeof(ss));
 	ss.ss_family = AF_INET6;
 
-	if ((env->sc_opts & IKED_OPT_NATT) == 0)
-		config_setsocket(env, &ss, ntohs(IKED_IKE_PORT), PROC_IKEV2);
-	if ((env->sc_opts & IKED_OPT_NONATT) == 0)
-		config_setsocket(env, &ss, ntohs(IKED_NATT_PORT), PROC_IKEV2);
+	if (env->sc_nattmode != NATT_FORCE)
+		config_setsocket(env, &ss, htons(IKED_IKE_PORT), PROC_IKEV2);
+	if (env->sc_nattmode != NATT_DISABLE)
+		config_setsocket(env, &ss, htons(env->sc_nattport), PROC_IKEV2);
 
 	/*
 	 * pledge in the parent process:
@@ -250,10 +267,12 @@ parent_configure(struct iked *env)
 	if (pledge("stdio rpath proc dns inet route sendfd", NULL) == -1)
 		fatal("pledge");
 
-	config_setmobike(env);
+	config_setstatic(env);
 	config_setcoupled(env, env->sc_decoupled ? 0 : 1);
-	config_setmode(env, env->sc_passive ? 1 : 0);
 	config_setocsp(env);
+	config_setcertpartialchain(env);
+	/* Must be last */
+	config_setmode(env, env->sc_passive ? 1 : 0);
 
 	return (0);
 }
@@ -281,10 +300,12 @@ parent_reload(struct iked *env, int reset, const char *filename)
 		/* Re-compile policies and skip steps */
 		config_setcompile(env, PROC_IKEV2);
 
-		config_setmobike(env);
+		config_setstatic(env);
 		config_setcoupled(env, env->sc_decoupled ? 0 : 1);
-		config_setmode(env, env->sc_passive ? 1 : 0);
 		config_setocsp(env);
+		config_setcertpartialchain(env);
+ 		/* Must be last */
+		config_setmode(env, env->sc_passive ? 1 : 0);
 	} else {
 		config_setreset(env, reset, PROC_IKEV2);
 		config_setreset(env, reset, PROC_CERT);
@@ -373,7 +394,7 @@ parent_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
 
 	switch (imsg->hdr.type) {
 	case IMSG_OCSP_FD:
-		ocsp_connect(env);
+		ocsp_connect(env, imsg);
 		break;
 	default:
 		return (-1);

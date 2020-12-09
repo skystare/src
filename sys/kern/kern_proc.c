@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_proc.c,v 1.84 2018/06/21 13:58:21 visa Exp $	*/
+/*	$OpenBSD: kern_proc.c,v 1.89 2020/12/07 16:55:28 mpi Exp $	*/
 /*	$NetBSD: kern_proc.c,v 1.14 1996/02/09 18:59:41 christos Exp $	*/
 
 /*
@@ -109,7 +109,7 @@ procinit(void)
 	pool_init(&rusage_pool, sizeof(struct rusage), 0, IPL_NONE,
 	    PR_WAITOK, "zombiepl", NULL);
 	pool_init(&ucred_pool, sizeof(struct ucred), 0, IPL_MPFLOOR,
-	    PR_WAITOK, "ucredpl", NULL);
+	    0, "ucredpl", NULL);
 	pool_init(&pgrp_pool, sizeof(struct pgrp), 0, IPL_NONE,
 	    PR_WAITOK, "pgrppl", NULL);
 	pool_init(&session_pool, sizeof(struct session), 0, IPL_NONE,
@@ -278,6 +278,7 @@ enternewpgrp(struct process *pr, struct pgrp *pgrp, struct session *newsess)
 	}
 	pgrp->pg_id = pr->ps_pid;
 	LIST_INIT(&pgrp->pg_members);
+	LIST_INIT(&pgrp->pg_sigiolst);
 	LIST_INSERT_HEAD(PGRPHASH(pr->ps_pid), pgrp, pg_hash);
 	pgrp->pg_jobc = 0;
 
@@ -328,6 +329,7 @@ leavepgrp(struct process *pr)
 void
 pgdelete(struct pgrp *pgrp)
 {
+	sigio_freelist(&pgrp->pg_sigiolst);
 
 	if (pgrp->pg_session->s_ttyp != NULL && 
 	    pgrp->pg_session->s_ttyp->t_pgrp == pgrp)
@@ -474,7 +476,7 @@ proc_printit(struct proc *p, const char *modif,
 	(*pr)("    flags process=%b proc=%b\n",
 	    p->p_p->ps_flags, PS_BITS, p->p_flag, P_BITS);
 	(*pr)("    pri=%u, usrpri=%u, nice=%d\n",
-	    p->p_priority, p->p_usrpri, p->p_p->ps_nice);
+	    p->p_runpri, p->p_usrpri, p->p_p->ps_nice);
 	(*pr)("    forw=%p, list=%p,%p\n",
 	    TAILQ_NEXT(p, p_runq), p->p_list.le_next, p->p_list.le_prev);
 	(*pr)("    process=%p user=%p, vmspace=%p\n",
@@ -492,7 +494,6 @@ void
 db_kill_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
 {
 	struct process *pr;
-	struct sigaction sa;
 	struct proc *p;
 
 	pr = prfind(addr);
@@ -501,14 +502,10 @@ db_kill_cmd(db_expr_t addr, int have_addr, db_expr_t count, char *modif)
 		return;
 	}
 
-	p = TAILQ_FIRST(&pr->ps_threads);
+	p = SMR_TAILQ_FIRST_LOCKED(&pr->ps_threads);
 
 	/* Send uncatchable SIGABRT for coredump */
-	memset(&sa, 0, sizeof sa);
-	sa.sa_handler = SIG_DFL;
-	setsigvec(p, SIGABRT, &sa);
-	atomic_clearbits_int(&p->p_sigmask, sigmask(SIGABRT));
-	psignal(p, SIGABRT);
+	sigabort(p);
 }
 
 void
@@ -561,7 +558,7 @@ db_show_all_procs(db_expr_t addr, int haddr, db_expr_t count, char *modif)
 	while (pr != NULL) {
 		ppr = pr->ps_pptr;
 
-		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
+		SMR_TAILQ_FOREACH_LOCKED(p, &pr->ps_threads, p_thr_link) {
 #ifdef MULTIPROCESSOR
 			if (__mp_lock_held(&kernel_lock, p->p_cpu))
 				has_kernel_lock = 1;

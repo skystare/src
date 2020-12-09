@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.12 2016/11/06 16:04:20 tb Exp $
+#	$OpenBSD: Makefile,v 1.15 2020/05/25 16:27:07 deraadt Exp $
 
 LIB=	sa
 
@@ -17,11 +17,11 @@ CPPFLAGS+= -D__INTERNAL_LIBSA_CREAD
 
 # stand routines
 SRCS=	alloc.c exit.c getfile.c getln.c globals.c \
-	memcmp.c memcpy.c memset.c printf.c snprintf.c strerror.c strncpy.c
+	memcmp.c memcpy.c memmove.c memset.c printf.c snprintf.c strerror.c strncpy.c
 
 # io routines
-SRCS+=	close.c closeall.c dev.c disklabel.c dkcksum.c fstat.c ioctl.c lseek.c \
-	open.c read.c stat.c write.c cread.c
+SRCS+=	close.c closeall.c dev.c disklabel.c dkcksum.c fstat.c fchmod.c \
+	ioctl.c lseek.c open.c read.c stat.c write.c cread.c
 
 # network routines
 SRCS+=	arp.c ether.c in_cksum.c net.c netif.c netudp.c rpc.c
@@ -30,7 +30,7 @@ SRCS+=	arp.c ether.c in_cksum.c net.c netif.c netudp.c rpc.c
 SRCS+=	bootp.c bootparam.c rarp.c
 
 # boot filesystems
-SRCS+=	ufs.c nfs.c cd9660.c
+SRCS+=	ufs.c ufs2.c nfs.c cd9660.c
 
 ${OBJS}:	${.CURDIR}/../Makefile.inc
 

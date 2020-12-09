@@ -1,4 +1,4 @@
-/*	$OpenBSD: local_passwd.c,v 1.53 2016/12/30 23:32:14 millert Exp $	*/
+/*	$OpenBSD: local_passwd.c,v 1.58 2019/10/24 12:56:40 anton Exp $	*/
 
 /*-
  * Copyright (c) 1990 The Regents of the University of California.
@@ -36,6 +36,7 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <paths.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +72,20 @@ local_passwd(char *uname, int authenticated)
 		return(1);
 	}
 
+	if (unveil(_PATH_MASTERPASSWD_LOCK, "rwc") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_MASTERPASSWD, "r") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_LOGIN_CONF, "r") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_LOGIN_CONF ".db", "r") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_BSHELL, "x") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_SHELLS, "r") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_PWD_MKDB, "x") == -1)
+		err(1, "unveil");
 	if (pledge("stdio rpath wpath cpath getpw tty id proc exec", NULL) == -1)
 		err(1, "pledge");
 
@@ -136,13 +151,13 @@ local_passwd(char *uname, int authenticated)
 	if (i >= 4)
 		fputc('\n', stderr);
 	pfd = open(_PATH_MASTERPASSWD, O_RDONLY | O_CLOEXEC, 0);
-	if (pfd < 0)
+	if (pfd == -1)
 		pw_error(_PATH_MASTERPASSWD, 1, 1);
 
 	/* Update master.passwd file and rebuild spwd.db. */
 	pw_copy(pfd, tfd, pw, opw);
 	free(opw);
-	if (pw_mkdb(uname, pwflags) < 0)
+	if (pw_mkdb(uname, pwflags) == -1)
 		pw_error(NULL, 0, 1);
 
 	return(0);

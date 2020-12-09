@@ -1,4 +1,4 @@
-/*	$OpenBSD: print-ppp.c,v 1.32 2018/02/06 03:41:58 dlg Exp $	*/
+/*	$OpenBSD: print-ppp.c,v 1.34 2020/01/24 22:46:37 procter Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1993, 1994, 1995, 1996, 1997
@@ -389,6 +389,9 @@ ppp_print(const u_char *p, u_int length)
 		break;
 	case PPP_IPV6CP:
 		handle_ipv6cp(p, l);
+		break;
+	case PPP_CDP:
+		cdp_print(p, length, l, 0);
 		break;
 	}
 }
@@ -1221,7 +1224,7 @@ ppp_ether_if_print(u_char *user, const struct pcap_pkthdr *h, const u_char *p)
 	}
 
 	if (length < pppoe_len) {
-                (void)printf(" truncated-pppoe - %d bytes missing!",
+                printf(" truncated-pppoe - %d bytes missing!",
                     pppoe_len - length);
                 pppoe_len = length;
         }
@@ -1282,7 +1285,7 @@ pppoe_if_print(u_short ethertype, const u_char *p, u_int length, u_int l)
 	length -= sizeof(struct pppoe_header);
 
 	if (length < pppoe_len) {
-                (void)printf(" truncated-pppoe - %d bytes missing!",
+                printf(" truncated-pppoe - %d bytes missing!",
                     pppoe_len - length);
                 pppoe_len = length;
         }

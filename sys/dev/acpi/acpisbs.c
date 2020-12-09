@@ -1,4 +1,4 @@
-/* $OpenBSD: acpisbs.c,v 1.7 2018/06/29 17:39:18 kettenis Exp $ */
+/* $OpenBSD: acpisbs.c,v 1.10 2020/06/10 22:26:40 jca Exp $ */
 /*
  * Smart Battery subsystem device driver
  * ACPI 5.0 spec section 10
@@ -27,6 +27,8 @@
 #include <sys/systm.h>
 #include <sys/device.h>
 #include <sys/malloc.h>
+
+#include <machine/apmvar.h>
 
 #include <dev/acpi/acpireg.h>
 #include <dev/acpi/acpivar.h>
@@ -126,6 +128,7 @@ extern void acpiec_write(struct acpiec_softc *, uint8_t, int, uint8_t *);
 
 int	acpisbs_match(struct device *, void *, void *);
 void	acpisbs_attach(struct device *, struct device *, void *);
+int	acpisbs_activate(struct device *, int);
 void	acpisbs_setup_sensors(struct acpisbs_softc *);
 void	acpisbs_refresh_sensors(struct acpisbs_softc *);
 void	acpisbs_read(struct acpisbs_softc *);
@@ -137,6 +140,8 @@ const struct cfattach acpisbs_ca = {
 	sizeof(struct acpisbs_softc),
 	acpisbs_match,
 	acpisbs_attach,
+	NULL,
+	acpisbs_activate,
 };
 
 struct cfdriver acpisbs_cd = {
@@ -170,7 +175,7 @@ acpisbs_attach(struct device *parent, struct device *self, void *aux)
 
 	memset(&sc->sc_battery, 0, sizeof(sc->sc_battery));
 
-	getmicrotime(&sc->sc_lastpoll);
+	getmicrouptime(&sc->sc_lastpoll);
 
 	if (aml_evalinteger(sc->sc_acpi, sc->sc_devnode, "_SBS", 0, NULL, &sbs))
 		return;
@@ -356,14 +361,29 @@ acpisbs_refresh_sensors(struct acpisbs_softc *sc)
 }
 
 int
+acpisbs_activate(struct device *self, int act)
+{
+	struct acpisbs_softc *sc = (struct acpisbs_softc *)self;
+
+	switch (act) {
+	case DVACT_WAKEUP:
+		acpisbs_read(sc);
+		acpisbs_refresh_sensors(sc);
+		break;
+	}
+
+	return 0;
+}
+
+int
 acpisbs_notify(struct aml_node *node, int notify_type, void *arg)
 {
 	struct acpisbs_softc *sc = arg;
-	struct timeval tv;
+	struct timeval diff, now;
 
 	DPRINTF(("%s: %s: %d\n", sc->sc_dev.dv_xname, __func__, notify_type));
 
-	getmicrotime(&tv);
+	getmicrouptime(&now);
 
 	switch (notify_type) {
 	case 0x00:
@@ -373,10 +393,12 @@ acpisbs_notify(struct aml_node *node, int notify_type, void *arg)
 		 * EC SCI will come for every data point, so only run once in a
 		 * while
 		 */
-		if (tv.tv_sec - sc->sc_lastpoll.tv_sec > ACPISBS_POLL_FREQ) {
+		timersub(&now, &sc->sc_lastpoll, &diff);
+		if (diff.tv_sec > ACPISBS_POLL_FREQ) {
 			acpisbs_read(sc);
 			acpisbs_refresh_sensors(sc);
-			getmicrotime(&sc->sc_lastpoll);
+			acpi_record_event(sc->sc_acpi, APM_POWER_CHANGE);
+			getmicrouptime(&sc->sc_lastpoll);
 		}
 		break;
 	default:

@@ -1,4 +1,4 @@
-/*	$OpenBSD: engine.h,v 1.2 2018/07/27 06:20:01 bket Exp $	*/
+/*	$OpenBSD: engine.h,v 1.5 2020/09/14 09:07:05 florian Exp $	*/
 
 /*
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
@@ -16,18 +16,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-struct imsg_proposal {
-	uint32_t			if_index;
-	pid_t				pid;
-	int64_t				id;
-	struct sockaddr_in6		addr;
-	struct in6_addr			mask;
-	struct sockaddr_in6		gateway;
-	struct sockaddr_rtdns		rdns;
-	struct sockaddr_rtsearch	dnssl;
-	int				rtm_addrs;
-};
-
 struct imsg_configure_address {
 	uint32_t		 if_index;
 	struct sockaddr_in6	 addr;
@@ -40,6 +28,7 @@ struct imsg_configure_address {
 
 struct imsg_configure_dfr {
 	uint32_t		 if_index;
+	int			 rdomain;
 	struct sockaddr_in6	 addr;
 	uint32_t		 router_lifetime;
 };

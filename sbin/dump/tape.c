@@ -1,4 +1,4 @@
-/*	$OpenBSD: tape.c,v 1.44 2017/12/08 17:04:15 deraadt Exp $	*/
+/*	$OpenBSD: tape.c,v 1.46 2020/10/01 07:58:54 otto Exp $	*/
 /*	$NetBSD: tape.c,v 1.11 1997/06/05 11:13:26 lukem Exp $	*/
 
 /*-
@@ -330,7 +330,10 @@ flushtape(void)
 	}
 
 	blks = 0;
-	if (spcl.c_type != TS_END) {
+	if (spcl.c_type != TS_END && spcl.c_type != TS_CLRI &&
+	    spcl.c_type != TS_BITS) {
+		if (spcl.c_count > TP_NINDIR)
+			quit("c_count too large\n");
 		for (i = 0; i < spcl.c_count; i++)
 			if (spcl.c_addr[i] != 0)
 				blks++;
@@ -416,7 +419,7 @@ trewind(void)
 	}
 
 	(void) close(tapefd);
-	while ((f = open(tape, O_RDONLY)) < 0)
+	while ((f = open(tape, O_RDONLY)) == -1)
 		sleep (10);
 	(void) close(f);
 }
@@ -577,7 +580,7 @@ restore_check_point:
 	 *	All signals are inherited...
 	 */
 	childpid = fork();
-	if (childpid < 0) {
+	if (childpid == -1) {
 		msg("Context save fork fails in parent %d\n", parentpid);
 		Exit(X_ABORT);
 	}
@@ -656,10 +659,10 @@ restore_check_point:
 		}
 #ifdef RDUMP
 		while ((tapefd = (host ? rmtopen(tape, O_WRONLY|O_CREAT) :
-			pipeout ? 1 : open(tape, O_WRONLY|O_CREAT, 0666))) < 0)
+			pipeout ? 1 : open(tape, O_WRONLY|O_CREAT, 0666))) == -1)
 #else
 		while ((tapefd = (pipeout ? 1 :
-				  open(tape, O_WRONLY|O_CREAT, 0666))) < 0)
+				  open(tape, O_WRONLY|O_CREAT, 0666))) == -1)
 #endif
 		    {
 			msg("Cannot open output \"%s\".\n", tape);
@@ -751,8 +754,8 @@ enslave(void)
 			caught = 0;
 		}
 
-		if (socketpair(AF_UNIX, SOCK_STREAM, 0, cmd) < 0 ||
-		    (slaves[i].pid = fork()) < 0)
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, cmd) == -1 ||
+		    (slaves[i].pid = fork()) == -1)
 			quit("too many slaves, %d (recompile smaller): %s\n",
 			    i, strerror(errno));
 
@@ -804,7 +807,7 @@ doslave(int cmd, int slave_number)
 	 * Need our own seek pointer.
 	 */
 	(void) close(diskfd);
-	if ((diskfd = open(disk, O_RDONLY)) < 0)
+	if ((diskfd = open(disk, O_RDONLY)) == -1)
 		quit("slave couldn't reopen disk: %s\n", strerror(errno));
 
 	/*

@@ -1,22 +1,23 @@
-# $OpenBSD: Makefile,v 1.8 2018/08/12 16:59:31 mortimer Exp $
+# $OpenBSD: Makefile,v 1.14 2020/08/09 15:56:40 patrick Exp $
 
 LIB=	LLVMCodeGen
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=-I${LLVM_SRC}/include/llvm/CodeGen
 CPPFLAGS+=-I${LLVM_SRC}/include/llvm/CodeGen/PBQP
 
-.include <bsd.own.mk>
-SRCS=	AggressiveAntiDepBreaker.cpp \
+SRCS+=	AggressiveAntiDepBreaker.cpp \
 	AllocationOrder.cpp \
-	Analysis.cpp \
+	CodeGenAnalysis.cpp \
 	AtomicExpandPass.cpp \
 	BasicTargetTransformInfo.cpp \
 	BranchFolding.cpp \
 	BranchRelaxation.cpp \
+	BreakFalseDeps.cpp \
+	CFIInstrInserter.cpp \
 	CalcSpillWeights.cpp \
 	CallingConvLower.cpp \
+	CFGuardLongjmp.cpp \
 	CodeGen.cpp \
 	CodeGenPrepare.cpp \
 	CriticalAntiDepBreaker.cpp \
@@ -26,20 +27,12 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	DwarfEHPrepare.cpp \
 	EarlyIfConversion.cpp \
 	EdgeBundles.cpp \
-	ExecutionDepsFix.cpp \
-	ExpandISelPseudos.cpp \
+	ExecutionDomainFix.cpp \
 	ExpandMemCmp.cpp \
 	ExpandPostRAPseudos.cpp \
 	ExpandReductions.cpp \
 	FEntryInserter.cpp \
-	IndirectBrExpandPass.cpp \
-	LazyMachineBlockFrequencyInfo.cpp \
-	LiveDebugValues.cpp \
-	LiveIntervals.cpp \
-	LiveStacks.cpp \
-	LiveRangeShrink.cpp \
-	LiveRegUnits.cpp \
-	LowLevelType.cpp \
+	FinalizeISel.cpp \
 	FaultMaps.cpp \
 	FuncletLayout.cpp \
 	GCMetadata.cpp \
@@ -47,25 +40,35 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	GCRootLowering.cpp \
 	GCStrategy.cpp \
 	GlobalMerge.cpp \
+	HardwareLoops.cpp \
 	IfConversion.cpp \
 	ImplicitNullChecks.cpp \
+	IndirectBrExpandPass.cpp \
 	InlineSpiller.cpp \
 	InterferenceCache.cpp \
 	InterleavedAccessPass.cpp \
+	InterleavedLoadCombinePass.cpp \
 	IntrinsicLowering.cpp \
 	LLVMTargetMachine.cpp \
 	LatencyPriorityQueue.cpp \
+	LazyMachineBlockFrequencyInfo.cpp \
 	LexicalScopes.cpp \
+	LiveDebugValues.cpp \
 	LiveDebugVariables.cpp \
 	LiveInterval.cpp \
 	LiveIntervalUnion.cpp \
+	LiveIntervals.cpp \
+	LivePhysRegs.cpp \
 	LiveRangeCalc.cpp \
 	LiveRangeEdit.cpp \
+	LiveRangeShrink.cpp \
 	LiveRegMatrix.cpp \
-	LivePhysRegs.cpp \
+	LiveRegUnits.cpp \
+	LiveStacks.cpp \
 	LiveVariables.cpp \
 	LocalStackSlotAllocation.cpp \
-	LowLevelType.cpp \
+	LoopTraversal.cpp \
+	CodeGenLowLevelType.cpp \
 	LowerEmuTLS.cpp \
 	MachineBasicBlock.cpp \
 	MachineBlockFrequencyInfo.cpp \
@@ -84,12 +87,12 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	MachineInstrBundle.cpp \
 	MachineLICM.cpp \
 	MachineLoopInfo.cpp \
+	MachineLoopUtils.cpp \
 	MachineModuleInfo.cpp \
 	MachineModuleInfoImpls.cpp \
 	MachineOperand.cpp \
 	MachineOptimizationRemarkEmitter.cpp \
 	MachineOutliner.cpp \
-	MachinePassRegistry.cpp \
 	MachinePipeliner.cpp \
 	MachinePostDominators.cpp \
 	MachineRegisterInfo.cpp \
@@ -97,12 +100,17 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	MachineSSAUpdater.cpp \
 	MachineScheduler.cpp \
 	MachineSink.cpp \
+	MachineSizeOpts.cpp \
 	MachineTraceMetrics.cpp \
 	MachineVerifier.cpp \
+	ModuloSchedule.cpp \
 	MacroFusion.cpp \
 	MIRCanonicalizerPass.cpp \
+	MIRNamerPass.cpp \
 	MIRPrinter.cpp \
 	MIRPrintingPass.cpp \
+	MIRVRegNamerUtils.cpp \
+	NonRelocatableStringpool.cpp \
 	OptimizePHIs.cpp \
 	PHIElimination.cpp \
 	PHIEliminationUtils.cpp \
@@ -115,6 +123,10 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	ProcessImplicitDefs.cpp \
 	PrologEpilogInserter.cpp \
 	PseudoSourceValue.cpp \
+	RDFGraph.cpp \
+	RDFLiveness.cpp \
+	RDFRegisters.cpp \
+	ReachingDefAnalysis.cpp \
 	RegAllocBase.cpp \
 	RegAllocBasic.cpp \
 	RegAllocFast.cpp \
@@ -146,10 +158,12 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	SpillPlacement.cpp \
 	SplitKit.cpp \
 	StackColoring.cpp \
-	StackProtector.cpp \
-	StackSlotColoring.cpp \
 	StackMapLivenessAnalysis.cpp \
 	StackMaps.cpp \
+	StackProtector.cpp \
+	StackSlotColoring.cpp \
+	SwiftErrorValueTracking.cpp \
+	SwitchLoweringUtils.cpp \
 	TailDuplication.cpp \
 	TailDuplicator.cpp \
 	TargetFrameLoweringImpl.cpp \
@@ -161,15 +175,21 @@ SRCS=	AggressiveAntiDepBreaker.cpp \
 	TargetRegisterInfo.cpp \
 	TargetSchedule.cpp \
 	TargetSubtargetInfo.cpp \
+	TypePromotion.cpp \
 	TwoAddressInstructionPass.cpp \
 	UnreachableBlockElim.cpp \
+	ValueTypes.cpp \
 	VirtRegMap.cpp \
+	WasmEHPrepare.cpp \
 	WinEHPrepare.cpp \
 	XRayInstrumentation.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/CodeGen
+CodeGenAnalysis.cpp:
+	ln -s ${LLVM_SRCS}/lib/CodeGen/Analysis.cpp $@
 
-install:
-	@# Nothing here so far ...
+CodeGenLowLevelType.cpp:
+	ln -s ${LLVM_SRCS}/lib/CodeGen/LowLevelType.cpp $@
 
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/CodeGen
+
+CLEANFILES+= CodeGenAnalysis.cpp CodeGenLowLevelType.cpp

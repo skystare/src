@@ -1,4 +1,4 @@
-/*	$OpenBSD: rkgrf.c,v 1.2 2017/07/23 17:07:18 kettenis Exp $	*/
+/*	$OpenBSD: rkgrf.c,v 1.4 2020/09/04 01:10:29 jmatthew Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -27,8 +27,14 @@
 #include <dev/ofw/ofw_misc.h>
 #include <dev/ofw/fdt.h>
 
+#ifdef __armv7__
+#include <arm/simplebus/simplebusvar.h>
+#else
+#include <arm64/dev/simplebusvar.h>
+#endif
+
 struct rkgrf_softc {
-	struct device		sc_dev;
+	struct simplebus_softc	sc_sbus;
 	bus_space_tag_t		sc_iot;
 	bus_space_handle_t	sc_ioh;
 };
@@ -52,6 +58,7 @@ rkgrf_match(struct device *parent, void *match, void *aux)
 	return (OF_is_compatible(faa->fa_node, "rockchip,rk3288-grf") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3288-pmu") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3288-sgrf") ||
+	    OF_is_compatible(faa->fa_node, "rockchip,rk3308-grf") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3399-grf") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3399-pmugrf"));
 }
@@ -79,4 +86,7 @@ rkgrf_attach(struct device *parent, struct device *self, void *aux)
 
 	regmap_register(faa->fa_node, sc->sc_iot, sc->sc_ioh,
 	    faa->fa_reg[0].size);
+
+	/* Attach PHYs. */
+	simplebus_attach(parent, &sc->sc_sbus.sc_dev, faa);
 }

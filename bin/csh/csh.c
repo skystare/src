@@ -1,4 +1,4 @@
-/*	$OpenBSD: csh.c,v 1.44 2018/09/08 01:28:39 miko Exp $	*/
+/*	$OpenBSD: csh.c,v 1.47 2020/08/30 22:23:47 mortimer Exp $	*/
 /*	$NetBSD: csh.c,v 1.14 1995/04/29 23:21:28 mycroft Exp $	*/
 
 /*-
@@ -61,6 +61,80 @@
  * June, 1991
  */
 
+/* Globals from csh.h */
+struct timespec time0;
+struct rusage ru0;
+struct Bin B;
+struct Ain lineloc;
+struct whyle *whyles;
+struct varent shvhed, aliases;
+struct wordent *alhistp;
+struct wordent *alhistt;
+struct wordent paraml;
+struct Hist Histlist;
+FILE   *cshin, *cshout, *csherr;
+bool    chkstop;
+bool    didfds;
+bool    doneinp;
+bool    exiterr;
+bool    child;
+bool    haderr;
+bool    intty;
+bool    intact;
+bool    justpr;
+bool    loginsh;
+bool    neednote;
+bool    noexec;
+bool    pjobs;
+bool    setintr;
+bool    timflg;
+bool    havhash;
+bool    needprompt;
+Char   *arginp;
+int     onelflg;
+Char   *ffile;
+Char   *doldol;
+int     backpid;
+uid_t   uid, euid;
+gid_t   gid, egid;
+time_t  chktim;
+pid_t   shpgrp;
+pid_t   tpgrp;
+pid_t   opgrp;
+int     SHIN;
+int     SHOUT;
+int     SHERR;
+int     OLDSTD;
+jmp_buf reslab;
+int     exitset;
+Char   *gointr;
+sig_t   parintr;
+sig_t   parterm;
+bool    cantell;
+Char   *lap;
+Char  **alvec;
+int     gflag;
+Char   *pargs;
+long    pnleft;
+Char   *pargcp;
+int     eventno;
+int     lastev;
+Char    HIST;
+Char    HISTSUB;
+char   *bname;
+Char   *Vsav;
+Char   *Vdp;
+Char   *Vexpath;
+char  **Vt;
+Char  **evalvec;
+Char   *evalp;
+Char   *word_chars;
+Char   *STR_SHELLPATH;
+Char   *STR_BSHELL;
+Char   *STR_WORD_CHARS;
+Char  **STR_environ;
+
+/* Locals */
 Char   *dumphist[] = {STRhistory, STRmh, 0, 0};
 Char   *loadhist[] = {STRsource, STRmh, STRtildothist, 0};
 
@@ -343,7 +417,7 @@ main(int argc, char *argv[])
      */
     if (nofile == 0 && argc > 0) {
 	nofile = open(tempv[0], O_RDONLY);
-	if (nofile < 0) {
+	if (nofile == -1) {
 	    child = 1;		/* So this doesn't return */
 	    stderror(ERR_SYSTEM, tempv[0], strerror(errno));
 	}
@@ -578,7 +652,7 @@ importpath(Char *cp)
      * i+2 where i is the number of colons in the path. There are i+1
      * directories in the path plus we need room for a zero terminator.
      */
-    pv = (Char **) xcalloc((size_t) (i + 2), sizeof(Char **));
+    pv = xcalloc(i + 2, sizeof(*pv));
     dp = cp;
     i = 0;
     if (*dp)
@@ -662,7 +736,7 @@ srcunit(int unit, bool onlyown, bool hflg)
     if (onlyown) {
 	struct stat stb;
 
-	if (fstat(unit, &stb) < 0) {
+	if (fstat(unit, &stb) == -1) {
 	    (void) close(unit);
 	    return;
 	}
@@ -1127,7 +1201,7 @@ mailchk(void)
     if (chktim + intvl > t)
 	return;
     for (; *vp; vp++) {
-	if (stat(short2str(*vp), &stb) < 0)
+	if (stat(short2str(*vp), &stb) == -1)
 	    continue;
 	new = stb.st_mtime > time0.tv_sec;
 	if (stb.st_size == 0 || stb.st_atime > stb.st_mtime ||

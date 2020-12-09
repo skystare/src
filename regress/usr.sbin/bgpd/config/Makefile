@@ -1,8 +1,6 @@
-# $OpenBSD: Makefile,v 1.5 2018/09/10 14:20:25 benno Exp $
+# $OpenBSD: Makefile,v 1.11 2020/04/24 10:34:54 claudio Exp $
 
-BGPDTESTS=1 2 3 4 5 6 7 8
-
-REGRESS_TARGETS = config
+BGPDTESTS=1 2 3 4 5 6 7 8 9 10 11 12 13
 
 .for n in ${BGPDTESTS}
 BGPD_TARGETS+=bgpd${n}
@@ -19,7 +17,8 @@ bgpd${n}-update:
 	    ${.CURDIR}/bgpd.conf.${n}.ok
 .endfor
 
-config: bgpd-example bgpd-printconf ${BGPD_TARGETS}
+REGRESS_TARGETS = bgpd-example bgpd-printconf ${BGPD_TARGETS}
+
 bgpd-update: ${BGPD_UPDATES}
 
 # check that the example configuration file we ship is ok

@@ -1,4 +1,4 @@
-/*	$OpenBSD: sigsetjmp.S,v 1.7 2016/05/29 22:39:21 guenther Exp $	*/
+/*	$OpenBSD: sigsetjmp.S,v 1.9 2020/10/21 17:22:59 kettenis Exp $	*/
 /*	$NetBSD: __setjmp14.S,v 1.1 2001/06/19 00:25:02 fvdl Exp $	*/
 
 /*
@@ -53,6 +53,7 @@
  */
 
 ENTRY(sigsetjmp)
+	RETGUARD_SETUP(sigsetjmp, r10)
 	movl    %esi,(_JB_SIGFLAG  * 8)(%rdi)
 	testl   %esi,%esi
 	jz      2f
@@ -82,8 +83,11 @@ ENTRY(sigsetjmp)
 	xorq	(2*8)(%rcx),%rax
 	movq	%rax,(_JB_PC  * 8)(%rdi)
 	xorq	%rcx,%rcx
+	stmxcsr	(_JB_MXCSR * 8)(%rdi)
+	fnstcw	(_JB_MXCSR * 8 + 4)(%rdi)
 
 	xorq	%rax,%rax
+	RETGUARD_CHECK(sigsetjmp, r10)
 	ret
 END(sigsetjmp)
 
@@ -100,6 +104,15 @@ ENTRY(siglongjmp)
 2:	movl	%r8d,%eax
 
 	leaq	 __jmpxor(%rip),%rcx
+	movq	(_JB_RSP * 8)(%r12),%r11
+	xorq	(1*8)(%rcx),%r11
+	movq	%r11,%rsp
+	movq	(_JB_PC  * 8)(%r12),%r11
+	xorq	(2*8)(%rcx),%r11
+	movq	%r11,0(%rsp)
+	RETGUARD_SETUP(siglongjmp, r10)
+	ldmxcsr	(_JB_MXCSR * 8)(%r12)
+	fldcw	(_JB_MXCSR * 8 + 4)(%r12)
 	movq	(_JB_RBX * 8)(%r12),%rbx
 	movq	(_JB_RBP * 8)(%r12),%r11
 	xorq	(0*8)(%rcx),%r11
@@ -107,17 +120,12 @@ ENTRY(siglongjmp)
 	movq	(_JB_R13 * 8)(%r12),%r13
 	movq	(_JB_R14 * 8)(%r12),%r14
 	movq	(_JB_R15 * 8)(%r12),%r15
-	movq	(_JB_RSP * 8)(%r12),%r11
-	xorq	(1*8)(%rcx),%r11
-	movq	%r11,%rsp
-	movq	(_JB_PC  * 8)(%r12),%r11
-	xorq	(2*8)(%rcx),%r11
 	movq	(_JB_R12 * 8)(%r12),%r12
 	xorq	%rcx,%rcx
 
 	testl	%eax,%eax
 	jnz	1f
 	incl	%eax
-1:	movq	%r11,0(%rsp)
+1:	RETGUARD_CHECK(siglongjmp, r10)
 	ret
 END(siglongjmp)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: lcore_access.S,v 1.27 2017/05/19 00:50:24 visa Exp $ */
+/*	$OpenBSD: lcore_access.S,v 1.30 2020/10/21 15:50:00 deraadt Exp $ */
 
 /*
  * Copyright (c) 2001-2003 Opsycon AB  (www.opsycon.se / www.opsycon.com)
@@ -79,13 +79,14 @@ sigcode:
 	syscall
 	.globl  _C_LABEL(sigcoderet)
 _C_LABEL(sigcoderet):
-	break	0			# just in case sigreturn fails
+	LI	v0, SYS_exit		# just in case sigreturn fails
+	syscall
 	.globl	esigcode
 esigcode:
 
 	.globl	sigfill
 sigfill:
-	break	0
+	teq	zero, zero, 0x52
 esigfill:
 
 	.data
@@ -105,7 +106,8 @@ sigfillsiz:
  *		u_long *lencopied;
  */
 LEAF(copystr, 0)
-	move	t2, a2			# Save the number of bytes
+	beq	a2, zero, 9f
+	 move	t2, a2			# Save the number of bytes
 	move	v0, zero
 1:
 	lbu	t0, 0(a0)
@@ -116,6 +118,7 @@ LEAF(copystr, 0)
 	 PTR_ADDU a1, a1, 1
 	bne	a2, zero, 1b
 	 NOP
+9:
 	LI	v0, ENAMETOOLONG	# String is longer than maxlength
 2:
 	beq	a3, zero, 3f

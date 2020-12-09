@@ -1,4 +1,4 @@
-/*	$OpenBSD: SYS.h,v 1.2 2018/05/15 20:37:48 kettenis Exp $ */
+/*	$OpenBSD: SYS.h,v 1.5 2020/02/18 12:19:11 kettenis Exp $ */
 
 /*
  * Copyright (c) 2016 Dale Rahn
@@ -29,18 +29,18 @@
 #include <machine/asm.h>
 #include <sys/syscall.h>
 
-#define SYSTRAP(x) \
-	ldr	x8, =SYS_ ## x;				\
-	svc	0
+#define SYSTRAP(x)					\
+	ldr	x8, =SYS_ ## x				;\
+	svc	0					;\
+	dsb	nsh					;\
+	isb
 
 #define DL_SYSCALL(n)					\
 	.global		__CONCAT(_dl_,n)		;\
 	.type		__CONCAT(_dl_,n)%function	;\
 __CONCAT(_dl_,n):					;\
+	RETGUARD_SETUP(__CONCAT(_dl_,n), x15)		;\
 	SYSTRAP(n)					;\
-	bcs	.L_cerr					;\
-	ret
-
-.L_cerr:
-	neg	x0, x0		/* r0 = -errno */
+	cneg	x0, x0, cs	/* r0 = -errno */	;\
+	RETGUARD_CHECK(__CONCAT(_dl_,n), x15)	 	;\
 	ret

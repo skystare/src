@@ -1,4 +1,4 @@
-/*	$OpenBSD: SYS.h,v 1.2 2018/05/28 19:36:43 kettenis Exp $	*/
+/*	$OpenBSD: SYS.h,v 1.5 2020/02/18 12:19:11 kettenis Exp $	*/
 /*	$NetBSD: SYS.h,v 1.8 2003/08/07 16:42:02 agc Exp $	*/
 
 /*-
@@ -53,7 +53,9 @@
 
 #define SYSTRAP(x) \
 	ldr	x8, =SYS_ ## x;		\
-	svc	0
+	svc	0;			\
+	dsb	nsh;			\
+	isb
 
 #define	CERROR		_C_LABEL(__cerror)
 
@@ -79,16 +81,27 @@
 
 
 #define PSEUDO_NOERROR(x,y)						\
-	_SYSCALL_NOERROR(x,y);						\
+	SYSENTRY(x);							\
+	RETGUARD_SETUP(x, x15);						\
+	SYSTRAP(y);							\
+	RETGUARD_CHECK(x, x15);						\
 	ret;								\
 	__END(x)
 
 #define PSEUDO(x,y)							\
-	_SYSCALL(x,y);							\
+	SYSENTRY(x);							\
+	RETGUARD_SETUP(x, x15);						\
+	SYSTRAP(y);							\
+	bcs CERROR;							\
+	RETGUARD_CHECK(x, x15);						\
 	ret;								\
 	__END(x)
 #define PSEUDO_HIDDEN(x,y)						\
-	_SYSCALL_HIDDEN(x,y);						\
+	SYSENTRY_HIDDEN(x);						\
+	RETGUARD_SETUP(x, x15);						\
+	SYSTRAP(y);							\
+	bcs CERROR;							\
+	RETGUARD_CHECK(x, x15);						\
 	ret;								\
 	__END_HIDDEN(x)
 

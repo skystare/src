@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.macppc,v 1.94 2018/02/09 03:59:15 tb Exp $
+#	$OpenBSD: Makefile.macppc,v 1.100 2020/11/29 18:57:29 gkoehler Exp $
 
 # For instructions on building kernels consult the config(8) and options(4)
 # manual pages.
@@ -21,22 +21,30 @@ S!=	cd ../../../..; pwd
 _machdir?=	$S/arch/${_mach}
 _archdir?=	$S/arch/${_arch}
 
-INCLUDES=	-nostdinc -I$S -I${.OBJDIR} -I$S/arch
+INCLUDES=	-nostdinc -I$S -I${.OBJDIR} -I$S/arch \
+		-I$S/dev/pci/drm/include \
+		-I$S/dev/pci/drm/include/uapi
 CPPFLAGS=	${INCLUDES} ${IDENT} ${PARAM} -D_KERNEL -D__${_mach}__ -MD -MP
 CWARNFLAGS=	-Werror -Wall -Wimplicit-function-declaration \
 		-Wno-main -Wno-uninitialized -Wno-pointer-sign \
 		-Wframe-larger-than=2047
 
-CMACHFLAGS=	-msoft-float -Wa,-many
-CMACHFLAGS+=	-fno-builtin-printf -fno-builtin-snprintf \
-		-fno-builtin-vsnprintf -fno-builtin-log \
-		-fno-builtin-log2 -fno-builtin-malloc ${NOPIE_FLAGS}
+CMACHFLAGS=	-msoft-float
+.if ${COMPILER_VERSION:Mgcc4}
+CMACHFLAGS+=	-Wa,-many
+.endif
+CMACHFLAGS+=	-ffreestanding ${NOPIE_FLAGS}
 SORTR=		sort -R
 .if ${IDENT:M-DNO_PROPOLICE}
 CMACHFLAGS+=	-fno-stack-protector
 .endif
 .if ${IDENT:M-DSMALL_KERNEL}
 SORTR=		cat
+COPTS?=		-Oz
+.endif
+.if ${COMPILER_VERSION:Mclang}
+NO_INTEGR_AS=	-no-integrated-as
+CWARNFLAGS+=	-Wno-address-of-packed-member -Wno-constant-conversion
 .endif
 
 DEBUG?=		-g
@@ -45,6 +53,13 @@ CFLAGS=		${DEBUG} ${CWARNFLAGS} ${CMACHFLAGS} ${COPTS} ${PIPE}
 AFLAGS=		-D_LOCORE ${CMACHFLAGS}
 LINKFLAGS=	-N -Ttext 100114 -e start --warn-common -nopie
 
+.if ${MACHINE} == "powerpc64"
+CFLAGS+=	-m32
+AFLAGS+=	-m32
+LDFLAGS=	-melf32ppc
+LINKFLAGS+=	${LDFLAGS}
+.endif
+
 HOSTCC?=	${CC}
 HOSTED_CPPFLAGS=${CPPFLAGS:S/^-nostdinc$//}
 HOSTED_CFLAGS=	${CFLAGS}
@@ -52,7 +67,7 @@ HOSTED_C=	${HOSTCC} ${HOSTED_CFLAGS} ${HOSTED_CPPFLAGS} -c $<
 
 NORMAL_C_NOP=	${CC} ${CFLAGS} ${CPPFLAGS} -c $<
 NORMAL_C=	${CC} ${CFLAGS} ${CPPFLAGS} ${PROF} -c $<
-NORMAL_S=	${CC} ${AFLAGS} ${CPPFLAGS} -c $<
+NORMAL_S=	${CC} ${AFLAGS} ${CPPFLAGS} ${PROF} -c $<
 
 %OBJS
 
@@ -95,7 +110,7 @@ LINKFLAGS+=	-S
 assym.h: $S/kern/genassym.sh Makefile \
 	 ${_archdir}/${_arch}/genassym.cf ${_machdir}/${_mach}/genassym.cf
 	cat ${_archdir}/${_arch}/genassym.cf ${_machdir}/${_mach}/genassym.cf | \
-	    sh $S/kern/genassym.sh ${CC} ${CFLAGS} ${CPPFLAGS} -MF assym.P > assym.h.tmp
+	    sh $S/kern/genassym.sh ${CC} ${NO_INTEGR_AS} ${CFLAGS} ${CPPFLAGS} -MF assym.P > assym.h.tmp
 	sed '1s/.*/assym.h: \\/' assym.P > assym.d
 	sort -u assym.h.tmp > assym.h
 
@@ -115,12 +130,16 @@ ioconf.o: ioconf.c
 ld.script: ${_machdir}/conf/ld.script
 	cp ${_machdir}/conf/ld.script $@
 
+gapdummy.o:
+	echo '__asm(".section .rodata,\"a\"");' > gapdummy.c
+	${CC} -c ${CFLAGS} ${CPPFLAGS} gapdummy.c -o $@
+
 makegap.sh:
 	cp $S/conf/makegap.sh $@
 
-MAKE_GAP = LD="${LD}" sh makegap.sh 0x00000000	# guaranteed illegal
+MAKE_GAP = LD="${LD}" sh makegap.sh 0x00000000 gapdummy.o
 
-gap.o:	Makefile makegap.sh vers.o
+gap.o:	Makefile makegap.sh gapdummy.o vers.o
 	${MAKE_GAP}
 
 vers.o: ${SYSTEM_DEP:Ngap.o}
@@ -129,7 +148,7 @@ vers.o: ${SYSTEM_DEP:Ngap.o}
 
 clean:
 	rm -f *bsd *bsd.gdb *.[dio] [a-z]*.s assym.* \
-	    gap.link ld.script lorder makegap.sh param.c
+	    gap.link gapdummy.c ld.script lorder makegap.sh param.c
 
 cleandir: clean
 	rm -f Makefile *.h ioconf.c options machine ${_mach} vers.c
@@ -144,8 +163,7 @@ hardlink-obsd:
 	[[ ! -f /bsd ]] || cmp -s bsd /bsd || ln -f /bsd /obsd
 
 newinstall:
-	umask 077 && cp bsd /nbsd && mv /nbsd /bsd && \
-	    sha256 -h /var/db/kernel.SHA256 /bsd
+	install -F -m 700 bsd /bsd && sha256 -h /var/db/kernel.SHA256 /bsd
 
 install: update-link hardlink-obsd newinstall
 

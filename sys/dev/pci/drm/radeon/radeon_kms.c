@@ -25,13 +25,23 @@
  *          Alex Deucher
  *          Jerome Glisse
  */
-#include <dev/pci/drm/drmP.h>
-#include <dev/pci/drm/drm_fb_helper.h>
-#include "radeon.h"
-#include <dev/pci/drm/radeon_drm.h>
-#include "radeon_asic.h"
 
-#include "radeon_kfd.h"
+#include <linux/pci.h>
+#include <linux/pm_runtime.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/vga_switcheroo.h>
+
+#include <drm/drm_agpsupport.h>
+#include <drm/drm_fb_helper.h>
+#include <drm/drm_file.h>
+#include <drm/drm_ioctl.h>
+#include <drm/radeon_drm.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_pci.h>
+
+#include "radeon.h"
+#include "radeon_asic.h"
 
 #if defined(CONFIG_VGA_SWITCHEROO)
 bool radeon_has_atpx(void);
@@ -42,6 +52,11 @@ static inline bool radeon_has_atpx(void) { return false; }
 #include "vga.h"
 
 #if NVGA > 0
+#include <dev/ic/mc6845reg.h>
+#include <dev/ic/pcdisplayvar.h>
+#include <dev/ic/vgareg.h>
+#include <dev/ic/vgavar.h>
+
 extern int vga_console_attached;
 #endif
 
@@ -64,7 +79,7 @@ int	radeondrm_forcedetach(struct radeon_device *);
 bool		radeon_msi_ok(struct radeon_device *);
 irqreturn_t	radeon_driver_irq_handler_kms(void *);
 
-extern const struct drm_pcidev radeondrm_pciidlist[];
+extern const struct pci_device_id radeondrm_pciidlist[];
 extern struct drm_driver kms_driver;
 const struct drm_ioctl_desc radeon_ioctls_kms[];
 extern int radeon_max_kms_ioctl;
@@ -125,6 +140,11 @@ int radeon_driver_unload_kms(struct drm_device *dev)
 	radeon_modeset_fini(rdev);
 	radeon_device_fini(rdev);
 
+	if (dev->agp)
+		arch_phys_wc_del(dev->agp->agp_mtrr);
+	kfree(dev->agp);
+	dev->agp = NULL;
+
 done_free:
 	kfree(rdev);
 	dev->dev_private = NULL;
@@ -153,7 +173,7 @@ radeondrm_detach_kms(struct device *self, int flags)
 	radeon_device_fini(rdev);
 
 	if (rdev->ddev != NULL) {
-		config_detach((struct device *)rdev->ddev, flags);
+		config_detach(rdev->ddev->dev, flags);
 		rdev->ddev = NULL;
 	}
 
@@ -165,7 +185,7 @@ void radeondrm_burner(void *, u_int, u_int);
 int radeondrm_wsioctl(void *, u_long, caddr_t, int, struct proc *);
 paddr_t radeondrm_wsmmap(void *, off_t, int);
 int radeondrm_alloc_screen(void *, const struct wsscreen_descr *,
-    void **, int *, int *, long *);
+    void **, int *, int *, uint32_t *);
 void radeondrm_free_screen(void *, void *);
 int radeondrm_show_screen(void *, void *, int,
     void (*)(void *, int, int), void *);
@@ -211,10 +231,11 @@ radeondrm_wsioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 {
 	struct rasops_info *ri = v;
 	struct wsdisplay_fbinfo *wdf;
+	struct wsdisplay_param *dp = (struct wsdisplay_param *)data;
 
 	switch (cmd) {
 	case WSDISPLAYIO_GTYPE:
-		*(int *)data = WSDISPLAY_TYPE_RADEONDRM;
+		*(u_int *)data = WSDISPLAY_TYPE_RADEONDRM;
 		return 0;
 	case WSDISPLAYIO_GINFO:
 		wdf = (struct wsdisplay_fbinfo *)data;
@@ -223,6 +244,14 @@ radeondrm_wsioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 		wdf->depth = ri->ri_depth;
 		wdf->cmsize = 0;
 		return 0;
+	case WSDISPLAYIO_GETPARAM:
+		if (ws_get_param == NULL)
+			return 0;
+		return ws_get_param(dp);
+	case WSDISPLAYIO_SETPARAM:
+		if (ws_set_param == NULL)
+			return 0;
+		return ws_set_param(dp);
 	default:
 		return -1;
 	}
@@ -236,7 +265,7 @@ radeondrm_wsmmap(void *v, off_t off, int prot)
 
 int
 radeondrm_alloc_screen(void *v, const struct wsscreen_descr *type,
-    void **cookiep, int *curxp, int *curyp, long *attrp)
+    void **cookiep, int *curxp, int *curyp, uint32_t *attrp)
 {
 	return rasops_alloc_screen(v, cookiep, curxp, curyp, attrp);
 }
@@ -275,20 +304,36 @@ radeondrm_doswitch(void *v)
 {
 	struct rasops_info *ri = v;
 	struct radeon_device *rdev = ri->ri_hw;
-	struct radeon_crtc *radeon_crtc;
-	int i, crtc;
+#ifndef __sparc64__
+	struct drm_device *dev = rdev->ddev;
+	struct drm_crtc *crtc;
+	uint16_t *r_base, *g_base, *b_base;
+	int i, ret = 0;
+#endif
 
 	rasops_show_screen(ri, rdev->switchcookie, 0, NULL, NULL);
-	for (crtc = 0; crtc < rdev->num_crtc; crtc++) {
-		for (i = 0; i < 256; i++) {
-			radeon_crtc = rdev->mode_info.crtcs[crtc];
-			radeon_crtc->lut_r[i] = rasops_cmap[3 * i] << 2;
-			radeon_crtc->lut_g[i] = rasops_cmap[(3 * i) + 1] << 2;
-			radeon_crtc->lut_b[i] = rasops_cmap[(3 * i) + 2] << 2;
-		}
-	}
 #ifdef __sparc64__
 	fbwscons_setcolormap(&rdev->sf, radeondrm_setcolor);
+#else
+	for (i = 0; i < rdev->num_crtc; i++) {
+		struct drm_modeset_acquire_ctx ctx;
+		crtc = &rdev->mode_info.crtcs[i]->base;
+
+		r_base = crtc->gamma_store;
+		g_base = r_base + crtc->gamma_size;
+		b_base = g_base + crtc->gamma_size;
+
+		DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+
+		*r_base = rasops_cmap[3 * i] << 2;
+		*g_base = rasops_cmap[(3 * i) + 1] << 2;
+		*b_base = rasops_cmap[(3 * i) + 2] << 2;
+
+		crtc->funcs->gamma_set(crtc, r_base, g_base, b_base,
+		    crtc->gamma_size, &ctx);
+
+		DRM_MODESET_LOCK_ALL_END(ctx, ret);
+	}
 #endif
 	drm_fb_helper_restore_fbdev_mode_unlocked((void *)rdev->mode_info.rfbdev);
 
@@ -316,18 +361,34 @@ radeondrm_setcolor(void *v, u_int index, u_int8_t r, u_int8_t g, u_int8_t b)
 {
 	struct sunfb *sf = v;
 	struct radeon_device *rdev = sf->sf_ro.ri_hw;
-	struct drm_fb_helper *fb_helper = (void *)rdev->mode_info.rfbdev;
-	u_int16_t red, green, blue;
+	struct drm_device *dev = rdev->ddev;
+	uint16_t red, green, blue;
+	uint16_t *r_base, *g_base, *b_base;
 	struct drm_crtc *crtc;
-	int i;
+	int i, ret = 0;
 
-	for (i = 0; i < fb_helper->crtc_count; i++) {
-		crtc = fb_helper->crtc_info[i].mode_set.crtc;
+	for (i = 0; i < rdev->num_crtc; i++) {
+		struct drm_modeset_acquire_ctx ctx;
+		crtc = &rdev->mode_info.crtcs[i]->base;
 
 		red = (r << 8) | r;
 		green = (g << 8) | g;
 		blue = (b << 8) | b;
-		fb_helper->funcs->gamma_set(crtc, red, green, blue, index);
+
+		DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+
+		r_base = crtc->gamma_store;
+		g_base = r_base + crtc->gamma_size;
+		b_base = g_base + crtc->gamma_size;
+
+		*r_base = red >> 6;
+		*g_base = green >> 6;
+		*b_base = blue >> 6;
+
+		crtc->funcs->gamma_set(crtc, r_base, g_base, b_base,
+		    crtc->gamma_size, &ctx);
+
+		DRM_MODESET_LOCK_ALL_END(ctx, ret);
 	}
 }
 #endif
@@ -368,7 +429,8 @@ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags)
 
 	if ((radeon_runtime_pm != 0) &&
 	    radeon_has_atpx() &&
-	    ((flags & RADEON_IS_IGP) == 0))
+	    ((flags & RADEON_IS_IGP) == 0) &&
+	    !pci_is_thunderbolt_attached(dev->pdev))
 		flags |= RADEON_IS_PX;
 
 	/* radeon_device_init should report only fatal error
@@ -401,12 +463,8 @@ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags)
 				"Error during ACPI methods call\n");
 	}
 
-#ifdef notyet
-	radeon_kfd_device_probe(rdev);
-	radeon_kfd_device_init(rdev);
-#endif
-
 	if (radeon_is_px(dev)) {
+		dev_pm_set_driver_flags(dev->dev, DPM_FLAG_NEVER_SKIP);
 		pm_runtime_use_autosuspend(dev->dev);
 		pm_runtime_set_autosuspend_delay(dev->dev, 5000);
 		pm_runtime_set_active(dev->dev);
@@ -430,7 +488,7 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 	struct radeon_device	*rdev = (struct radeon_device *)self;
 	struct drm_device	*dev;
 	struct pci_attach_args	*pa = aux;
-	const struct drm_pcidev *id_entry;
+	const struct pci_device_id *id_entry;
 	int			 is_agp;
 	pcireg_t		 type;
 	int			 i;
@@ -457,22 +515,25 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 
 #if defined(__sparc64__) || defined(__macppc__)
 	if (fbnode == PCITAG_NODE(rdev->pa_tag))
-		rdev->console = 1;
+		rdev->console = rdev->primary = 1;
 #else
 	if (PCI_CLASS(pa->pa_class) == PCI_CLASS_DISPLAY &&
 	    PCI_SUBCLASS(pa->pa_class) == PCI_SUBCLASS_DISPLAY_VGA &&
 	    (pci_conf_read(pa->pa_pc, pa->pa_tag, PCI_COMMAND_STATUS_REG)
 	    & (PCI_COMMAND_IO_ENABLE | PCI_COMMAND_MEM_ENABLE))
 	    == (PCI_COMMAND_IO_ENABLE | PCI_COMMAND_MEM_ENABLE)) {
-		rdev->console = 1;
+		rdev->primary = 1;
 #if NVGA > 0
+		rdev->console = vga_is_console(pa->pa_iot, -1);
 		vga_console_attached = 1;
 #endif
 	}
+
 #if NEFIFB > 0
-	if (efifb_is_console(pa)) {
-		rdev->console = 1;
-		efifb_cndetach();
+	if (efifb_is_primary(pa)) {
+		rdev->primary = 1;
+		rdev->console = efifb_is_console(pa);
+		efifb_detach();
 	}
 #endif
 #endif
@@ -507,29 +568,28 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 	}
 #endif
 
-	for (i = PCI_MAPREG_START; i < PCI_MAPREG_END ; i+= 4) {
+	for (i = PCI_MAPREG_START; i < PCI_MAPREG_END; i += 4) {
 		type = pci_mapreg_type(pa->pa_pc, pa->pa_tag, i);
-		if (PCI_MAPREG_TYPE(type) != PCI_MAPREG_TYPE_IO)
-			continue;
-		if (pci_mapreg_map(pa, i, type, 0, NULL,
-		    &rdev->rio_mem, NULL, &rdev->rio_mem_size, 0)) {
-			printf(": can't map rio space\n");
-			return;
+		if (type == PCI_MAPREG_TYPE_IO) {
+			pci_mapreg_map(pa, i, type, 0, NULL,
+			    &rdev->rio_mem, NULL, &rdev->rio_mem_size, 0);
+			break;
 		}
-
-		if (type & PCI_MAPREG_MEM_TYPE_64BIT)
+		if (type == PCI_MAPREG_MEM_TYPE_64BIT)
 			i += 4;
 	}
 
 	if (rdev->family >= CHIP_BONAIRE) {
 		type = pci_mapreg_type(pa->pa_pc, pa->pa_tag, 0x18);
 		if (PCI_MAPREG_TYPE(type) != PCI_MAPREG_TYPE_MEM ||
-		    pci_mapreg_map(pa, 0x18, type, 0, NULL,
+		    pci_mapreg_map(pa, 0x18, type, BUS_SPACE_MAP_LINEAR, NULL,
 		    &rdev->doorbell.bsh, &rdev->doorbell.base,
 		    &rdev->doorbell.size, 0)) {
 			printf(": can't map doorbell space\n");
 			return;
 		}
+		rdev->doorbell.ptr = bus_space_vaddr(rdev->memt,
+		    rdev->doorbell.bsh);
 	}
 
 	if (rdev->family >= CHIP_BONAIRE)
@@ -539,11 +599,12 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 
 	type = pci_mapreg_type(pa->pa_pc, pa->pa_tag, rmmio_bar);
 	if (PCI_MAPREG_TYPE(type) != PCI_MAPREG_TYPE_MEM ||
-	    pci_mapreg_map(pa, rmmio_bar, type, 0, NULL,
+	    pci_mapreg_map(pa, rmmio_bar, type, BUS_SPACE_MAP_LINEAR, NULL,
 	    &rdev->rmmio_bsh, &rdev->rmmio_base, &rdev->rmmio_size, 0)) {
 		printf(": can't map rmmio space\n");
 		return;
 	}
+	rdev->rmmio = bus_space_vaddr(rdev->memt, rdev->rmmio_bsh);
 
 #if !defined(__sparc64__)
 	/*
@@ -601,8 +662,8 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 	kms_driver.num_ioctls = radeon_max_kms_ioctl;
 	kms_driver.driver_features |= DRIVER_MODESET;
 
-	dev = (struct drm_device *)drm_attach_pci(&kms_driver, pa, is_agp,
-	    rdev->console, self);
+	dev = drm_attach_pci(&kms_driver, pa, is_agp, rdev->primary,
+	    self, NULL);
 	rdev->ddev = dev;
 	rdev->pdev = dev->pdev;
 
@@ -669,8 +730,6 @@ radeondrm_attach_kms(struct device *parent, struct device *self, void *aux)
 	config_mountroot(self, radeondrm_attachhook);
 }
 
-extern void mainbus_efifb_reattach(void);
-
 int
 radeondrm_forcedetach(struct radeon_device *rdev)
 {
@@ -678,7 +737,7 @@ radeondrm_forcedetach(struct radeon_device *rdev)
 	pcitag_t		 tag = rdev->pa_tag;
 
 #if NVGA > 0
-	if (rdev->console)
+	if (rdev->primary)
 		vga_console_attached = 0;
 #endif
 
@@ -689,8 +748,8 @@ radeondrm_forcedetach(struct radeon_device *rdev)
 		config_detach(&rdev->self, 0);
 		return pci_probe_device(sc, tag, NULL, NULL);
 #if NEFIFB > 0
-	} else if (rdev->console) {
-		mainbus_efifb_reattach();
+	} else if (rdev->primary) {
+		efifb_reattach();
 	}
 #endif
 
@@ -749,7 +808,6 @@ radeondrm_attachhook(struct device *self)
 	}
 
 {
-	struct drm_fb_helper *fb_helper = (void *)rdev->mode_info.rfbdev;
 	struct wsemuldisplaydev_attach_args aa;
 	struct rasops_info *ri = &rdev->ro;
 
@@ -761,7 +819,6 @@ radeondrm_attachhook(struct device *self)
 #ifdef __sparc64__
 	fbwscons_setcolormap(&rdev->sf, radeondrm_setcolor);
 #endif
-	drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
 
 #ifndef __sparc64__
 	ri->ri_flg = RI_CENTER | RI_VCONS | RI_WRONLY;
@@ -780,15 +837,16 @@ radeondrm_attachhook(struct device *self)
 	radeondrm_stdscreen.fontheight = ri->ri_font->fontheight;
 
 	aa.console = rdev->console;
+	aa.primary = rdev->primary;
 	aa.scrdata = &radeondrm_screenlist;
 	aa.accessops = &radeondrm_accessops;
 	aa.accesscookie = ri;
 	aa.defaultscreens = 0;
 
 	if (rdev->console) {
-		long defattr;
+		uint32_t defattr;
 
-		ri->ri_ops.alloc_attr(ri->ri_active, 0, 0, 0, &defattr);
+		ri->ri_ops.pack_attr(ri->ri_active, 0, 0, 0, &defattr);
 		wsdisplay_cnattach(&radeondrm_stdscreen, ri->ri_active,
 		    ri->ri_ccol, ri->ri_crow, defattr);
 	}
@@ -805,6 +863,11 @@ radeondrm_attachhook(struct device *self)
 
 	config_found_sm(&rdev->self, &aa, wsemuldisplaydevprint,
 	    wsemuldisplaydevsubmatch);
+
+	/*
+	 * in linux via radeon_pci_probe -> drm_get_pci_dev -> drm_dev_register
+	 */
+	drm_dev_register(rdev->ddev, rdev->flags);
 }
 }
 
@@ -820,7 +883,7 @@ radeondrm_activate_kms(struct device *self, int act)
 	switch (act) {
 	case DVACT_QUIESCE:
 		rv = config_activate_children(self, act);
-		radeon_suspend_kms(rdev->ddev, true, true);
+		radeon_suspend_kms(rdev->ddev, true, true, false);
 		break;
 	case DVACT_SUSPEND:
 		break;
@@ -1278,13 +1341,11 @@ static int radeon_info_ioctl(struct drm_device *dev, void *data, struct drm_file
  */
 void radeon_driver_lastclose_kms(struct drm_device *dev)
 {
-	struct radeon_device *rdev = dev->dev_private;
-
 #ifdef __sparc64__
+	struct radeon_device *rdev = dev->dev_private;
 	fbwscons_setcolormap(&rdev->sf, radeondrm_setcolor);
 #endif
-	if (rdev->mode_info.mode_config_initialized)
-		radeon_fbdev_restore_mode(rdev);
+	drm_fb_helper_lastclose(dev);
 	vga_switcheroo_process_delayed_switch();
 }
 
@@ -1305,18 +1366,20 @@ int radeon_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
 	file_priv->driver_priv = NULL;
 
 	r = pm_runtime_get_sync(dev->dev);
-	if (r < 0)
+	if (r < 0) {
+		pm_runtime_put_autosuspend(dev->dev);
 		return r;
+	}
 
 	/* new gpu have virtual address space support */
 	if (rdev->family >= CHIP_CAYMAN) {
 		struct radeon_fpriv *fpriv;
 		struct radeon_vm *vm;
-		int r;
 
 		fpriv = kzalloc(sizeof(*fpriv), GFP_KERNEL);
 		if (unlikely(!fpriv)) {
-			return -ENOMEM;
+			r = -ENOMEM;
+			goto out_suspend;
 		}
 
 		if (rdev->accel_working) {
@@ -1324,14 +1387,14 @@ int radeon_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
 			r = radeon_vm_init(rdev, vm);
 			if (r) {
 				kfree(fpriv);
-				return r;
+				goto out_suspend;
 			}
 
 			r = radeon_bo_reserve(rdev->ring_tmp_bo.bo, false);
 			if (r) {
 				radeon_vm_fini(rdev, vm);
 				kfree(fpriv);
-				return r;
+				goto out_suspend;
 			}
 
 			/* map the ib pool buffer read only into
@@ -1345,15 +1408,16 @@ int radeon_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
 			if (r) {
 				radeon_vm_fini(rdev, vm);
 				kfree(fpriv);
-				return r;
+				goto out_suspend;
 			}
 		}
 		file_priv->driver_priv = fpriv;
 	}
 
+out_suspend:
 	pm_runtime_mark_last_busy(dev->dev);
 	pm_runtime_put_autosuspend(dev->dev);
-	return 0;
+	return r;
 }
 
 /**
@@ -1362,12 +1426,25 @@ int radeon_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
  * @dev: drm dev pointer
  * @file_priv: drm file
  *
- * On device post close, tear down vm on cayman+ (all asics).
+ * On device close, tear down hyperz and cmask filps on r1xx-r5xx
+ * (all asics).  And tear down vm on cayman+ (all asics).
  */
 void radeon_driver_postclose_kms(struct drm_device *dev,
 				 struct drm_file *file_priv)
 {
 	struct radeon_device *rdev = dev->dev_private;
+
+	pm_runtime_get_sync(dev->dev);
+
+	mutex_lock(&rdev->gem.mutex);
+	if (rdev->hyperz_filp == file_priv)
+		rdev->hyperz_filp = NULL;
+	if (rdev->cmask_filp == file_priv)
+		rdev->cmask_filp = NULL;
+	mutex_unlock(&rdev->gem.mutex);
+
+	radeon_uvd_free_handles(rdev, file_priv);
+	radeon_vce_free_handles(rdev, file_priv);
 
 	/* new gpu have virtual address space support */
 	if (rdev->family >= CHIP_CAYMAN && file_priv->driver_priv) {
@@ -1388,31 +1465,8 @@ void radeon_driver_postclose_kms(struct drm_device *dev,
 		kfree(fpriv);
 		file_priv->driver_priv = NULL;
 	}
-}
-
-/**
- * radeon_driver_preclose_kms - drm callback for pre close
- *
- * @dev: drm dev pointer
- * @file_priv: drm file
- *
- * On device pre close, tear down hyperz and cmask filps on r1xx-r5xx
- * (all asics).
- */
-void radeon_driver_preclose_kms(struct drm_device *dev,
-				struct drm_file *file_priv)
-{
-	struct radeon_device *rdev = dev->dev_private;
-
-	mutex_lock(&rdev->gem.mutex);
-	if (rdev->hyperz_filp == file_priv)
-		rdev->hyperz_filp = NULL;
-	if (rdev->cmask_filp == file_priv)
-		rdev->cmask_filp = NULL;
-	mutex_unlock(&rdev->gem.mutex);
-
-	radeon_uvd_free_handles(rdev, file_priv);
-	radeon_vce_free_handles(rdev, file_priv);
+	pm_runtime_mark_last_busy(dev->dev);
+	pm_runtime_put_autosuspend(dev->dev);
 }
 
 /*
@@ -1421,20 +1475,21 @@ void radeon_driver_preclose_kms(struct drm_device *dev,
 /**
  * radeon_get_vblank_counter_kms - get frame count
  *
- * @dev: drm dev pointer
  * @crtc: crtc to get the frame count from
  *
  * Gets the frame count on the requested crtc (all asics).
  * Returns frame count on success, -EINVAL on failure.
  */
-u32 radeon_get_vblank_counter_kms(struct drm_device *dev, int crtc)
+u32 radeon_get_vblank_counter_kms(struct drm_crtc *crtc)
 {
+	struct drm_device *dev = crtc->dev;
+	unsigned int pipe = crtc->index;
 	int vpos, hpos, stat;
 	u32 count;
 	struct radeon_device *rdev = dev->dev_private;
 
-	if (crtc < 0 || crtc >= rdev->num_crtc) {
-		DRM_ERROR("Invalid crtc %d\n", crtc);
+	if (pipe >= rdev->num_crtc) {
+		DRM_ERROR("Invalid crtc %u\n", pipe);
 		return -EINVAL;
 	}
 
@@ -1446,29 +1501,29 @@ u32 radeon_get_vblank_counter_kms(struct drm_device *dev, int crtc)
 	 * and start of vsync, so vpos >= 0 means to bump the hw frame counter
 	 * result by 1 to give the proper appearance to caller.
 	 */
-	if (rdev->mode_info.crtcs[crtc]) {
+	if (rdev->mode_info.crtcs[pipe]) {
 		/* Repeat readout if needed to provide stable result if
 		 * we cross start of vsync during the queries.
 		 */
 		do {
-			count = radeon_get_vblank_counter(rdev, crtc);
+			count = radeon_get_vblank_counter(rdev, pipe);
 			/* Ask radeon_get_crtc_scanoutpos to return vpos as
 			 * distance to start of vblank, instead of regular
 			 * vertical scanout pos.
 			 */
 			stat = radeon_get_crtc_scanoutpos(
-				dev, crtc, GET_DISTANCE_TO_VBLANKSTART,
+				dev, pipe, GET_DISTANCE_TO_VBLANKSTART,
 				&vpos, &hpos, NULL, NULL,
-				&rdev->mode_info.crtcs[crtc]->base.hwmode);
-		} while (count != radeon_get_vblank_counter(rdev, crtc));
+				&rdev->mode_info.crtcs[pipe]->base.hwmode);
+		} while (count != radeon_get_vblank_counter(rdev, pipe));
 
 		if (((stat & (DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE)) !=
 		    (DRM_SCANOUTPOS_VALID | DRM_SCANOUTPOS_ACCURATE))) {
 			DRM_DEBUG_VBL("Query failed! stat %d\n", stat);
 		}
 		else {
-			DRM_DEBUG_VBL("crtc %d: dist from vblank start %d\n",
-				      crtc, vpos);
+			DRM_DEBUG_VBL("crtc %u: dist from vblank start %d\n",
+				      pipe, vpos);
 
 			/* Bump counter if we are at >= leading edge of vblank,
 			 * but before vsync where vpos would turn negative and
@@ -1480,7 +1535,7 @@ u32 radeon_get_vblank_counter_kms(struct drm_device *dev, int crtc)
 	}
 	else {
 	    /* Fallback to use value as is. */
-	    count = radeon_get_vblank_counter(rdev, crtc);
+	    count = radeon_get_vblank_counter(rdev, pipe);
 	    DRM_DEBUG_VBL("NULL mode info! Returned count may be wrong.\n");
 	}
 
@@ -1490,25 +1545,26 @@ u32 radeon_get_vblank_counter_kms(struct drm_device *dev, int crtc)
 /**
  * radeon_enable_vblank_kms - enable vblank interrupt
  *
- * @dev: drm dev pointer
  * @crtc: crtc to enable vblank interrupt for
  *
  * Enable the interrupt on the requested crtc (all asics).
  * Returns 0 on success, -EINVAL on failure.
  */
-int radeon_enable_vblank_kms(struct drm_device *dev, int crtc)
+int radeon_enable_vblank_kms(struct drm_crtc *crtc)
 {
+	struct drm_device *dev = crtc->dev;
+	unsigned int pipe = crtc->index;
 	struct radeon_device *rdev = dev->dev_private;
 	unsigned long irqflags;
 	int r;
 
-	if (crtc < 0 || crtc >= rdev->num_crtc) {
-		DRM_ERROR("Invalid crtc %d\n", crtc);
+	if (pipe < 0 || pipe >= rdev->num_crtc) {
+		DRM_ERROR("Invalid crtc %d\n", pipe);
 		return -EINVAL;
 	}
 
 	spin_lock_irqsave(&rdev->irq.lock, irqflags);
-	rdev->irq.crtc_vblank_int[crtc] = true;
+	rdev->irq.crtc_vblank_int[pipe] = true;
 	r = radeon_irq_set(rdev);
 	spin_unlock_irqrestore(&rdev->irq.lock, irqflags);
 	return r;
@@ -1517,62 +1573,26 @@ int radeon_enable_vblank_kms(struct drm_device *dev, int crtc)
 /**
  * radeon_disable_vblank_kms - disable vblank interrupt
  *
- * @dev: drm dev pointer
  * @crtc: crtc to disable vblank interrupt for
  *
  * Disable the interrupt on the requested crtc (all asics).
  */
-void radeon_disable_vblank_kms(struct drm_device *dev, int crtc)
+void radeon_disable_vblank_kms(struct drm_crtc *crtc)
 {
+	struct drm_device *dev = crtc->dev;
+	unsigned int pipe = crtc->index;
 	struct radeon_device *rdev = dev->dev_private;
 	unsigned long irqflags;
 
-	if (crtc < 0 || crtc >= rdev->num_crtc) {
-		DRM_ERROR("Invalid crtc %d\n", crtc);
+	if (pipe < 0 || pipe >= rdev->num_crtc) {
+		DRM_ERROR("Invalid crtc %d\n", pipe);
 		return;
 	}
 
 	spin_lock_irqsave(&rdev->irq.lock, irqflags);
-	rdev->irq.crtc_vblank_int[crtc] = false;
+	rdev->irq.crtc_vblank_int[pipe] = false;
 	radeon_irq_set(rdev);
 	spin_unlock_irqrestore(&rdev->irq.lock, irqflags);
-}
-
-/**
- * radeon_get_vblank_timestamp_kms - get vblank timestamp
- *
- * @dev: drm dev pointer
- * @crtc: crtc to get the timestamp for
- * @max_error: max error
- * @vblank_time: time value
- * @flags: flags passed to the driver
- *
- * Gets the timestamp on the requested crtc based on the
- * scanout position.  (all asics).
- * Returns postive status flags on success, negative error on failure.
- */
-int radeon_get_vblank_timestamp_kms(struct drm_device *dev, int crtc,
-				    int *max_error,
-				    struct timeval *vblank_time,
-				    unsigned flags)
-{
-	struct drm_crtc *drmcrtc;
-	struct radeon_device *rdev = dev->dev_private;
-
-	if (crtc < 0 || crtc >= dev->num_crtcs) {
-		DRM_ERROR("Invalid crtc %d\n", crtc);
-		return -EINVAL;
-	}
-
-	/* Get associated drm_crtc: */
-	drmcrtc = &rdev->mode_info.crtcs[crtc]->base;
-	if (!drmcrtc)
-		return -EINVAL;
-
-	/* Helper routine in DRM core does all the work: */
-	return drm_calc_vbltimestamp_from_scanoutpos(dev, crtc, max_error,
-						     vblank_time, flags,
-						     &drmcrtc->hwmode);
 }
 
 const struct drm_ioctl_desc radeon_ioctls_kms[] = {

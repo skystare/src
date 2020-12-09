@@ -6,16 +6,14 @@ STRING-DOTT(1) - General Commands Manual
 
 # DESCRIPTION
 
-initial text
-
 BEGINTEST
 
 We are using the  markdown device.
+It can also be written as the  markdown device.
 
 The device name can be overridden.
+Both escape forms work for the name.
+ENDTEST  
+end of file
 
-ENDTEST
-
-final text
-
-OpenBSD - August 16, 2018
+OpenBSD - October 24, 2020

@@ -1,4 +1,4 @@
-/* $OpenBSD: dsdt.c,v 1.243 2018/08/19 08:23:47 kettenis Exp $ */
+/* $OpenBSD: dsdt.c,v 1.256 2020/09/27 16:46:15 kettenis Exp $ */
 /*
  * Copyright (c) 2005 Jordan Hargrave <jordan@openbsd.org>
  *
@@ -102,13 +102,11 @@ struct aml_value	*aml_callosi(struct aml_scope *, struct aml_value *);
 const char		*aml_getname(const char *);
 int64_t			aml_hextoint(const char *);
 void			aml_dump(int, uint8_t *);
-void			_aml_die(const char *fn, int line, const char *fmt, ...);
+__dead void		_aml_die(const char *fn, int line, const char *fmt, ...);
 #define aml_die(x...)	_aml_die(__FUNCTION__, __LINE__, x)
 
 void aml_notify_task(void *, int);
 void acpi_poll_notify_task(void *, int);
-
-extern char		*hw_vendor;
 
 /*
  * @@@: Global variables
@@ -230,8 +228,8 @@ struct aml_opcode aml_table[] = {
 	/* Conversion operations */
 	{ AMLOP_TOINTEGER,	"ToInteger",	"tr",	},
 	{ AMLOP_TOBUFFER,	"ToBuffer",	"tr",	},
-	{ AMLOP_TODECSTRING,	"ToDecString",	"ir",	},
-	{ AMLOP_TOHEXSTRING,	"ToHexString",	"ir",	},
+	{ AMLOP_TODECSTRING,	"ToDecString",	"tr",	},
+	{ AMLOP_TOHEXSTRING,	"ToHexString",	"tr",	},
 	{ AMLOP_TOSTRING,	"ToString",	"tir",	},
 	{ AMLOP_MID,		"Mid",		"tiir",	},
 	{ AMLOP_FROMBCD,	"FromBCD",	"ir",	},
@@ -465,15 +463,14 @@ void
 acpi_sleep(int ms, char *reason)
 {
 	static int acpinowait;
-	int to = ms * hz / 1000;
+
+	/* XXX ACPI integers are supposed to be unsigned. */
+	ms = MAX(1, ms);
 
 	if (cold)
 		delay(ms * 1000);
-	else {
-		if (to <= 0)
-			to = 1;
-		tsleep(&acpinowait, PWAIT, reason, to);
-	}
+	else
+		tsleep_nsec(&acpinowait, PWAIT, reason, MSEC_TO_NSEC(ms));
 }
 
 void
@@ -528,7 +525,7 @@ acpi_poll(void *arg)
 {
 	int s;
 
-	s = spltty();
+	s = splbio();
 	acpi_addtask(acpi_softc, acpi_poll_notify_task, NULL, 0);
 	acpi_softc->sc_threadwaiting = 0;
 	wakeup(acpi_softc);
@@ -997,6 +994,8 @@ aml_copyvalue(struct aml_value *lhs, struct aml_value *rhs)
 		lhs->v_objref = rhs->v_objref;
 		aml_addref(lhs->v_objref.ref, "");
 		break;
+	case AML_OBJTYPE_DEVICE:
+		break;
 	default:
 		printf("copyvalue: %x", rhs->type);
 		break;
@@ -1263,6 +1262,7 @@ aml_find_node(struct aml_node *node, const char *name,
 	struct aml_node *child;
 	const char *nn;
 
+	/* match child of this node first before recursing */
 	SIMPLEQ_FOREACH(child, &node->son, sib) {
 		nn = child->name;
 		if (nn != NULL) {
@@ -1270,12 +1270,14 @@ aml_find_node(struct aml_node *node, const char *name,
 			while (*nn == AMLOP_PARENTPREFIX) nn++;
 			if (strcmp(name, nn) == 0) {
 				/* Only recurse if cbproc() wants us to */
-				if (cbproc(child, arg) == 0)
-					continue;
+				if (cbproc(child, arg) != 0)
+					return;
 			}
 		}
-		aml_find_node(child, name, cbproc, arg);
 	}
+
+	SIMPLEQ_FOREACH(child, &node->son, sib)
+		aml_find_node(child, name, cbproc, arg);
 }
 
 /*
@@ -1483,25 +1485,11 @@ struct aml_defval {
  * We return True for Windows to fake out nasty bad AML
  */
 char *aml_valid_osi[] = {
-	"Windows 2000",
-	"Windows 2001",
-	"Windows 2001.1",
-	"Windows 2001.1 SP1",
-	"Windows 2001 SP0",
-	"Windows 2001 SP1",
-	"Windows 2001 SP2",
-	"Windows 2001 SP3",
-	"Windows 2001 SP4",
-	"Windows 2006",
-	"Windows 2006.1",
-	"Windows 2006 SP1",
-	"Windows 2006 SP2",
-	"Windows 2009",
-	"Windows 2012",
-	"Windows 2013",
-	"Windows 2015",
+	AML_VALID_OSI,
 	NULL
 };
+
+enum acpi_osi acpi_max_osi = OSI_UNKNOWN;
 
 struct aml_value *
 aml_callosi(struct aml_scope *scope, struct aml_value *val)
@@ -1528,6 +1516,11 @@ aml_callosi(struct aml_scope *scope, struct aml_value *val)
 	for (idx=0; !result && aml_valid_osi[idx] != NULL; idx++) {
 		dnprintf(10,"osi: %s,%s\n", fa->v_string, aml_valid_osi[idx]);
 		result = !strcmp(fa->v_string, aml_valid_osi[idx]);
+		if (result) {
+			if (idx > acpi_max_osi)
+				acpi_max_osi = idx;
+			break;
+		}
 	}
 	dnprintf(10,"@@ OSI found: %x\n", result);
 	return aml_allocvalue(AML_OBJTYPE_INTEGER, result, NULL);
@@ -2087,6 +2080,9 @@ aml_convert(struct aml_value *a, int ctype, int clen)
 		case AML_OBJTYPE_STRING:
 			aml_addref(a, "XConvert");
 			return a;
+		case AML_OBJTYPE_PACKAGE: /* XXX Deal with broken Lenovo X1 BIOS. */
+			c = aml_allocvalue(AML_OBJTYPE_STRING, 0, NULL);
+			break;
 		}
 		break;
 	}
@@ -2905,29 +2901,33 @@ int
 acpi_event_wait(struct aml_scope *scope, struct aml_value *evt, int timeout)
 {
 	/* Wait for event to occur; do work in meantime */
-	evt->v_evt.state = 0;
-	while (!evt->v_evt.state) {
-		if (!acpi_dotask(acpi_softc) && !cold)
-			tsleep(evt, PWAIT, "acpievt", 1);
-		else
-			delay(100);
+	while (evt->v_evt.state == 0 && timeout >= 0) {
+		if (acpi_dotask(acpi_softc))
+		    continue;
+		if (!cold) {
+			if (rwsleep(evt, &acpi_softc->sc_lck, PWAIT,
+			    "acpievt", 1) == EWOULDBLOCK) {
+				if (timeout < AML_NO_TIMEOUT)
+					timeout -= (1000 / hz);
+			}
+		} else {
+			delay(1000);
+			if (timeout < AML_NO_TIMEOUT)
+				timeout--;
+		}
 	}
-	if (evt->v_evt.state == 1) {
-		/* Object is signaled */
-		return (0);
-	} else if (timeout == 0) {
-		/* Zero timeout */
+	if (evt->v_evt.state == 0)
 		return (-1);
-	}
-	/* Wait for timeout or signal */
+	evt->v_evt.state--;
 	return (0);
 }
 
 void
 acpi_event_signal(struct aml_scope *scope, struct aml_value *evt)
 {
-	evt->v_evt.state = 1;
-	/* Wakeup waiters */
+	evt->v_evt.state++;
+	if (evt->v_evt.state > 0)
+		wakeup_one(evt);
 }
 
 void
@@ -3079,7 +3079,7 @@ aml_disasm(struct aml_scope *scope, int lvl,
 		strlcpy(mch, aml_nodename(rv->node), sizeof(mch));
 		if (rv->type == AML_OBJTYPE_METHOD) {
 			strlcat(mch, "(", sizeof(mch));
-			for (ival=0; 
+			for (ival=0;
 			    ival < AML_METHOD_ARGCOUNT(rv->v_method.flags);
 			    ival++) {
 				strlcat(mch, ival ? ", %z" : "%z",
@@ -4030,13 +4030,9 @@ aml_parse(struct aml_scope *scope, int ret_type, const char *stype)
 	case AMLOP_INDEX:
 		/* Index: tir => ObjRef */
 		idx = opargs[1]->v_integer;
-		if (idx >= opargs[0]->length || idx < 0) {
-#ifndef SMALL_KERNEL
-			aml_showvalue(opargs[0]);
-#endif
-			aml_die("Index out of bounds %d/%d\n", idx,
-			    opargs[0]->length);
-		}
+		/* Reading past the end of the array? - Ignore */
+		if (idx >= opargs[0]->length || idx < 0)
+			break;
 		switch (opargs[0]->type) {
 		case AML_OBJTYPE_PACKAGE:
 			/* Don't set opargs[0] to NULL */
@@ -4215,7 +4211,7 @@ aml_parse(struct aml_scope *scope, int ret_type, const char *stype)
 	case AMLOP_EVENT:
 		/* Event: N */
 		rv = _aml_setvalue(opargs[0], AML_OBJTYPE_EVENT, 0, 0);
-		rv->v_integer = 0;
+		rv->v_evt.state = 0;
 		break;
 	case AMLOP_MUTEX:
 		/* Mutex: Nw */

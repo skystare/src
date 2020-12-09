@@ -1,25 +1,20 @@
-# $OpenBSD: Makefile,v 1.2 2017/07/09 15:28:35 espie Exp $
+# $OpenBSD: Makefile,v 1.4 2020/08/03 14:45:27 patrick Exp $
 
 LIB=	LLVMPowerPCDesc
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=      -I${.OBJDIR}/../include/llvm/PowerPC \
 		-I${LLVM_SRCS}/lib/Target/PowerPC
 
-.include <bsd.own.mk>
-SRCS=	PPCAsmBackend.cpp \
+SRCS+=	PPCAsmBackend.cpp \
+	PPCInstPrinter.cpp \
 	PPCMCTargetDesc.cpp \
 	PPCMCAsmInfo.cpp \
 	PPCMCCodeEmitter.cpp \
 	PPCMCExpr.cpp \
 	PPCPredicates.cpp \
 	PPCMachObjectWriter.cpp \
-	PPCELFObjectWriter.cpp
+	PPCELFObjectWriter.cpp \
+	PPCXCOFFObjectWriter.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Target/PowerPC/MCTargetDesc
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Target/PowerPC/MCTargetDesc

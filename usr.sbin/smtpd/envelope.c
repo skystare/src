@@ -1,4 +1,4 @@
-/*	$OpenBSD: envelope.c,v 1.39 2018/05/29 19:48:19 eric Exp $	*/
+/*	$OpenBSD: envelope.c,v 1.47 2019/11/25 14:18:32 gilles Exp $	*/
 
 /*
  * Copyright (c) 2013 Eric Faurot <eric@openbsd.org>
@@ -33,7 +33,6 @@
 #include <fcntl.h>
 #include <imsg.h>
 #include <inttypes.h>
-#include <libgen.h>
 #include <pwd.h>
 #include <limits.h>
 #include <stdio.h>
@@ -60,7 +59,7 @@ envelope_set_errormsg(struct envelope *e, char *fmt, ...)
 	va_end(ap);
 
 	/* this should not happen */
-	if (ret == -1)
+	if (ret < 0)
 		err(1, "vsnprintf");
 
 	if ((size_t)ret >= sizeof(e->errorline))
@@ -178,6 +177,7 @@ envelope_dump_buffer(const struct envelope *ep, char *dest, size_t len)
 	envelope_ascii_dump(ep, &dest, &len, "smtpname");
 	envelope_ascii_dump(ep, &dest, &len, "helo");
 	envelope_ascii_dump(ep, &dest, &len, "hostname");
+	envelope_ascii_dump(ep, &dest, &len, "username");
 	envelope_ascii_dump(ep, &dest, &len, "errorline");
 	envelope_ascii_dump(ep, &dest, &len, "sockaddr");
 	envelope_ascii_dump(ep, &dest, &len, "sender");
@@ -199,6 +199,7 @@ envelope_dump_buffer(const struct envelope *ep, char *dest, size_t len)
 	switch (ep->type) {
 	case D_MDA:
 		envelope_ascii_dump(ep, &dest, &len, "mda-exec");
+		envelope_ascii_dump(ep, &dest, &len, "mda-subaddress");
 		envelope_ascii_dump(ep, &dest, &len, "mda-user");
 		break;
 	case D_MTA:
@@ -297,7 +298,16 @@ ascii_load_sockaddr(struct sockaddr_storage *ss, char *buf)
 		ss->ss_family = AF_LOCAL;
 	}
 	else if (strncasecmp("IPv6:", buf, 5) == 0) {
+		/* XXX - remove this after 6.6 release */
 		if (inet_pton(AF_INET6, buf + 5, &ssin6.sin6_addr) != 1)
+			return 0;
+		ssin6.sin6_family = AF_INET6;
+		memcpy(ss, &ssin6, sizeof(ssin6));
+		ss->ss_len = sizeof(struct sockaddr_in6);
+	}
+	else if (buf[0] == '[' && buf[strlen(buf)-1] == ']') {
+		buf[strlen(buf)-1] = '\0';
+		if (inet_pton(AF_INET6, buf+1, &ssin6.sin6_addr) != 1)
 			return 0;
 		ssin6.sin6_family = AF_INET6;
 		memcpy(ss, &ssin6, sizeof(ssin6));
@@ -344,12 +354,14 @@ ascii_load_flags(enum envelope_flags *dest, char *buf)
 static int
 ascii_load_bounce_type(enum bounce_type *dest, char *buf)
 {
-	if (strcasecmp(buf, "error") == 0)
-		*dest = B_ERROR;
-	else if (strcasecmp(buf, "warn") == 0)
-		*dest = B_WARNING;
-	else if (strcasecmp(buf, "dsn") == 0)
-		*dest = B_DSN;
+	if (strcasecmp(buf, "error") == 0 || strcasecmp(buf, "failed") == 0)
+		*dest = B_FAILED;
+	else if (strcasecmp(buf, "warn") == 0 ||
+	    strcasecmp(buf, "delayed") == 0)
+		*dest = B_DELAYED;
+	else if (strcasecmp(buf, "dsn") == 0 ||
+	    strcasecmp(buf, "delivered") == 0)
+		*dest = B_DELIVERED;
 	else
 		return 0;
 	return 1;
@@ -389,6 +401,9 @@ ascii_load_field(const char *field, struct envelope *ep, char *buf)
 	if (strcasecmp("dest", field) == 0)
 		return ascii_load_mailaddr(&ep->dest, buf);
 
+	if (strcasecmp("username", field) == 0)
+		return ascii_load_string(ep->username, buf, sizeof(ep->username));
+
 	if (strcasecmp("errorline", field) == 0)
 		return ascii_load_string(ep->errorline, buf,
 		    sizeof ep->errorline);
@@ -420,6 +435,9 @@ ascii_load_field(const char *field, struct envelope *ep, char *buf)
 
 	if (strcasecmp("mda-exec", field) == 0)
 		return ascii_load_string(ep->mda_exec, buf, sizeof(ep->mda_exec));
+
+	if (strcasecmp("mda-subaddress", field) == 0)
+		return ascii_load_string(ep->mda_subaddress, buf, sizeof(ep->mda_subaddress));
 
 	if (strcasecmp("mda-user", field) == 0)
 		return ascii_load_string(ep->mda_user, buf, sizeof(ep->mda_user));
@@ -574,14 +592,14 @@ ascii_dump_bounce_type(enum bounce_type type, char *dest, size_t len)
 	char *p = NULL;
 
 	switch (type) {
-	case B_ERROR:
-		p = "error";
+	case B_FAILED:
+		p = "failed";
 		break;
-	case B_WARNING:
-		p = "warn";
+	case B_DELAYED:
+		p = "delayed";
 		break;
-	case B_DSN:
-		p = "dsn";
+	case B_DELIVERED:
+		p = "delivered";
 		break;
 	default:
 		return 0;
@@ -612,13 +630,13 @@ ascii_dump_field(const char *field, const struct envelope *ep,
 		return ascii_dump_string(ep->dispatcher, buf, len);
 
 	if (strcasecmp(field, "bounce-delay") == 0) {
-		if (ep->agent.bounce.type != B_WARNING)
+		if (ep->agent.bounce.type != B_DELAYED)
 			return (1);
 		return ascii_dump_time(ep->agent.bounce.delay, buf, len);
 	}
 
 	if (strcasecmp(field, "bounce-ttl") == 0) {
-		if (ep->agent.bounce.type != B_WARNING)
+		if (ep->agent.bounce.type != B_DELAYED)
 			return (1);
 		return ascii_dump_time(ep->agent.bounce.ttl, buf, len);
 	}
@@ -631,6 +649,12 @@ ascii_dump_field(const char *field, const struct envelope *ep,
 
 	if (strcasecmp(field, "dest") == 0)
 		return ascii_dump_mailaddr(&ep->dest, buf, len);
+
+	if (strcasecmp(field, "username") == 0) {
+		if (ep->username[0])
+			return ascii_dump_string(ep->username, buf, len);
+		return 1;
+	}
 
 	if (strcasecmp(field, "errorline") == 0)
 		return ascii_dump_string(ep->errorline, buf, len);
@@ -662,6 +686,12 @@ ascii_dump_field(const char *field, const struct envelope *ep,
 	if (strcasecmp(field, "mda-exec") == 0) {
 		if (ep->mda_exec[0])
 			return ascii_dump_string(ep->mda_exec, buf, len);
+		return 1;
+	}
+
+	if (strcasecmp(field, "mda-subaddress") == 0) {
+		if (ep->mda_subaddress[0])
+			return ascii_dump_string(ep->mda_subaddress, buf, len);
 		return 1;
 	}
 
@@ -737,7 +767,7 @@ envelope_ascii_dump(const struct envelope *ep, char **dest, size_t *len,
 		return;
 
 	l = snprintf(*dest, *len, "%s: %s\n", field, buf);
-	if (l == -1 || (size_t) l >= *len)
+	if (l < 0 || (size_t) l >= *len)
 		goto err;
 	*dest += l;
 	*len -= l;

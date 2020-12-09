@@ -1,7 +1,7 @@
-# $OpenBSD: files.arm64,v 1.26 2018/07/30 10:56:00 kettenis Exp $
+# $OpenBSD: files.arm64,v 1.32 2020/07/25 12:26:09 tobhe Exp $
 
 maxpartitions	16
-maxusers	2 8 64
+maxusers	2 8 128
 
 major	{wd = 16}
 major	{sd = 24}
@@ -38,10 +38,12 @@ file	arch/arm64/arm64/support.S
 file	arch/arm64/arm64/bus_dma.c
 
 file	arch/arm64/dev/arm64_bus_space.c
+file	arch/arm64/dev/pci_machdep.c
 
 file	arch/arm64/arm64/db_disasm.c		ddb
 file	arch/arm64/arm64/db_interface.c		ddb
 file	arch/arm64/arm64/db_trace.c		ddb
+file	arch/arm64/arm64/disasm.c		ddb
 
 pseudo-device	openprom
 file	arch/arm64/arm64/openprom.c		openprom needs-flag
@@ -58,9 +60,13 @@ device	simplebus: fdt
 attach	simplebus at fdt
 file	arch/arm64/dev/simplebus.c		simplebus
 
-device	efi
+device	efi {}
 attach	efi at fdt
 file	arch/arm64/dev/efi.c			efi
+
+device	smbios
+attach	smbios at efi
+file	arch/arm64/dev/smbios.c			smbios
 
 # FDT support
 include "dev/ofw/files.ofw"
@@ -131,10 +137,6 @@ device	bcmintc
 attach	bcmintc at fdt
 file	arch/arm64/dev/bcm2836_intr.c		bcmintc
 
-include	"dev/usb/dwc2/files.dwc2"
-attach	dwctwo at fdt with bcmdwctwo
-file	arch/arm64/dev/bcm2835_dwctwo.c		bcmdwctwo	needs-flag
-
 device	pciecam: pcibus
 attach	pciecam at fdt
 file	arch/arm64/dev/pciecam.c		pciecam
@@ -148,3 +150,8 @@ file	arch/arm64/arm64/acpi_machdep.c		acpi_fdt
 device	acpipci: pcibus
 attach	acpipci at acpi
 file	arch/arm64/dev/acpipci.c		acpipci
+
+device  apm
+attach  apm at mainbus
+file	arch/arm64/dev/apm.c			apm		needs-flag
+file	arch/arm64/arm64/acpiapm.c		apm

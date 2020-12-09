@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.35 2018/08/29 17:47:07 anton Exp $
+#	$OpenBSD: Makefile,v 1.37 2020/06/22 01:02:30 dlg Exp $
 
 LDSTATIC=${STATIC}
 PROG=	kdump
@@ -16,7 +16,7 @@ ioctl.c: ${.CURDIR}/Makefile ${.CURDIR}/mkioctls
 	    ${SYS_DIR}/dev/wscons/wsconsio.h \
 	    ${SYS_DIR}/dev/vndioctl.h \
 	    ${SYS_DIR}/dev/vscsivar.h \
-	    ${SYS_DIR}/dev/pci/drm/i915_drm.h \
+	    ${SYS_DIR}/dev/pci/drm/include/uapi/drm/i915_drm.h \
 	    ${SYS_DIR}/dev/pv/pvvar.h \
 	    ${SYS_DIR}/dev/usb/udlio.h \
 	    ${SYS_DIR}/dev/usb/usb.h \
@@ -26,6 +26,7 @@ ioctl.c: ${.CURDIR}/Makefile ${.CURDIR}/mkioctls
 	    ${SYS_DIR}/net/if_pppoe.h \
 	    ${SYS_DIR}/net/if_trunk.h \
 	    ${SYS_DIR}/net/if_tun.h \
+	    ${SYS_DIR}/net/if_wg.h \
 	    ${SYS_DIR}/net/pfvar.h \
 	    ${SYS_DIR}/net/pipex.h \
 	    ${SYS_DIR}/net80211/ieee80211_ioctl.h \

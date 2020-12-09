@@ -1,4 +1,4 @@
-/*	$OpenBSD: uhci.c,v 1.143 2017/05/15 10:52:08 mpi Exp $	*/
+/*	$OpenBSD: uhci.c,v 1.152 2020/04/03 20:11:47 patrick Exp $	*/
 /*	$NetBSD: uhci.c,v 1.172 2003/02/23 04:19:26 simonb Exp $	*/
 /*	$FreeBSD: src/sys/dev/usb/uhci.c,v 1.33 1999/11/17 22:33:41 n_hibma Exp $	*/
 
@@ -190,7 +190,7 @@ usbd_status	uhci_device_setintr(struct uhci_softc *sc,
 
 void		uhci_device_clear_toggle(struct usbd_pipe *pipe);
 
-__inline__ struct uhci_soft_qh *uhci_find_prev_qh(struct uhci_soft_qh *,
+static inline struct uhci_soft_qh *uhci_find_prev_qh(struct uhci_soft_qh *,
 		    struct uhci_soft_qh *);
 
 #ifdef UHCI_DEBUG
@@ -314,7 +314,7 @@ struct usbd_pipe_methods uhci_device_isoc_methods = {
 	} while (0)
 #define uhci_active_intr_list(ex) ((ex)->inext.le_prev != NULL)
 
-__inline__ struct uhci_soft_qh *
+static inline struct uhci_soft_qh *
 uhci_find_prev_qh(struct uhci_soft_qh *pqh, struct uhci_soft_qh *sqh)
 {
 	DPRINTFN(15,("uhci_find_prev_qh: pqh=%p sqh=%p\n", pqh, sqh));
@@ -379,7 +379,7 @@ uhci_init(struct uhci_softc *sc)
 	/* Allocate and initialize real frame array. */
 	err = usb_allocmem(&sc->sc_bus,
 		  UHCI_FRAMELIST_COUNT * sizeof(uhci_physaddr_t),
-		  UHCI_FRAMELIST_ALIGN, &sc->sc_dma);
+		  UHCI_FRAMELIST_ALIGN, USB_DMA_COHERENT, &sc->sc_dma);
 	if (err)
 		return (err);
 	sc->sc_pframes = KERNADDR(&sc->sc_dma, 0);
@@ -1236,6 +1236,9 @@ uhci_idone(struct usbd_xfer *xfer)
 			actlen += len;
 		}
 		upipe->u.iso.inuse -= nframes;
+		usb_syncmem(&xfer->dmabuf, 0, xfer->length,
+		    usbd_xfer_isread(xfer) ?
+		    BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE);
 		xfer->actlen = actlen;
 		xfer->status = USBD_NORMAL_COMPLETION;
 		goto end;
@@ -1299,6 +1302,10 @@ uhci_idone(struct usbd_xfer *xfer)
 		else
 			xfer->status = USBD_IOERROR; /* more info XXX */
 	} else {
+		if (xfer->actlen)
+			usb_syncmem(&xfer->dmabuf, 0, xfer->actlen,
+			    usbd_xfer_isread(xfer) ?
+			    BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE);
 		xfer->status = USBD_NORMAL_COMPLETION;
 	}
 
@@ -1415,7 +1422,7 @@ uhci_alloc_std(struct uhci_softc *sc)
 	if (sc->sc_freetds == NULL) {
 		DPRINTFN(2,("uhci_alloc_std: allocating chunk\n"));
 		err = usb_allocmem(&sc->sc_bus, UHCI_STD_SIZE * UHCI_STD_CHUNK,
-			  UHCI_TD_ALIGN, &dma);
+			  UHCI_TD_ALIGN, USB_DMA_COHERENT, &dma);
 		if (err)
 			goto out;
 		for(i = 0; i < UHCI_STD_CHUNK; i++) {
@@ -1469,7 +1476,7 @@ uhci_alloc_sqh(struct uhci_softc *sc)
 	if (sc->sc_freeqhs == NULL) {
 		DPRINTFN(2, ("uhci_alloc_sqh: allocating chunk\n"));
 		err = usb_allocmem(&sc->sc_bus, UHCI_SQH_SIZE * UHCI_SQH_CHUNK,
-			  UHCI_QH_ALIGN, &dma);
+			  UHCI_QH_ALIGN, USB_DMA_COHERENT, &dma);
 		if (err)
 			goto out;
 		for (i = 0; i < UHCI_SQH_CHUNK; i++) {
@@ -1526,6 +1533,10 @@ uhci_alloc_std_chain(struct uhci_softc *sc, u_int len, struct usbd_xfer *xfer,
 	DPRINTFN(8, ("%s: addr=%d endpt=%d len=%u speed=%d flags=0x%x\n",
 	    __func__, addr, UE_GET_ADDR(endpt), len, xfer->device->speed,
 	    flags));
+
+	usb_syncmem(&xfer->dmabuf, 0, xfer->length,
+	    usbd_xfer_isread(xfer) ?
+	    BUS_DMASYNC_PREREAD : BUS_DMASYNC_PREWRITE);
 
 	mps = UGETW(xfer->pipe->endpoint->edesc->wMaxPacketSize);
 	if (mps == 0) {
@@ -1744,7 +1755,7 @@ uhci_abort_xfer(struct usbd_xfer *xfer, usbd_status status)
 	sc->sc_softwake = 1;
 	usb_schedsoftintr(&sc->sc_bus);
 	DPRINTFN(1,("uhci_abort_xfer: tsleep\n"));
-	tsleep(&sc->sc_softwake, PZERO, "uhciab", 0);
+	tsleep_nsec(&sc->sc_softwake, PZERO, "uhciab", INFSLP);
 	splx(s);
 
 	/*
@@ -1924,10 +1935,12 @@ uhci_device_intr_close(struct usbd_pipe *pipe)
 {
 	struct uhci_pipe *upipe = (struct uhci_pipe *)pipe;
 	struct uhci_softc *sc = (struct uhci_softc *)pipe->device->bus;
+	struct uhci_soft_qh **qhs;
 	int i, npoll;
 	int s;
 
 	/* Unlink descriptors from controller data structures. */
+	qhs = upipe->u.intr.qhs;
 	npoll = upipe->u.intr.npoll;
 	s = splusb();
 	for (i = 0; i < npoll; i++)
@@ -1942,7 +1955,7 @@ uhci_device_intr_close(struct usbd_pipe *pipe)
 
 	for(i = 0; i < npoll; i++)
 		uhci_free_sqh(sc, upipe->u.intr.qhs[i]);
-	free(upipe->u.intr.qhs, M_USBHC, 0);
+	free(qhs, M_USBHC, npoll * sizeof(*qhs));
 
 	/* XXX free other resources */
 }
@@ -2125,6 +2138,10 @@ uhci_device_isoc_enter(struct usbd_xfer *xfer)
 		printf("uhci_device_isoc_enter: overflow!\n");
 #endif
 
+	usb_syncmem(&xfer->dmabuf, 0, xfer->length,
+	    usbd_xfer_isread(xfer) ?
+	    BUS_DMASYNC_PREREAD : BUS_DMASYNC_PREWRITE);
+
 	next = iso->next;
 	if (next == -1) {
 		/* Not in use yet, schedule it a few frames ahead. */
@@ -2186,7 +2203,7 @@ uhci_device_isoc_start(struct usbd_xfer *xfer)
 #endif
 
 	/* Find the last TD */
-	i = ux->curframe + xfer->nframes;
+	i = ux->curframe + (xfer->nframes - 1);
 	if (i >= UHCI_VFRAMELIST_COUNT)
 		i -= UHCI_VFRAMELIST_COUNT;
 	end = upipe->u.iso.stds[i];
@@ -2302,7 +2319,7 @@ uhci_device_isoc_close(struct usbd_pipe *pipe)
 	}
 	splx(s);
 
-	free(iso->stds, M_USBHC, 0);
+	free(iso->stds, M_USBHC, UHCI_VFRAMELIST_COUNT * sizeof(*iso->stds));
 }
 
 usbd_status
@@ -2319,9 +2336,8 @@ uhci_setup_isoc(struct usbd_pipe *pipe)
 	int i, s;
 
 	iso = &upipe->u.iso;
-	iso->stds = malloc(UHCI_VFRAMELIST_COUNT *
-			   sizeof (struct uhci_soft_td *),
-			   M_USBHC, M_WAITOK);
+	iso->stds = mallocarray(UHCI_VFRAMELIST_COUNT, sizeof(*iso->stds),
+	    M_USBHC, M_WAITOK);
 
 	token = rd ? UHCI_TD_IN (0, endpt, addr, 0) :
 		     UHCI_TD_OUT(0, endpt, addr, 0);
@@ -2356,7 +2372,7 @@ uhci_setup_isoc(struct usbd_pipe *pipe)
  bad:
 	while (--i >= 0)
 		uhci_free_std(sc, iso->stds[i]);
-	free(iso->stds, M_USBHC, 0);
+	free(iso->stds, M_USBHC, UHCI_VFRAMELIST_COUNT * sizeof(*iso->stds));
 	return (USBD_NOMEM);
 }
 
@@ -2557,8 +2573,7 @@ uhci_device_setintr(struct uhci_softc *sc, struct uhci_pipe *upipe, int ival)
 	npoll = (UHCI_VFRAMELIST_COUNT + ival - 1) / ival;
 	DPRINTFN(2, ("uhci_device_setintr: ival=%d npoll=%d\n", ival, npoll));
 
-	qhs = mallocarray(npoll, sizeof(struct uhci_soft_qh *), M_USBHC,
-	    M_NOWAIT);
+	qhs = mallocarray(npoll, sizeof(*qhs), M_USBHC, M_NOWAIT);
 	if (qhs == NULL)
 		return (USBD_NOMEM);
 
@@ -2582,7 +2597,7 @@ uhci_device_setintr(struct uhci_softc *sc, struct uhci_pipe *upipe, int ival)
 		if (sqh == NULL) {
 			while (i > 0)
 				uhci_free_sqh(sc, qhs[--i]);
-			free(qhs, M_USBHC, 0);
+			free(qhs, M_USBHC, npoll * sizeof(*qhs));
 			return (USBD_NOMEM);
 		}
 		sqh->elink = NULL;
@@ -2633,7 +2648,7 @@ uhci_open(struct usbd_pipe *pipe)
 			return (USBD_INVAL);
 		}
 	} else {
-		switch (ed->bmAttributes & UE_XFERTYPE) {
+		switch (UE_GET_XFERTYPE(ed->bmAttributes)) {
 		case UE_CONTROL:
 			pipe->methods = &uhci_device_ctrl_methods;
 			upipe->u.ctl.sqh = uhci_alloc_sqh(sc);
@@ -2652,7 +2667,8 @@ uhci_open(struct usbd_pipe *pipe)
 			}
 			err = usb_allocmem(&sc->sc_bus,
 				  sizeof(usb_device_request_t),
-				  0, &upipe->u.ctl.reqdma);
+				  0, USB_DMA_COHERENT,
+				  &upipe->u.ctl.reqdma);
 			if (err) {
 				uhci_free_sqh(sc, upipe->u.ctl.sqh);
 				uhci_free_std(sc, upipe->u.ctl.setup);
@@ -2708,7 +2724,7 @@ usb_config_descriptor_t uhci_confd = {
 	1,
 	1,
 	0,
-	UC_SELF_POWERED,
+	UC_BUS_POWERED | UC_SELF_POWERED,
 	0			/* max power */
 };
 

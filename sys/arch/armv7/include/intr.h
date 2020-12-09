@@ -1,4 +1,4 @@
-/*	$OpenBSD: intr.h,v 1.10 2018/08/20 15:02:07 visa Exp $	*/
+/*	$OpenBSD: intr.h,v 1.14 2020/07/17 08:07:34 patrick Exp $	*/
 /*	$NetBSD: intr.h,v 1.12 2003/06/16 20:00:59 thorpej Exp $	*/
 
 /*
@@ -41,27 +41,29 @@
 
 #ifdef _KERNEL
 
-/* Interrupt priority "levels". */
+/* Interrupt priority `levels'; not mutually exclusive. */
 #define	IPL_NONE	0	/* nothing */
-#define	IPL_SOFT	1	/* generic software interrupts */
-#define	IPL_SOFTCLOCK	2	/* software clock interrupt */
-#define	IPL_SOFTNET	3	/* software network interrupt */
-#define	IPL_SOFTTTY	4	/* software serial interrupt */
+#define	IPL_SOFT	1	/* soft interrupts */
+#define	IPL_SOFTCLOCK	2	/* soft clock interrupts */
+#define	IPL_SOFTNET	3	/* soft network interrupts */
+#define	IPL_SOFTTTY	4	/* soft terminal interrupts */
 #define	IPL_BIO		5	/* block I/O */
 #define	IPL_NET		6	/* network */
-#define	IPL_TTY		7	/* terminals */
+#define	IPL_TTY		7	/* terminal */
 #define	IPL_VM		8	/* memory allocation */
-#define	IPL_AUDIO	9	/* audio device */
-#define	IPL_CLOCK	10	/* clock interrupt */
-#define	IPL_STATCLOCK	11	/* statistics clock interrupt */
-#define	IPL_SCHED	12	/* everything */
-#define	IPL_HIGH	12	/* everything */
+#define	IPL_AUDIO	9	/* audio */
+#define	IPL_CLOCK	10	/* clock */
+#define	IPL_SCHED	IPL_CLOCK
+#define	IPL_STATCLOCK	IPL_CLOCK
+#define	IPL_HIGH	11	/* everything */
+#define	IPL_IPI		12	/* interprocessor interrupt */
+#define	NIPL		13	/* number of levels */
 
-#define	NIPL		13
-
-/* Interrupt priority "flags". */
-#define	IPL_MPSAFE	0	/* no "mpsafe" interrupts */
-#define	IPL_MPFLOOR	IPL_NONE	/* no MP on armv7 */
+#define	IPL_MPFLOOR	IPL_TTY
+/* Interrupt priority 'flags'. */
+#define	IPL_IRQMASK	0xf	/* priority only */
+#define	IPL_FLAGMASK	0xf00	/* flags only*/
+#define	IPL_MPSAFE	0x100	/* 'mpsafe' interrupt, no kernel lock */
 
 /* Interrupt sharing types. */
 #define	IST_NONE	0	/* none */
@@ -69,15 +71,17 @@
 #define	IST_EDGE	2	/* edge-triggered */
 #define	IST_LEVEL	3	/* level-triggered */
 
-#define IST_LEVEL_LOW	 IST_LEVEL
-#define IST_LEVEL_HIGH   4
-#define IST_EDGE_FALLING IST_EDGE
-#define IST_EDGE_RISING  5
-#define IST_EDGE_BOTH    6
+#define	IST_LEVEL_LOW		IST_LEVEL
+#define	IST_LEVEL_HIGH		4
+#define	IST_EDGE_FALLING	IST_EDGE
+#define	IST_EDGE_RISING		5
+#define	IST_EDGE_BOTH		6
 
 #ifndef _LOCORE
 #include <sys/device.h>
 #include <sys/queue.h>
+
+struct cpu_info;
 
 int     splraise(int);
 int     spllower(int);
@@ -86,8 +90,8 @@ void    splx(int);
 void	arm_do_pending_intr(int);
 void	arm_set_intr_handler(int (*raise)(int), int (*lower)(int),
 	void (*x)(int), void (*setipl)(int),
-	void *(*intr_establish)(int irqno, int level, int (*func)(void *),
-	    void *cookie, char *name),
+	void *(*intr_establish)(int irqno, int level, struct cpu_info *ci,
+	    int (*func)(void *), void *cookie, char *name),
 	void (*intr_disestablish)(void *cookie),
 	const char *(*intr_string)(void *cookie),
 	void (*intr_handle)(void *));
@@ -97,8 +101,8 @@ struct arm_intr_func {
 	int (*lower)(int);
 	void (*x)(int);
 	void (*setipl)(int);
-	void *(*intr_establish)(int irqno, int level, int (*func)(void *),
-	    void *cookie, char *name);
+	void *(*intr_establish)(int irqno, int level, struct cpu_info *,
+	    int (*func)(void *), void *cookie, char *name);
 	void (*intr_disestablish)(void *cookie);
 	const char *(*intr_string)(void *cookie);
 };
@@ -135,7 +139,7 @@ void arm_setsoftintr(int si);
 #define _setsoftintr arm_setsoftintr
 
 #include <arm/softintr.h>
-    
+
 void *arm_intr_establish(int irqno, int level, int (*func)(void *),
     void *cookie, char *name);
 void arm_intr_disestablish(void *cookie);
@@ -145,19 +149,19 @@ const char *arm_intr_string(void *cookie);
 void arm_clock_register(void (*)(void), void (*)(u_int), void (*)(int),
     void (*)(void));
 
-struct cpu_info;
-
 struct interrupt_controller {
 	int	ic_node;
 	void	*ic_cookie;
-	void	*(*ic_establish)(void *, int *, int, int (*)(void *),
-		    void *, char *);
-	void	*(*ic_establish_msi)(void *, uint64_t *, uint64_t *, int,
+	void	*(*ic_establish)(void *, int *, int, struct cpu_info *,
 		    int (*)(void *), void *, char *);
+	void	*(*ic_establish_msi)(void *, uint64_t *, uint64_t *, int,
+		    struct cpu_info *, int (*)(void *), void *, char *);
 	void	 (*ic_disestablish)(void *);
 	void	 (*ic_enable)(void *);
 	void	 (*ic_disable)(void *);
 	void	 (*ic_route)(void *, int, struct cpu_info *);
+	void	 (*ic_cpu_enable)(void);
+	void	 (*ic_barrier)(void *);
 
 	LIST_ENTRY(interrupt_controller) ic_list;
 	uint32_t ic_phandle;
@@ -168,20 +172,35 @@ void	 arm_intr_init_fdt(void);
 void	 arm_intr_register_fdt(struct interrupt_controller *);
 void	*arm_intr_establish_fdt(int, int, int (*)(void *),
 	    void *, char *);
+void	*arm_intr_establish_fdt_cpu(int, int, struct cpu_info *,
+	    int (*)(void *), void *, char *);
 void	*arm_intr_establish_fdt_idx(int, int, int, int (*)(void *),
 	    void *, char *);
+void	*arm_intr_establish_fdt_idx_cpu(int, int, int, struct cpu_info *,
+	    int (*)(void *), void *, char *);
 void	*arm_intr_establish_fdt_imap(int, int *, int, int, int (*)(void *),
 	    void *, char *);
-void	*arm_intr_establish_fdt_msi(int, uint64_t *, uint64_t *, int ,
+void	*arm_intr_establish_fdt_imap_cpu(int, int *, int, int,
+	    struct cpu_info *, int (*)(void *), void *, char *);
+void	*arm_intr_establish_fdt_msi(int, uint64_t *, uint64_t *, int,
 	    int (*)(void *), void *, char *);
+void	*arm_intr_establish_fdt_msi_cpu(int, uint64_t *, uint64_t *, int,
+	    struct cpu_info *, int (*)(void *), void *, char *);
 void	 arm_intr_disestablish_fdt(void *);
 void	 arm_intr_enable(void *);
 void	 arm_intr_disable(void *);
 void	 arm_intr_route(void *, int, struct cpu_info *);
+void	 arm_intr_cpu_enable(void);
 
 void	*arm_intr_parent_establish_fdt(void *, int *, int,
-	    int (*)(void *), void *, char *);
+	    struct cpu_info *ci, int (*)(void *), void *, char *);
 void	 arm_intr_parent_disestablish_fdt(void *);
+
+void	 arm_send_ipi(struct cpu_info *, int);
+extern void (*intr_send_ipi_func)(struct cpu_info *, int);
+
+#define ARM_IPI_NOP	0
+#define ARM_IPI_DDB	1
 
 #ifdef DIAGNOSTIC
 /*

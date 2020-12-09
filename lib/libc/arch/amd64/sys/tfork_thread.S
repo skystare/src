@@ -1,4 +1,4 @@
-/*	$OpenBSD: tfork_thread.S,v 1.6 2016/05/07 19:05:21 guenther Exp $ */
+/*	$OpenBSD: tfork_thread.S,v 1.10 2020/10/18 14:28:17 deraadt Exp $ */
 /*-
  * Copyright (c) 2000 Peter Wemm <peter@FreeBSD.org>
  * Copyright (c) 2003 Alan L. Cox <alc@cs.rice.edu>
@@ -27,9 +27,6 @@
  */
 
 #include <machine/asm.h>
-#if 0
-__FBSDID("$FreeBSD: /repoman/r/ncvs/src/lib/libc/amd64/gen/rfork_thread.S,v 1.1 2003/10/13 20:32:33 alc Exp $");
-#endif
 
 /*
  * With thanks to John Dyson for the original version of this.
@@ -48,6 +45,7 @@ __FBSDID("$FreeBSD: /repoman/r/ncvs/src/lib/libc/amd64/gen/rfork_thread.S,v 1.1 
  */
 
 ENTRY(__tfork_thread)
+	.cfi_startproc
 	movq	%rdx, %r8
 	movq	%rcx, %r9
 
@@ -55,6 +53,7 @@ ENTRY(__tfork_thread)
 	 * Prepare and execute the thread creation syscall
 	 */
 	movl	$SYS___tfork, %eax
+	.cfi_endproc
 	syscall
 	jb 	2f
 
@@ -65,14 +64,24 @@ ENTRY(__tfork_thread)
 	jz	1f
 	ret
 
+	/* the retpoline we'll use to call the child's main */
+	_ALIGN_TRAPS
+	.cfi_startproc
+0:	JMP_RETPOLINE(r8)
+
 	/*
 	 * If we are in the child (new thread), then
 	 * set-up the call to the internal subroutine.  If it
 	 * returns, then call __threxit.
 	 */
+	_ALIGN_TRAPS
 1:
+	/* Mark top frame of new thread in CFI and with zero FP */
+	.cfi_undefined	rip
+	.cfi_undefined	rsp
+	xorl	%ebp, %ebp
 	movq	%r9, %rdi
-	call	*%r8
+	call	0b
 
 	/*
 	 * Thread exit system call
@@ -80,6 +89,7 @@ ENTRY(__tfork_thread)
 	movl	$SYS___threxit, %eax
 	xorl	%edi, %edi
 	syscall
+	int3
 
 	/*
 	 * Branch here if the thread creation fails:
@@ -87,4 +97,5 @@ ENTRY(__tfork_thread)
 2:
 	SET_ERRNO
 	ret
+	.cfi_endproc
 END(__tfork_thread)

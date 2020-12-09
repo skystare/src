@@ -1,4 +1,4 @@
-/* $OpenBSD: mainbus.c,v 1.19 2017/09/11 05:38:51 jsg Exp $ */
+/* $OpenBSD: mainbus.c,v 1.23 2020/08/26 03:29:05 visa Exp $ */
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
@@ -24,6 +24,7 @@
 
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/fdt.h>
+#include <dev/ofw/ofw_thermal.h>
 
 #include <arm/mainbus/mainbus.h>
 
@@ -59,8 +60,6 @@ struct cfdriver mainbus_cd = {
 };
 
 struct arm32_bus_dma_tag mainbus_dma_tag = {
-	0,
-	0,
 	NULL,
 	_bus_dmamap_create,
 	_bus_dmamap_destroy,
@@ -68,6 +67,7 @@ struct arm32_bus_dma_tag mainbus_dma_tag = {
 	_bus_dmamap_load_mbuf,
 	_bus_dmamap_load_uio,
 	_bus_dmamap_load_raw,
+	_bus_dmamap_load_buffer,
 	_bus_dmamap_unload,
 	_bus_dmamap_sync,
 	_bus_dmamem_alloc,
@@ -87,7 +87,6 @@ mainbus_match(struct device *parent, void *cfdata, void *aux)
 	return (1);
 }
 
-extern char *hw_prod;
 extern struct bus_space armv7_bs_tag;
 void platform_init_mainbus(struct device *);
 
@@ -95,7 +94,7 @@ void
 mainbus_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct mainbus_softc *sc = (struct mainbus_softc *)self;
-	char model[128];
+	char prop[128];
 	int node, len;
 
 	arm_intr_init_fdt();
@@ -106,14 +105,21 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_acells = OF_getpropint(OF_peer(0), "#address-cells", 1);
 	sc->sc_scells = OF_getpropint(OF_peer(0), "#size-cells", 1);
 
-	len = OF_getprop(sc->sc_node, "model", model, sizeof(model));
+	len = OF_getprop(sc->sc_node, "model", prop, sizeof(prop));
 	if (len > 0) {
-		printf(": %s\n", model);
+		printf(": %s\n", prop);
 		hw_prod = malloc(len, M_DEVBUF, M_NOWAIT);
 		if (hw_prod)
-			strlcpy(hw_prod, model, len);
+			strlcpy(hw_prod, prop, len);
 	} else
 		printf(": unknown model\n");
+
+	len = OF_getprop(sc->sc_node, "serial-number", prop, sizeof(prop));
+	if (len > 0) {
+		hw_serial = malloc(len, M_DEVBUF, M_NOWAIT);
+		if (hw_serial)
+			strlcpy(hw_serial, prop, len);
+	}
 
 	/* Attach primary CPU first. */
 	mainbus_attach_cpus(self, mainbus_match_primary);
@@ -140,6 +146,8 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 
 	/* Attach secondary CPUs. */
 	mainbus_attach_cpus(self, mainbus_match_secondary);
+
+	thermal_init();
 }
 
 /*

@@ -1,4 +1,4 @@
-.\"	$OpenBSD: npppd.conf.5,v 1.22 2018/06/18 06:04:25 jmc Exp $
+.\"	$OpenBSD: npppd.conf.5,v 1.28 2020/08/09 14:35:32 mvs Exp $
 .\"
 .\" Copyright (c) 2012 YASUOKA Masahiko <yasuoka@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 18 2018 $
+.Dd $Mdocdate: August 9 2020 $
 .Dt NPPPD.CONF 5
 .Os
 .Sh NAME
@@ -325,6 +325,9 @@ The link is disconnected if there are no data packets sent or received
 for more than the amount of the
 .Ar idle-timeout .
 The default is 0, which disables the idle timer.
+This value must be 0 for
+.Xr pppx 4
+sessions.
 .It Ic tcp-mss-adjust Ar yes | no
 If
 .Dq yes
@@ -488,7 +491,7 @@ The address space can be specified by
 (e.g. 192.168.0.2-192.168.0.254)
 or
 .Ar address-mask
-(e.g. 192.168.0.0/24) .
+(e.g. 192.168.0.0/24).
 .Ar dynamic
 means the address space is reserved for dynamic allocation;
 .Ar static
@@ -522,7 +525,7 @@ setting is described below:
 .Ic interface Ar ifname Ic address Ar address Ic ipcp Ar ipcp
 .Pp
 Use
-.Xr tun 4
+.Xr pppac 4
 or
 .Xr pppx 4
 and
@@ -542,7 +545,7 @@ The
 .Ic authentication
 setting is described below:
 .Pp
-.Ic authentication Ar name Ic type Ar type { Ar option ... Ic }
+.Ic authentication Ar name Ic type Ar type Ic { Ar option ... Ic }
 .Pp
 Specify a
 .Ar name
@@ -642,7 +645,7 @@ and
 .Ar interface
 settings so that they are used together.
 .Pp
-.Ic bind Ic tunnel from Ar tunnel Ic authenticated by Ar authentication
+.Ic bind tunnel from Ar tunnel Ic authenticated by Ar authentication
 .Ic to Ar ifname
 .Sh EXAMPLES
 A very simple configuration example is below:
@@ -670,8 +673,8 @@ ipcp IPCP {
     pool-address 10.0.0.2-10.0.0.254
     dns-servers 8.8.8.8
 }
-interface tun0 address 10.0.0.1 ipcp IPCP
-interface tun1 address 10.0.0.1 ipcp IPCP
+interface pppac0 address 10.0.0.1 ipcp IPCP
+interface pppac1 address 10.0.0.1 ipcp IPCP
 authentication RADIUS type radius {
     username-suffix "@example.com"
     authentication-server {
@@ -685,13 +688,12 @@ authentication LOCAL type local {
     username-suffix "@local"
     users-file "/etc/npppd/npppd-users"
 }
-bind tunnel from L2TP authenticated by RADIUS to tun0
-bind tunnel from L2TP authenticated by LOCAL to tun1
+bind tunnel from L2TP authenticated by RADIUS to pppac0
+bind tunnel from L2TP authenticated by LOCAL to pppac1
 .Ed
 .Sh SEE ALSO
 .Xr pipex 4 ,
 .Xr pppx 4 ,
-.Xr tun 4 ,
 .Xr npppctl 8 ,
 .Xr npppd 8 ,
 .Xr sysctl 8

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ufs_vnops.c,v 1.142 2018/06/21 14:17:23 visa Exp $	*/
+/*	$OpenBSD: ufs_vnops.c,v 1.152 2020/06/11 09:18:43 mpi Exp $	*/
 /*	$NetBSD: ufs_vnops.c,v 1.18 1996/05/11 18:28:04 mycroft Exp $	*/
 
 /*
@@ -72,8 +72,8 @@
 
 #include <uvm/uvm_extern.h>
 
-int ufs_chmod(struct vnode *, int, struct ucred *, struct proc *);
-int ufs_chown(struct vnode *, uid_t, gid_t, struct ucred *, struct proc *);
+int ufs_chmod(struct vnode *, int, struct ucred *);
+int ufs_chown(struct vnode *, uid_t, gid_t, struct ucred *);
 int filt_ufsread(struct knote *, long);
 int filt_ufswrite(struct knote *, long);
 int filt_ufsvnode(struct knote *, long);
@@ -274,9 +274,13 @@ ufs_access(void *v)
 	if ((mode & VWRITE) && (DIP(ip, flags) & IMMUTABLE))
 		return (EPERM);
 
-	if ((vp->v_mount->mnt_flag & MNT_NOPERM) &&
-	    (vp->v_flag & VROOT) == 0)
-		return (0);
+	if (vnoperm(vp)) {
+		/* For VEXEC, at least one of the execute bits must be set. */
+		if ((mode & VEXEC) && vp->v_type != VDIR &&
+		    (DIP(ip, mode) & (S_IXUSR|S_IXGRP|S_IXOTH)) == 0)
+			return EACCES;
+		return 0;
+	}
 
 	return (vaccess(vp->v_type, DIP(ip, mode), DIP(ip, uid), DIP(ip, gid),
 	    mode, ap->a_cred));
@@ -335,7 +339,6 @@ ufs_setattr(void *v)
 	struct vnode *vp = ap->a_vp;
 	struct inode *ip = VTOI(vp);
 	struct ucred *cred = ap->a_cred;
-	struct proc *p = ap->a_p;
 	int error;
 	long hint = NOTE_ATTRIB;
 	u_quad_t oldsize;
@@ -353,10 +356,10 @@ ufs_setattr(void *v)
 		if (vp->v_mount->mnt_flag & MNT_RDONLY)
 			return (EROFS);
 		if (cred->cr_uid != DIP(ip, uid) &&
-		    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0 &&
+		    !vnoperm(vp) &&
 		    (error = suser_ucred(cred)))
 			return (error);
-		if (cred->cr_uid == 0) {
+		if (cred->cr_uid == 0 || vnoperm(vp)) {
 			if ((DIP(ip, flags) & (SF_IMMUTABLE | SF_APPEND)) &&
 			    securelevel > 0)
 				return (EPERM);
@@ -380,7 +383,7 @@ ufs_setattr(void *v)
 	if (vap->va_uid != (uid_t)VNOVAL || vap->va_gid != (gid_t)VNOVAL) {
 		if (vp->v_mount->mnt_flag & MNT_RDONLY)
 			return (EROFS);
-		error = ufs_chown(vp, vap->va_uid, vap->va_gid, cred, p);
+		error = ufs_chown(vp, vap->va_uid, vap->va_gid, cred);
 		if (error)
 			return (error);
 	}
@@ -413,10 +416,10 @@ ufs_setattr(void *v)
 		if (vp->v_mount->mnt_flag & MNT_RDONLY)
 			return (EROFS);
 		if (cred->cr_uid != DIP(ip, uid) &&
-		    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0 &&
+		    !vnoperm(vp) &&
 		    (error = suser_ucred(cred)) &&
 		    ((vap->va_vaflags & VA_UTIMES_NULL) == 0 || 
-		    (error = VOP_ACCESS(vp, VWRITE, cred, p))))
+		    (error = VOP_ACCESS(vp, VWRITE, cred, ap->a_p))))
 			return (error);
 		if (vap->va_mtime.tv_nsec != VNOVAL)
 			ip->i_flag |= IN_CHANGE | IN_UPDATE;
@@ -444,7 +447,7 @@ ufs_setattr(void *v)
 	if (vap->va_mode != (mode_t)VNOVAL) {
 		if (vp->v_mount->mnt_flag & MNT_RDONLY)
 			return (EROFS);
-		error = ufs_chmod(vp, (int)vap->va_mode, cred, p);
+		error = ufs_chmod(vp, (int)vap->va_mode, cred);
 	}
 	VN_KNOTE(vp, hint);
 	return (error);
@@ -455,17 +458,16 @@ ufs_setattr(void *v)
  * Inode must be locked before calling.
  */
 int
-ufs_chmod(struct vnode *vp, int mode, struct ucred *cred, struct proc *p)
+ufs_chmod(struct vnode *vp, int mode, struct ucred *cred)
 {
 	struct inode *ip = VTOI(vp);
 	int error;
 
 	if (cred->cr_uid != DIP(ip, uid) &&
-	    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0 &&
+	    !vnoperm(vp) &&
 	    (error = suser_ucred(cred)))
 		return (error);
-	if (cred->cr_uid &&
-	    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0) {
+	if (cred->cr_uid && !vnoperm(vp)) {
 		if (vp->v_type != VDIR && (mode & S_ISTXT))
 			return (EFTYPE);
 		if (!groupmember(DIP(ip, gid), cred) && (mode & ISGID))
@@ -484,8 +486,7 @@ ufs_chmod(struct vnode *vp, int mode, struct ucred *cred, struct proc *p)
  * inode must be locked prior to call.
  */
 int
-ufs_chown(struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred,
-    struct proc *p)
+ufs_chown(struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred)
 {
 	struct inode *ip = VTOI(vp);
 	uid_t ouid;
@@ -505,7 +506,7 @@ ufs_chown(struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred,
 	 */
 	if ((cred->cr_uid != DIP(ip, uid) || uid != DIP(ip, uid) ||
 	    (gid != DIP(ip, gid) && !groupmember(gid, cred))) &&
-	    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0 &&
+	    !vnoperm(vp) &&
 	    (error = suser_ucred(cred)))
 		return (error);
 	ogid = DIP(ip, gid);
@@ -546,12 +547,12 @@ ufs_chown(struct vnode *vp, uid_t uid, gid_t gid, struct ucred *cred,
 
 	if (ouid != uid || ogid != gid)
 		ip->i_flag |= IN_CHANGE;
-	if (ouid != uid && cred->cr_uid != 0 &&
-	    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0)
-		DIP_AND(ip, mode, ~ISUID);
-	if (ogid != gid && cred->cr_uid != 0 &&
-	    (vp->v_mount->mnt_flag & MNT_NOPERM) == 0)
-		DIP_AND(ip, mode, ~ISGID);
+	if (!vnoperm(vp)) {
+		if (ouid != uid && cred->cr_uid != 0)
+			DIP_AND(ip, mode, ~ISUID);
+		if (ogid != gid && cred->cr_uid != 0)
+			DIP_AND(ip, mode, ~ISGID);
+	}
 	return (0);
 
 error:
@@ -975,7 +976,7 @@ abortit:
 		if ((DIP(dp, mode) & S_ISTXT) && tcnp->cn_cred->cr_uid != 0 &&
 		    tcnp->cn_cred->cr_uid != DIP(dp, uid) &&
 		    DIP(xp, uid )!= tcnp->cn_cred->cr_uid &&
-		    (tdvp->v_mount->mnt_flag & MNT_NOPERM) == 0) {
+		    !vnoperm(tdvp)) {
 			error = EPERM;
 			goto bad;
 		}
@@ -1853,7 +1854,7 @@ ufs_makeinode(int mode, struct vnode *dvp, struct vnode **vpp,
 		softdep_change_linkcnt(ip, 0);
 	if ((DIP(ip, mode) & ISGID) &&
 		!groupmember(DIP(ip, gid), cnp->cn_cred) &&
-	    (dvp->v_mount->mnt_flag & MNT_NOPERM) == 0 &&
+	    !vnoperm(dvp) &&
 	    suser_ucred(cnp->cn_cred))
 		DIP_AND(ip, mode, ~ISGID);
 
@@ -1889,12 +1890,26 @@ bad:
 	return (error);
 }
 
-struct filterops ufsread_filtops = 
-	{ 1, NULL, filt_ufsdetach, filt_ufsread };
-struct filterops ufswrite_filtops = 
-	{ 1, NULL, filt_ufsdetach, filt_ufswrite };
-struct filterops ufsvnode_filtops = 
-	{ 1, NULL, filt_ufsdetach, filt_ufsvnode };
+const struct filterops ufsread_filtops = {
+	.f_flags	= FILTEROP_ISFD,
+	.f_attach	= NULL,
+	.f_detach	= filt_ufsdetach,
+	.f_event	= filt_ufsread,
+};
+
+const struct filterops ufswrite_filtops = {
+	.f_flags	= FILTEROP_ISFD,
+	.f_attach	= NULL,
+	.f_detach	= filt_ufsdetach,
+	.f_event	= filt_ufswrite,
+};
+
+const struct filterops ufsvnode_filtops = {
+	.f_flags	= FILTEROP_ISFD,
+	.f_attach	= NULL,
+	.f_detach	= filt_ufsdetach,
+	.f_event	= filt_ufsvnode,
+};
 
 int
 ufs_kqfilter(void *v)
@@ -1919,7 +1934,7 @@ ufs_kqfilter(void *v)
 
 	kn->kn_hook = (caddr_t)vp;
 
-	SLIST_INSERT_HEAD(&vp->v_selectinfo.si_note, kn, kn_selnext);
+	klist_insert(&vp->v_selectinfo.si_note, kn);
 
 	return (0);
 }
@@ -1929,7 +1944,7 @@ filt_ufsdetach(struct knote *kn)
 {
 	struct vnode *vp = (struct vnode *)kn->kn_hook;
 
-	SLIST_REMOVE(&vp->v_selectinfo.si_note, kn, knote, kn_selnext);
+	klist_remove(&vp->v_selectinfo.si_note, kn);
 }
 
 int
@@ -1949,14 +1964,17 @@ filt_ufsread(struct knote *kn, long hint)
 
 #ifdef EXT2FS
 	if (IS_EXT2_VNODE(ip->i_vnode))
-		kn->kn_data = ext2fs_size(ip) - kn->kn_fp->f_offset;
+		kn->kn_data = ext2fs_size(ip) - foffset(kn->kn_fp);
 	else
 #endif
-		kn->kn_data = DIP(ip, size) - kn->kn_fp->f_offset;
+		kn->kn_data = DIP(ip, size) - foffset(kn->kn_fp);
 	if (kn->kn_data == 0 && kn->kn_sfflags & NOTE_EOF) {
 		kn->kn_fflags |= NOTE_EOF;
 		return (1);
 	}
+
+	if (kn->kn_flags & __EV_POLL)
+		return (1);
 
 	return (kn->kn_data != 0);
 }

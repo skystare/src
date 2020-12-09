@@ -1,4 +1,4 @@
-#	$OpenBSD: GENERIC,v 1.463 2018/08/31 00:09:13 jmatthew Exp $
+#	$OpenBSD: GENERIC,v 1.495 2020/11/15 16:47:12 kettenis Exp $
 #
 # For further information on compiling OpenBSD kernels, see the config(8)
 # man page.
@@ -15,7 +15,6 @@ maxusers	80			# estimated number of users
 
 option		USER_PCICONF	# user-space PCI configuration
 
-#option		VM86		# Virtual 8086 emulation
 option		APERTURE	# in-kernel aperture driver for XFree86
 option		MTRR		# CPU memory range attributes control
 
@@ -46,7 +45,9 @@ acpibtn*	at acpi?
 acpicpu*	at acpi?
 acpicmos*	at acpi?
 acpidock*	at acpi?
+acpidmar0	at acpi? disable
 acpiec*		at acpi?
+acpipci*	at acpi?
 acpiprt*	at acpi?
 acpisbs*	at acpi?
 acpitz*		at acpi?
@@ -60,14 +61,21 @@ acpivideo*	at acpi?
 acpivout*	at acpivideo?
 acpipwrres*	at acpi?
 aibs*		at acpi?
+amdgpio*	at acpi?
+aplgpio*	at acpi?
 bytgpio*	at acpi?
 chvgpio*	at acpi?
+glkgpio*	at acpi?
+pchgpio*	at acpi?
 sdhc*		at acpi?
 acpicbkbd*	at acpi?
 acpials*	at acpi?
+abl*		at acpi?	# Apple Backlight
+asmc*		at acpi?	# Apple SMC
 tpm*		at acpi?
 acpihve*	at acpi?
 acpisurface*	at acpi?
+acpihid*	at acpi?
 ipmi0		at acpi? disable
 ccpmic*		at iic?
 tipmic*		at iic?
@@ -77,6 +85,7 @@ mpbios0		at bios0
 ipmi0	at mainbus? disable	# IPMI
 
 vmt0	at pvbus?		# VMware Tools
+pvclock0 at pvbus?		# KVM pvclock
 
 xen0	at pvbus?		# Xen HVM domU
 xnf*	at xen?			# Xen Netfront
@@ -99,6 +108,7 @@ amdpcib* at pci?		# AMD 8111 LPC bridge
 tcpcib*	at pci?			# Intel Atom E600 LPC bridge
 kate*	at pci?			# AMD K8 temperature sensor
 km*	at pci?			# AMD K10 temperature sensor
+ksmn*	at pci?			# AMD K17 temperature sensor
 amas*	at pci? disable		# AMD memory configuration
 pchtemp* at pci?		# Intel C610 termperature sensor
 ccp*	at pci?			# AMD Cryptographic Co-processor
@@ -126,7 +136,6 @@ lm*	at wbsio?
 uguru0	at isa? disable port 0xe0	# ABIT uGuru
 
 aps0	at isa? port 0x1600		# ThinkPad Active Protection System
-asmc0	at isa? port 0x300		# Apple SMC
 
 piixpm*	at pci?			# Intel PIIX PM
 iic*	at piixpm?
@@ -222,6 +231,8 @@ uvscom*	at uhub?		# SUNTAC Slipper U VS-10U serial
 ucom*	at uvscom?
 ubsa*	at uhub?		# Belkin serial adapter
 ucom*	at ubsa?
+ukspan* at uhub?		# Keyspan USA19HS serial adapter
+ucom*	at ukspan?
 uftdi*	at uhub?		# FTDI FT8U100AX serial adapter
 ucom*	at uftdi?
 uplcom* at uhub?		# I/O DATA USB-RSAQ2 serial adapter
@@ -232,6 +243,8 @@ uslcom*	at uhub?		# Silicon Laboratories CP210x serial
 ucom*	at uslcom?
 uscom*	at uhub?		# Simple USB serial adapters
 ucom*	at uscom?
+ucrcom*	at uhub?		# Chromebook serial
+ucom*	at ucrcom?
 uark*	at uhub?		# Arkmicro ARK3116 serial
 ucom*	at uark?
 moscom*	at uhub?		# MosChip MCS7703 serial
@@ -246,6 +259,8 @@ uchcom*	at uhub?		# WinChipHead CH341/340 serial
 ucom*	at uchcom?
 uticom*	at uhub?		# TI serial
 ucom*	at uticom?
+uxrcom*	at uhub?		# Exar XR21V1410 serial
+ucom*	at uxrcom?
 uaudio* at uhub?		# USB Audio
 audio*	at uaudio?
 umidi*	at uhub?		# USB MIDI
@@ -270,7 +285,9 @@ ucom*	at ucycom?
 uslhcom* at uhidev?		# Silicon Labs CP2110 USB HID UART
 ucom*	at uslhcom?
 uhid*	at uhidev?		# USB generic HID support
+fido*	at uhidev?		# FIDO/U2F security key support
 upd*	at uhidev?		# USB Power Devices sensors
+umstc*	at uhidev?		# Microsoft Surface Type Cover
 aue*	at uhub?		# ADMtek AN986 Pegasus Ethernet
 atu*	at uhub?		# Atmel AT76c50x based 802.11b
 axe*	at uhub?		# ASIX Electronics AX88172 USB Ethernet
@@ -304,6 +321,7 @@ urtw*	at uhub?		# Realtek 8187
 rsu*	at uhub?		# Realtek RTL8188SU/RTL8191SU/RTL8192SU
 urtwn*	at uhub?		# Realtek RTL8188CU/RTL8192CU
 udcf*	at uhub?		# Gude Expert mouseCLOCK
+umbg*	at uhub?		# Meinberg Funkuhren USB5131/DCF600USB
 umb*	at uhub?		# Mobile Broadband Interface Model
 uthum*	at uhidev?		# TEMPerHUM sensor
 ugold*	at uhidev?		# gold TEMPer sensor
@@ -325,6 +343,7 @@ bwfm*	at uhub?		# Broadcom FullMAC
 
 puc*	at pci?			# PCI "universal" communication device
 com*	at cardbus?
+com*	at pci?
 
 sdhc*	at pci?			# SD Host Controller
 sdmmc*	at sdhc?		# SD/MMC bus
@@ -354,15 +373,20 @@ wsmouse*	at pms? mux 0
 inteldrm*	at pci? 	# Intel i915, i945 DRM driver
 intagp*		at inteldrm?
 agp*		at intagp?
-drm0		at inteldrm? console 1
+drm0		at inteldrm? primary 1
 drm*		at inteldrm?
-wsdisplay0	at inteldrm? console 1
+wsdisplay0	at inteldrm? primary 1
 wsdisplay*	at inteldrm? mux -1
 radeondrm*	at pci? 	# ATI Radeon DRM driver
-drm0		at radeondrm? console 1
+drm0		at radeondrm? primary 1
 drm*		at radeondrm?
-wsdisplay0	at radeondrm? console 1
+wsdisplay0	at radeondrm? primary 1
 wsdisplay*	at radeondrm? mux -1
+amdgpu*		at pci?
+drm0		at amdgpu? primary 1
+drm*		at amdgpu?
+wsdisplay0	at amdgpu? primary 1
+wsdisplay*	at amdgpu? mux -1
 
 pcppi0		at isa?
 
@@ -384,7 +408,7 @@ lpt0	at isa? port 0x378 irq 7	# standard PC parallel ports
 lpt*	at puc?
 
 efifb0		at mainbus?		# EFI Framebuffer
-wsdisplay0	at efifb? console ?
+wsdisplay0	at efifb?
 
 ahc*	at pci?				# Adaptec 2940 SCSI controllers
 jmb*	at pci?				# JMicron JMB36x controllers
@@ -411,9 +435,7 @@ qlw*	at pci?				# QLogic ISP SCSI
 qla*	at pci?				# QLogic ISP 2[123]xx FibreChannel
 qle*	at pci?				# QLogic ISP 2[45]xx FibreChannel
 aic*	at pcmcia?			# PCMCIA Adaptec 152[02] SCSI
-#esp*	at pcmcia?			# PCMCIA based NCR 53C9X SCSI
 siop*	at pci?				# NCR 538XX SCSI controllers
-#adv*	at pci?				# AdvanSys 1200A/B and ULTRA SCSI
 adw*	at pci?				# AdvanSys ULTRA WIDE SCSI
 pcscp*	at pci?				# AMD 53c974 PCscsi-PCI SCSI
 #trm*	at pci?				# Tekram DC-3x5U SCSI Controllers
@@ -470,13 +492,10 @@ rl*	at pci?				# Realtek 81[23]9 ethernet
 rl*	at cardbus?			# Realtek 81[23]9 ethernet
 #mtd*	at pci?				# Myson MTD800/803/891
 epic*	at pci?				# SMC EPIC/100 ethernet
-#tl*	at pci?				# Compaq Thunderlan ethernet
 vr*	at pci?				# VIA Rhine ethernet
-#wb*	at pci?				# Winbond W89C840F ethernet
 sf*	at pci?				# Adaptec AIC-6915 ethernet
 sis*	at pci?				# SiS 900/7016 ethernet
 se*	at pci?				# SiS 190/191 ethernet
-#ste*	at pci?				# Sundance ST201 ethernet BORKED
 pcn*	at pci?				# AMD PCnet-PCI Ethernet
 dc*	at pci?				# 21143, "tulip" clone ethernet
 dc*	at cardbus?			# 21143, "tulip" clone ethernet
@@ -496,6 +515,7 @@ bge*	at pci?				# Broadcom BCM57xx (aka Tigon3)
 bnx*	at pci?				# Broadcom BCM5706/5708 GigE
 re*	at pci?				# Realtek 8169/8169S/8110S
 re*	at cardbus?			# Realtek 8169/8169S/8110S
+rge*	at pci?				# Realtek 8125
 stge*	at pci?				# Sundance TC9021 GigE
 #lge*	at pci?				# Level1 LXT1001 GigE
 hme*	at pci?				# Sun Happy Meal
@@ -516,6 +536,9 @@ ale*	at pci?				# Attansic L1E Ethernet
 lii*	at pci?				# Attansic L2 Ethernet
 jme*	at pci?				# JMicron JMC250/JMC260 Ethernet
 bnxt*	at pci?				# Broadcom BCM573xx, BCM574xx
+ixl*	at pci?				# Intel Ethernet 700 Series
+mcx*	at pci?				# Mellanox ConnectX-4
+iavf*	at pci?				# Intel Ethernet Adaptive VF
 
 # Wireless network cards
 acx*	at pci?				# TI ACX100/ACX111 (802.11b/g)
@@ -536,6 +559,7 @@ iwi*	at pci?				# Intel PRO/Wireless 2200BG/2915ABG
 wpi*	at pci?				# Intel PRO/Wireless 3945ABG
 iwn*	at pci?				# Intel WiFi Link 4965/5000/1000/6000
 iwm*	at pci?				# Intel WiFi Link 7xxx
+iwx*	at pci?				# Intel WiFi Link 22xxx
 ral*	at pci?				# Ralink RT2500/RT2501/RT2600
 ral*	at cardbus?			# Ralink RT2500/RT2501/RT2600
 rtw*	at pci?				# Realtek 8180

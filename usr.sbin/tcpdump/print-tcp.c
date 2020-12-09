@@ -1,4 +1,4 @@
-/*	$OpenBSD: print-tcp.c,v 1.37 2016/11/16 13:47:27 reyk Exp $	*/
+/*	$OpenBSD: print-tcp.c,v 1.39 2020/01/24 22:46:37 procter Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997
@@ -26,6 +26,7 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <netinet/ip_var.h>
 #include <netinet/tcp.h>
 #include <net/if.h>
@@ -37,10 +38,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#ifdef INET6
-#include <netinet/ip6.h>
-#endif
 
 #include "interface.h"
 #include "addrtoname.h"
@@ -94,13 +91,8 @@ static void print_tcp_rst_data(const u_char *sp, u_int length);
 #endif
 
 struct tha {
-#ifndef INET6
-	struct in_addr src;
-	struct in_addr dst;
-#else
 	struct in6_addr src;
 	struct in6_addr dst;
-#endif /*INET6*/
 	u_int port;
 };
 
@@ -155,7 +147,6 @@ static int tcp_cksum(const struct ip *ip, const struct tcphdr *tp, int len)
 	return in_cksum((u_short *)tp, len, sum);
 }
 
-#ifdef INET6
 static int tcp6_cksum(const struct ip6_hdr *ip6, const struct tcphdr *tp,
 		      u_int len)
 {
@@ -184,8 +175,6 @@ static int tcp6_cksum(const struct ip6_hdr *ip6, const struct tcphdr *tp,
 
 	return in_cksum((u_short *)tp, len, sum);
 }
-#endif
-
 
 void
 tcp_print(const u_char *bp, u_int length, const u_char *bp2)
@@ -199,47 +188,38 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 	int rev = 0;
 	u_int16_t sport, dport, win, urp;
 	tcp_seq seq, ack;
-#ifdef INET6
 	const struct ip6_hdr *ip6;
-#endif
 
 	tp = (struct tcphdr *)bp;
 	switch (((struct ip *)bp2)->ip_v) {
 	case 4:
 		ip = (struct ip *)bp2;
-#ifdef INET6
 		ip6 = NULL;
-#endif
 		break;
-#ifdef INET6
 	case 6:
 		ip = NULL;
 		ip6 = (struct ip6_hdr *)bp2;
 		break;
-#endif
 	default:
-		(void)printf("invalid ip version");
+		printf("invalid ip version");
 		return;
 	}
 
 	ch = '\0';
 	if (length < sizeof(*tp)) {
-		(void)printf("truncated-tcp %u", length);
+		printf("truncated-tcp %u", length);
 		return;
 	}
 
 	if (!TTEST(tp->th_dport)) {
-#ifdef INET6
 		if (ip6) {
-			(void)printf("%s > %s: [|tcp]",
-				ip6addr_string(&ip6->ip6_src),
-				ip6addr_string(&ip6->ip6_dst));
-		} else
-#endif /*INET6*/
-		{
-			(void)printf("%s > %s: [|tcp]",
-				ipaddr_string(&ip->ip_src),
-				ipaddr_string(&ip->ip_dst));
+			printf("%s > %s: [|tcp]",
+			    ip6addr_string(&ip6->ip6_src),
+			    ip6addr_string(&ip6->ip6_dst));
+		} else {
+			printf("%s > %s: [|tcp]",
+			    ipaddr_string(&ip->ip_src),
+			    ipaddr_string(&ip->ip_dst));
 		}
 		return;
 	}
@@ -247,35 +227,32 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 	sport = ntohs(tp->th_sport);
 	dport = ntohs(tp->th_dport);
 
-#ifdef INET6
 	if (ip6) {
 		if (ip6->ip6_nxt == IPPROTO_TCP) {
-			(void)printf("%s.%s > %s.%s: ",
-				ip6addr_string(&ip6->ip6_src),
-				tcpport_string(sport),
-				ip6addr_string(&ip6->ip6_dst),
-				tcpport_string(dport));
+			printf("%s.%s > %s.%s: ",
+			    ip6addr_string(&ip6->ip6_src),
+			    tcpport_string(sport),
+			    ip6addr_string(&ip6->ip6_dst),
+			    tcpport_string(dport));
 		} else {
-			(void)printf("%s > %s: ",
-				tcpport_string(sport), tcpport_string(dport));
+			printf("%s > %s: ",
+			    tcpport_string(sport), tcpport_string(dport));
 		}
-	} else
-#endif /*INET6*/
-	{
+	} else {
 		if (ip->ip_p == IPPROTO_TCP) {
-			(void)printf("%s.%s > %s.%s: ",
-				ipaddr_string(&ip->ip_src),
-				tcpport_string(sport),
-				ipaddr_string(&ip->ip_dst),
-				tcpport_string(dport));
+			printf("%s.%s > %s.%s: ",
+			    ipaddr_string(&ip->ip_src),
+			    tcpport_string(sport),
+			    ipaddr_string(&ip->ip_dst),
+			    tcpport_string(dport));
 		} else {
-			(void)printf("%s > %s: ",
-				tcpport_string(sport), tcpport_string(dport));
+			printf("%s > %s: ",
+			    tcpport_string(sport), tcpport_string(dport));
 		}
 	}
 
 	if (!qflag && TTEST(tp->th_seq) && !TTEST(tp->th_ack))
-		(void)printf("%u ", ntohl(tp->th_seq));
+		printf("%u ", ntohl(tp->th_seq));
 
 	TCHECK(*tp);
 	seq = ntohl(tp->th_seq);
@@ -285,7 +262,7 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 	hlen = tp->th_off * 4;
 
 	if (qflag) {
-		(void)printf("tcp %d", length - tp->th_off * 4);
+		printf("tcp %d", length - tp->th_off * 4);
 		return;
 	} else if (packettype != PT_TCP) {
 
@@ -330,7 +307,6 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 		 * collating order so there's only one entry for
 		 * both directions).
 		 */
-#ifdef INET6
 		bzero(&tha, sizeof(tha));
 		rev = 0;
 		if (ip6) {
@@ -372,19 +348,6 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 				tha.port = sport << 16 | dport;
 			}
 		}
-#else
-		if (sport < dport ||
-		    (sport == dport &&
-		     ip->ip_src.s_addr < ip->ip_dst.s_addr)) {
-			tha.src = ip->ip_src, tha.dst = ip->ip_dst;
-			tha.port = sport << 16 | dport;
-			rev = 0;
-		} else {
-			tha.src = ip->ip_dst, tha.dst = ip->ip_src;
-			tha.port = dport << 16 | sport;
-			rev = 1;
-		}
-#endif
 
 		for (th = &tcp_seq_hash[tha.port % TSEQ_HASHSIZE];
 		     th->nxt; th = th->nxt)
@@ -413,7 +376,7 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 	}
 	hlen = tp->th_off * 4;
 	if (hlen > length) {
-		(void)printf(" [bad hdr length]");
+		printf(" [bad hdr length]");
 		return;
 	}
 
@@ -423,26 +386,24 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 			sum = tcp_cksum(ip, tp, length);
 			if (sum != 0) {
 				tcp_sum = EXTRACT_16BITS(&tp->th_sum);
-				(void)printf(" [bad tcp cksum %x! -> %x]", tcp_sum,
+				printf(" [bad tcp cksum %x! -> %x]", tcp_sum,
 				    in_cksum_shouldbe(tcp_sum, sum));
 			} else
-				(void)printf(" [tcp sum ok]");
+				printf(" [tcp sum ok]");
 		}
 	}
-#ifdef INET6
 	if (ip6 && ip6->ip6_plen && vflag) {
 		if (TTEST2(tp->th_sport, length)) {
 			u_int16_t sum, tcp_sum;
 			sum = tcp6_cksum(ip6, tp, length);
 			if (sum != 0) {
 				tcp_sum = EXTRACT_16BITS(&tp->th_sum);
-				(void)printf(" [bad tcp cksum %x! -> %x]", tcp_sum,
+				printf(" [bad tcp cksum %x! -> %x]", tcp_sum,
 				    in_cksum_shouldbe(tcp_sum, sum));
 			} else
-				(void)printf(" [tcp sum ok]");
+				printf(" [tcp sum ok]");
 		}
 	}
-#endif
 
 	/* OS Fingerprint */
 	if (oflag && (flags & (TH_SYN|TH_ACK)) == TH_SYN) {
@@ -479,14 +440,14 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 
 	length -= hlen;
 	if (vflag > 1 || length > 0 || flags & (TH_SYN | TH_FIN | TH_RST))
-		(void)printf(" %u:%u(%u)", seq, seq + length, length);
+		printf(" %u:%u(%u)", seq, seq + length, length);
 	if (flags & TH_ACK)
-		(void)printf(" ack %u", ack);
+		printf(" ack %u", ack);
 
-	(void)printf(" win %u", win);
+	printf(" win %u", win);
 
 	if (flags & TH_URG)
-		(void)printf(" urg %u", urp);
+		printf(" urg %u", urp);
 	/*
 	 * Handle any options.
 	 */
@@ -519,32 +480,32 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 			switch (opt) {
 
 			case TCPOPT_MAXSEG:
-				(void)printf("mss");
+				printf("mss");
 				datalen = 2;
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_16BITS(cp));
+				printf(" %u", EXTRACT_16BITS(cp));
 
 				break;
 
 			case TCPOPT_EOL:
-				(void)printf("eol");
+				printf("eol");
 				break;
 
 			case TCPOPT_NOP:
-				(void)printf("nop");
+				printf("nop");
 				break;
 
 			case TCPOPT_WSCALE:
-				(void)printf("wscale");
+				printf("wscale");
 				datalen = 1;
 				LENCHECK(datalen);
-				(void)printf(" %u", *cp);
+				printf(" %u", *cp);
 				break;
 
 			case TCPOPT_SACKOK:
-				(void)printf("sackOK");
+				printf("sackOK");
 				if (len != 2)
-					(void)printf("[len %d]", len);
+					printf("[len %d]", len);
 				break;
 
 			case TCPOPT_SACK:
@@ -554,8 +515,8 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 				datalen = len - 2;
 				if ((datalen % TCPOLEN_SACK) != 0 ||
 				    !(flags & TH_ACK)) {
-				         (void)printf("malformed sack ");
-					 (void)printf("[len %d] ", datalen);
+				         printf("malformed sack ");
+					 printf("[len %d] ", datalen);
 					 break;
 				}
 				printf("sack %d ", datalen/TCPOLEN_SACK);
@@ -572,69 +533,69 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 							e -= th->ack;
 						}
 					}
-					(void) printf("{%lu:%lu} ", s, e);
+					printf("{%lu:%lu} ", s, e);
 				}
 				break;
 			}
 			case TCPOPT_ECHO:
-				(void)printf("echo");
+				printf("echo");
 				datalen = 4;
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_32BITS(cp));
+				printf(" %u", EXTRACT_32BITS(cp));
 				break;
 
 			case TCPOPT_ECHOREPLY:
-				(void)printf("echoreply");
+				printf("echoreply");
 				datalen = 4;
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_32BITS(cp));
+				printf(" %u", EXTRACT_32BITS(cp));
 				break;
 
 			case TCPOPT_TIMESTAMP:
-				(void)printf("timestamp");
+				printf("timestamp");
 				datalen = 8;
 				LENCHECK(4);
-				(void)printf(" %u", EXTRACT_32BITS(cp));
+				printf(" %u", EXTRACT_32BITS(cp));
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_32BITS(cp + 4));
+				printf(" %u", EXTRACT_32BITS(cp + 4));
 				break;
 
 			case TCPOPT_CC:
-				(void)printf("cc");
+				printf("cc");
 				datalen = 4;
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_32BITS(cp));
+				printf(" %u", EXTRACT_32BITS(cp));
 				break;
 
 			case TCPOPT_CCNEW:
-				(void)printf("ccnew");
+				printf("ccnew");
 				datalen = 4;
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_32BITS(cp));
+				printf(" %u", EXTRACT_32BITS(cp));
 				break;
 
 			case TCPOPT_CCECHO:
-				(void)printf("ccecho");
+				printf("ccecho");
 				datalen = 4;
 				LENCHECK(datalen);
-				(void)printf(" %u", EXTRACT_32BITS(cp));
+				printf(" %u", EXTRACT_32BITS(cp));
 				break;
 
 			case TCPOPT_SIGNATURE:
-				(void)printf("tcpmd5:");
+				printf("tcpmd5:");
 				datalen = len - 2;
 				for (i = 0; i < datalen; ++i) {
 					LENCHECK(i+1);
-					(void)printf("%02x", cp[i]);
+					printf("%02x", cp[i]);
 				}
 				break;
 
 			default:
-				(void)printf("opt-%d:", opt);
+				printf("opt-%d:", opt);
 				datalen = len - 2;
 				for (i = 0; i < datalen; ++i) {
 					LENCHECK(i+1);
-					(void)printf("%02x", cp[i]);
+					printf("%02x", cp[i]);
 				}
 				break;
 			}
@@ -648,7 +609,7 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 			if (!ZEROLENOPT(opt))
 				++datalen;		/* size octet */
 			if (datalen != len)
-				(void)printf("[len %d]", len);
+				printf("[len %d]", len);
 			ch = ',';
 			if (opt == TCPOPT_EOL)
 				break;
@@ -679,12 +640,12 @@ tcp_print(const u_char *bp, u_int length, const u_char *bp2)
 	}
 	return;
 bad:
-	fputs("[bad opt]", stdout);
+	printf("[bad opt]");
 	if (ch != '\0')
 		putchar('>');
 	return;
 trunc:
-	fputs("[|tcp]", stdout);
+	printf("[|tcp]");
 	if (ch != '\0')
 		putchar('>');
 }

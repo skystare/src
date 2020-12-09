@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.25 2018/08/05 09:33:13 mestre Exp $	*/
+/*	$OpenBSD: proc.c,v 1.27 2020/06/30 17:11:49 martijn Exp $	*/
 
 /*
  * Copyright (c) 2010 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -29,13 +29,14 @@
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
+#include <paths.h>
 #include <pwd.h>
 #include <event.h>
 #include <imsg.h>
 
 #include "snmpd.h"
 
-void	 proc_exec(struct privsep *, struct privsep_proc *, unsigned int,
+void	 proc_exec(struct privsep *, struct privsep_proc *, unsigned int, int,
 	    int, char **);
 void	 proc_setup(struct privsep *, struct privsep_proc *, unsigned int);
 void	 proc_open(struct privsep *, int, int);
@@ -80,7 +81,7 @@ proc_getid(struct privsep_proc *procs, unsigned int nproc,
 
 void
 proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
-    int argc, char **argv)
+    int debug, int argc, char **argv)
 {
 	unsigned int		 proc, nargc, i, proc_i;
 	char			**nargv;
@@ -141,6 +142,16 @@ proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 				} else if (fcntl(fd, F_SETFD, 0) == -1)
 					fatal("fcntl");
 
+				/* Daemons detach from terminal. */
+				if (!debug && (fd =
+				    open(_PATH_DEVNULL, O_RDWR, 0)) != -1) {
+					(void)dup2(fd, STDIN_FILENO);
+					(void)dup2(fd, STDOUT_FILENO);
+					(void)dup2(fd, STDERR_FILENO);
+					if (fd > 2)
+						(void)close(fd);
+				}
+
 				execvp(argv[0], nargv);
 				fatal("%s: execvp", __func__);
 				break;
@@ -191,7 +202,7 @@ proc_connect(struct privsep *ps)
 
 void
 proc_init(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
-    int argc, char **argv, enum privsep_procid proc_id)
+    int debug, int argc, char **argv, enum privsep_procid proc_id)
 {
 	struct privsep_proc	*p = NULL;
 	struct privsep_pipes	*pa, *pb;
@@ -231,7 +242,7 @@ proc_init(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 		}
 
 		/* Engage! */
-		proc_exec(ps, procs, nproc, argc, argv);
+		proc_exec(ps, procs, nproc, debug, argc, argv);
 		return;
 	}
 
@@ -514,20 +525,11 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 {
 	struct passwd		*pw;
 	const char		*root;
-	struct control_sock	*rcs;
 
 	log_procinit(p->p_title);
 
 	/* Set the process group of the current process */
 	setpgid(0, 0);
-
-	if (p->p_id == PROC_CONTROL && ps->ps_instance == 0) {
-		if (control_init(ps, &ps->ps_csock) == -1)
-			fatalx("%s: control_init", __func__);
-		TAILQ_FOREACH(rcs, &ps->ps_rcsocks, cs_entry)
-			if (control_init(ps, rcs) == -1)
-				fatalx("%s: control_init", __func__);
-	}
 
 	/* Use non-standard user */
 	if (p->p_pw != NULL)
@@ -573,15 +575,6 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 
 	proc_setup(ps, procs, nproc);
 	proc_accept(ps, PROC_PARENT_SOCK_FILENO, PROC_PARENT, 0);
-	if (p->p_id == PROC_CONTROL && ps->ps_instance == 0) {
-		TAILQ_INIT(&ctl_conns);
-		if (control_listen(&ps->ps_csock) == -1)
-			fatalx("%s: control_listen", __func__);
-		TAILQ_FOREACH(rcs, &ps->ps_rcsocks, cs_entry)
-			if (control_listen(rcs) == -1)
-				fatalx("%s: control_listen", __func__);
-	}
-
 	DPRINTF("%s: %s %d/%d, pid %d", __func__, p->p_title,
 	    ps->ps_instance + 1, ps->ps_instances[p->p_id], getpid());
 

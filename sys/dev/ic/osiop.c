@@ -1,4 +1,4 @@
-/*	$OpenBSD: osiop.c,v 1.51 2017/04/30 16:45:46 mpi Exp $	*/
+/*	$OpenBSD: osiop.c,v 1.63 2020/09/22 19:32:52 krw Exp $	*/
 /*	$NetBSD: osiop.c,v 1.9 2002/04/05 18:27:54 bouyer Exp $	*/
 
 /*
@@ -90,7 +90,6 @@
 #include <dev/microcode/siop/osiop.out>
 
 void osiop_attach(struct osiop_softc *);
-void osiop_minphys(struct buf *, struct scsi_link *);
 void *osiop_io_get(void *);
 void osiop_io_put(void *, void *);
 void osiop_scsicmd(struct scsi_xfer *xs);
@@ -180,11 +179,8 @@ struct cfdriver osiop_cd = {
 	NULL, "osiop", DV_DULL
 };
 
-struct scsi_adapter osiop_adapter = {
-	osiop_scsicmd,
-	osiop_minphys,
-	NULL,
-	NULL,
+struct scsi_adapter osiop_switch = {
+	osiop_scsicmd, NULL, NULL, NULL, NULL
 };
 
 void
@@ -328,34 +324,17 @@ osiop_attach(sc)
 	 */
 	osiop_init(sc);
 
-	/*
-	 * Fill in the sc_link.
-	 */
-	sc->sc_link.adapter = &osiop_adapter;
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.openings = 4;
-	sc->sc_link.adapter_buswidth = OSIOP_NTGT;
-	sc->sc_link.adapter_target = sc->sc_id;
-	sc->sc_link.pool = &sc->sc_iopool;
+	saa.saa_adapter = &osiop_switch;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter_buswidth = OSIOP_NTGT;
+	saa.saa_adapter_target = sc->sc_id;
+	saa.saa_luns = 8;
+	saa.saa_openings = 4;
+	saa.saa_pool = &sc->sc_iopool;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
-
-	/*
-	 * Now try to attach all the sub devices.
-	 */
 	config_found(&sc->sc_dev, &saa, scsiprint);
-}
-
-/*
- * default minphys routine for osiop based controllers
- */
-void
-osiop_minphys(struct buf *bp, struct scsi_link *sl)
-{
-	if (bp->b_bcount > OSIOP_MAX_XFER)
-		bp->b_bcount = OSIOP_MAX_XFER;
-	minphys(bp);
 }
 
 void *
@@ -394,7 +373,7 @@ osiop_scsicmd(xs)
 {
 	struct scsi_link *periph = xs->sc_link;
 	struct osiop_acb *acb;
-	struct osiop_softc *sc = periph->adapter_softc;
+	struct osiop_softc *sc = periph->bus->sb_adapter_softc;
 	int err, s;
 	int dopoll;
 
@@ -412,7 +391,7 @@ osiop_scsicmd(xs)
 	acb->status = ACB_S_READY;
 	acb->xs = xs;
 	acb->xsflags = xs->flags;
-	memcpy(&acb->ds->scsi_cmd, xs->cmd, xs->cmdlen);
+	memcpy(&acb->ds->scsi_cmd, &xs->cmd, xs->cmdlen);
 	acb->ds->cmd.count = xs->cmdlen;
 	acb->datalen = 0;
 #ifdef OSIOP_DEBUG
@@ -1951,7 +1930,7 @@ osiop_timeout(arg)
 	int s;
 
 	sc_print_addr(xs->sc_link);
-	printf("command 0x%02x timeout on xs %p\n", xs->cmd->opcode, xs);
+	printf("command 0x%02x timeout on xs %p\n", xs->cmd.opcode, xs);
 
 	s = splbio();
 	/* reset the scsi bus */
@@ -1996,7 +1975,7 @@ osiop_dump_acb(acb)
 	}
 
 	b = (u_int8_t *)&acb->ds->scsi_cmd;
-	printf("(%d:%d) status %2x cmdlen %2ld cmd ",
+	printf("(%d:%d) status %2x cmdlen %2u cmd ",
 	    acb->xs->sc_link->target,
 	    acb->xs->sc_link->lun,
 	    acb->status,

@@ -1,4 +1,4 @@
-/*	$OpenBSD: def.h,v 1.156 2018/08/29 07:50:16 reyk Exp $	*/
+/*	$OpenBSD: def.h,v 1.166 2020/02/09 10:13:13 florian Exp $	*/
 
 /* This file is in the public domain. */
 
@@ -46,7 +46,7 @@ typedef int	(*PF)(int, int);	/* generally useful type */
  * flag controls the clearing versus appending
  * of data in the kill buffer.
  */
-#define CFCPCN	0x0001		/* Last command was C-P, C-N	 */
+#define CFCPCN	0x0001		/* Last command was C-p or C-n	 */
 #define CFKILL	0x0002		/* Last command was a kill	 */
 #define CFINS	0x0004		/* Last command was self-insert	 */
 
@@ -98,6 +98,7 @@ typedef int	(*PF)(int, int);	/* generally useful type */
 
 #define MAX_TOKEN 64
 
+#define	BUFSIZE	128	/* Size of line contents in extend.c  */
 /*
  * Previously from sysdef.h
  */
@@ -336,7 +337,7 @@ void		 ttnowindow(void);
 void		 ttcolor(int);
 void		 ttresize(void);
 
-volatile sig_atomic_t winch_flag;
+extern volatile sig_atomic_t winch_flag;
 
 /* ttyio.c */
 void		 ttopen(void);
@@ -417,6 +418,7 @@ int		 delwind(int, int);
 
 /* buffer.c */
 int		 togglereadonly(int, int);
+int		 togglereadonlyall(int, int);
 struct buffer   *bfind(const char *, int);
 int		 poptobuffer(int, int);
 int		 killbuffer(struct buffer *);
@@ -442,12 +444,12 @@ int		 diffbuffer(int, int);
 struct buffer	*findbuffer(char *);
 
 /* display.c */
-int		vtresize(int, int, int);
-void		vtinit(void);
-void		vttidy(void);
-void		update(int);
-int		linenotoggle(int, int);
-int		colnotoggle(int, int);
+int		 vtresize(int, int, int);
+void		 vtinit(void);
+void		 vttidy(void);
+void		 update(int);
+int		 linenotoggle(int, int);
+int		 colnotoggle(int, int);
 
 /* echo.c X */
 void		 eerase(void);
@@ -465,7 +467,7 @@ int		 ffropen(FILE **, const char *, struct buffer *);
 void		 ffstat(FILE *, struct buffer *);
 int		 ffwopen(FILE **, const char *, struct buffer *);
 int		 ffclose(FILE *, struct buffer *);
-int		 ffputbuf(FILE *, struct buffer *);
+int		 ffputbuf(FILE *, struct buffer *, int);
 int		 ffgetline(FILE *, char *, int, int *);
 int		 fbackupfile(const char *);
 char		*adjustname(const char *, int);
@@ -489,6 +491,7 @@ int		 rescan(int, int);
 int		 universal_argument(int, int);
 int		 digit_argument(int, int);
 int		 negative_argument(int, int);
+int		 ask_selfinsert(int, int);
 int		 selfinsert(int, int);
 int		 quote(int, int);
 
@@ -525,7 +528,7 @@ int		 swapmark(int, int);
 int		 gotoline(int, int);
 int		 setlineno(int);
 
-/* random.c X */
+/* util.c X */
 int		 showcpos(int, int);
 int		 getcolpos(struct mgwin *);
 int		 twiddle(int, int);
@@ -551,19 +554,19 @@ int		 tagsvisit(int, int);
 int		 curtoken(int, int, char *);
 
 /* cscope.c */
-int		cssymbol(int, int);
-int		csdefinition(int, int);
-int		csfuncalled(int, int);
-int		cscallerfuncs(int, int);
-int		csfindtext(int, int);
-int		csegrep(int, int);
-int		csfindfile(int, int);
-int		csfindinc(int, int);
-int		csnextfile(int, int);
-int		csnextmatch(int, int);
-int		csprevfile(int, int);
-int		csprevmatch(int, int);
-int		cscreatelist(int, int);
+int		 cssymbol(int, int);
+int		 csdefinition(int, int);
+int		 csfuncalled(int, int);
+int		 cscallerfuncs(int, int);
+int		 csfindtext(int, int);
+int		 csegrep(int, int);
+int		 csfindfile(int, int);
+int		 csfindinc(int, int);
+int		 csnextfile(int, int);
+int		 csnextmatch(int, int);
+int		 csprevfile(int, int);
+int		 csprevmatch(int, int);
+int		 cscreatelist(int, int);
 
 /* extend.c X */
 int		 insert(int, int);
@@ -578,6 +581,7 @@ int		 evalbuffer(int, int);
 int		 evalfile(int, int);
 int		 load(const char *);
 int		 excline(char *);
+char		*skipwhite(char *);
 
 /* help.c X */
 int		 desckey(int, int);
@@ -709,7 +713,13 @@ int		 compile(int, int);
 void		 bellinit(void);
 int		 toggleaudiblebell(int, int);
 int		 togglevisiblebell(int, int);
+int		 dobeep_msgs(const char *, const char *);
+int		 dobeep_msg(const char *);
 void		 dobeep(void);
+
+/* interpreter.c */
+int		 foundparen(char *);
+int		 clearvars(void);
 
 /*
  * Externals.
@@ -737,15 +747,12 @@ extern int		 defb_flag;
 extern int		 doaudiblebell;
 extern int		 dovisiblebell;
 extern int		 dblspace;
+extern int		 allbro;
 extern char	 	 cinfo[];
 extern char		*keystrings[];
 extern char		 pat[NPAT];
 extern char		 prompt[];
-
-/*
- * Globals.
- */
-int		 tceeol;
-int		 tcinsl;
-int		 tcdell;
-int		 rptcount;	/* successive invocation count */
+extern int		 tceeol;
+extern int		 tcinsl;
+extern int		 tcdell;
+extern int		 rptcount;	/* successive invocation count */

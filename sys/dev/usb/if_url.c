@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_url.c,v 1.83 2018/07/03 14:33:43 kevlo Exp $ */
+/*	$OpenBSD: if_url.c,v 1.88 2020/07/31 10:49:33 mglocker Exp $ */
 /*	$NetBSD: if_url.c,v 1.6 2002/09/29 10:19:21 martin Exp $	*/
 /*
  * Copyright (c) 2001, 2002
@@ -146,7 +146,6 @@ static const struct url_type {
 #define URL_EXT_PHY	0x0001
 } url_devs [] = {
 	{{ USB_VENDOR_ABOCOM, USB_PRODUCT_ABOCOM_LCS8138TX}, 0},
-	{{ USB_VENDOR_ABOCOM, USB_PRODUCT_ABOCOM_RTL8151}, 0},
 	{{ USB_VENDOR_MELCO, USB_PRODUCT_MELCO_LUAKTX }, 0},
 	{{ USB_VENDOR_MICRONET, USB_PRODUCT_MICRONET_SP128AR}, 0},
 	{{ USB_VENDOR_OQO, USB_PRODUCT_OQO_ETHER01}, 0},
@@ -216,13 +215,13 @@ url_attach(struct device *parent, struct device *self, void *aux)
 			printf("%s: couldn't get endpoint %d\n", devname, i);
 			goto bad;
 		}
-		if ((ed->bmAttributes & UE_XFERTYPE) == UE_BULK &&
+		if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK &&
 		    UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN)
 			sc->sc_bulkin_no = ed->bEndpointAddress; /* RX */
-		else if ((ed->bmAttributes & UE_XFERTYPE) == UE_BULK &&
+		else if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK &&
 			 UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_OUT)
 			sc->sc_bulkout_no = ed->bEndpointAddress; /* TX */
-		else if ((ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT &&
+		else if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT &&
 			 UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN)
 			sc->sc_intrin_no = ed->bEndpointAddress; /* Status */
 	}
@@ -888,7 +887,7 @@ url_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	m_freem(c->url_mbuf);
 	c->url_mbuf = NULL;
 
-	if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+	if (ifq_empty(&ifp->if_snd) == 0)
 		url_start(ifp);
 
 	splx(s);
@@ -995,7 +994,7 @@ url_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	DPRINTF(("%s: %s: enter\n", sc->sc_dev.dv_xname, __func__));
 
 	if (usbd_is_dying(sc->sc_udev))
-		return (EIO);
+		return ENXIO;
 
 	s = splnet();
 
@@ -1055,7 +1054,7 @@ url_watchdog(struct ifnet *ifp)
 	usbd_get_xfer_status(c->url_xfer, NULL, NULL, NULL, &stat);
 	url_txeof(c->url_xfer, c, stat);
 
-	if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+	if (ifq_empty(&ifp->if_snd) == 0)
 		url_start(ifp);
 	splx(s);
 }
@@ -1087,7 +1086,6 @@ url_stop(struct ifnet *ifp, int disable)
 	/* Stop transfers */
 	/* RX endpoint */
 	if (sc->sc_pipe_rx != NULL) {
-		usbd_abort_pipe(sc->sc_pipe_rx);
 		err = usbd_close_pipe(sc->sc_pipe_rx);
 		if (err)
 			printf("%s: close rx pipe failed: %s\n",
@@ -1097,7 +1095,6 @@ url_stop(struct ifnet *ifp, int disable)
 
 	/* TX endpoint */
 	if (sc->sc_pipe_tx != NULL) {
-		usbd_abort_pipe(sc->sc_pipe_tx);
 		err = usbd_close_pipe(sc->sc_pipe_tx);
 		if (err)
 			printf("%s: close tx pipe failed: %s\n",
@@ -1109,7 +1106,6 @@ url_stop(struct ifnet *ifp, int disable)
 	/* XXX: Interrupt endpoint is not yet supported!! */
 	/* Interrupt endpoint */
 	if (sc->sc_pipe_intr != NULL) {
-		usbd_abort_pipe(sc->sc_pipe_intr);
 		err = usbd_close_pipe(sc->sc_pipe_intr);
 		if (err)
 			printf("%s: close intr pipe failed: %s\n",
@@ -1239,7 +1235,7 @@ url_tick_task(void *xsc)
 		DPRINTF(("%s: %s: got link\n",
 			 sc->sc_dev.dv_xname, __func__));
 		sc->sc_link++;
-		if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+		if (ifq_empty(&ifp->if_snd) == 0)
 			   url_start(ifp);
 	}
 

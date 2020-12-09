@@ -1,4 +1,4 @@
-/*	$OpenBSD: mkbc.c,v 1.13 2015/02/11 07:05:39 dlg Exp $  */
+/*	$OpenBSD: mkbc.c,v 1.15 2019/10/17 13:42:15 cheloha Exp $  */
 
 /*
  * Copyright (c) 2006, 2007, Joel Sing
@@ -287,7 +287,7 @@ mkbc_attach(struct device *parent, struct device *self, void *aux)
 
 	/* Establish interrupt handler. */
 	if (macebus_intr_establish(maa->maa_intr, maa->maa_mace_intr,
-	    IST_EDGE, IPL_TTY, mkbcintr, msc, sc->sc_dv.dv_xname))
+	    IPL_TTY, mkbcintr, msc, sc->sc_dv.dv_xname))
 		printf("\n");
 	else
 		printf(": unable to establish interrupt\n");
@@ -747,7 +747,7 @@ pckbc_enqueue_cmd(pckbc_tag_t self, pckbc_slot_t slot, u_char *cmd, int len,
 	if (q->polling)
 		res = (sync ? nc->status : 0);
 	else if (sync) {
-		if ((res = tsleep(nc, 0, "kbccmd", 1*hz))) {
+		if ((res = tsleep_nsec(nc, 0, "kbccmd", SEC_TO_NSEC(1)))) {
 			TAILQ_REMOVE(&q->cmdqueue, nc, next);
 			mkbc_cleanup(t);
 		} else

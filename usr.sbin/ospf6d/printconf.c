@@ -1,4 +1,4 @@
-/*	$OpenBSD: printconf.c,v 1.7 2018/07/12 13:45:03 remi Exp $ */
+/*	$OpenBSD: printconf.c,v 1.10 2020/01/21 20:38:52 remi Exp $ */
 
 /*
  * Copyright (c) 2004, 2005 Esben Norby <norby@openbsd.org>
@@ -44,6 +44,8 @@ print_mainconf(struct ospfd_conf *conf)
 		printf("fib-update no\n");
 	else
 		printf("fib-update yes\n");
+
+	printf("fib-priority %hhu\n", conf->fib_priority);
 
 	if (conf->rdomain)
 		printf("rdomain %d\n", conf->rdomain);
@@ -132,6 +134,9 @@ print_iface(struct iface *iface)
 	printf("\t\trouter-dead-time %d\n", iface->dead_interval);
 	printf("\t\trouter-priority %d\n", iface->priority);
 	printf("\t\ttransmit-delay %d\n", iface->transmit_delay);
+
+	if (iface->type == IF_TYPE_POINTOPOINT)
+		printf("\t\ttype p2p\n");
 
 	printf("\t}\n");
 }

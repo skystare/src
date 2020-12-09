@@ -1,4 +1,4 @@
-/*	$OpenBSD: kvm_proc2.c,v 1.27 2016/11/07 00:26:33 guenther Exp $	*/
+/*	$OpenBSD: kvm_proc2.c,v 1.32 2020/12/07 16:55:28 mpi Exp $	*/
 /*	$NetBSD: kvm_proc.c,v 1.30 1999/03/24 05:50:50 mrg Exp $	*/
 /*-
  * Copyright (c) 1998 The NetBSD Foundation, Inc.
@@ -80,6 +80,8 @@
 #include <sys/resource.h>
 #include <sys/resourcevar.h>
 #include <sys/signalvar.h>
+#include <sys/pledge.h>
+#include <sys/wait.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,15 +118,39 @@ kvm_proclist(kvm_t *kd, int op, int arg, struct process *pr,
 	struct process process, process2;
 	struct pgrp pgrp;
 	struct tty tty;
+	struct timeval elapsed, monostart, monostop, realstart, realstop;
+	struct nlist nl[3];
 	struct sigacts sa, *sap;
 	struct vmspace vm, *vmp;
 	struct plimit limits, *limp;
 	pid_t parent_pid, leader_pid;
 	int cnt = 0;
 	int dothreads = 0;
+	int i;
 
 	dothreads = op & KERN_PROC_SHOW_THREADS;
 	op &= ~KERN_PROC_SHOW_THREADS;
+
+	/* Anchor a time to compare process starting times from. */
+	nl[0].n_name = "_time_second";
+	nl[1].n_name = "_time_uptime";
+	nl[2].n_name = NULL;
+	if (kvm_nlist(kd, nl) != 0) {
+		for (i = 0; nl[i].n_type != 0; ++i)
+			continue;
+		_kvm_err(kd, kd->program, "%s: no such symbol", nl[i].n_name);
+		return (-1);
+	}
+	timerclear(&realstop);
+	timerclear(&monostop);
+	if (KREAD(kd, nl[0].n_value, &realstop.tv_sec)) {
+		_kvm_err(kd, kd->program, "cannot read time_second");
+		return (-1);
+	}
+	if (KREAD(kd, nl[1].n_value, &monostop.tv_sec)) {
+		_kvm_err(kd, kd->program, "cannot read time_uptime");
+		return (-1);
+	}
 
 	/*
 	 * Modelled on sysctl_doproc() in sys/kern/kern_sysctl.c
@@ -196,7 +222,7 @@ kvm_proclist(kvm_t *kd, int op, int arg, struct process *pr,
 
 		switch (op) {
 		case KERN_PROC_PID:
-			if (parent_pid != (pid_t)arg)
+			if (process.ps_pid != (pid_t)arg)
 				continue;
 			break;
 
@@ -289,6 +315,18 @@ kvm_proclist(kvm_t *kd, int op, int arg, struct process *pr,
 			kp.p_tdev = NODEV;
 		}
 
+		/* Convert the starting uptime to a starting UTC time. */
+		if ((process.ps_flags & PS_ZOMBIE) == 0) {
+			monostart.tv_sec = kp.p_ustart_sec;
+			monostart.tv_usec = kp.p_ustart_usec;
+			timersub(&monostop, &monostart, &elapsed);
+			if (elapsed.tv_sec < 0)
+				timerclear(&elapsed);
+			timersub(&realstop, &elapsed, &realstart);
+			kp.p_ustart_sec = realstart.tv_sec;
+			kp.p_ustart_usec = realstart.tv_usec;
+		}
+
 		/* update %cpu for all threads */
 		if (dothreads) {
 			if (KREAD(kd, (u_long)process.ps_mainproc, &proc)) {
@@ -303,8 +341,9 @@ kvm_proclist(kvm_t *kd, int op, int arg, struct process *pr,
 			kp.p_pctcpu = 0;
 			kp.p_stat = (process.ps_flags & PS_ZOMBIE) ? SDEAD :
 			    SIDL;
-			for (p = TAILQ_FIRST(&process.ps_threads); p != NULL; 
-			    p = TAILQ_NEXT(&proc, p_thr_link)) {
+			for (p = SMR_TAILQ_FIRST_LOCKED(&process.ps_threads);
+			    p != NULL;
+			    p = SMR_TAILQ_NEXT_LOCKED(&proc, p_thr_link)) {
 				if (KREAD(kd, (u_long)p, &proc)) {
 					_kvm_err(kd, kd->program,
 					    "can't read proc at %lx",
@@ -338,8 +377,8 @@ kvm_proclist(kvm_t *kd, int op, int arg, struct process *pr,
 		if (!dothreads)
 			continue;
 
-		for (p = TAILQ_FIRST(&process.ps_threads); p != NULL; 
-		    p = TAILQ_NEXT(&proc, p_thr_link)) {
+		for (p = SMR_TAILQ_FIRST_LOCKED(&process.ps_threads); p != NULL;
+		    p = SMR_TAILQ_NEXT_LOCKED(&proc, p_thr_link)) {
 			if (KREAD(kd, (u_long)p, &proc)) {
 				_kvm_err(kd, kd->program,
 				    "can't read proc at %lx",

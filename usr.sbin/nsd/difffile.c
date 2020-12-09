@@ -1042,6 +1042,12 @@ apply_ixfr(namedb_type* db, FILE *in, const char* zone, uint32_t serialno,
 	qcount = QDCOUNT(packet);
 	ancount = ANCOUNT(packet);
 	buffer_skip(packet, QHEADERSZ);
+	/* qcount should be 0 or 1 really, ancount limited by 64k packet */
+	if(qcount > 64 || ancount > 65530) {
+		log_msg(LOG_ERR, "RR count impossibly high");
+		region_destroy(region);
+		return 0;
+	}
 
 	/* skip queries */
 	for(i=0; i<qcount; ++i)
@@ -1138,15 +1144,12 @@ apply_ixfr(namedb_type* db, FILE *in, const char* zone, uint32_t serialno,
 		if(*rr_count == 1 && type != TYPE_SOA) {
 			/* second RR: if not SOA: this is an AXFR; delete all zone contents */
 #ifdef NSEC3
-			nsec3_hash_tree_clear(zone_db);
+			nsec3_clear_precompile(db, zone_db);
+			zone_db->nsec3_param = NULL;
 #endif
 			delete_zone_rrs(db, zone_db);
 			if(db->udb)
 				udb_zone_clear(db->udb, udbz);
-#ifdef NSEC3
-			nsec3_clear_precompile(db, zone_db);
-			zone_db->nsec3_param = NULL;
-#endif /* NSEC3 */
 			/* add everything else (incl end SOA) */
 			*delete_mode = 0;
 			*is_axfr = 1;
@@ -1169,15 +1172,12 @@ apply_ixfr(namedb_type* db, FILE *in, const char* zone, uint32_t serialno,
 			if(thisserial == serialno) {
 				/* AXFR */
 #ifdef NSEC3
-				nsec3_hash_tree_clear(zone_db);
+				nsec3_clear_precompile(db, zone_db);
+				zone_db->nsec3_param = NULL;
 #endif
 				delete_zone_rrs(db, zone_db);
 				if(db->udb)
 					udb_zone_clear(db->udb, udbz);
-#ifdef NSEC3
-				nsec3_clear_precompile(db, zone_db);
-				zone_db->nsec3_param = NULL;
-#endif /* NSEC3 */
 				*delete_mode = 0;
 				*is_axfr = 1;
 			}
@@ -1387,6 +1387,7 @@ apply_ixfr_for_zone(nsd_type* nsd, zone_type* zonedb, FILE* in,
 #endif /* NSEC3 */
 		zonedb->is_changed = 1;
 		if(nsd->db->udb) {
+			assert(z.base);
 			ZONE(&z)->is_changed = 1;
 			ZONE(&z)->mtime = time_end_0;
 			ZONE(&z)->mtime_nsec = time_end_1*1000;
@@ -1636,7 +1637,7 @@ void* task_new_stat_info(udb_base* udb, udb_ptr* last, struct nsdst* stat,
 	p = TASKLIST(&e)->zname;
 	memcpy(p, stat, sizeof(*stat));
 	udb_ptr_unlink(&e, udb);
-	return p + sizeof(*stat);
+	return (char*)p + sizeof(*stat);
 }
 #endif /* BIND8_STATS */
 
@@ -1658,7 +1659,7 @@ task_new_add_zone(udb_base* udb, udb_ptr* last, const char* zone,
 	TASKLIST(&e)->yesno = zonestatid;
 	p = TASKLIST(&e)->zname;
 	memcpy(p, zone, zlen+1);
-	memmove(p+zlen+1, pattern, plen+1);
+	memmove((char*)p+zlen+1, pattern, plen+1);
 	udb_ptr_unlink(&e, udb);
 }
 
@@ -1913,7 +1914,8 @@ task_process_del_zone(struct nsd* nsd, struct task_list_d* task)
 		return;
 
 #ifdef NSEC3
-	nsec3_hash_tree_clear(zone);
+	nsec3_clear_precompile(nsd->db, zone);
+	zone->nsec3_param = NULL;
 #endif
 	delete_zone_rrs(nsd->db, zone);
 	if(nsd->db->udb) {
@@ -1924,10 +1926,6 @@ task_process_del_zone(struct nsd* nsd, struct task_list_d* task)
 			udb_ptr_unlink(&udbz, nsd->db->udb);
 		}
 	}
-#ifdef NSEC3
-	nsec3_clear_precompile(nsd->db, zone);
-	zone->nsec3_param = NULL;
-#endif /* NSEC3 */
 
 	/* remove from zonetree, apex, soa */
 	zopt = zone->opts;

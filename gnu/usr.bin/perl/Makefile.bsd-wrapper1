@@ -1,42 +1,8 @@
 .include <bsd.own.mk>
 
-# There is no point in building a profiled libperl that is never used.
-NOPROFILE=
-
-# Perl builds with -fno-strict-aliasing, we want libperl to do the same
-CFLAGS+= -fno-strict-aliasing
-
-H2PH=		/usr/bin/h2ph
-
-LIB=	perl
-
-SRCS1=	gv.c toke.c perly.c pad.c regcomp.c dump.c util.c mg.c reentr.c \
-	mro_core.c keywords.c hv.c av.c run.c pp_hot.c sv.c pp.c scope.c pp_ctl.c \
-	pp_sys.c doop.c doio.c dquote.c regexec.c utf8.c taint.c deb.c universal.c \
-	globals.c perlio.c perlapi.c numeric.c mathoms.c locale.c time64.c \
-	pp_pack.c pp_sort.c caretx.c
-SRCS=	${SRCS1} op.c perl.c
-
-# We must not try to mkdep DynaLoader.c as it requires miniperl
-OBJS+= DynaLoader.o
-
-# For generating DynaLoader.c
-.if defined(NOPIC)
-DYNALOADER=ext/DynaLoader/dl_none.xs
-.else
-DYNALOADER=ext/DynaLoader/dl_dlopen.xs
-.endif
-
 .if defined (INSTALL_STRIP) && ${INSTALL_STRIP} == "-s"
 STRIPFLAGS='-s'
 .endif
-
-perl.build:	perl.lib DynaLoader.c
-	cd ${.OBJDIR} && exec ${MAKE}
-
-# Never try to regenerate perly.c or perly.h
-perly.c perly.h: perly.y
-	-@true
 
 # If we are cross-compiling, we use the native pod2man.
 # Otherwise, we use the pod2man (and libperl) we just
@@ -51,27 +17,11 @@ POD2MAN=	LD_LIBRARY_PATH=${.OBJDIR} ${.OBJDIR}/perl -I ${.OBJDIR}/lib \
 
 MANLOCALBUILD=	yes
 
-MLINKS=		c2ph.1 pstruct.1 \
-		Carp.3p carp.3p Carp.3p cluck.3p Carp.3p croak.3p \
-		Carp.3p confess.3p Carp.3p shortmess.3p Carp.3p longmess.3p \
-		Getopt::Std.3p getopt.3p Getopt::Std.3p getopts.3p \
-		File::Basename.3p dirname.3p File::Basename.3p basename.3p \
-		File::Basename.3p fileparse.3p Search::Dict.3p look.3p \
-		ExtUtils::Miniperl.3p writemain.3p \
-		IPC::Open2.3p open2.3p IPC::Open3.3p open3.3p \
-		Socket.3p sockaddr_in.3p Socket.3p sockaddr_un.3p \
-		Socket.3p inet_aton.3p Socket.3p inet_ntoa.3p \
-		Tie::Hash.3p Tie::StdHash.3p Tie::Hash.3p Tie::ExtraHash.3p \
-		Tie::Scalar.3p Tie::StdScalar.3p splain.1 diagnostics.1 \
-		Pod::Checker.3p podchecker.3p Pod::Select.3p podselect.3p \
-		Pod::Usage.3p pod2usage.3p
-
 MAN=
 _quick1=
 _quick3p=
 
 .for page sect file in \
-    c2ph 1				utils/pstruct \
     corelist 1				utils/corelist \
     cpan 1				utils/cpan \
     enc2xs 1				utils/enc2xs \
@@ -79,7 +29,9 @@ _quick3p=
     h2ph 1				utils/h2ph \
     h2xs 1				utils/h2xs \
     instmodsh 1				utils/instmodsh \
+    Internals 1				lib/Internals.pod \
     libnetcfg 1				utils/libnetcfg \
+    PACKAGING 1				PACKAGING \
     perl 1				pod/perl.pod \
     perl5004delta 1			pod/perl5004delta.pod \
     perl5005delta 1			pod/perl5005delta.pod \
@@ -111,8 +63,24 @@ _quick3p=
     perl5220delta 1			pod/perl5220delta.pod \
     perl5221delta 1			pod/perl5221delta.pod \
     perl5222delta 1			pod/perl5222delta.pod \
+    perl5223delta 1			pod/perl5223delta.pod \
+    perl5224delta 1			pod/perl5224delta.pod \
     perl5240delta 1			pod/perl5240delta.pod \
     perl5241delta 1			pod/perl5241delta.pod \
+    perl5242delta 1			pod/perl5242delta.pod \
+    perl5243delta 1			pod/perl5243delta.pod \
+    perl5244delta 1			pod/perl5244delta.pod \
+    perl5260delta 1			pod/perl5260delta.pod \
+    perl5261delta 1			pod/perl5261delta.pod \
+    perl5262delta 1			pod/perl5262delta.pod \
+    perl5263delta 1			pod/perl5263delta.pod \
+    perl5280delta 1			pod/perl5280delta.pod \
+    perl5281delta 1			pod/perl5281delta.pod \
+    perl5282delta 1			pod/perl5282delta.pod \
+    perl5300delta 1			pod/perl5300delta.pod \
+    perl5301delta 1			pod/perl5301delta.pod \
+    perl5302delta 1			pod/perl5302delta.pod \
+    perl5303delta 1			pod/perl5303delta.pod \
     perl561delta 1			pod/perl561delta.pod \
     perl56delta 1			pod/perl56delta.pod \
     perl581delta 1			pod/perl581delta.pod \
@@ -140,6 +108,7 @@ _quick3p=
     perldebtut 1			pod/perldebtut.pod \
     perldebug 1				pod/perldebug.pod \
     perldelta 1				pod/perldelta.pod \
+    perldeprecation 1			pod/perldeprecation.pod \
     perldiag 1				pod/perldiag.pod \
     perldoc 1				lib/perldoc.pod \
     perldsc 1				pod/perldsc.pod \
@@ -250,7 +219,6 @@ _quick3p=
     App::Prove::State::Result::Test 3p	lib/App/Prove/State/Result/Test.pm \
     Archive::Tar 3p			lib/Archive/Tar.pm \
     Archive::Tar::File 3p		lib/Archive/Tar/File.pm \
-    arybase 3p				lib/arybase.pm \
     Attribute::Handlers 3p		lib/Attribute/Handlers.pm \
     attributes 3p			lib/attributes.pm \
     autodie 3p				lib/autodie.pm \
@@ -266,7 +234,6 @@ _quick3p=
     autouse 3p				lib/autouse.pm \
     B 3p				lib/B.pm \
     B::Concise 3p			lib/B/Concise.pm \
-    B::Debug 3p				lib/B/Debug.pm \
     B::Deparse 3p			lib/B/Deparse.pm \
     B::Op_private 3p			lib/B/Op_private.pm \
     B::Showlex 3p			lib/B/Showlex.pm \
@@ -510,31 +477,17 @@ _quick3p=
     List::Util 3p			lib/List/Util.pm \
     List::Util::XS 3p			lib/List/Util/XS.pm \
     locale 3p				lib/locale.pm \
-    Locale::Codes 3p			lib/Locale/Codes.pod \
-    Locale::Codes::API 3p		lib/Locale/Codes/API.pod \
-    Locale::Codes::Changes 3p		lib/Locale/Codes/Changes.pod \
-    Locale::Codes::Country 3p		lib/Locale/Codes/Country.pod \
-    Locale::Codes::Currency 3p		lib/Locale/Codes/Currency.pod \
-    Locale::Codes::LangExt 3p		lib/Locale/Codes/LangExt.pod \
-    Locale::Codes::LangFam 3p		lib/Locale/Codes/LangFam.pod \
-    Locale::Codes::Language 3p		lib/Locale/Codes/Language.pod \
-    Locale::Codes::LangVar 3p		lib/Locale/Codes/LangVar.pod \
-    Locale::Codes::Script 3p		lib/Locale/Codes/Script.pod \
-    Locale::Country 3p			lib/Locale/Country.pod \
-    Locale::Currency 3p			lib/Locale/Currency.pod \
-    Locale::Language 3p			lib/Locale/Language.pod \
     Locale::Maketext 3p			lib/Locale/Maketext.pod \
     Locale::Maketext::Cookbook 3p	lib/Locale/Maketext/Cookbook.pod \
     Locale::Maketext::Guts 3p		lib/Locale/Maketext/Guts.pm \
     Locale::Maketext::GutsLoader 3p	lib/Locale/Maketext/GutsLoader.pm \
     Locale::Maketext::Simple 3p		lib/Locale/Maketext/Simple.pm \
     Locale::Maketext::TPJ13 3p		lib/Locale/Maketext/TPJ13.pod \
-    Locale::Script 3p			lib/Locale/Script.pod \
     Math::BigFloat 3p			lib/Math/BigFloat.pm \
     Math::BigInt 3p			lib/Math/BigInt.pm \
     Math::BigInt::Calc 3p		lib/Math/BigInt/Calc.pm \
-    Math::BigInt::CalcEmu 3p		lib/Math/BigInt/CalcEmu.pm \
     Math::BigInt::FastCalc 3p		lib/Math/BigInt/FastCalc.pm \
+    Math::BigInt::Lib 3p		lib/Math/BigInt/Lib.pm \
     Math::BigRat 3p			lib/Math/BigRat.pm \
     Math::Complex 3p			lib/Math/Complex.pm \
     Math::Trig 3p			lib/Math/Trig.pm \
@@ -579,6 +532,7 @@ _quick3p=
     open 3p				lib/open.pm \
     OpenBSD::MkTemp 3p			lib/OpenBSD/MkTemp.pm \
     OpenBSD::Pledge 3p			lib/OpenBSD/Pledge.pm \
+    OpenBSD::Unveil 3p			lib/OpenBSD/Unveil.pm \
     ops 3p				lib/ops.pm \
     overload 3p				lib/overload.pm \
     overloading 3p			lib/overloading.pm \
@@ -711,14 +665,68 @@ _quick3p=
     Term::ANSIColor 3p			lib/Term/ANSIColor.pm \
     Term::Cap 3p			lib/Term/Cap.pm \
     Term::Complete 3p			lib/Term/Complete.pm \
-    Term::ReadKey 3p			cpan/Term-ReadKey/ReadKey.pm \
+    Term::ReadKey 3p			lib/Term/ReadKey.pm \
     Term::ReadLine 3p			lib/Term/ReadLine.pm \
     Test 3p				lib/Test.pm \
+    Test2 3p				lib/Test2.pm \
+    Test2::API 3p			lib/Test2/API.pm \
+    Test2::API::Breakage 3p		lib/Test2/API/Breakage.pm \
+    Test2::API::Context 3p		lib/Test2/API/Context.pm \
+    Test2::API::Instance 3p		lib/Test2/API/Instance.pm \
+    Test2::API::Stack 3p		lib/Test2/API/Stack.pm \
+    Test2::Event 3p			lib/Test2/Event.pm \
+    Test2::Event::Bail 3p		lib/Test2/Event/Bail.pm \
+    Test2::Event::Diag 3p		lib/Test2/Event/Diag.pm \
+    Test2::Event::Encoding 3p		lib/Test2/Event/Encoding.pm \
+    Test2::Event::Exception 3p		lib/Test2/Event/Exception.pm \
+    Test2::Event::Fail 3p		lib/Test2/Event/Fail.pm \
+    Test2::Event::Generic 3p		lib/Test2/Event/Generic.pm \
+    Test2::Event::Note 3p		lib/Test2/Event/Note.pm \
+    Test2::Event::Ok 3p			lib/Test2/Event/Ok.pm \
+    Test2::Event::Pass 3p		lib/Test2/Event/Pass.pm \
+    Test2::Event::Plan 3p		lib/Test2/Event/Plan.pm \
+    Test2::Event::Skip 3p		lib/Test2/Event/Skip.pm \
+    Test2::Event::Subtest 3p		lib/Test2/Event/Subtest.pm \
+    Test2::Event::TAP::Version 3p	lib/Test2/Event/TAP/Version.pm \
+    Test2::Event::V2 3p			lib/Test2/Event/V2.pm \
+    Test2::Event::Waiting 3p		lib/Test2/Event/Waiting.pm \
+    Test2::EventFacet 3p		lib/Test2/EventFacet.pm \
+    Test2::EventFacet::About 3p		lib/Test2/EventFacet/About.pm \
+    Test2::EventFacet::Amnesty 3p	lib/Test2/EventFacet/Amnesty.pm \
+    Test2::EventFacet::Assert 3p	lib/Test2/EventFacet/Assert.pm \
+    Test2::EventFacet::Control 3p	lib/Test2/EventFacet/Control.pm \
+    Test2::EventFacet::Error 3p		lib/Test2/EventFacet/Error.pm \
+    Test2::EventFacet::Hub 3p		lib/Test2/EventFacet/Hub.pm \
+    Test2::EventFacet::Info 3p		lib/Test2/EventFacet/Info.pm \
+    Test2::EventFacet::Info::Table 3p	lib/Test2/EventFacet/Info/Table.pm \
+    Test2::EventFacet::Meta 3p		lib/Test2/EventFacet/Meta.pm \
+    Test2::EventFacet::Parent 3p	lib/Test2/EventFacet/Parent.pm \
+    Test2::EventFacet::Plan 3p		lib/Test2/EventFacet/Plan.pm \
+    Test2::EventFacet::Render 3p	lib/Test2/EventFacet/Render.pm \
+    Test2::EventFacet::Trace 3p		lib/Test2/EventFacet/Trace.pm \
+    Test2::Formatter 3p			lib/Test2/Formatter.pm \
+    Test2::Formatter::TAP 3p		lib/Test2/Formatter/TAP.pm \
+    Test2::Hub 3p			lib/Test2/Hub.pm \
+    Test2::Hub::Interceptor 3p		lib/Test2/Hub/Interceptor.pm \
+    Test2::Hub::Interceptor::Terminator 3p	lib/Test2/Hub/Interceptor/Terminator.pm \
+    Test2::Hub::Subtest 3p		lib/Test2/Hub/Subtest.pm \
+    Test2::IPC 3p			lib/Test2/IPC.pm \
+    Test2::IPC::Driver 3p		lib/Test2/IPC/Driver.pm \
+    Test2::IPC::Driver::Files 3p	lib/Test2/IPC/Driver/Files.pm \
+    Test2::Tools::Tiny 3p		lib/Test2/Tools/Tiny.pm \
+    Test2::Transition 3p		lib/Test2/Transition.pod \
+    Test2::Util 3p			lib/Test2/Util.pm \
+    Test2::Util::ExternalMeta 3p	lib/Test2/Util/ExternalMeta.pm \
+    Test2::Util::Facets2Legacy 3p	lib/Test2/Util/Facets2Legacy.pm \
+    Test2::Util::HashBase 3p		lib/Test2/Util/HashBase.pm \
+    Test2::Util::Trace 3p		lib/Test2/Util/Trace.pm \
     Test::Builder 3p			lib/Test/Builder.pm \
+    Test::Builder::Formatter 3p		lib/Test/Builder/Formatter.pm \
     Test::Builder::IO::Scalar 3p	lib/Test/Builder/IO/Scalar.pm \
     Test::Builder::Module 3p		lib/Test/Builder/Module.pm \
     Test::Builder::Tester 3p		lib/Test/Builder/Tester.pm \
     Test::Builder::Tester::Color 3p	lib/Test/Builder/Tester/Color.pm \
+    Test::Builder::TodoDiag 3p		lib/Test/Builder/TodoDiag.pm \
     Test::Harness 3p			lib/Test/Harness.pm \
     Test::More 3p			lib/Test/More.pm \
     Test::Simple 3p			lib/Test/Simple.pm \
@@ -803,57 +811,22 @@ stamp-mansrc.build:
 
 .PHONY: mansrc.build
 
+perl.build:
+	cd ${.OBJDIR} && exec ${MAKE}
+
 cleandir:
 	rm -f ${MAN} stamp-mansrc.build
 
-.include <bsd.lib.mk>
-# These have to come after the inclusion of <bsd.lib.mk>
-
-# Need -fPIC, not -fpic on sparc
-.if ($(TARGET_MACHINE_ARCH) == sparc)
-PICFLAG=-fPIC
-.endif
-
-# Unaligned access on alpha with -ftree-ter
-# http://gcc.gnu.org/bugzilla/show_bug.cgi?id=59679
-# More details
-# https://rt.perl.org/Public/Bug/Display.html?id=120888
-.if ($(TARGET_MACHINE_ARCH) == alpha)
-CFLAGS+= -fno-tree-ter
-.endif
-
-# The DynaLoader extension is now compiled statically into libperl
-miniperl: ${GENERATED} ${SRCS1:S/.c/.o/g} opmini.o perlmini.o miniperlmain.o
-	${CC} ${CPPFLAGS} ${CFLAGS} -o $@ ${SRCS1:S/.c/.o/g} opmini.o perlmini.o miniperlmain.o ${LDFLAGS} -lm -lutil
-
-opmini.c: op.c
-	rm -f opmini.c
-	cp op.c opmini.c
-
-opmini.o: opmini.c
-	${CC} ${CPPFLAGS} ${CFLAGS} -DPERL_EXTERNAL_GLOB -c  $> -o $@
-
-perlmini.o: perlmini.c
-	${CC} ${CPPFLAGS} ${CFLAGS} -DPERL_EXTERNAL_GLOB -DPERL_IS_MINIPERL -c $> -o $@
-
-lib/Config.pm: miniperl config.sh
-	cd ${.OBJDIR} && exec ${MAKE} preplibrary
-
-DynaLoader.c: miniperl ${DYNALOADER} lib/Config.pm
-	./miniperl -Ilib -Idist/Cwd -Idist/Cwd/lib -Idist/ExtUtils-ParseXS/lib \
-	    -Icpan/Getopt-Long/lib -Idist/constant/lib -Iext/re \
-	    -mExtUtils::Typemaps dist/ExtUtils-ParseXS/lib/ExtUtils/xsubpp \
-	    -noprototypes -typemap ../../lib/ExtUtils/typemap ${DYNALOADER} | \
-	    sed -f ${.CURDIR}/DynaLoader.sed > $@; test -s $@ || rm -f $@
-
-perl.lib:	${GENERATED} ${_LIBS}
-
-afterinstall: install.perl
+install: install.perl maninstall
 	-chmod -R a+rX ${DESTDIR}/usr/libdata/perl5
 
 install.perl:
 	cd ${.OBJDIR}; INSTALL=${INSTALL} INSTALL_COPY=${INSTALL_COPY} \
-	 STRIPFLAGS=${STRIPFLAGS} INSTALLFLAGS=-o NOLIBINSTALL=1 \
-	 LD_LIBRARY_PATH=${.OBJDIR} exec ./perl installperl --user=${LIBOWN} --group=${LIBGRP} --destdir=${DESTDIR} -o ${STRIPFLAGS}
+	 STRIPFLAGS=${STRIPFLAGS} INSTALLFLAGS=-o \
+	 LD_LIBRARY_PATH=${.OBJDIR} exec ./perl installperl \
+	  --user=${LIBOWN} --group=${LIBGRP} \
+	  --destdir=${DESTDIR} -o ${STRIPFLAGS}
 
-.PHONY: perl.lib perl.build install.perl man.build
+.PHONY: perl.build install.perl man.build
+
+.include <bsd.man.mk>

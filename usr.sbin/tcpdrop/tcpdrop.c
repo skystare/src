@@ -1,4 +1,4 @@
-/* $OpenBSD: tcpdrop.c,v 1.17 2015/01/16 06:40:21 deraadt Exp $ */
+/* $OpenBSD: tcpdrop.c,v 1.19 2019/11/27 17:49:09 deraadt Exp $ */
 
 /*
  * Copyright (c) 2004 Markus Friedl <markus@openbsd.org>
@@ -27,10 +27,12 @@
 #include <netinet/tcp_var.h>
 
 #include <err.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <netdb.h>
+#include <unistd.h>
+#include <resolv.h>
 
 __dead void	 usage(void);
 
@@ -61,6 +63,13 @@ main(int argc, char **argv)
 	char *laddr1, *addr1, *port1, *faddr2, *addr2, *port2;
 	struct tcp_ident_mapping tir;
 	int gaierr, rval = 0;
+
+	if (unveil(_PATH_HOSTS, "r") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_RESCONF, "r") == -1)
+		err(1, "unveil");
+	if (unveil(NULL, NULL) == -1)
+		err(1, "unveil");
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;

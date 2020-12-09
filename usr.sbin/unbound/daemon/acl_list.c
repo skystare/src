@@ -111,6 +111,8 @@ acl_list_str_cfg(struct acl_list* acl, const char* str, const char* s2,
 		control = acl_refuse_non_local;
 	else if(strcmp(s2, "allow_snoop") == 0)
 		control = acl_allow_snoop;
+	else if(strcmp(s2, "allow_setrd") == 0)
+		control = acl_allow_setrd;
 	else {
 		log_err("access control type %s unknown", str);
 		return 0;
@@ -271,7 +273,7 @@ check_data(const char* data, const struct config_strlist* head)
 	if(res == 0)
 		return 1;
 	log_err("rr data [char %d] parse error %s",
-		(int)LDNS_WIREPARSE_OFFSET(res)-13,
+		(int)LDNS_WIREPARSE_OFFSET(res)-2,
 		sldns_get_errorstr_parse(res));
 	return 0;
 }

@@ -1,4 +1,4 @@
-/* $OpenBSD: tasn_dec.c,v 1.35 2018/03/29 02:29:24 inoguchi Exp $ */
+/* $OpenBSD: tasn_dec.c,v 1.38 2020/12/08 15:06:42 tb Exp $ */
 /* Written by Dr Stephen N Henson (steve@openssl.org) for the OpenSSL
  * project 2000.
  */
@@ -164,7 +164,7 @@ asn1_item_ex_d2i(ASN1_VALUE **pval, const unsigned char **in, long len,
 	const ASN1_TEMPLATE *tt, *errtt = NULL;
 	const ASN1_EXTERN_FUNCS *ef;
 	const ASN1_AUX *aux = it->funcs;
-	ASN1_aux_cb *asn1_cb;
+	ASN1_aux_cb *asn1_cb = NULL;
 	const unsigned char *p = NULL, *q;
 	unsigned char oclass;
 	char seq_eoc, seq_nolen, cst, isopt;
@@ -183,8 +183,6 @@ asn1_item_ex_d2i(ASN1_VALUE **pval, const unsigned char **in, long len,
 
 	if (aux && aux->asn1_cb)
 		asn1_cb = aux->asn1_cb;
-	else
-		asn1_cb = 0;
 
 	if (++depth > ASN1_MAX_CONSTRUCTED_NEST) {
 		ASN1error(ASN1_R_NESTED_TOO_DEEP);
@@ -212,6 +210,16 @@ asn1_item_ex_d2i(ASN1_VALUE **pval, const unsigned char **in, long len,
 		break;
 
 	case ASN1_ITYPE_MSTRING:
+		/*
+		 * It never makes sense for multi-strings to have implicit
+		 * tagging, so if tag != -1, then this looks like an error in
+		 * the template.
+		 */
+		if (tag != -1) {
+			ASN1error(ASN1_R_BAD_TEMPLATE);
+			goto err;
+		}
+
 		p = *in;
 		/* Just read in tag and class */
 		ret = asn1_check_tlen(NULL, &otag, &oclass, NULL, NULL,
@@ -247,6 +255,16 @@ asn1_item_ex_d2i(ASN1_VALUE **pval, const unsigned char **in, long len,
 		    it, tag, aclass, opt, ctx);
 
 	case ASN1_ITYPE_CHOICE:
+		/*
+		 * It never makes sense for CHOICE types to have implicit
+		 * tagging, so if tag != -1, then this looks like an error in
+		 * the template.
+		 */
+		if (tag != -1) {
+			ASN1error(ASN1_R_BAD_TEMPLATE);
+			goto err;
+		}
+
 		if (asn1_cb && !asn1_cb(ASN1_OP_D2I_PRE, pval, it, NULL))
 			goto auxerr;
 
@@ -795,14 +813,17 @@ asn1_ex_c2i(ASN1_VALUE **pval, const unsigned char *cont, int len, int utype,
 	ASN1_VALUE **opval = NULL;
 	ASN1_STRING *stmp;
 	ASN1_TYPE *typ = NULL;
-	int ret = 0;
-	const ASN1_PRIMITIVE_FUNCS *pf;
 	ASN1_INTEGER **tint;
+	int ret = 0;
 
-	pf = it->funcs;
+	if (it->funcs != NULL) {
+		const ASN1_PRIMITIVE_FUNCS *pf = it->funcs;
 
-	if (pf && pf->prim_c2i)
+		if (pf->prim_c2i == NULL)
+			return 0;
 		return pf->prim_c2i(pval, cont, len, utype, free_cont, it);
+	}
+
 	/* If ANY type clear type and set pointer to internal value */
 	if (it->utype == V_ASN1_ANY) {
 		if (!*pval) {

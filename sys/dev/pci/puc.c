@@ -1,4 +1,4 @@
-/*	$OpenBSD: puc.c,v 1.26 2018/05/02 19:11:01 phessler Exp $	*/
+/*	$OpenBSD: puc.c,v 1.30 2020/08/14 18:14:11 jcs Exp $	*/
 /*	$NetBSD: puc.c,v 1.3 1999/02/06 06:29:54 cgd Exp $	*/
 
 /*
@@ -61,9 +61,12 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pucvar.h>
+#include <dev/pci/pcidevs.h>
 
 #include <dev/ic/comreg.h>
 #include <dev/ic/comvar.h>
+
+#include "com.h"
 
 struct puc_pci_softc {
 	struct puc_softc	sc_psc;
@@ -78,6 +81,7 @@ int	puc_pci_detach(struct device *, int);
 const char *puc_pci_intr_string(struct puc_attach_args *);
 void	*puc_pci_intr_establish(struct puc_attach_args *, int,
     int (*)(void *), void *, char *);
+int	puc_pci_xr17v35x_intr(void *arg);
 
 struct cfattach puc_pci_ca = {
 	sizeof(struct puc_pci_softc), puc_pci_match,
@@ -125,7 +129,17 @@ puc_pci_intr_establish(struct puc_attach_args *paa, int type,
 {
 	struct puc_pci_softc *sc = paa->puc;
 	struct puc_softc *psc = &sc->sc_psc;
-	
+
+	if (psc->sc_xr17v35x) {
+		psc->sc_ports[paa->port].real_intrhand = func;
+		psc->sc_ports[paa->port].real_intrhand_arg = arg;
+		if (paa->port == 0)
+			psc->sc_ports[paa->port].intrhand =
+			    pci_intr_establish(sc->pc, sc->ih, type,
+			    puc_pci_xr17v35x_intr, sc, name);
+		return (psc->sc_ports[paa->port].real_intrhand);
+	}
+
 	psc->sc_ports[paa->port].intrhand =
 	    pci_intr_establish(sc->pc, sc->ih, type, func, arg, name);
 
@@ -146,6 +160,10 @@ puc_pci_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_desc = puc_find_description(PCI_VENDOR(pa->pa_id),
 	    PCI_PRODUCT(pa->pa_id), PCI_VENDOR(subsys), PCI_PRODUCT(subsys));
 
+	if (PCI_VENDOR(pa->pa_id) == PCI_VENDOR_EXAR &&
+	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_EXAR_XR17V354)
+		sc->sc_xr17v35x = 1;
+
 	puc_print_ports(sc->sc_desc);
 
 	for (i = 0; i < PUC_NBARS; i++) {
@@ -161,9 +179,13 @@ puc_pci_attach(struct device *parent, struct device *self, void *aux)
 		    0, &sc->sc_bar_mappings[i].t, &sc->sc_bar_mappings[i].h,
 		    &sc->sc_bar_mappings[i].a, &sc->sc_bar_mappings[i].s, 0)
 		      == 0);
-		if (sc->sc_bar_mappings[i].mapped)
+		if (sc->sc_bar_mappings[i].mapped) {
+			if (type == PCI_MAPREG_MEM_TYPE_64BIT)
+				i++;
 			continue;
+		}
 
+#if NCOM > 0
 		/*
 		 * If a port on this card is used as serial console,
 		 * mapping the associated BAR will fail because the
@@ -181,8 +203,11 @@ puc_pci_attach(struct device *parent, struct device *self, void *aux)
 			sc->sc_bar_mappings[i].h = comconsioh;
 			sc->sc_bar_mappings[i].s = COM_NPORTS;
 			sc->sc_bar_mappings[i].mapped = 1;
+			if (type == PCI_MAPREG_MEM_TYPE_64BIT)
+				i++;
 			continue;
 		}
+#endif
 
 		printf("%s: couldn't map BAR at offset 0x%lx\n",
 		    sc->sc_dev.dv_xname, (long)bar);
@@ -319,7 +344,6 @@ puc_find_description(u_int16_t vend, u_int16_t prod,
 const char *
 puc_port_type_name(int type)
 {
-
 	if (PUC_IS_COM(type))
 		return "com";
 	if (PUC_IS_LPT(type))
@@ -347,4 +371,23 @@ puc_print_ports(const struct puc_device_description *desc)
 		printf("%d lpt", nlpt);
 	}
 	printf("\n");
+}
+
+int
+puc_pci_xr17v35x_intr(void *arg)
+{
+	struct puc_pci_softc *sc = arg;
+	struct puc_softc *psc = &sc->sc_psc;
+	int ports, i;
+
+	ports = bus_space_read_1(psc->sc_bar_mappings[0].t,
+	    psc->sc_bar_mappings[0].h, UART_EXAR_INT0);
+
+	for (i = 0; i < 8; i++) {
+		if ((ports & (1 << i)) && psc->sc_ports[i].real_intrhand)
+			(*(psc->sc_ports[i].real_intrhand))(
+			    psc->sc_ports[i].real_intrhand_arg);
+	}
+
+	return (1);
 }

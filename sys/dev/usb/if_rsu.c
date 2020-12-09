@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_rsu.c,v 1.43 2018/04/26 12:50:07 pirofti Exp $	*/
+/*	$OpenBSD: if_rsu.c,v 1.48 2020/11/30 16:09:33 krw Exp $	*/
 
 /*-
  * Copyright (c) 2010 Damien Bergamini <damien.bergamini@free.fr>
@@ -161,7 +161,8 @@ void		rsu_event_join_bss(struct rsu_softc *, uint8_t *, int);
 void		rsu_rx_event(struct rsu_softc *, uint8_t, uint8_t *, int);
 void		rsu_rx_multi_event(struct rsu_softc *, uint8_t *, int);
 int8_t		rsu_get_rssi(struct rsu_softc *, int, void *);
-void		rsu_rx_frame(struct rsu_softc *, uint8_t *, int);
+void		rsu_rx_frame(struct rsu_softc *, uint8_t *, int,
+		    struct mbuf_list *);
 void		rsu_rx_multi_frame(struct rsu_softc *, uint8_t *, int);
 void		rsu_rxeof(struct usbd_xfer *, void *, usbd_status);
 void		rsu_txeof(struct usbd_xfer *, void *, usbd_status);
@@ -380,7 +381,6 @@ rsu_close_pipes(struct rsu_softc *sc)
 	for (i = 0; i < sc->npipes; i++) {
 		if (sc->pipe[i] == NULL)
 			continue;
-		usbd_abort_pipe(sc->pipe[i]);
 		usbd_close_pipe(sc->pipe[i]);
 	}
 }
@@ -749,9 +749,9 @@ rsu_media_change(struct ifnet *ifp)
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) ==
 	    (IFF_UP | IFF_RUNNING)) {
 		rsu_stop(ifp);
-		rsu_init(ifp);
+		error = rsu_init(ifp);
 	}
-	return (0);
+	return (error);
 }
 
 void
@@ -898,16 +898,21 @@ rsu_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	/* Do it in a process context. */
 	cmd.key = *k;
+	cmd.ni = ni;
 	rsu_do_async(sc, rsu_set_key_cb, &cmd, sizeof(cmd));
-	return (0);
+	sc->sc_key_tasks++;
+	return EBUSY;
 }
 
 void
 rsu_set_key_cb(struct rsu_softc *sc, void *arg)
 {
 	struct rsu_cmd_key *cmd = arg;
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_key *k = &cmd->key;
 	struct r92s_fw_cmd_set_key key;
+
+	sc->sc_key_tasks--;
 
 	memset(&key, 0, sizeof(key));
 	/* Map net80211 cipher to HW crypto algorithm. */
@@ -925,12 +930,22 @@ rsu_set_key_cb(struct rsu_softc *sc, void *arg)
 		key.algo = R92S_KEY_ALGO_AES;
 		break;
 	default:
+		IEEE80211_SEND_MGMT(ic, cmd->ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+		    IEEE80211_REASON_AUTH_LEAVE);
+		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 		return;
 	}
 	key.id = k->k_id;
 	key.grpkey = (k->k_flags & IEEE80211_KEY_GROUP) != 0;
 	memcpy(key.key, k->k_key, MIN(k->k_len, sizeof(key.key)));
 	(void)rsu_fw_cmd(sc, R92S_CMD_SET_KEY, &key, sizeof(key));
+
+	if (sc->sc_key_tasks == 0) {
+		DPRINTF(("marking port %s valid\n",
+		    ether_sprintf(cmd->ni->ni_macaddr)));
+		cmd->ni->ni_port_valid = 1;
+		ieee80211_set_link_state(ic, LINK_STATE_UP);
+	}
 }
 
 /* ARGSUSED */
@@ -1261,7 +1276,8 @@ rsu_get_rssi(struct rsu_softc *sc, int rate, void *physt)
 }
 
 void
-rsu_rx_frame(struct rsu_softc *sc, uint8_t *buf, int pktlen)
+rsu_rx_frame(struct rsu_softc *sc, uint8_t *buf, int pktlen,
+    struct mbuf_list *ml)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -1371,7 +1387,7 @@ rsu_rx_frame(struct rsu_softc *sc, uint8_t *buf, int pktlen)
 	rxi.rxi_flags = 0;
 	rxi.rxi_rssi = rssi;
 	rxi.rxi_tstamp = 0;	/* Unused. */
-	ieee80211_input(ifp, m, ni, &rxi);
+	ieee80211_inputm(ifp, m, ni, &rxi, ml);
 	/* Node is no longer needed. */
 	ieee80211_release_node(ic, ni);
 	splx(s);
@@ -1380,6 +1396,7 @@ rsu_rx_frame(struct rsu_softc *sc, uint8_t *buf, int pktlen)
 void
 rsu_rx_multi_frame(struct rsu_softc *sc, uint8_t *buf, int len)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct r92s_rx_stat *stat;
 	uint32_t rxdw0;
 	int totlen, pktlen, infosz, npkts;
@@ -1408,13 +1425,14 @@ rsu_rx_multi_frame(struct rsu_softc *sc, uint8_t *buf, int len)
 			break;
 
 		/* Process 802.11 frame. */
-		rsu_rx_frame(sc, buf, pktlen);
+		rsu_rx_frame(sc, buf, pktlen, &ml);
 
 		/* Next chunk is 128-byte aligned. */
 		totlen = (totlen + 127) & ~127;
 		buf += totlen;
 		len -= totlen;
 	}
+	if_input(&sc->sc_ic.ic_if, &ml);
 }
 
 void
@@ -1636,7 +1654,7 @@ rsu_start(struct ifnet *ifp)
 			break;
 
 		/* Encapsulate and send data frames. */
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 #if NBPFILTER > 0

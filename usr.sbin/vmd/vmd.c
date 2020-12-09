@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmd.c,v 1.100 2018/09/10 10:39:26 bluhm Exp $	*/
+/*	$OpenBSD: vmd.c,v 1.119 2020/09/23 19:18:18 martijn Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -21,6 +21,7 @@
 #include <sys/wait.h>
 #include <sys/cdefs.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/tty.h>
 #include <sys/ttycom.h>
 #include <sys/ioctl.h>
@@ -62,6 +63,8 @@ int	 vmd_check_vmh(struct vm_dump_header *);
 int	 vm_instance(struct privsep *, struct vmd_vm **,
 	    struct vmop_create_params *, uid_t);
 int	 vm_checkinsflag(struct vmop_create_params *, unsigned int, uid_t);
+int	 vm_claimid(const char *, int, uint32_t *);
+void	 start_vm_batch(int, short, void*);
 
 struct vmd	*env;
 
@@ -71,6 +74,8 @@ static struct privsep_proc procs[] = {
 	{ "control",	PROC_CONTROL,	vmd_dispatch_control, control },
 	{ "vmm",	PROC_VMM,	vmd_dispatch_vmm, vmm, vmm_shutdown },
 };
+
+struct event staggered_start_timer;
 
 /* For the privileged process */
 static struct privsep_proc *proc_priv = &procs[0];
@@ -100,7 +105,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 		if (vmc.vmc_flags == 0) {
 			/* start an existing VM with pre-configured options */
 			if (!(ret == -1 && errno == EALREADY &&
-			    vm->vm_running == 0)) {
+			    !(vm->vm_state & VM_STATE_RUNNING))) {
 				res = errno;
 				cmd = IMSG_VMDOP_START_VM_RESPONSE;
 			}
@@ -115,6 +120,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
 		}
 		break;
+	case IMSG_VMDOP_WAIT_VM_REQUEST:
 	case IMSG_VMDOP_TERMINATE_VM_REQUEST:
 		IMSG_SIZE_CHECK(imsg, &vid);
 		memcpy(&vid, imsg->data, sizeof(vid));
@@ -126,12 +132,12 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 				res = ENOENT;
 				cmd = IMSG_VMDOP_TERMINATE_VM_RESPONSE;
 				break;
-			} else if (vm->vm_shutdown &&
+			} else if ((vm->vm_state & VM_STATE_SHUTDOWN) &&
 			    (flags & VMOP_FORCE) == 0) {
 				res = EALREADY;
 				cmd = IMSG_VMDOP_TERMINATE_VM_RESPONSE;
 				break;
-			} else if (vm->vm_running == 0) {
+			} else if (!(vm->vm_state & VM_STATE_RUNNING)) {
 				res = EINVAL;
 				cmd = IMSG_VMDOP_TERMINATE_VM_RESPONSE;
 				break;
@@ -231,7 +237,6 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 			cmd = IMSG_VMDOP_SEND_VM_RESPONSE;
 			close(imsg->fd);
 			break;
-		} else {
 		}
 		vmr.vmr_id = vid.vid_id;
 		log_debug("%s: sending fd to vmm", __func__);
@@ -280,7 +285,7 @@ vmd_dispatch_control(int fd, struct privsep_proc *p, struct imsg *imsg)
 			cmd = IMSG_VMDOP_START_VM_RESPONSE;
 			close(imsg->fd);
 		} else {
-			vm->vm_received = 1;
+			vm->vm_state |= VM_STATE_RECEIVED;
 			config_setvm(ps, vm, imsg->hdr.peerid,
 			    vmc.vmc_owner.uid);
 			log_debug("%s: sending fd to vmm", __func__);
@@ -343,6 +348,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		log_info("%s: paused vm %d successfully",
 		    vm->vm_params.vmc_params.vcp_name,
 		    vm->vm_vmid);
+		vm->vm_state |= VM_STATE_PAUSED;
 		break;
 	case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
 		IMSG_SIZE_CHECK(imsg, &vmr);
@@ -355,6 +361,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		log_info("%s: unpaused vm %d successfully.",
 		    vm->vm_params.vmc_params.vcp_name,
 		    vm->vm_vmid);
+		vm->vm_state &= ~VM_STATE_PAUSED;
 		break;
 	case IMSG_VMDOP_START_VM_RESPONSE:
 		IMSG_SIZE_CHECK(imsg, &vmr);
@@ -411,7 +418,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 			break;
 		if (vmr.vmr_result == 0) {
 			/* Mark VM as shutting down */
-			vm->vm_shutdown = 1;
+			vm->vm_state |= VM_STATE_SHUTDOWN;
 		}
 		break;
 	case IMSG_VMDOP_SEND_VM_RESPONSE:
@@ -419,10 +426,27 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		memcpy(&vmr, imsg->data, sizeof(vmr));
 		if ((vm = vm_getbyvmid(vmr.vmr_id)) == NULL)
 			break;
-		if (!vmr.vmr_result)
+		if (!vmr.vmr_result) {
 			log_info("%s: sent vm %d successfully.",
 			    vm->vm_params.vmc_params.vcp_name,
 			    vm->vm_vmid);
+			if (vm->vm_from_config)
+				vm_stop(vm, 0, __func__);
+			else
+				vm_remove(vm, __func__);
+		}
+
+		/* Send a response if a control client is waiting for it */
+		if (imsg->hdr.peerid != (uint32_t)-1) {
+			/* the error is meaningless for deferred responses */
+			vmr.vmr_result = 0;
+
+			if (proc_compose_imsg(ps, PROC_CONTROL, -1,
+			    IMSG_VMDOP_SEND_VM_RESPONSE,
+			    imsg->hdr.peerid, -1, &vmr, sizeof(vmr)) == -1)
+				return (-1);
+		}
+		break;
 	case IMSG_VMDOP_TERMINATE_VM_EVENT:
 		IMSG_SIZE_CHECK(imsg, &vmr);
 		memcpy(&vmr, imsg->data, sizeof(vmr));
@@ -433,7 +457,8 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 			    __func__, vmr.vmr_id);
 			break;
 		}
-		if (vmr.vmr_result != EAGAIN) {
+		if (vmr.vmr_result != EAGAIN ||
+		    vm->vm_params.vmc_bootdevice) {
 			if (vm->vm_from_config)
 				vm_stop(vm, 0, __func__);
 			else
@@ -463,12 +488,9 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 			if (vm->vm_ttyname != NULL)
 				strlcpy(vir.vir_ttyname, vm->vm_ttyname,
 				    sizeof(vir.vir_ttyname));
-			if (vm->vm_shutdown) {
-				/* XXX there might be a nicer way */
-				(void)strlcat(vir.vir_info.vir_name,
-				    " - stopping",
-				    sizeof(vir.vir_info.vir_name));
-			}
+			log_debug("%s: running vm: %d, vm_state: 0x%x",
+			    __func__, vm->vm_vmid, vm->vm_state);
+			vir.vir_state = vm->vm_state;
 			/* get the user id who started the vm */
 			vir.vir_uid = vm->vm_uid;
 			vir.vir_gid = vm->vm_params.vmc_owner.gid;
@@ -488,7 +510,7 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 		 * kernel id to indicate that they are not running.
 		 */
 		TAILQ_FOREACH(vm, env->vmd_vms, vm_entry) {
-			if (!vm->vm_running) {
+			if (!(vm->vm_state & VM_STATE_RUNNING)) {
 				memset(&vir, 0, sizeof(vir));
 				vir.vir_info.vir_id = vm->vm_vmid;
 				strlcpy(vir.vir_info.vir_name,
@@ -502,6 +524,9 @@ vmd_dispatch_vmm(int fd, struct privsep_proc *p, struct imsg *imsg)
 				/* get the configured user id for this vm */
 				vir.vir_uid = vm->vm_params.vmc_owner.uid;
 				vir.vir_gid = vm->vm_params.vmc_owner.gid;
+				log_debug("%s: vm: %d, vm_state: 0x%x",
+				    __func__, vm->vm_vmid, vm->vm_state);
+				vir.vir_state = vm->vm_state;
 				if (proc_compose_imsg(ps, PROC_CONTROL, -1,
 				    IMSG_VMDOP_GET_INFO_VM_DATA,
 				    imsg->hdr.peerid, -1, &vir,
@@ -530,6 +555,10 @@ vmd_check_vmh(struct vm_dump_header *vmh)
 	unsigned int code, leaf;
 	unsigned int a, b, c, d;
 
+	if (strncmp(vmh->vmh_signature, VM_DUMP_SIGNATURE, strlen(VM_DUMP_SIGNATURE)) != 0) {
+		log_warnx("%s: incompatible dump signature", __func__);
+		return (-1);
+	}
 
 	if (vmh->vmh_version != VM_DUMP_VERSION) {
 		log_warnx("%s: incompatible dump version", __func__);
@@ -829,11 +858,40 @@ main(int argc, char **argv)
 	return (0);
 }
 
+void
+start_vm_batch(int fd, short type, void *args)
+{
+	int		i = 0;
+	struct vmd_vm	*vm;
+
+	log_debug("%s: starting batch of %d vms", __func__,
+	    env->vmd_cfg.parallelism);
+	TAILQ_FOREACH(vm, env->vmd_vms, vm_entry) {
+		if (!(vm->vm_state & VM_STATE_WAITING)) {
+			log_debug("%s: not starting vm %s (disabled)",
+			    __func__,
+			    vm->vm_params.vmc_params.vcp_name);
+			continue;
+		}
+		i++;
+		if (i > env->vmd_cfg.parallelism) {
+			evtimer_add(&staggered_start_timer,
+			    &env->vmd_cfg.delay);
+			break;
+		}
+		vm->vm_state &= ~VM_STATE_WAITING;
+		config_setvm(&env->vmd_ps, vm, -1, vm->vm_params.vmc_owner.uid);
+	}
+	log_debug("%s: done starting vms", __func__);
+}
+
 int
 vmd_configure(void)
 {
-	struct vmd_vm		*vm;
+	int			ncpus;
 	struct vmd_switch	*vsw;
+	int ncpu_mib[] = {CTL_HW, HW_NCPUONLINE};
+	size_t ncpus_sz = sizeof(ncpus);
 
 	if ((env->vmd_ptmfd = open(PATH_PTMDEV, O_RDWR|O_CLOEXEC)) == -1)
 		fatal("open %s", PATH_PTMDEV);
@@ -881,17 +939,20 @@ vmd_configure(void)
 		}
 	}
 
-	TAILQ_FOREACH(vm, env->vmd_vms, vm_entry) {
-		if (vm->vm_disabled) {
-			log_debug("%s: not creating vm %s (disabled)",
-			    __func__,
-			    vm->vm_params.vmc_params.vcp_name);
-			continue;
-		}
-		if (config_setvm(&env->vmd_ps, vm,
-		    -1, vm->vm_params.vmc_owner.uid) == -1)
-			return (-1);
+	if (!(env->vmd_cfg.cfg_flags & VMD_CFG_STAGGERED_START)) {
+		env->vmd_cfg.delay.tv_sec = VMD_DEFAULT_STAGGERED_START_DELAY;
+		if (sysctl(ncpu_mib, NELEM(ncpu_mib), &ncpus, &ncpus_sz, NULL, 0) == -1)
+			ncpus = 1;
+		env->vmd_cfg.parallelism = ncpus;
+		log_debug("%s: setting staggered start configuration to "
+		    "parallelism: %d and delay: %lld",
+		    __func__, ncpus, (long long) env->vmd_cfg.delay.tv_sec);
 	}
+
+	log_debug("%s: starting vms in staggered fashion", __func__);
+	evtimer_set(&staggered_start_timer, start_vm_batch, NULL);
+	/* start first batch */
+	start_vm_batch(0, 0, NULL);
 
 	return (0);
 }
@@ -927,7 +988,7 @@ vmd_reload(unsigned int reset, const char *filename)
 		if (reload) {
 			TAILQ_FOREACH_SAFE(vm, env->vmd_vms, vm_entry,
 			    next_vm) {
-				if (vm->vm_running == 0) {
+				if (!(vm->vm_state & VM_STATE_RUNNING)) {
 					DPRINTF("%s: calling vm_remove",
 					    __func__);
 					vm_remove(vm, __func__);
@@ -958,24 +1019,12 @@ vmd_reload(unsigned int reset, const char *filename)
 			}
 		}
 
-		TAILQ_FOREACH(vm, env->vmd_vms, vm_entry) {
-			if (vm->vm_running == 0) {
-				if (vm->vm_disabled) {
-					log_debug("%s: not creating vm %s"
-					    " (disabled)", __func__,
-					    vm->vm_params.vmc_params.vcp_name);
-					continue;
-				}
-				if (config_setvm(&env->vmd_ps, vm,
-				    -1, vm->vm_params.vmc_owner.uid) == -1)
-					return (-1);
-			} else {
-				log_debug("%s: not creating vm \"%s\": "
-				    "(running)", __func__,
-				    vm->vm_params.vmc_params.vcp_name);
-			}
+		log_debug("%s: starting vms in staggered fashion", __func__);
+		evtimer_set(&staggered_start_timer, start_vm_batch, NULL);
+		/* start first batch */
+		start_vm_batch(0, 0, NULL);
+
 		}
-	}
 
 	return (0);
 }
@@ -1080,7 +1129,7 @@ void
 vm_stop(struct vmd_vm *vm, int keeptty, const char *caller)
 {
 	struct privsep	*ps = &env->vmd_ps;
-	unsigned int	 i;
+	unsigned int	 i, j;
 
 	if (vm == NULL)
 		return;
@@ -1089,8 +1138,7 @@ vm_stop(struct vmd_vm *vm, int keeptty, const char *caller)
 	    __func__, ps->ps_title[privsep_process], caller,
 	    vm->vm_vmid, keeptty ? ", keeping tty open" : "");
 
-	vm->vm_running = 0;
-	vm->vm_shutdown = 0;
+	vm->vm_state &= ~(VM_STATE_RUNNING | VM_STATE_SHUTDOWN);
 
 	user_inc(&vm->vm_params.vmc_params, vm->vm_user, 0);
 	user_put(vm->vm_user);
@@ -1100,9 +1148,11 @@ vm_stop(struct vmd_vm *vm, int keeptty, const char *caller)
 		close(vm->vm_iev.ibuf.fd);
 	}
 	for (i = 0; i < VMM_MAX_DISKS_PER_VM; i++) {
-		if (vm->vm_disks[i] != -1) {
-			close(vm->vm_disks[i]);
-			vm->vm_disks[i] = -1;
+		for (j = 0; j < VM_MAX_BASE_PER_DISK; j++) {
+			if (vm->vm_disks[i][j] != -1) {
+				close(vm->vm_disks[i][j]);
+				vm->vm_disks[i][j] = -1;
+			}
 		}
 	}
 	for (i = 0; i < VMM_MAX_NICS_PER_VM; i++) {
@@ -1151,6 +1201,37 @@ vm_remove(struct vmd_vm *vm, const char *caller)
 }
 
 int
+vm_claimid(const char *name, int uid, uint32_t *id)
+{
+	struct name2id *n2i = NULL;
+
+	TAILQ_FOREACH(n2i, env->vmd_known, entry)
+		if (strcmp(n2i->name, name) == 0 && n2i->uid == uid)
+			goto out;
+
+	if (++env->vmd_nvm == 0) {
+		log_warnx("too many vms");
+		return -1;
+	}
+	if ((n2i = calloc(1, sizeof(struct name2id))) == NULL) {
+		log_warnx("could not alloc vm name");
+		return -1;
+	}
+	n2i->id = env->vmd_nvm;
+	n2i->uid = uid;
+	if (strlcpy(n2i->name, name, sizeof(n2i->name)) >= sizeof(n2i->name)) {
+		log_warnx("vm name too long");
+		free(n2i);
+		return -1;
+	}
+	TAILQ_INSERT_TAIL(env->vmd_known, n2i, entry);
+
+out:
+	*id = n2i->id;
+	return 0;
+}
+
+int
 vm_register(struct privsep *ps, struct vmop_create_params *vmc,
     struct vmd_vm **ret_vm, uint32_t id, uid_t uid)
 {
@@ -1158,8 +1239,8 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 	struct vm_create_params	*vcp = &vmc->vmc_params;
 	struct vmop_owner	*vmo = NULL;
 	struct vmd_user		*usr = NULL;
-	uint32_t		 rng;
-	unsigned int		 i;
+	uint32_t		 nid, rng;
+	unsigned int		 i, j;
 	struct vmd_switch	*sw;
 	char			*s;
 
@@ -1246,11 +1327,12 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 	vm->vm_pid = -1;
 	vm->vm_tty = -1;
 	vm->vm_receive_fd = -1;
-	vm->vm_paused = 0;
+	vm->vm_state &= ~VM_STATE_PAUSED;
 	vm->vm_user = usr;
 
 	for (i = 0; i < VMM_MAX_DISKS_PER_VM; i++)
-		vm->vm_disks[i] = -1;
+		for (j = 0; j < VM_MAX_BASE_PER_DISK; j++)
+			vm->vm_disks[i][j] = -1;
 	for (i = 0; i < VMM_MAX_NICS_PER_VM; i++)
 		vm->vm_ifs[i].vif_fd = -1;
 	for (i = 0; i < vcp->vcp_nnics; i++) {
@@ -1280,11 +1362,16 @@ vm_register(struct privsep *ps, struct vmop_create_params *vmc,
 	vm->vm_cdrom = -1;
 	vm->vm_iev.ibuf.fd = -1;
 
-	if (++env->vmd_nvm == 0)
-		fatalx("too many vms");
-
-	/* Assign a new internal Id if not specified */
-	vm->vm_vmid = id == 0 ? env->vmd_nvm : id;
+	/*
+	 * Assign a new internal Id if not specified and we succeed in
+	 * claiming a new Id.
+	 */
+	if (id != 0)
+		vm->vm_vmid = id;
+	else if (vm_claimid(vcp->vcp_name, uid, &nid) == -1)
+		goto fail;
+	else
+		vm->vm_vmid = nid;
 
 	log_debug("%s: registering vm %d", __func__, vm->vm_vmid);
 	TAILQ_INSERT_TAIL(env->vmd_vms, vm, vm_entry);
@@ -1311,8 +1398,13 @@ vm_instance(struct privsep *ps, struct vmd_vm **vm_parent,
 
 	/* return without error if the parent is NULL (nothing to inherit) */
 	if ((vmc->vmc_flags & VMOP_CREATE_INSTANCE) == 0 ||
-	    (*vm_parent = vm_getbyname(vmc->vmc_instance)) == NULL)
+	    vmc->vmc_instance[0] == '\0')
 		return (0);
+
+	if ((*vm_parent = vm_getbyname(vmc->vmc_instance)) == NULL) {
+		errno = VMD_PARENT_INVALID;
+		return (-1);
+	}
 
 	errno = 0;
 	vmcp = &(*vm_parent)->vm_params;
@@ -1537,8 +1629,8 @@ vm_checkperm(struct vmd_vm *vm, struct vmop_owner *vmo, uid_t uid)
 		 * check user of running vm (the owner of a running vm can
 		 * be different to (or more specific than) the configured owner.
 		 */
-		if ((vm->vm_running && vm->vm_uid == uid) ||
-		    (!vm->vm_running && vmo->uid == uid))
+		if (((vm->vm_state & VM_STATE_RUNNING) && vm->vm_uid == uid) ||
+		    (!(vm->vm_state & VM_STATE_RUNNING) && vmo->uid == uid))
 			return (0);
 	}
 
@@ -1674,7 +1766,7 @@ vm_opentty(struct vmd_vm *vm)
 	 * We use user ioctl(2) mode to pass break commands.
 	 */
 	on = 1;
-	if (ioctl(ptm.cfd, TIOCUCNTL, &on))
+	if (ioctl(ptm.cfd, TIOCUCNTL, &on) == -1)
 		fatal("could not enable user ioctl mode");
 
 	vm->vm_tty = ptm.cfd;
@@ -1861,7 +1953,7 @@ user_checklimit(struct vmd_user *usr, struct vm_create_params *vcp)
 		limit = "cpu ";
 		goto fail;
 	}
-	if (usr->usr_maxcpu > VM_DEFAULT_USER_MAXMEM) {
+	if (usr->usr_maxmem > VM_DEFAULT_USER_MAXMEM) {
 		limit = "memory ";
 		goto fail;
 	}
@@ -1900,4 +1992,34 @@ prefixlen2mask(uint8_t prefixlen)
 		prefixlen = 32;
 
 	return (htonl(0xffffffff << (32 - prefixlen)));
+}
+
+void
+prefixlen2mask6(uint8_t prefixlen, struct in6_addr *mask)
+{
+	struct in6_addr	 s6;
+	int		 i;
+
+	if (prefixlen > 128)
+		prefixlen = 128;
+
+	memset(&s6, 0, sizeof(s6));
+	for (i = 0; i < prefixlen / 8; i++)
+		s6.s6_addr[i] = 0xff;
+	i = prefixlen % 8;
+	if (i)
+		s6.s6_addr[prefixlen / 8] = 0xff00 >> i;
+
+	memcpy(mask, &s6, sizeof(s6));
+}
+
+void
+getmonotime(struct timeval *tv)
+{
+	struct timespec	 ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+		fatal("clock_gettime");
+
+	TIMESPEC_TO_TIMEVAL(tv, &ts);
 }

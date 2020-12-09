@@ -1,4 +1,4 @@
-/*	$OpenBSD: sched_bsd.c,v 1.47 2017/12/04 09:38:20 mpi Exp $	*/
+/*	$OpenBSD: sched_bsd.c,v 1.64 2020/10/15 07:49:55 mpi Exp $	*/
 /*	$NetBSD: kern_synch.c,v 1.37 1996/04/22 01:38:37 christos Exp $	*/
 
 /*-
@@ -47,6 +47,8 @@
 #include <uvm/uvm_extern.h>
 #include <sys/sched.h>
 #include <sys/timeout.h>
+#include <sys/smr.h>
+#include <sys/tracepoint.h>
 
 #ifdef KTRACE
 #include <sys/ktrace.h>
@@ -60,8 +62,8 @@ int	rrticks_init;		/* # of hardclock ticks per roundrobin() */
 struct __mp_lock sched_lock;
 #endif
 
-void	 schedcpu(void *);
-void	 updatepri(struct proc *);
+void			schedcpu(void *);
+uint32_t		decay_aftersleep(uint32_t, uint32_t);
 
 void
 scheduler_start(void)
@@ -218,6 +220,13 @@ schedcpu(void *arg)
 
 	LIST_FOREACH(p, &allproc, p_list) {
 		/*
+		 * Idle threads are never placed on the runqueue,
+		 * therefore computing their priority is pointless.
+		 */
+		if (p->p_cpu != NULL &&
+		    p->p_cpu->ci_schedstate.spc_idleproc == p)
+			continue;
+		/*
 		 * Increment sleep time (if sleeping). We ignore overflow.
 		 */
 		if (p->p_stat == SSLEEP || p->p_stat == SSTOP)
@@ -244,17 +253,12 @@ schedcpu(void *arg)
 #endif
 		p->p_cpticks = 0;
 		newcpu = (u_int) decay_cpu(loadfac, p->p_estcpu);
-		p->p_estcpu = newcpu;
-		resetpriority(p);
-		if (p->p_priority >= PUSER) {
-			if (p->p_stat == SRUN &&
-			    (p->p_priority / SCHED_PPQ) !=
-			    (p->p_usrpri / SCHED_PPQ)) {
-				remrunqueue(p);
-				p->p_priority = p->p_usrpri;
-				setrunqueue(p);
-			} else
-				p->p_priority = p->p_usrpri;
+		setpriority(p, newcpu, p->p_p->ps_nice);
+
+		if (p->p_stat == SRUN &&
+		    (p->p_runpri / SCHED_PPQ) != (p->p_usrpri / SCHED_PPQ)) {
+			remrunqueue(p);
+			setrunqueue(p->p_cpu, p, p->p_usrpri);
 		}
 		SCHED_UNLOCK(s);
 	}
@@ -268,23 +272,23 @@ schedcpu(void *arg)
  * For all load averages >= 1 and max p_estcpu of 255, sleeping for at
  * least six times the loadfactor will decay p_estcpu to zero.
  */
-void
-updatepri(struct proc *p)
+uint32_t
+decay_aftersleep(uint32_t estcpu, uint32_t slptime)
 {
-	unsigned int newcpu = p->p_estcpu;
 	fixpt_t loadfac = loadfactor(averunnable.ldavg[0]);
+	uint32_t newcpu;
 
-	SCHED_ASSERT_LOCKED();
-
-	if (p->p_slptime > 5 * loadfac)
-		p->p_estcpu = 0;
+	if (slptime > 5 * loadfac)
+		newcpu = 0;
 	else {
-		p->p_slptime--;	/* the first time was done in schedcpu */
-		while (newcpu && --p->p_slptime)
-			newcpu = (int) decay_cpu(loadfac, newcpu);
-		p->p_estcpu = newcpu;
+		newcpu = estcpu;
+		slptime--;	/* the first time was done in schedcpu */
+		while (newcpu && --slptime)
+			newcpu = decay_cpu(loadfac, newcpu);
+
 	}
-	resetpriority(p);
+
+	return (newcpu);
 }
 
 /*
@@ -297,12 +301,8 @@ yield(void)
 	struct proc *p = curproc;
 	int s;
 
-	NET_ASSERT_UNLOCKED();
-
 	SCHED_LOCK(s);
-	p->p_priority = p->p_usrpri;
-	p->p_stat = SRUN;
-	setrunqueue(p);
+	setrunqueue(p->p_cpu, p, p->p_usrpri);
 	p->p_ru.ru_nvcsw++;
 	mi_switch();
 	SCHED_UNLOCK(s);
@@ -321,9 +321,7 @@ preempt(void)
 	int s;
 
 	SCHED_LOCK(s);
-	p->p_priority = p->p_usrpri;
-	p->p_stat = SRUN;
-	setrunqueue(p);
+	setrunqueue(p->p_cpu, p, p->p_usrpri);
 	p->p_ru.ru_nivcsw++;
 	mi_switch();
 	SCHED_UNLOCK(s);
@@ -336,8 +334,6 @@ mi_switch(void)
 	struct proc *p = curproc;
 	struct proc *nextproc;
 	struct process *pr = p->p_p;
-	struct rlimit *rlim;
-	rlim_t secs;
 	struct timespec ts;
 #ifdef MULTIPROCESSOR
 	int hold_count;
@@ -382,22 +378,6 @@ mi_switch(void)
 	tuagg_unlocked(pr, p);
 
 	/*
-	 * Check if the process exceeds its cpu resource allocation.
-	 * If over max, kill it.
-	 */
-	rlim = &pr->ps_limit->pl_rlimit[RLIMIT_CPU];
-	secs = pr->ps_tu.tu_runtime.tv_sec;
-	if (secs >= rlim->rlim_cur) {
-		if (secs >= rlim->rlim_max) {
-			psignal(p, SIGKILL);
-		} else {
-			psignal(p, SIGXCPU);
-			if (rlim->rlim_cur < rlim->rlim_max)
-				rlim->rlim_cur += 5;
-		}
-	}
-
-	/*
 	 * Process is about to yield the CPU; clear the appropriate
 	 * scheduling flags.
 	 */
@@ -407,8 +387,12 @@ mi_switch(void)
 
 	if (p != nextproc) {
 		uvmexp.swtch++;
+		TRACEPOINT(sched, off__cpu, nextproc->p_tid,
+		    nextproc->p_p->ps_pid);
 		cpu_switchto(p, nextproc);
+		TRACEPOINT(sched, on__cpu, NULL);
 	} else {
+		TRACEPOINT(sched, remain__cpu, NULL);
 		p->p_stat = SONPROC;
 	}
 
@@ -427,6 +411,8 @@ mi_switch(void)
 #endif
 
 	SCHED_ASSERT_UNLOCKED();
+
+	smr_idle();
 
 	/*
 	 * We're running again; record our new start time.  We might
@@ -449,37 +435,16 @@ mi_switch(void)
 #endif
 }
 
-static __inline void
-resched_proc(struct proc *p, u_char pri)
-{
-	struct cpu_info *ci;
-
-	/*
-	 * XXXSMP
-	 * This does not handle the case where its last
-	 * CPU is running a higher-priority process, but every
-	 * other CPU is running a lower-priority process.  There
-	 * are ways to handle this situation, but they're not
-	 * currently very pretty, and we also need to weigh the
-	 * cost of moving a process from one CPU to another.
-	 *
-	 * XXXSMP
-	 * There is also the issue of locking the other CPU's
-	 * sched state, which we currently do not do.
-	 */
-	ci = (p->p_cpu != NULL) ? p->p_cpu : curcpu();
-	if (pri < ci->ci_schedstate.spc_curpriority)
-		need_resched(ci);
-}
-
 /*
  * Change process state to be runnable,
- * placing it on the run queue if it is in memory,
- * and awakening the swapper if it isn't in memory.
+ * placing it on the run queue.
  */
 void
 setrunnable(struct proc *p)
 {
+	struct process *pr = p->p_p;
+	u_char prio;
+
 	SCHED_ASSERT_LOCKED();
 
 	switch (p->p_stat) {
@@ -495,38 +460,39 @@ setrunnable(struct proc *p)
 		 * If we're being traced (possibly because someone attached us
 		 * while we were stopped), check for a signal from the debugger.
 		 */
-		if ((p->p_p->ps_flags & PS_TRACED) != 0 && p->p_xstat != 0)
-			atomic_setbits_int(&p->p_siglist, sigmask(p->p_xstat));
+		if ((pr->ps_flags & PS_TRACED) != 0 && pr->ps_xsig != 0)
+			atomic_setbits_int(&p->p_siglist, sigmask(pr->ps_xsig));
+		prio = p->p_usrpri;
+		unsleep(p);
+		break;
 	case SSLEEP:
+		prio = p->p_slppri;
 		unsleep(p);		/* e.g. when sending signals */
 		break;
 	}
-	p->p_stat = SRUN;
-	p->p_cpu = sched_choosecpu(p);
-	setrunqueue(p);
-	if (p->p_slptime > 1)
-		updatepri(p);
+	setrunqueue(NULL, p, prio);
+	if (p->p_slptime > 1) {
+		uint32_t newcpu;
+
+		newcpu = decay_aftersleep(p->p_estcpu, p->p_slptime);
+		setpriority(p, newcpu, pr->ps_nice);
+	}
 	p->p_slptime = 0;
-	resched_proc(p, p->p_priority);
 }
 
 /*
- * Compute the priority of a process when running in user mode.
- * Arrange to reschedule if the resulting priority is better
- * than that of the current process.
+ * Compute the priority of a process.
  */
 void
-resetpriority(struct proc *p)
+setpriority(struct proc *p, uint32_t newcpu, uint8_t nice)
 {
-	unsigned int newpriority;
+	unsigned int newprio;
+
+	newprio = min((PUSER + newcpu + NICE_WEIGHT * (nice - NZERO)), MAXPRI);
 
 	SCHED_ASSERT_LOCKED();
-
-	newpriority = PUSER + p->p_estcpu +
-	    NICE_WEIGHT * (p->p_p->ps_nice - NZERO);
-	newpriority = min(newpriority, MAXPRI);
-	p->p_usrpri = newpriority;
-	resched_proc(p, p->p_usrpri);
+	p->p_estcpu = newcpu;
+	p->p_usrpri = newprio;
 }
 
 /*
@@ -546,13 +512,17 @@ resetpriority(struct proc *p)
 void
 schedclock(struct proc *p)
 {
+	struct cpu_info *ci = curcpu();
+	struct schedstate_percpu *spc = &ci->ci_schedstate;
+	uint32_t newcpu;
 	int s;
 
+	if (p == spc->spc_idleproc || spc->spc_spinning)
+		return;
+
 	SCHED_LOCK(s);
-	p->p_estcpu = ESTCPULIM(p->p_estcpu + 1);
-	resetpriority(p);
-	if (p->p_priority >= PUSER)
-		p->p_priority = p->p_usrpri;
+	newcpu = ESTCPULIM(p->p_estcpu + 1);
+	setpriority(p, newcpu, p->p_p->ps_nice);
 	SCHED_UNLOCK(s);
 }
 
@@ -604,6 +574,8 @@ setperf_auto(void *v)
 	j = 0;
 	speedup = 0;
 	CPU_INFO_FOREACH(cii, ci) {
+		if (!cpu_is_online(ci))
+			continue;
 		total = 0;
 		for (i = 0; i < CPUSTATES; i++) {
 			total += ci->ci_schedstate.spc_cp_time[i];

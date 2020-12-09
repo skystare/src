@@ -1,4 +1,4 @@
-/*	$OpenBSD: slaacd.h,v 1.20 2018/07/27 06:23:08 bket Exp $	*/
+/*	$OpenBSD: slaacd.h,v 1.27 2020/09/14 09:07:05 florian Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -27,6 +27,10 @@
 /* MAXDNAME from arpa/namesr.h */
 #define SLAACD_MAX_DNSSL	1025
 
+#define	MAX_RDNS_COUNT		8 /* max nameserver in a RTM_PROPOSAL */
+
+#define	IMSG_DATA_SIZE(imsg)	((imsg).hdr.len - IMSG_HEADER_SIZE)
+
 static const char * const log_procnames[] = {
 	"main",
 	"engine",
@@ -53,26 +57,28 @@ enum imsg_type {
 	IMSG_CTL_SHOW_INTERFACE_INFO_ADDR_PROPOSAL,
 	IMSG_CTL_SHOW_INTERFACE_INFO_DFR_PROPOSALS,
 	IMSG_CTL_SHOW_INTERFACE_INFO_DFR_PROPOSAL,
+	IMSG_CTL_SHOW_INTERFACE_INFO_RDNS_PROPOSALS,
+	IMSG_CTL_SHOW_INTERFACE_INFO_RDNS_PROPOSAL,
 	IMSG_CTL_END,
 	IMSG_UPDATE_ADDRESS,
 	IMSG_UPDATE_LINK_STATE,
+	IMSG_PROPOSE_RDNS,
+	IMSG_REPROPOSE_RDNS,
 #endif	/* SMALL */
 	IMSG_CTL_SEND_SOLICITATION,
 	IMSG_SOCKET_IPC,
+	IMSG_OPEN_ICMP6SOCK,
 	IMSG_ICMP6SOCK,
 	IMSG_ROUTESOCK,
 	IMSG_CONTROLFD,
 	IMSG_STARTUP,
-	IMSG_STARTUP_DONE,
 	IMSG_UPDATE_IF,
 	IMSG_REMOVE_IF,
 	IMSG_RA,
-	IMSG_PROPOSAL,
-	IMSG_PROPOSAL_ACK,
 	IMSG_CONFIGURE_ADDRESS,
+	IMSG_WITHDRAW_ADDRESS,
 	IMSG_DEL_ADDRESS,
 	IMSG_DEL_ROUTE,
-	IMSG_FAKE_ACK,
 	IMSG_CONFIGURE_DFR,
 	IMSG_WITHDRAW_DFR,
 	IMSG_DUP_ADDRESS,
@@ -160,6 +166,19 @@ struct ctl_engine_info_dfr_proposal {
 	char			 rpref[sizeof("MEDIUM")];
 };
 
+struct ctl_engine_info_rdns_proposal {
+	int64_t			 id;
+	char			 state[sizeof("PROPOSAL_NEARLY_EXPIRED")];
+	time_t			 next_timeout;
+	int			 timeout_count;
+	struct timespec		 when;
+	struct timespec		 uptime;
+	struct sockaddr_in6	 from;
+	uint32_t		 rdns_lifetime;
+	int			 rdns_count;
+	struct in6_addr		 rdns[MAX_RDNS_COUNT];
+};
+
 struct imsg_addrinfo {
 	uint32_t		if_index;
 	struct ether_addr	hw_address;
@@ -175,10 +194,19 @@ struct imsg_link_state {
 	uint32_t	if_index;
 	int		link_state;
 };
+
+struct imsg_propose_rdns {
+	uint32_t		if_index;
+	int			rdomain;
+	int			rdns_count;
+	struct in6_addr		rdns[MAX_RDNS_COUNT];
+};
+
 #endif	/* SMALL */
 
 struct imsg_ifinfo {
 	uint32_t		if_index;
+	int			rdomain;
 	int			running;
 	int			autoconfprivacy;
 	int			soii;
@@ -195,12 +223,6 @@ struct imsg_del_addr {
 struct imsg_del_route {
 	uint32_t		if_index;
 	struct sockaddr_in6	gw;
-};
-
-struct imsg_proposal_ack {
-	int64_t		 id;
-	pid_t		 pid;
-	uint32_t	 if_index;
 };
 
 struct imsg_ra {

@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-kill-session.c,v 1.24 2017/07/09 22:33:09 nicm Exp $ */
+/* $OpenBSD: cmd-kill-session.c,v 1.27 2020/04/13 10:59:58 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -45,11 +45,10 @@ const struct cmd_entry cmd_kill_session_entry = {
 static enum cmd_retval
 cmd_kill_session_exec(struct cmd *self, struct cmdq_item *item)
 {
-	struct args	*args = self->args;
-	struct session	*s, *sloop, *stmp;
-	struct winlink	*wl;
-
-	s = item->target.s;
+	struct args		*args = cmd_get_args(self);
+	struct cmd_find_state	*target = cmdq_get_target(item);
+	struct session		*s = target->s, *sloop, *stmp;
+	struct winlink		*wl;
 
 	if (args_has(args, 'C')) {
 		RB_FOREACH(wl, winlinks, &s->windows) {
@@ -61,12 +60,12 @@ cmd_kill_session_exec(struct cmd *self, struct cmdq_item *item)
 		RB_FOREACH_SAFE(sloop, sessions, &sessions, stmp) {
 			if (sloop != s) {
 				server_destroy_session(sloop);
-				session_destroy(sloop, __func__);
+				session_destroy(sloop, 1, __func__);
 			}
 		}
 	} else {
 		server_destroy_session(s);
-		session_destroy(s, __func__);
+		session_destroy(s, 1, __func__);
 	}
 	return (CMD_RETURN_NORMAL);
 }

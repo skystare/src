@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ether.h,v 1.73 2016/11/29 10:09:57 reyk Exp $	*/
+/*	$OpenBSD: if_ether.h,v 1.78 2020/07/22 02:16:02 dlg Exp $	*/
 /*	$NetBSD: if_ether.h,v 1.22 1996/05/11 13:00:00 mycroft Exp $	*/
 
 /*
@@ -108,6 +108,13 @@ struct  ether_vlan_header {
 #include <net/ethertypes.h>
 
 #define	ETHER_IS_MULTICAST(addr) (*(addr) & 0x01) /* is address mcast/bcast? */
+#define	ETHER_IS_BROADCAST(addr) \
+	(((addr)[0] & (addr)[1] & (addr)[2] & \
+	  (addr)[3] & (addr)[4] & (addr)[5]) == 0xff)
+#define	ETHER_IS_ANYADDR(addr)		\
+	(((addr)[0] | (addr)[1] | (addr)[2] | \
+	  (addr)[3] | (addr)[4] | (addr)[5]) == 0x00)
+#define	ETHER_IS_EQ(a1, a2)	(memcmp((a1), (a2), ETHER_ADDR_LEN) == 0)
 
 #define	ETHERMTU	(ETHER_MAX_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
 #define	ETHERMIN	(ETHER_MIN_LEN - ETHER_HDR_LEN - ETHER_CRC_LEN)
@@ -192,6 +199,11 @@ do {									\
 
 #include <net/if_var.h>	/* for "struct ifnet" */
 
+struct ether_brport {
+	struct mbuf	*(*eb_input)(struct ifnet *, struct mbuf *, void *);
+	void		  *eb_port;
+};
+
 /*
  * Structure shared between the ethernet driver modules and
  * the address resolution code.  For example, each ec_softc or il_softc
@@ -205,6 +217,8 @@ struct	arpcom {
 	int	 ac_multicnt;			/* length of ac_multiaddrs */
 	int	 ac_multirangecnt;		/* number of mcast ranges */
 
+	void	*ac_trunkport;
+	const struct ether_brport *ac_brport;
 };
 
 extern int arpt_keep;				/* arp resolved cache expire */
@@ -239,12 +253,24 @@ int	ether_multiaddr(struct sockaddr *, u_int8_t[], u_int8_t[]);
 void	ether_ifattach(struct ifnet *);
 void	ether_ifdetach(struct ifnet *);
 int	ether_ioctl(struct ifnet *, struct arpcom *, u_long, caddr_t);
-int	ether_input(struct ifnet *, struct mbuf *, void *);
-int	ether_output(struct ifnet *,
-	    struct mbuf *, struct sockaddr *, struct rtentry *);
+void	ether_input(struct ifnet *, struct mbuf *);
+int	ether_resolve(struct ifnet *, struct mbuf *, struct sockaddr *,
+	    struct rtentry *, struct ether_header *);
+struct mbuf *
+	ether_encap(struct ifnet *, struct mbuf *, struct sockaddr *,
+	    struct rtentry *, int *);
+int	ether_output(struct ifnet *, struct mbuf *, struct sockaddr *,
+	    struct rtentry *);
 void	ether_rtrequest(struct ifnet *, int, struct rtentry *);
 char	*ether_sprintf(u_char *);
 
+int	ether_brport_isset(struct ifnet *);
+void	ether_brport_set(struct ifnet *, const struct ether_brport *);
+void	ether_brport_clr(struct ifnet *);
+const struct ether_brport *
+	ether_brport_get(struct ifnet *);
+const struct ether_brport *
+	ether_brport_get_locked(struct ifnet *);
 
 /*
  * Ethernet multicast address structure.  There is one of these for each

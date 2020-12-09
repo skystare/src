@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_exit.c,v 1.169 2018/08/25 15:38:07 anton Exp $	*/
+/*	$OpenBSD: kern_exit.c,v 1.192 2020/12/07 16:55:28 mpi Exp $	*/
 /*	$NetBSD: kern_exit.c,v 1.39 1996/04/22 01:38:25 christos Exp $	*/
 
 /*
@@ -63,6 +63,7 @@
 #ifdef SYSVSEM
 #include <sys/sem.h>
 #endif
+#include <sys/smr.h>
 #include <sys/witness.h>
 
 #include <sys/mount.h>
@@ -76,6 +77,7 @@
 #endif
 
 void	proc_finish_wait(struct proc *, struct proc *);
+void	process_clear_orphan(struct process *);
 void	process_zap(struct process *);
 void	proc_free(struct proc *);
 void	unveil_destroy(struct process *ps);
@@ -91,7 +93,7 @@ sys_exit(struct proc *p, void *v, register_t *retval)
 		syscallarg(int) rval;
 	} */ *uap = v;
 
-	exit1(p, W_EXITCODE(SCARG(uap, rval), 0), EXIT_NORMAL);
+	exit1(p, SCARG(uap, rval), 0, EXIT_NORMAL);
 	/* NOTREACHED */
 	return (0);
 }
@@ -108,7 +110,7 @@ sys___threxit(struct proc *p, void *v, register_t *retval)
 		if (copyout(&zero, SCARG(uap, notdead), sizeof(zero)))
 			psignal(p, SIGSEGV);
 	}
-	exit1(p, 0, EXIT_THREAD);
+	exit1(p, 0, 0, EXIT_THREAD);
 
 	return (0);
 }
@@ -119,7 +121,7 @@ sys___threxit(struct proc *p, void *v, register_t *retval)
  * status and rusage for wait().  Check for child processes and orphan them.
  */
 void
-exit1(struct proc *p, int rv, int flags)
+exit1(struct proc *p, int xexit, int xsig, int flags)
 {
 	struct process *pr, *qr, *nqr;
 	struct rusage *rup;
@@ -139,13 +141,13 @@ exit1(struct proc *p, int rv, int flags)
 			single_thread_check(p, 0);
 	}
 
-	if (flags == EXIT_NORMAL) {
+	if (flags == EXIT_NORMAL && !(pr->ps_flags & PS_EXITING)) {
 		if (pr->ps_pid == 1)
-			panic("init died (signal %d, exit %d)",
-			    WTERMSIG(rv), WEXITSTATUS(rv));
+			panic("init died (signal %d, exit %d)", xsig, xexit);
 
 		atomic_setbits_int(&pr->ps_flags, PS_EXITING);
-		pr->ps_mainproc->p_xstat = rv;
+		pr->ps_xexit = xexit;
+		pr->ps_xsig  = xsig;
 
 		/*
 		 * If parent is waiting for us to exit or exec, PS_PPWAIT
@@ -160,11 +162,11 @@ exit1(struct proc *p, int rv, int flags)
 	}
 
 	/* unlink ourselves from the active threads */
-	TAILQ_REMOVE(&pr->ps_threads, p, p_thr_link);
+	SMR_TAILQ_REMOVE_LOCKED(&pr->ps_threads, p, p_thr_link);
 	if ((p->p_flag & P_THREAD) == 0) {
 		/* main thread gotta wait because it has the pid, et al */
 		while (pr->ps_refcnt > 1)
-			tsleep(&pr->ps_threads, PUSER, "thrdeath", 0);
+			tsleep_nsec(&pr->ps_threads, PWAIT, "thrdeath", INFSLP);
 		if (pr->ps_flags & PS_PROFIL)
 			stopprofclock(pr);
 	}
@@ -180,16 +182,22 @@ exit1(struct proc *p, int rv, int flags)
 		}
 	}
 	p->p_siglist = 0;
+	if ((p->p_flag & P_THREAD) == 0)
+		pr->ps_siglist = 0;
 
 #if NKCOV > 0
 	kcov_exit(p);
 #endif
 
 	if ((p->p_flag & P_THREAD) == 0) {
+		sigio_freelist(&pr->ps_sigiolst);
+
 		/* close open files and release open-file table */
 		fdfree(p);
 
-		timeout_del(&pr->ps_realit_to);
+		cancel_all_itimers();
+
+		timeout_del(&pr->ps_rucheck_to);
 #ifdef SYSVSEM
 		semexit(pr);
 #endif
@@ -204,11 +212,13 @@ exit1(struct proc *p, int rv, int flags)
 			ktrcleartrace(pr);
 #endif
 
+		unveil_destroy(pr);
+
 		/*
 		 * If parent has the SAS_NOCLDWAIT flag set, we're not
 		 * going to become a zombie.
 		 */
-		if (pr->ps_pptr->ps_sigacts->ps_flags & SAS_NOCLDWAIT)
+		if (pr->ps_pptr->ps_sigacts->ps_sigflags & SAS_NOCLDWAIT)
 			atomic_setbits_int(&pr->ps_flags, PS_NOZOMBIE);
 	}
 
@@ -246,21 +256,22 @@ exit1(struct proc *p, int rv, int flags)
 		}
 
 		/*
-		 * Give orphaned children to init(8).
+		 * Reparent children to their original parent, in case
+		 * they were being traced, or to init(8).
 		 */
 		qr = LIST_FIRST(&pr->ps_children);
 		if (qr)		/* only need this if any child is S_ZOMB */
 			wakeup(initprocess);
 		for (; qr != 0; qr = nqr) {
 			nqr = LIST_NEXT(qr, ps_sibling);
-			proc_reparent(qr, initprocess);
 			/*
 			 * Traced processes are killed since their
 			 * existence means someone is screwing up.
 			 */
 			if (qr->ps_flags & PS_TRACED &&
 			    !(qr->ps_flags & PS_EXITING)) {
-				atomic_clearbits_int(&qr->ps_flags, PS_TRACED);
+				process_untrace(qr);
+
 				/*
 				 * If single threading is active,
 				 * direct the signal to the active
@@ -271,7 +282,18 @@ exit1(struct proc *p, int rv, int flags)
 					    STHREAD);
 				else
 					prsignal(qr, SIGKILL);
+			} else {
+				process_reparent(qr, initprocess);
 			}
+		}
+
+		/*
+		 * Make sure orphans won't remember the exiting process.
+		 */
+		while ((qr = LIST_FIRST(&pr->ps_orphans)) != NULL) {
+			KASSERT(qr->ps_oppid == pr->ps_pid);
+			qr->ps_oppid = 0;
+			process_clear_orphan(qr);
 		}
 	}
 
@@ -303,7 +325,7 @@ exit1(struct proc *p, int rv, int flags)
 		 */
 		if (pr->ps_flags & PS_NOZOMBIE) {
 			struct process *ppr = pr->ps_pptr;
-			proc_reparent(pr, initprocess);
+			process_reparent(pr, initprocess);
 			wakeup(ppr);
 		}
 
@@ -319,6 +341,15 @@ exit1(struct proc *p, int rv, int flags)
 		if (--pr->ps_refcnt == 1)
 			wakeup(&pr->ps_threads);
 		KASSERT(pr->ps_refcnt > 0);
+	}
+
+	/* Release the thread's read reference of resource limit structure. */
+	if (p->p_limit != NULL) {
+		struct plimit *limit;
+
+		limit = p->p_limit;
+		p->p_limit = NULL;
+		lim_free(limit);
 	}
 
 	/*
@@ -347,7 +378,7 @@ exit1(struct proc *p, int rv, int flags)
  * proclist.  We use the p_hash member to linkup to deadproc.
  */
 struct mutex deadproc_mutex =
-    MUTEX_INITIALIZER_FLAGS(IPL_NONE, NULL, MTX_NOWITNESS);
+    MUTEX_INITIALIZER_FLAGS(IPL_NONE, "deadproc", MTX_NOWITNESS);
 struct proclist deadproc = LIST_HEAD_INITIALIZER(deadproc);
 
 /*
@@ -396,7 +427,8 @@ reaper(void *arg)
 	for (;;) {
 		mtx_enter(&deadproc_mutex);
 		while ((p = LIST_FIRST(&deadproc)) == NULL)
-			msleep(&deadproc, &deadproc_mutex, PVM, "reaper", 0);
+			msleep_nsec(&deadproc, &deadproc_mutex, PVM, "reaper",
+			    INFSLP);
 
 		/* Remove us from the deadproc list. */
 		LIST_REMOVE(p, p_hash);
@@ -498,7 +530,8 @@ loop:
 			retval[0] = pr->ps_pid;
 
 			if (statusp != NULL)
-				*statusp = p->p_xstat;	/* convert to int */
+				*statusp = W_EXITCODE(pr->ps_xexit,
+				    pr->ps_xsig);
 			if (rusage != NULL)
 				memcpy(rusage, pr->ps_ru, sizeof(*rusage));
 			proc_finish_wait(q, p);
@@ -508,13 +541,14 @@ loop:
 		    (pr->ps_flags & PS_WAITED) == 0 && pr->ps_single &&
 		    pr->ps_single->p_stat == SSTOP &&
 		    (pr->ps_single->p_flag & P_SUSPSINGLE) == 0) {
-			single_thread_wait(pr);
+			if (single_thread_wait(pr, 0))
+				goto loop;
 
 			atomic_setbits_int(&pr->ps_flags, PS_WAITED);
 			retval[0] = pr->ps_pid;
 
 			if (statusp != NULL)
-				*statusp = W_STOPCODE(pr->ps_single->p_xstat);
+				*statusp = W_STOPCODE(pr->ps_xsig);
 			if (rusage != NULL)
 				memset(rusage, 0, sizeof(*rusage));
 			return (0);
@@ -528,7 +562,7 @@ loop:
 			retval[0] = pr->ps_pid;
 
 			if (statusp != NULL)
-				*statusp = W_STOPCODE(p->p_xstat);
+				*statusp = W_STOPCODE(pr->ps_xsig);
 			if (rusage != NULL)
 				memset(rusage, 0, sizeof(*rusage));
 			return (0);
@@ -544,13 +578,36 @@ loop:
 			return (0);
 		}
 	}
+	/*
+	 * Look in the orphans list too, to allow the parent to
+	 * collect it's child exit status even if child is being
+	 * debugged.
+	 *
+	 * Debugger detaches from the parent upon successful
+	 * switch-over from parent to child.  At this point due to
+	 * re-parenting the parent loses the child to debugger and a
+	 * wait4(2) call would report that it has no children to wait
+	 * for.  By maintaining a list of orphans we allow the parent
+	 * to successfully wait until the child becomes a zombie.
+	 */
+	if (nfound == 0) {
+		LIST_FOREACH(pr, &q->p_p->ps_orphans, ps_orphan) {
+			if ((pr->ps_flags & PS_NOZOMBIE) ||
+			    (pid != WAIT_ANY &&
+			    pr->ps_pid != pid &&
+			    pr->ps_pgid != -pid))
+				continue;
+			nfound++;
+			break;
+		}
+	}
 	if (nfound == 0)
 		return (ECHILD);
 	if (options & WNOHANG) {
 		retval[0] = 0;
 		return (0);
 	}
-	if ((error = tsleep(q->p_p, PWAIT | PCATCH, "wait", 0)) != 0)
+	if ((error = tsleep_nsec(q->p_p, PWAIT | PCATCH, "wait", INFSLP)) != 0)
 		return (error);
 	goto loop;
 }
@@ -566,15 +623,15 @@ proc_finish_wait(struct proc *waiter, struct proc *p)
 	 * we need to give it back to the old parent.
 	 */
 	pr = p->p_p;
-	if (pr->ps_oppid && (tr = prfind(pr->ps_oppid))) {
-		atomic_clearbits_int(&pr->ps_flags, PS_TRACED);
+	if (pr->ps_oppid != 0 && (pr->ps_oppid != pr->ps_pptr->ps_pid) &&
+	   (tr = prfind(pr->ps_oppid))) {
 		pr->ps_oppid = 0;
-		proc_reparent(pr, tr);
+		atomic_clearbits_int(&pr->ps_flags, PS_TRACED);
+		process_reparent(pr, tr);
 		prsignal(tr, SIGCHLD);
 		wakeup(tr);
 	} else {
 		scheduler_wait_hook(waiter, p);
-		p->p_xstat = 0;
 		rup = &waiter->p_p->ps_cru;
 		ruadd(rup, pr->ps_ru);
 		LIST_REMOVE(pr, ps_list);	/* off zombprocess */
@@ -584,17 +641,56 @@ proc_finish_wait(struct proc *waiter, struct proc *p)
 }
 
 /*
+ * give process back to original parent or init(8)
+ */
+void
+process_untrace(struct process *pr)
+{
+	struct process *ppr = NULL;
+
+	KASSERT(pr->ps_flags & PS_TRACED);
+
+	if (pr->ps_oppid != 0 &&
+	    (pr->ps_oppid != pr->ps_pptr->ps_pid))
+		ppr = prfind(pr->ps_oppid);
+
+	/* not being traced any more */
+	pr->ps_oppid = 0;
+	atomic_clearbits_int(&pr->ps_flags, PS_TRACED);
+	process_reparent(pr, ppr ? ppr : initprocess);
+}
+
+void
+process_clear_orphan(struct process *pr)
+{
+	if (pr->ps_flags & PS_ORPHAN) {
+		LIST_REMOVE(pr, ps_orphan);
+		atomic_clearbits_int(&pr->ps_flags, PS_ORPHAN);
+	}
+}
+
+/*
  * make process 'parent' the new parent of process 'child'.
  */
 void
-proc_reparent(struct process *child, struct process *parent)
+process_reparent(struct process *child, struct process *parent)
 {
 
 	if (child->ps_pptr == parent)
 		return;
 
+	KASSERT(child->ps_oppid == 0 ||
+		child->ps_oppid == child->ps_pptr->ps_pid);
+
 	LIST_REMOVE(child, ps_sibling);
 	LIST_INSERT_HEAD(&parent->ps_children, child, ps_sibling);
+
+	process_clear_orphan(child);
+	if (child->ps_flags & PS_TRACED) {
+		atomic_setbits_int(&child->ps_flags, PS_ORPHAN);
+		LIST_INSERT_HEAD(&child->ps_pptr->ps_orphans, child, ps_orphan);
+	}
+
 	child->ps_pptr = parent;
 }
 
@@ -610,13 +706,12 @@ process_zap(struct process *pr)
 	 */
 	leavepgrp(pr);
 	LIST_REMOVE(pr, ps_sibling);
+	process_clear_orphan(pr);
 
 	/*
 	 * Decrement the count of procs running with this uid.
 	 */
 	(void)chgproccnt(pr->ps_ucred->cr_ruid, -1);
-
-	unveil_destroy(pr);
 
 	/*
 	 * Release reference to text vnode
@@ -630,8 +725,8 @@ process_zap(struct process *pr)
 	if (pr->ps_ptstat != NULL)
 		free(pr->ps_ptstat, M_SUBPROC, sizeof(*pr->ps_ptstat));
 	pool_put(&rusage_pool, pr->ps_ru);
-	KASSERT(TAILQ_EMPTY(&pr->ps_threads));
-	limfree(pr->ps_limit);
+	KASSERT(SMR_TAILQ_EMPTY_LOCKED(&pr->ps_threads));
+	lim_free(pr->ps_limit);
 	crfree(pr->ps_ucred);
 	pool_put(&process_pool, pr);
 	nprocesses--;

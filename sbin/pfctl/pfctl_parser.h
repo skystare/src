@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_parser.h,v 1.112 2018/09/06 15:07:34 kn Exp $ */
+/*	$OpenBSD: pfctl_parser.h,v 1.117 2020/07/21 14:10:51 henning Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -36,21 +36,22 @@
 
 #define PF_OSFP_FILE		"/etc/pf.os"
 
-#define PF_OPT_DISABLE		0x0001
-#define PF_OPT_ENABLE		0x0002
-#define PF_OPT_VERBOSE		0x0004
-#define PF_OPT_NOACTION		0x0008
-#define PF_OPT_QUIET		0x0010
-#define PF_OPT_CLRRULECTRS	0x0020
-#define PF_OPT_USEDNS		0x0040
-#define PF_OPT_VERBOSE2		0x0080
-#define PF_OPT_DUMMYACTION	0x0100
-#define PF_OPT_DEBUG		0x0200
-#define PF_OPT_SHOWALL		0x0400
-#define PF_OPT_OPTIMIZE		0x0800
-#define PF_OPT_NODNS		0x1000
-#define PF_OPT_RECURSE		0x4000
-#define PF_OPT_PORTNAMES	0x8000
+#define PF_OPT_DISABLE		0x00001
+#define PF_OPT_ENABLE		0x00002
+#define PF_OPT_VERBOSE		0x00004
+#define PF_OPT_NOACTION		0x00008
+#define PF_OPT_QUIET		0x00010
+#define PF_OPT_CLRRULECTRS	0x00020
+#define PF_OPT_USEDNS		0x00040
+#define PF_OPT_VERBOSE2		0x00080
+#define PF_OPT_DUMMYACTION	0x00100
+#define PF_OPT_DEBUG		0x00200
+#define PF_OPT_SHOWALL		0x00400
+#define PF_OPT_OPTIMIZE		0x00800
+#define PF_OPT_NODNS		0x01000
+#define PF_OPT_RECURSE		0x04000
+#define PF_OPT_PORTNAMES	0x08000
+#define PF_OPT_IGNFAIL		0x10000
 
 #define PF_TH_ALL		0xFF
 
@@ -183,7 +184,6 @@ struct pf_opt_tbl {
 	struct node_tinithead	 pt_nodes;
 	struct pfr_buffer	*pt_buf;
 };
-#define PF_OPT_TABLE_PREFIX	"__automatic_"
 
 /* optimizer pf_rule container */
 struct pf_opt_rule {
@@ -210,16 +210,15 @@ struct pfctl_watermarks {
 	u_int32_t	lo;
 };
 
+void		 copy_satopfaddr(struct pf_addr *, struct sockaddr *);
+
 int	pfctl_rules(int, char *, int, int, char *, struct pfr_buffer *);
 int	pfctl_optimize_ruleset(struct pfctl *, struct pf_ruleset *);
 int     pf_opt_create_table(struct pfctl *, struct pf_opt_tbl *);
 int     add_opt_table(struct pfctl *, struct pf_opt_tbl **, sa_family_t,
             struct pf_rule_addr *, char *);
 
-int	pfctl_add_rule(struct pfctl *, struct pf_rule *, const char *);
-int	pfctl_add_pool(struct pfctl *, struct pf_pool *, sa_family_t, int);
-void	pfctl_move_pool(struct pf_pool *, struct pf_pool *);
-void	pfctl_clear_pool(struct pf_pool *);
+void	pfctl_add_rule(struct pfctl *, struct pf_rule *);
 
 int	pfctl_set_timeout(struct pfctl *, const char *, int, int);
 int	pfctl_set_reassembly(struct pfctl *, int, int);

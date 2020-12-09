@@ -1,4 +1,4 @@
-/* $OpenBSD: dwiicvar.h,v 1.2 2018/01/19 18:20:38 jcs Exp $ */
+/* $OpenBSD: dwiicvar.h,v 1.4 2020/02/18 12:13:39 mpi Exp $ */
 /*
  * Synopsys DesignWare I2C controller
  *
@@ -20,7 +20,6 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/kthread.h>
 
 #include <dev/acpi/acpireg.h>
 #include <dev/acpi/acpivar.h>
@@ -33,6 +32,8 @@
 #include <dev/i2c/i2cvar.h>
 
 #include <dev/ic/dwiicreg.h>
+
+#include "acpi.h"
 
 /* #define DWIIC_DEBUG */
 
@@ -99,4 +100,8 @@ void		dwiic_write(struct dwiic_softc *, int, uint32_t);
 int		dwiic_i2c_exec(void *, i2c_op_t, i2c_addr_t, const void *,
 		    size_t, void *, size_t, int);
 
-int		dwiic_acpi_found_hid(struct aml_node *node, void *arg);
+#if NACPI > 0
+int		dwiic_acpi_found_hid(struct aml_node *, void *);
+void		dwiic_acpi_get_params(struct dwiic_softc *, char *, uint16_t *,
+		    uint16_t *, uint32_t *);
+#endif

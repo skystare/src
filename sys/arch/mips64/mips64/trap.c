@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.133 2018/06/13 14:38:42 visa Exp $	*/
+/*	$OpenBSD: trap.c,v 1.152 2020/10/22 13:41:51 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1988 University of Utah.
@@ -50,6 +50,7 @@
 #include <sys/kernel.h>
 #include <sys/signalvar.h>
 #include <sys/user.h>
+#include <sys/stacktrace.h>
 #include <sys/syscall.h>
 #include <sys/syscall_mi.h>
 #include <sys/buf.h>
@@ -146,13 +147,20 @@ int	process_sstep(struct proc *, int);
 void
 ast(void)
 {
-	struct cpu_info *ci = curcpu();
-	struct proc *p = ci->ci_curproc;
+	struct proc *p = curproc;
 
 	p->p_md.md_astpending = 0;
 
+	/*
+	 * Make sure the AST flag gets cleared before handling the AST.
+	 * Otherwise there is a risk of losing an AST that was sent
+	 * by another CPU.
+	 */
+	membar_enter();
+
+	refreshcreds(p);
 	atomic_inc_int(&uvmexp.softs);
-	mi_ast(p, ci->ci_want_resched);
+	mi_ast(p, curcpu()->ci_want_resched);
 	userret(p);
 }
 
@@ -252,29 +260,8 @@ trap(struct trapframe *trapframe)
 	}
 #endif
 
-	if (type & T_USER) {
-		vaddr_t sp;
-
+	if (type & T_USER)
 		refreshcreds(p);
-
-		sp = trapframe->sp;
-		if (p->p_vmspace->vm_map.serial != p->p_spserial ||
-		    p->p_spstart == 0 || sp < p->p_spstart ||
-		    sp >= p->p_spend) {
-			KERNEL_LOCK();
-			if (!uvm_map_check_stack_range(p, sp)) {
-				union sigval sv;
-
-				printf("trap [%s]%d/%d type %d: sp %lx not inside %lx-%lx\n",
-				    p->p_p->ps_comm, p->p_p->ps_pid, p->p_tid, type,
-				    sp, p->p_spstart, p->p_spend);
-
-				sv.sival_ptr = (void *)trapframe->pc;
-				trapsignal(p, SIGSEGV, 0, SEGV_ACCERR, sv);
-			}
-			KERNEL_UNLOCK();
-		}
-	}
 
 	itsa(trapframe, ci, p, type);
 
@@ -290,7 +277,7 @@ itsa(struct trapframe *trapframe, struct cpu_info *ci, struct proc *p,
     int type)
 {
 	unsigned ucode = 0;
-	vm_prot_t ftype;
+	vm_prot_t access_type;
 	extern vaddr_t onfault_table[];
 	int onfault;
 	int signal, sicode;
@@ -304,7 +291,7 @@ itsa(struct trapframe *trapframe, struct cpu_info *ci, struct proc *p,
 			if (pmap_emulate_modify(pmap_kernel(),
 			    trapframe->badvaddr)) {
 				/* write to read only page in the kernel */
-				ftype = PROT_WRITE;
+				access_type = PROT_WRITE;
 				pcb = &p->p_addr->u_pcb;
 				goto kernel_fault;
 			}
@@ -316,7 +303,7 @@ itsa(struct trapframe *trapframe, struct cpu_info *ci, struct proc *p,
 		if (pmap_emulate_modify(p->p_vmspace->vm_map.pmap,
 		    trapframe->badvaddr)) {
 			/* write to read only page */
-			ftype = PROT_WRITE;
+			access_type = PROT_WRITE;
 			pcb = &p->p_addr->u_pcb;
 			goto fault_common_no_miss;
 		}
@@ -336,12 +323,12 @@ itsa(struct trapframe *trapframe, struct cpu_info *ci, struct proc *p,
 			if (trapframe->cause & CR_BR_DELAY)
 				pc += 4;
 			if (pc == trapframe->badvaddr)
-				ftype = PROT_EXEC;
+				access_type = PROT_EXEC;
 			else
 #endif
-			ftype = PROT_READ;
+			access_type = PROT_READ;
 		} else
-			ftype = PROT_WRITE;
+			access_type = PROT_WRITE;
 
 		pcb = &p->p_addr->u_pcb;
 		/* check for kernel address */
@@ -354,7 +341,7 @@ itsa(struct trapframe *trapframe, struct cpu_info *ci, struct proc *p,
 			onfault = pcb->pcb_onfault;
 			pcb->pcb_onfault = 0;
 			KERNEL_LOCK();
-			rv = uvm_fault(kernel_map, va, 0, ftype);
+			rv = uvm_fault(kernel_map, va, 0, access_type);
 			KERNEL_UNLOCK();
 			pcb->pcb_onfault = onfault;
 			if (rv == 0)
@@ -389,18 +376,23 @@ itsa(struct trapframe *trapframe, struct cpu_info *ci, struct proc *p,
 		if (trapframe->cause & CR_BR_DELAY)
 			pc += 4;
 		if (pc == trapframe->badvaddr)
-			ftype = PROT_EXEC;
+			access_type = PROT_EXEC;
 		else
 #endif
-		ftype = PROT_READ;
+		access_type = PROT_READ;
 		pcb = &p->p_addr->u_pcb;
 		goto fault_common;
 	}
 
 	case T_TLB_ST_MISS+T_USER:
-		ftype = PROT_WRITE;
+		access_type = PROT_WRITE;
 		pcb = &p->p_addr->u_pcb;
 fault_common:
+		if ((type & T_USER) &&
+		    !uvm_map_inentry(p, &p->p_spinentry, PROC_STACK(p),
+		    "[%s]%d/%d sp=%lx inside %lx-%lx: not MAP_STACK\n",
+		    uvm_map_inentry_sp, p->p_vmspace->vm_map.sserial))
+			return;
 
 #ifdef CPU_R4000
 		if (r4000_errata != 0) {
@@ -430,8 +422,8 @@ fault_common_no_miss:
 		onfault = pcb->pcb_onfault;
 		pcb->pcb_onfault = 0;
 		KERNEL_LOCK();
-
-		rv = uvm_fault(map, va, 0, ftype);
+		rv = uvm_fault(map, va, 0, access_type);
+		KERNEL_UNLOCK();
 		pcb->pcb_onfault = onfault;
 
 		/*
@@ -441,12 +433,11 @@ fault_common_no_miss:
 		 * the current limit and we need to reflect that as an access
 		 * error.
 		 */
-		if (rv == 0 && (caddr_t)va >= vm->vm_maxsaddr)
+		if (rv == 0) {
 			uvm_grow(p, va);
-
-		KERNEL_UNLOCK();
-		if (rv == 0)
 			return;
+		}
+
 		if (!USERMODE(trapframe->sr)) {
 			if (onfault != 0) {
 				pcb->pcb_onfault = 0;
@@ -456,7 +447,7 @@ fault_common_no_miss:
 			goto err;
 		}
 
-		ucode = ftype;
+		ucode = access_type;
 		signal = SIGSEGV;
 		sicode = SEGV_MAPERR;
 		if (rv == EACCES)
@@ -770,6 +761,19 @@ fault_common_no_miss:
 		    (instr & 0x001fffc0) == ((ZERO << 16) | (7 << 6))) {
 			signal = SIGFPE;
 			sicode = FPE_INTDIV;
+		} else if (instr == (0x00000034 | (0x52 << 6)) /* teq */) {
+			/* trap used by sigfill and similar */
+			KERNEL_LOCK();
+			sigexit(p, SIGABRT);
+			/* NOTREACHED */
+		} else if ((instr & 0xfc00003f) == 0x00000036 /* tne */ &&
+		    (instr & 0x0000ffc0) == (0x52 << 6)) {
+			KERNEL_LOCK();
+			log(LOG_ERR, "%s[%d]: retguard trap\n",
+			    p->p_p->ps_comm, p->p_p->ps_pid);
+			/* Send uncatchable SIGABRT for coredump */
+			sigexit(p, SIGABRT);
+			/* NOTREACHED */
 		} else {
 			signal = SIGEMT; /* Stuff it with something for now */
 			sicode = 0;
@@ -804,7 +808,7 @@ fault_common_no_miss:
 			sicode = BUS_OBJERR;
 			break;
 		}
-		
+
 		/* Emulate "RDHWR rt, UserLocal". */
 		if (inst.RType.op == OP_SPECIAL3 &&
 		    inst.RType.rs == 0 &&
@@ -925,9 +929,7 @@ fault_common_no_miss:
 	p->p_md.md_regs->cause = trapframe->cause;
 	p->p_md.md_regs->badvaddr = trapframe->badvaddr;
 	sv.sival_ptr = (void *)trapframe->badvaddr;
-	KERNEL_LOCK();
 	trapsignal(p, signal, ucode, sicode, sv);
-	KERNEL_UNLOCK();
 }
 
 void
@@ -1484,7 +1486,7 @@ end:
 
 #ifdef DDB
 void
-db_save_stack_trace(struct db_stack_trace *st)
+stacktrace_save_at(struct stacktrace *st, unsigned int skip)
 {
 	extern char k_general[];
 	extern char u_general[];
@@ -1506,12 +1508,16 @@ db_save_stack_trace(struct db_stack_trace *st)
 	sp = (vaddr_t)__builtin_frame_address(0);
 
 	st->st_count = 0;
-	while (st->st_count < DB_STACK_TRACE_MAX && pc != 0) {
+	while (st->st_count < STACKTRACE_MAX && pc != 0) {
 		if (!VALID_ADDRESS(pc) || !VALID_ADDRESS(sp))
 			break;
 
-		if (!first)
-			st->st_pc[st->st_count++] = pc;
+		if (!first) {
+			if (skip == 0)
+				st->st_pc[st->st_count++] = pc;
+			else
+				skip--;
+		}
 		first = 0;
 
 		/* Determine the start address of the current subroutine. */
@@ -1521,8 +1527,9 @@ db_save_stack_trace(struct db_stack_trace *st)
 		db_symbol_values(sym, &name, NULL);
 		subr = pc - (vaddr_t)diff;
 
-		if (subr == (vaddr_t)k_general || subr == (vaddr_t)k_intr ||
-		    subr == (vaddr_t)u_general || subr == (vaddr_t)u_intr) {
+		if (subr == (vaddr_t)u_general || subr == (vaddr_t)u_intr)
+			break;
+		if (subr == (vaddr_t)k_general || subr == (vaddr_t)k_intr) {
 			tf = (struct trapframe *)*(register_t *)sp;
 			pc = tf->pc;
 			ra = tf->ra;
@@ -1538,8 +1545,7 @@ db_save_stack_trace(struct db_stack_trace *st)
 		framesize = 0;
 		for (va = subr; va < pc && !done; va += 4) {
 			inst.word = kdbpeek(va);
-			if (inst_branch(inst.word) || inst_call(inst.word) ||
-			    inst_return(inst.word)) {
+			if (inst_call(inst.word) || inst_return(inst.word)) {
 				/* Check the delay slot and stop. */
 				va += 4;
 				inst.word = kdbpeek(va);
@@ -1692,7 +1698,7 @@ fpe_branch_emulate(struct proc *p, struct trapframe *tf, uint32_t insn,
 	 */
 
 	rc = uvm_map_protect(map, p->p_md.md_fppgva,
-	    p->p_md.md_fppgva + PAGE_SIZE, PROT_MASK, FALSE);
+	    p->p_md.md_fppgva + PAGE_SIZE, PROT_READ | PROT_WRITE, FALSE);
 	if (rc != 0) {
 #ifdef DEBUG
 		printf("%s: uvm_map_protect on %p failed: %d\n",
@@ -1702,7 +1708,7 @@ fpe_branch_emulate(struct proc *p, struct trapframe *tf, uint32_t insn,
 	}
 	KERNEL_LOCK();
 	rc = uvm_fault_wire(map, p->p_md.md_fppgva,
-	    p->p_md.md_fppgva + PAGE_SIZE, PROT_MASK);
+	    p->p_md.md_fppgva + PAGE_SIZE, PROT_READ | PROT_WRITE);
 	KERNEL_UNLOCK();
 	if (rc != 0) {
 #ifdef DEBUG
@@ -1736,7 +1742,6 @@ fpe_branch_emulate(struct proc *p, struct trapframe *tf, uint32_t insn,
 	p->p_md.md_fpslotva = (vaddr_t)tf->pc + 4;
 	p->p_md.md_flags |= MDP_FPUSED;
 	tf->pc = p->p_md.md_fppgva;
-	pmap_proc_iflush(p->p_p, tf->pc, 2 * 4);
 
 	return 0;
 

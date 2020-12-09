@@ -1,4 +1,4 @@
-/* $OpenBSD: intc.c,v 1.7 2016/08/06 18:21:34 patrick Exp $ */
+/* $OpenBSD: intc.c,v 1.10 2020/07/14 15:34:15 patrick Exp $ */
 /*
  * Copyright (c) 2007,2009 Dale Rahn <drahn@openbsd.org>
  *
@@ -108,8 +108,8 @@ int	intc_spllower(int new);
 int	intc_splraise(int new);
 void	intc_setipl(int new);
 void	intc_calc_mask(void);
-void	*intc_intr_establish_fdt(void *, int *, int, int (*)(void *),
-	    void *, char *);
+void	*intc_intr_establish_fdt(void *, int *, int, struct cpu_info *,
+	    int (*)(void *), void *, char *);
 
 struct cfattach	intc_ca = {
 	sizeof (struct device), intc_match, intc_attach
@@ -231,7 +231,7 @@ intc_calc_mask(void)
 		for (; i <= IPL_HIGH; i++)
 			intc_imask[INTC_IRQ_TO_REG(irq)][i] |=
 			    1 << INTC_IRQ_TO_REGi(irq);
-		/* XXX - set enable/disable, priority */ 
+		/* XXX - set enable/disable, priority */
 		bus_space_write_4(intc_iot, intc_ioh, INTC_ILRn(irq),
 		    INTC_ILR_PRIs(NIPL-max)|INTC_ILR_IRQ);
 	}
@@ -276,7 +276,7 @@ intc_splraise(int new)
 		new = old;
 
 	intc_setipl(new);
-  
+ 
 	return (old);
 }
 
@@ -295,7 +295,7 @@ intc_setipl(int new)
 		volatile static int recursed = 0;
 		if (recursed == 0) {
 			recursed = 1;
-			if (new != 12) 
+			if (new != 12)
 				printf("setipl %d\n", new);
 			recursed = 0;
 		}
@@ -342,7 +342,7 @@ intc_irq_handler(void *frame)
 		else
 			arg = frame;
 
-		if (ih->ih_func(arg)) 
+		if (ih->ih_func(arg))
 			ih->ih_count.ec_count++;
 
 	}
@@ -353,8 +353,8 @@ intc_irq_handler(void *frame)
 }
 
 void *
-intc_intr_establish(int irqno, int level, int (*func)(void *),
-    void *arg, char *name)
+intc_intr_establish(int irqno, int level, struct cpu_info *ci,
+    int (*func)(void *), void *arg, char *name)
 {
 	int psw;
 	struct intrhand *ih;
@@ -362,12 +362,18 @@ intc_intr_establish(int irqno, int level, int (*func)(void *),
 	if (irqno < 0 || irqno >= INTC_NUM_IRQ)
 		panic("intc_intr_establish: bogus irqnumber %d: %s",
 		     irqno, name);
+
+	if (ci == NULL)
+		ci = &cpu_info_primary;
+	else if (!CPU_IS_PRIMARY(ci))
+		return NULL;
+
 	psw = disable_interrupts(PSR_I);
 
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK);
 	ih->ih_func = func;
 	ih->ih_arg = arg;
-	ih->ih_ipl = level;
+	ih->ih_ipl = level & IPL_IRQMASK;
 	ih->ih_irq = irqno;
 	ih->ih_name = name;
 
@@ -388,9 +394,9 @@ intc_intr_establish(int irqno, int level, int (*func)(void *),
 
 void *
 intc_intr_establish_fdt(void *cookie, int *cell, int level,
-    int (*func)(void *), void *arg, char *name)
+    struct cpu_info *ci, int (*func)(void *), void *arg, char *name)
 {
-	return intc_intr_establish(cell[0], level, func, arg, name);
+	return intc_intr_establish(cell[0], level, ci, func, arg, name);
 }
 
 void

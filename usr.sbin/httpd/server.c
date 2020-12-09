@@ -1,4 +1,4 @@
-/*	$OpenBSD: server.c,v 1.114 2018/05/19 13:56:56 jsing Exp $	*/
+/*	$OpenBSD: server.c,v 1.121 2020/10/11 03:21:44 tb Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -480,6 +480,8 @@ server_purge(struct server *srv)
 void
 serverconfig_free(struct server_config *srv_conf)
 {
+	struct fastcgi_param	*param, *tparam;
+
 	free(srv_conf->return_uri);
 	free(srv_conf->tls_ca_file);
 	free(srv_conf->tls_ca);
@@ -491,6 +493,9 @@ serverconfig_free(struct server_config *srv_conf)
 	free(srv_conf->tls_ocsp_staple);
 	freezero(srv_conf->tls_cert, srv_conf->tls_cert_len);
 	freezero(srv_conf->tls_key, srv_conf->tls_key_len);
+
+	TAILQ_FOREACH_SAFE(param, &srv_conf->fcgiparams, entry, tparam)
+		free(param);
 }
 
 void
@@ -508,6 +513,7 @@ serverconfig_reset(struct server_config *srv_conf)
 	srv_conf->tls_key_file = NULL;
 	srv_conf->tls_ocsp_staple = NULL;
 	srv_conf->tls_ocsp_staple_file = NULL;
+	TAILQ_INIT(&srv_conf->fcgiparams);
 }
 
 struct server *
@@ -804,7 +810,7 @@ server_tls_readcb(int fd, short event, void *arg)
 	ret = tls_read(clt->clt_tls_ctx, rbuf, howmuch);
 	if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 		goto retry;
-	} else if (ret < 0) {
+	} else if (ret == -1) {
 		what |= EVBUFFER_ERROR;
 		goto err;
 	}
@@ -864,7 +870,7 @@ server_tls_writecb(int fd, short event, void *arg)
 		    EVBUFFER_LENGTH(bufev->output));
 		if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 			goto retry;
-		} else if (ret < 0) {
+		} else if (ret == -1) {
 			what |= EVBUFFER_ERROR;
 			goto err;
 		}
@@ -1019,7 +1025,10 @@ server_error(struct bufferevent *bev, short error, void *arg)
 	struct evbuffer		*dst;
 
 	if (error & EVBUFFER_TIMEOUT) {
-		server_abort_http(clt, 408, "timeout");
+		if (!clt->clt_headersdone && clt->clt_line > 0)
+			server_abort_http(clt, 408, "timeout");
+		else
+			server_close(clt, "timeout");
 		return;
 	}
 	if (error & EVBUFFER_ERROR) {
@@ -1140,7 +1149,7 @@ server_accept(int fd, short event, void *arg)
 	if (srv->srv_conf.flags & SRVFLAG_TLS) {
 		if (tls_accept_socket(srv->srv_tls_ctx, &clt->clt_tls_ctx,
 		    clt->clt_s) != 0) {
-			server_close(clt, "failed to setup tls context");
+			server_close(clt, "failed to accept tls socket");
 			return;
 		}
 		event_again(&clt->clt_ev, clt->clt_s, EV_TIMEOUT|EV_READ,
@@ -1358,6 +1367,9 @@ server_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		break;
 	case IMSG_CFG_TLS:
 		config_getserver_tls(httpd_env, imsg);
+		break;
+	case IMSG_CFG_FCGI:
+		config_getserver_fcgiparams(httpd_env, imsg);
 		break;
 	case IMSG_CFG_DONE:
 		config_getcfg(httpd_env, imsg);

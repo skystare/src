@@ -1,4 +1,4 @@
-/*	$OpenBSD: in_pcb.c,v 1.245 2018/09/14 12:55:17 bluhm Exp $	*/
+/*	$OpenBSD: in_pcb.c,v 1.252 2020/11/07 09:51:40 denis Exp $	*/
 /*	$NetBSD: in_pcb.c,v 1.25 1996/02/13 23:41:53 christos Exp $	*/
 
 /*
@@ -114,7 +114,6 @@ int ipport_hilastauto = IPPORT_HILASTAUTO;
 struct baddynamicports baddynamicports;
 struct baddynamicports rootonlyports;
 struct pool inpcb_pool;
-int inpcb_pool_initialized = 0;
 
 int in_pcbresize (struct inpcbtable *, int);
 
@@ -123,6 +122,17 @@ int in_pcbresize (struct inpcbtable *, int);
 struct inpcbhead *in_pcbhash(struct inpcbtable *, int,
     const struct in_addr *, u_short, const struct in_addr *, u_short);
 struct inpcbhead *in_pcblhash(struct inpcbtable *, int, u_short);
+
+/*
+ * in_pcb is used for inet and inet6.  in6_pcb only contains special
+ * IPv6 cases.  So the internet initializer is used for both domains.
+ */
+void
+in_init(void)
+{
+	pool_init(&inpcb_pool, sizeof(struct inpcb), 0,
+	    IPL_SOFTNET, 0, "inpcb", NULL);
+}
 
 struct inpcbhead *
 in_pcbhash(struct inpcbtable *table, int rdom,
@@ -218,11 +228,6 @@ in_pcballoc(struct socket *so, struct inpcbtable *table)
 
 	NET_ASSERT_LOCKED();
 
-	if (inpcb_pool_initialized == 0) {
-		pool_init(&inpcb_pool, sizeof(struct inpcb), 0,
-		    IPL_SOFTNET, 0, "inpcbpl", NULL);
-		inpcb_pool_initialized = 1;
-	}
 	inp = pool_get(&inpcb_pool, PR_NOWAIT|PR_ZERO);
 	if (inp == NULL)
 		return (ENOBUFS);
@@ -525,6 +530,13 @@ in_pcbconnect(struct inpcb *inp, struct mbuf *nam)
 void
 in_pcbdisconnect(struct inpcb *inp)
 {
+#if NPF > 0
+	if (inp->inp_pf_sk) {
+		pf_remove_divert_state(inp->inp_pf_sk);
+		/* pf_remove_divert_state() may have detached the state */
+		pf_inp_unlink(inp);
+	}
+#endif
 	switch (sotopf(inp->inp_socket)) {
 #ifdef INET6
 	case PF_INET6:
@@ -679,7 +691,7 @@ in_pcbnotifyall(struct inpcbtable *table, struct sockaddr *dst, u_int rtable,
 #endif
 		if (inp->inp_faddr.s_addr != faddr.s_addr ||
 		    rtable_l2(inp->inp_rtableid) != rdomain ||
-		    inp->inp_socket == 0) {
+		    inp->inp_socket == NULL) {
 			continue;
 		}
 		if (notify)
@@ -875,6 +887,7 @@ in_pcbselsrc(struct in_addr **insrc, struct sockaddr_in *sin,
 	struct route *ro = &inp->inp_route;
 	struct in_addr *laddr = &inp->inp_laddr;
 	u_int rtableid = inp->inp_rtableid;
+	struct sockaddr	*ip4_source = NULL;
 
 	struct sockaddr_in *sin2;
 	struct in_ifaddr *ia = NULL;
@@ -911,6 +924,7 @@ in_pcbselsrc(struct in_addr **insrc, struct sockaddr_in *sin,
 			return (0);
 		}
 	}
+
 	/*
 	 * If route is known or can be allocated now,
 	 * our src addr is taken from the i/f, else punt.
@@ -935,12 +949,32 @@ in_pcbselsrc(struct in_addr **insrc, struct sockaddr_in *sin,
 		sin2 = satosin(&ro->ro_dst);
 		memset(sin2->sin_zero, 0, sizeof(sin2->sin_zero));
 	}
+
 	/*
 	 * If we found a route, use the address
 	 * corresponding to the outgoing interface.
 	 */
 	if (ro->ro_rt != NULL)
 		ia = ifatoia(ro->ro_rt->rt_ifa);
+
+	/*
+	 * Use preferred source address if :
+	 * - destination is not onlink
+	 * - preferred source addresss is set
+	 * - output interface is UP
+	 */
+	if (ro->ro_rt && !(ro->ro_rt->rt_flags & RTF_LLINFO) &&
+	    !(ro->ro_rt->rt_flags & RTF_HOST)) {
+		ip4_source = rtable_getsource(rtableid, AF_INET);
+		if (ip4_source != NULL) {
+			struct ifaddr *ifa;
+			if ((ifa = ifa_ifwithaddr(ip4_source, rtableid)) !=
+			    NULL && ISSET(ifa->ifa_ifp->if_flags, IFF_UP)) {
+				*insrc = &satosin(ip4_source)->sin_addr;
+				return (0);
+			}
+		}
+	}
 
 	if (ia == NULL)
 		return (EADDRNOTAVAIL);

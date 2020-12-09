@@ -1,4 +1,4 @@
-/*	$OpenBSD: switchofp.c,v 1.71 2018/08/21 16:40:23 akoshibe Exp $	*/
+/*	$OpenBSD: switchofp.c,v 1.77 2020/08/28 12:01:48 mvs Exp $	*/
 
 /*
  * Copyright (c) 2016 Kazuya GODA <goda@openbsd.org>
@@ -449,7 +449,6 @@ int	swofp_mp_recv_port_stats(struct switch_softc *, struct mbuf *);
 int	swofp_mp_recv_port_desc(struct switch_softc *, struct mbuf *);
 int	swofp_mp_recv_group_desc(struct switch_softc *, struct mbuf *);
 
-#define OFP_ALIGNMENT 8
 /*
  * OXM (OpenFlow Extensible Match) structures appear in ofp_match structure
  * and ofp_instruction_{apply|write}_action structure.
@@ -586,7 +585,7 @@ struct ofp_mpmsg_class ofp_mpmsg_table[] = {
 
 struct ofp_oxm_class {
 	uint8_t	 oxm_field;
-	uint8_t	 oxm_len; /* This length defined by speficication */
+	uint8_t	 oxm_len; /* This length defined by specification */
 	uint8_t	 oxm_flags;
 	int	(*oxm_match)(struct switch_flow_classify *,
 		    struct ofp_ox_match *);
@@ -2175,7 +2174,8 @@ swofp_validate_action(struct switch_softc *sc, struct ofp_action_header *ah,
 		}
 		break;
 	case OFP_ACTION_SET_FIELD:
-		if (ahlen < sizeof(struct ofp_action_set_field)) {
+		if (ahlen < sizeof(struct ofp_action_set_field) ||
+		    ahlen != OFP_ALIGN(ahlen)) {
 			*err = OFP_ERRACTION_LEN;
 			return (-1);
 		}
@@ -2190,22 +2190,37 @@ swofp_validate_action(struct switch_softc *sc, struct ofp_action_header *ah,
 		dptr = (uint8_t *)ah;
 		dptr += sizeof(struct ofp_action_set_field) -
 		    offsetof(struct ofp_action_set_field, asf_field);
-		while (oxmlen > 0) {
-			oxm = (struct ofp_ox_match *)dptr;
-			if (swofp_validate_oxm(oxm, err)) {
-				if (*err == OFP_ERRMATCH_BAD_LEN)
-					*err = OFP_ERRACTION_SET_LEN;
-				else
-					*err = OFP_ERRACTION_SET_TYPE;
+		oxm = (struct ofp_ox_match *)dptr;
+		oxmlen -= sizeof(struct ofp_ox_match);
+		if (oxmlen < oxm->oxm_length) {
+			*err = OFP_ERRACTION_SET_LEN;
+			return (-1);
+		}
+		/* Remainder is padding. */
+		oxmlen -= oxm->oxm_length;
+		if (oxmlen >= OFP_ALIGNMENT) {
+			*err = OFP_ERRACTION_SET_LEN;
+			return (-1);
+		}
 
+		if (swofp_validate_oxm(oxm, err)) {
+			if (*err == OFP_ERRMATCH_BAD_LEN)
+				*err = OFP_ERRACTION_SET_LEN;
+			else
+				*err = OFP_ERRACTION_SET_TYPE;
+			return (-1);
+		}
+
+	 	dptr += sizeof(struct ofp_ox_match) + oxm->oxm_length;
+		while (oxmlen > 0) {
+			if (*dptr != 0) {
+				*err = OFP_ERRACTION_SET_ARGUMENT;
 				return (-1);
 			}
-
-			dptr += sizeof(*oxm) + oxm->oxm_length;
-			oxmlen -= sizeof(*oxm) + oxm->oxm_length;
+			oxmlen--;
+			dptr++;
 		}
 		break;
-
 	default:
 		/* Unknown/unsupported action. */
 		*err = OFP_ERRACTION_TYPE;
@@ -3492,6 +3507,7 @@ swofp_action_output(struct switch_softc *sc, struct mbuf *m,
 	struct ofp_action_output	*oao;
 	struct switch_port		*swpo;
 	struct mbuf			*mc;
+	uint32_t			protected = 0;
 
 	m->m_pkthdr.csum_flags = 0;
 
@@ -3509,6 +3525,14 @@ swofp_action_output(struct switch_softc *sc, struct mbuf *m,
 		}
 	}
 
+	TAILQ_FOREACH(swpo, &sc->sc_swpo_list, swpo_list_next) {
+		if (swpo->swpo_port_no ==
+		    swpld->swpld_swfcl->swfcl_in_port) {
+			protected = swpo->swpo_protected;
+			break;
+		}
+	}
+
 	switch (ntohl(oao->ao_port)) {
 	case OFP_PORT_CONTROLLER:
 		swofp_action_output_controller(sc, mc, swpld,
@@ -3521,7 +3545,8 @@ swofp_action_output(struct switch_softc *sc, struct mbuf *m,
 	case OFP_PORT_FLOOD:
 		TAILQ_FOREACH(swpo, &sc->sc_swpo_list, swpo_list_next) {
 			if (swpo->swpo_port_no !=
-			    swpld->swpld_swfcl->swfcl_in_port)
+			    swpld->swpld_swfcl->swfcl_in_port &&
+			    (protected & swpo->swpo_protected) == 0)
 				TAILQ_INSERT_HEAD(&swpld->swpld_fwdp_q, swpo,
 				    swpo_fwdp_next);
 		}
@@ -3543,7 +3568,8 @@ swofp_action_output(struct switch_softc *sc, struct mbuf *m,
 		break;
 	case OFP_PORT_LOCAL:
 		TAILQ_FOREACH(swpo, &sc->sc_swpo_list, swpo_list_next) {
-			if (swpo->swpo_flags & IFBIF_LOCAL) {
+			if ((swpo->swpo_flags & IFBIF_LOCAL) &&
+			    (protected & swpo->swpo_protected) == 0) {
 				TAILQ_INSERT_HEAD(&swpld->swpld_fwdp_q, swpo,
 				    swpo_fwdp_next);
 				break;
@@ -3552,7 +3578,8 @@ swofp_action_output(struct switch_softc *sc, struct mbuf *m,
 		break;
 	default:
 		TAILQ_FOREACH(swpo, &sc->sc_swpo_list, swpo_list_next) {
-			if (swpo->swpo_port_no == ntohl(oao->ao_port))
+			if (swpo->swpo_port_no == ntohl(oao->ao_port) &&
+			    (protected & swpo->swpo_protected) == 0)
 				TAILQ_INSERT_HEAD(&swpld->swpld_fwdp_q, swpo,
 				    swpo_fwdp_next);
 		}
@@ -4653,7 +4680,9 @@ swofp_forward_ofs(struct switch_softc *sc, struct switch_flow_classify *swfcl,
 int
 swofp_input(struct switch_softc *sc, struct mbuf *m)
 {
-	struct swofp_ofs	*swofs = sc->sc_ofs;
+#if NBPFILTER > 0
+	struct swofp_ofs        *swofs = sc->sc_ofs;
+#endif
 	struct ofp_header	*oh;
 	ofp_msg_handler		 handler;
 	uint16_t		 ohlen;
@@ -4666,7 +4695,8 @@ swofp_input(struct switch_softc *sc, struct mbuf *m)
 
 	ohlen = ntohs(oh->oh_length);
 	/* Validate that we have a sane header. */
-	if (ohlen < sizeof(*oh)) {
+	KASSERT(m->m_flags & M_PKTHDR);
+	if (ohlen < sizeof(*oh) || m->m_pkthdr.len < ohlen) {
 		swofp_send_error(sc, m, OFP_ERRTYPE_BAD_REQUEST,
 		    OFP_ERRREQ_BAD_LEN);
 		return (0);
@@ -4694,7 +4724,9 @@ swofp_input(struct switch_softc *sc, struct mbuf *m)
 int
 swofp_output(struct switch_softc *sc, struct mbuf *m)
 {
+#if NBPFILTER > 0
 	struct swofp_ofs	*swofs = sc->sc_ofs;
+#endif
 
 	if (sc->sc_swdev == NULL) {
 		m_freem(m);
@@ -4761,28 +4793,37 @@ void
 swofp_send_error(struct switch_softc *sc, struct mbuf *m,
     uint16_t type, uint16_t code)
 {
+	struct mbuf		*n;
+	struct ofp_header	*oh;
 	struct ofp_error	*oe;
+	int			 off;
+	uint32_t		 xid;
 	uint16_t		 len;
-	uint8_t			 data[OFP_ERRDATA_MAX];
 
 	/* Reuse mbuf from request message */
-	oe = mtod(m, struct ofp_error *);
+	oh = mtod(m, struct ofp_header *);
 
 	/* Save data for the response and copy back later. */
-	len = min(ntohs(oe->err_oh.oh_length), OFP_ERRDATA_MAX);
-	m_copydata(m, 0, len, data);
+	len = min(ntohs(oh->oh_length), OFP_ERRDATA_MAX);
+	if (len < m->m_pkthdr.len)
+		m_adj(m, len - m->m_pkthdr.len);
+	xid = oh->oh_xid;
 
-	oe->err_oh.oh_version = OFP_V_1_3;
-	oe->err_oh.oh_type = OFP_T_ERROR;
-	oe->err_type = htons(type);
-	oe->err_code = htons(code);
-	oe->err_oh.oh_length = htons(len + sizeof(struct ofp_error));
-	m->m_len = m->m_pkthdr.len = sizeof(struct ofp_error);
-
-	if (m_copyback(m, sizeof(struct ofp_error), len, data, M_DONTWAIT)) {
+	if ((n = m_makespace(m, 0, sizeof(struct ofp_error), &off)) == NULL) {
 		m_freem(m);
 		return;
 	}
+	/* if skip is 0, off is also 0 */
+	KASSERT(off == 0);
+
+	oe = mtod(n, struct ofp_error *);
+
+	oe->err_oh.oh_version = OFP_V_1_3;
+	oe->err_oh.oh_type = OFP_T_ERROR;
+	oe->err_oh.oh_length = htons(sizeof(struct ofp_error) + len);
+	oe->err_oh.oh_xid = xid;
+	oe->err_type = htons(type);
+	oe->err_code = htons(code);
 
 	(void)swofp_output(sc, m);
 }

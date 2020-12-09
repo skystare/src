@@ -1,4 +1,4 @@
-/* $OpenBSD: session.c,v 1.81 2018/08/18 20:08:52 nicm Exp $ */
+/* $OpenBSD: session.c,v 1.87 2020/05/16 14:49:50 nicm Exp $ */
 
 /*
  * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <vis.h>
 #include <time.h>
 
 #include "tmux.h"
@@ -112,12 +113,10 @@ session_find_by_id(u_int id)
 
 /* Create a new session. */
 struct session *
-session_create(const char *prefix, const char *name, int argc, char **argv,
-    const char *path, const char *cwd, struct environ *env, struct termios *tio,
-    int idx, u_int sx, u_int sy, char **cause)
+session_create(const char *prefix, const char *name, const char *cwd,
+    struct environ *env, struct options *oo, struct termios *tio)
 {
 	struct session	*s;
-	struct winlink	*wl;
 
 	s = xcalloc(1, sizeof *s);
 	s->references = 1;
@@ -125,18 +124,13 @@ session_create(const char *prefix, const char *name, int argc, char **argv,
 
 	s->cwd = xstrdup(cwd);
 
-	s->curw = NULL;
 	TAILQ_INIT(&s->lastw);
 	RB_INIT(&s->windows);
 
-	s->environ = environ_create();
-	if (env != NULL)
-		environ_copy(env, s->environ);
+	s->environ = env;
+	s->options = oo;
 
-	s->options = options_create(global_s_options);
-	s->hooks = hooks_create(global_hooks);
-
-	status_update_saved(s);
+	status_update_cache(s);
 
 	s->tio = NULL;
 	if (tio != NULL) {
@@ -144,14 +138,10 @@ session_create(const char *prefix, const char *name, int argc, char **argv,
 		memcpy(s->tio, tio, sizeof *s->tio);
 	}
 
-	s->sx = sx;
-	s->sy = sy;
-
 	if (name != NULL) {
 		s->name = xstrdup(name);
 		s->id = next_session_id++;
 	} else {
-		s->name = NULL;
 		do {
 			s->id = next_session_id++;
 			free(s->name);
@@ -168,17 +158,6 @@ session_create(const char *prefix, const char *name, int argc, char **argv,
 	if (gettimeofday(&s->creation_time, NULL) != 0)
 		fatal("gettimeofday failed");
 	session_update_activity(s, &s->creation_time);
-
-	if (argc >= 0) {
-		wl = session_new(s, NULL, argc, argv, path, cwd, idx, cause);
-		if (wl == NULL) {
-			session_destroy(s, __func__);
-			return (NULL);
-		}
-		session_select(s, RB_ROOT(&s->windows)->idx);
-	}
-
-	log_debug("session %s created", s->name);
 
 	return (s);
 }
@@ -212,9 +191,7 @@ session_free(__unused int fd, __unused short events, void *arg)
 
 	if (s->references == 0) {
 		environ_free(s->environ);
-
 		options_free(s->options);
-		hooks_free(s->hooks);
 
 		free(s->name);
 		free(s);
@@ -223,7 +200,7 @@ session_free(__unused int fd, __unused short events, void *arg)
 
 /* Destroy a session. */
 void
-session_destroy(struct session *s, const char *from)
+session_destroy(struct session *s, int notify, const char *from)
 {
 	struct winlink	*wl;
 
@@ -231,7 +208,8 @@ session_destroy(struct session *s, const char *from)
 	s->curw = NULL;
 
 	RB_REMOVE(sessions, &sessions, s);
-	notify_session("session-closed", s);
+	if (notify)
+		notify_session("session-closed", s);
 
 	free(s->tio);
 
@@ -253,11 +231,20 @@ session_destroy(struct session *s, const char *from)
 	session_remove_ref(s, __func__);
 }
 
-/* Check a session name is valid: not empty and no colons or periods. */
-int
+/* Sanitize session name. */
+char *
 session_check_name(const char *name)
 {
-	return (*name != '\0' && name[strcspn(name, ":.")] == '\0');
+	char	*copy, *cp, *new_name;
+
+	copy = xstrdup(name);
+	for (cp = copy; *cp != '\0'; cp++) {
+		if (*cp == ':' || *cp == '.')
+			*cp = '_';
+	}
+	utf8_stravis(&new_name, copy, VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
+	free(copy);
+	return (new_name);
 }
 
 /* Lock session if it has timed out. */
@@ -341,44 +328,6 @@ session_previous_session(struct session *s)
 	return (s2);
 }
 
-/* Create a new window on a session. */
-struct winlink *
-session_new(struct session *s, const char *name, int argc, char **argv,
-    const char *path, const char *cwd, int idx, char **cause)
-{
-	struct window	*w;
-	struct winlink	*wl;
-	struct environ	*env;
-	const char	*shell;
-	u_int		 hlimit;
-
-	if ((wl = winlink_add(&s->windows, idx)) == NULL) {
-		xasprintf(cause, "index in use: %d", idx);
-		return (NULL);
-	}
-	wl->session = s;
-
-	shell = options_get_string(s->options, "default-shell");
-	if (*shell == '\0' || areshell(shell))
-		shell = _PATH_BSHELL;
-
-	hlimit = options_get_number(s->options, "history-limit");
-	env = environ_for_session(s, 0);
-	w = window_create_spawn(name, argc, argv, path, shell, cwd, env, s->tio,
-	    s->sx, s->sy, hlimit, cause);
-	if (w == NULL) {
-		winlink_remove(&s->windows, wl);
-		environ_free(env);
-		return (NULL);
-	}
-	winlink_set_window(wl, w);
-	environ_free(env);
-	notify_session_window("window-linked", s, w);
-
-	session_group_synchronize_from(s);
-	return (wl);
-}
-
 /* Attach a window to a session. */
 struct winlink *
 session_attach(struct session *s, struct window *w, int idx, char **cause)
@@ -414,7 +363,7 @@ session_detach(struct session *s, struct winlink *wl)
 	session_group_synchronize_from(s);
 
 	if (RB_EMPTY(&s->windows)) {
-		session_destroy(s, __func__);
+		session_destroy(s, 1, __func__);
 		return (1);
 	}
 	return (0);
@@ -548,6 +497,7 @@ session_set_current(struct session *s, struct winlink *wl)
 	s->curw = wl;
 	winlink_clear_flags(wl);
 	window_update_activity(wl->window);
+	tty_update_window_offset(wl->window);
 	notify_session("session-window-changed", s);
 	return (0);
 }
@@ -614,6 +564,7 @@ session_group_remove(struct session *s)
 	TAILQ_REMOVE(&sg->sessions, s, gentry);
 	if (TAILQ_EMPTY(&sg->sessions)) {
 		RB_REMOVE(session_groups, &session_groups, sg);
+		free((void *)sg->name);
 		free(sg);
 	}
 }
@@ -627,7 +578,20 @@ session_group_count(struct session_group *sg)
 
 	n = 0;
 	TAILQ_FOREACH(s, &sg->sessions, gentry)
-	    n++;
+		n++;
+	return (n);
+}
+
+/* Count number of clients attached to sessions in session group. */
+u_int
+session_group_attached_count(struct session_group *sg)
+{
+	struct session	*s;
+	u_int		 n;
+
+	n = 0;
+	TAILQ_FOREACH(s, &sg->sessions, gentry)
+		n += s->attached;
 	return (n);
 }
 

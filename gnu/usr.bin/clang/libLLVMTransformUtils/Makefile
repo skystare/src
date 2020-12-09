@@ -1,24 +1,25 @@
-# $OpenBSD: Makefile,v 1.6 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.12 2020/08/03 14:45:28 patrick Exp $
 
 LIB=	LLVMTransformUtils
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Transforms
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Transforms/Utils
 
-.include <bsd.own.mk>
-SRCS=	ASanStackFrameLayout.cpp \
+SRCS+=	ASanStackFrameLayout.cpp \
 	AddDiscriminators.cpp \
 	BasicBlockUtils.cpp \
 	BreakCriticalEdges.cpp \
 	BuildLibCalls.cpp \
 	BypassSlowDivision.cpp \
 	CallPromotionUtils.cpp \
+	CanonicalizeAliases.cpp \
 	CloneFunction.cpp \
 	CloneModule.cpp \
 	CodeExtractor.cpp \
+	CodeMoverUtils.cpp \
 	CtorUtils.cpp \
+	Debugify.cpp \
 	DemoteRegToStack.cpp \
 	EntryExitInstrumenter.cpp \
 	EscapeEnumerator.cpp \
@@ -27,44 +28,54 @@ SRCS=	ASanStackFrameLayout.cpp \
 	FunctionComparator.cpp \
 	FunctionImportUtils.cpp \
 	GlobalStatus.cpp \
+	TransformUtilsGuardUtils.cpp \
 	ImportedFunctionsInliningStatistics.cpp \
+	InjectTLIMappings.cpp \
 	InlineFunction.cpp \
 	InstructionNamer.cpp \
 	IntegerDivision.cpp \
 	LCSSA.cpp \
 	LibCallsShrinkWrap.cpp \
 	Local.cpp \
+	LoopRotationUtils.cpp \
 	LoopSimplify.cpp \
 	LoopUnroll.cpp \
+	LoopUnrollAndJam.cpp \
 	LoopUnrollPeel.cpp \
 	LoopUnrollRuntime.cpp \
 	LoopUtils.cpp \
 	LoopVersioning.cpp \
 	LowerInvoke.cpp \
+	LowerMemIntrinsics.cpp \
 	LowerSwitch.cpp \
 	Mem2Reg.cpp \
 	MetaRenamer.cpp \
+	MisExpect.cpp \
 	ModuleUtils.cpp \
 	NameAnonGlobals.cpp \
-	OrderedInstructions.cpp \
 	PredicateInfo.cpp \
 	PromoteMemoryToRegister.cpp \
+	StripGCRelocates.cpp \
 	SSAUpdater.cpp \
 	SanitizerStats.cpp \
 	SimplifyCFG.cpp \
 	SimplifyIndVar.cpp \
-	SimplifyInstructions.cpp \
 	SimplifyLibCalls.cpp \
+	SizeOpts.cpp \
 	SplitModule.cpp \
+	StripNonLineTableDebugInfo.cpp \
 	SymbolRewriter.cpp \
 	UnifyFunctionExitNodes.cpp \
-	Utils.cpp \
+	TransformUtilsUtils.cpp \
 	VNCoercion.cpp \
 	ValueMapper.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Transforms/Utils
+TransformUtilsGuardUtils.cpp:
+	ln -s ${LLVM_SRCS}/lib/Transforms/Utils/GuardUtils.cpp $@
 
-install:
-	@# Nothing here so far ...
+TransformUtilsUtils.cpp:
+	ln -s ${LLVM_SRCS}/lib/Transforms/Utils/Utils.cpp $@
 
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Transforms/Utils
+
+CLEANFILES+= TransformUtilsUtils.cpp

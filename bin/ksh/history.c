@@ -1,4 +1,4 @@
-/*	$OpenBSD: history.c,v 1.80 2018/01/15 22:30:38 jca Exp $	*/
+/*	$OpenBSD: history.c,v 1.84 2019/10/27 15:02:19 jca Exp $	*/
 
 /*
  * command history
@@ -13,7 +13,6 @@
  */
 
 #include <sys/stat.h>
-#include <sys/uio.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -48,6 +47,8 @@ static uint32_t	line_co;
 
 static struct stat last_sb;
 
+static volatile sig_atomic_t	c_fc_depth;
+
 int
 c_fc(char **wp)
 {
@@ -58,9 +59,8 @@ c_fc(char **wp)
 	int optc, ret;
 	char *first = NULL, *last = NULL;
 	char **hfirst, **hlast, **hp;
-	static int depth;
 
-	if (depth != 0) {
+	if (c_fc_depth != 0) {
 		bi_errorf("history function called recursively");
 		return 1;
 	}
@@ -146,9 +146,9 @@ c_fc(char **wp)
 		    hist_get_newest(false);
 		if (!hp)
 			return 1;
-		depth++;
+		c_fc_depth++;
 		ret = hist_replace(hp, pat, rep, gflag);
-		depth--;
+		c_fc_reset();
 		return ret;
 	}
 
@@ -251,7 +251,7 @@ c_fc(char **wp)
 			return 1;
 		}
 
-		n = fstat(shf->fd, &statb) < 0 ? 128 :
+		n = fstat(shf->fd, &statb) == -1 ? 128 :
 		    statb.st_size + 1;
 		Xinit(xs, xp, n, hist_source->areap);
 		while ((n = shf_read(xp, Xnleft(xs, xp), shf)) > 0) {
@@ -268,11 +268,20 @@ c_fc(char **wp)
 		shf_close(shf);
 		*xp = '\0';
 		strip_nuls(Xstring(xs, xp), Xlength(xs, xp));
-		depth++;
+		c_fc_depth++;
 		ret = hist_execute(Xstring(xs, xp));
-		depth--;
+		c_fc_reset();
 		return ret;
 	}
+}
+
+/* Reset the c_fc depth counter.
+ * Made available for when an fc call is interrupted.
+ */
+void
+c_fc_reset(void)
+{
+	c_fc_depth = 0;
 }
 
 /* Save cmd in history, execute cmd (cmd gets trashed) */
@@ -544,6 +553,7 @@ void
 sethistsize(int n)
 {
 	if (n > 0 && (uint32_t)n != histsize) {
+		char **tmp;
 		int offset = histptr - history;
 
 		/* save most recent history */
@@ -556,10 +566,15 @@ sethistsize(int n)
 			memmove(history, histptr - offset, n * sizeof(char *));
 		}
 
-		histsize = n;
-		histbase = areallocarray(histbase, n + 1, sizeof(char *), APERM);
-		history = histbase + 1;
-		histptr = history + offset;
+		tmp = reallocarray(histbase, n + 1, sizeof(char *));
+		if (tmp != NULL) {
+			histbase = tmp;
+			histsize = n;
+			history = histbase + 1;
+			histptr = history + offset;
+		} else
+			warningf(false, "resizing history storage: %s",
+			    strerror(errno));
 	}
 }
 
@@ -603,8 +618,10 @@ init_histvec(void)
 		 * allocate one extra element so that histptr always
 		 * lies within array bounds
 		 */
-		histbase = areallocarray(NULL, histsize + 1, sizeof(char *),
-		    APERM);
+		histbase = reallocarray(NULL, histsize + 1, sizeof(char *));
+		if (histbase == NULL)
+			internal_errorf("allocating history storage: %s",
+			    strerror(errno));
 		*histbase = NULL;
 		history = histbase + 1;
 		histptr = history - 1;

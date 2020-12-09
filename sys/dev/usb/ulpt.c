@@ -1,4 +1,4 @@
-/*	$OpenBSD: ulpt.c,v 1.55 2017/09/08 05:36:52 deraadt Exp $ */
+/*	$OpenBSD: ulpt.c,v 1.57 2020/07/31 10:49:33 mglocker Exp $ */
 /*	$NetBSD: ulpt.c,v 1.57 2003/01/05 10:19:42 scw Exp $	*/
 /*	$FreeBSD: src/sys/dev/usb/ulpt.c,v 1.24 1999/11/17 22:33:44 n_hibma Exp $	*/
 
@@ -51,9 +51,6 @@
 #include <dev/usb/usbdi_util.h>
 #include <dev/usb/usbdevs.h>
 #include <dev/usb/usb_quirks.h>
-
-#define	TIMEOUT		hz*16	/* wait up to 16 seconds for a ready */
-#define	STEP		hz/4
 
 #define	LPTPRI		(PZERO+8)
 #define	ULPT_BSIZE	16384
@@ -578,7 +575,6 @@ ulptclose(dev_t dev, int flag, int mode, struct proc *p)
 		sc->sc_out_pipe = NULL;
 	}
 	if (sc->sc_in_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_in_pipe);
 		usbd_close_pipe(sc->sc_in_pipe);
 		sc->sc_in_pipe = NULL;
 		if (sc->sc_in_xfer1 != NULL) {

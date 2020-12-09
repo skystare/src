@@ -1,4 +1,4 @@
-/*	$OpenBSD: snmpd.c,v 1.39 2018/08/05 09:33:13 mestre Exp $	*/
+/*	$OpenBSD: snmpd.c,v 1.42 2020/09/06 15:51:28 martijn Exp $	*/
 
 /*
  * Copyright (c) 2007, 2008, 2012 Reyk Floeter <reyk@openbsd.org>
@@ -230,7 +230,7 @@ main(int argc, char *argv[])
 	pf_init();
 	snmpd_generate_engineid(env);
 
-	proc_init(ps, procs, nitems(procs), argc0, argv0, proc_id);
+	proc_init(ps, procs, nitems(procs), debug, argc0, argv0, proc_id);
 	if (!debug && daemon(0, 0) == -1)
 		err(1, "failed to daemonize");
 
@@ -255,7 +255,7 @@ main(int argc, char *argv[])
 
 	proc_connect(ps);
 
-	if (pledge("stdio rpath dns sendfd proc exec id", NULL) == -1)
+	if (pledge("stdio dns sendfd proc exec id", NULL) == -1)
 		fatal("pledge");
 
 	event_dispatch();
@@ -310,33 +310,10 @@ snmpd_dispatch_snmpe(int fd, struct privsep_proc *p, struct imsg *imsg)
 }
 
 int
-snmpd_socket_af(struct sockaddr_storage *ss, in_port_t port, int ipproto)
+snmpd_socket_af(struct sockaddr_storage *ss, int type)
 {
-	int	 s;
-
-	switch (ss->ss_family) {
-	case AF_INET:
-		((struct sockaddr_in *)ss)->sin_port = port;
-		((struct sockaddr_in *)ss)->sin_len =
-		    sizeof(struct sockaddr_in);
-		break;
-	case AF_INET6:
-		((struct sockaddr_in6 *)ss)->sin6_port = port;
-		((struct sockaddr_in6 *)ss)->sin6_len =
-		    sizeof(struct sockaddr_in6);
-		break;
-	default:
-		return (-1);
-	}
-
-	if (ipproto == IPPROTO_TCP)
-		s = socket(ss->ss_family,
-		    SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_TCP);
-	else
-		s = socket(ss->ss_family,
-		    SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
-
-	return (s);
+	return socket(ss->ss_family, (type == SOCK_STREAM ?
+	    SOCK_STREAM | SOCK_NONBLOCK : SOCK_DGRAM) | SOCK_CLOEXEC, 0);
 }
 
 void

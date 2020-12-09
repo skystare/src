@@ -1,4 +1,4 @@
-/*	$OpenBSD: db_sym.c,v 1.53 2017/05/30 15:39:05 mpi Exp $	*/
+/*	$OpenBSD: db_sym.c,v 1.55 2020/10/15 03:14:00 deraadt Exp $	*/
 /*	$NetBSD: db_sym.c,v 1.24 2000/08/11 22:50:47 tv Exp $	*/
 
 /*
@@ -85,9 +85,9 @@ int
 db_eqname(char *src, char *dst, int c)
 {
 	if (!strcmp(src, dst))
-	    return (1);
+		return (1);
 	if (src[0] == c)
-	    return (!strcmp(src+1,dst));
+		return (!strcmp(src+1,dst));
 	return (0);
 }
 
@@ -96,7 +96,7 @@ db_eqname(char *src, char *dst, int c)
  * and the difference between val and the symbol found.
  */
 Elf_Sym *
-db_search_symbol(db_addr_t val, db_strategy_t strategy, db_expr_t *offp)
+db_search_symbol(vaddr_t val, db_strategy_t strategy, db_expr_t *offp)
 {
 	unsigned int	diff;
 	db_expr_t	newdiff;
@@ -139,10 +139,10 @@ db_printsym(db_expr_t off, db_strategy_t strategy,
     int (*pr)(const char *, ...))
 {
 	db_expr_t	d;
-	char 		*filename;
+	char		*filename;
 	char		*name;
 	db_expr_t	value;
-	int 		linenum;
+	int		linenum;
 	Elf_Sym		*cursym;
 	char		buf[DB_FORMAT_BUF_SIZE];
 

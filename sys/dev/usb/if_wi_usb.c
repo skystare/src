@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_wi_usb.c,v 1.68 2015/11/24 17:11:40 mpi Exp $ */
+/*	$OpenBSD: if_wi_usb.c,v 1.73 2020/07/31 10:49:33 mglocker Exp $ */
 
 /*
  * Copyright (c) 2003 Dale Rahn. All rights reserved.
@@ -409,13 +409,13 @@ wi_usb_detach(struct device *self, int flags)
 
 	while (sc->wi_usb_nummem) {
 		sc->wi_usb_nummem--;
-		if (sc->wi_usb_txmem[sc->wi_usb_nummem] != NULL)
-			free(sc->wi_usb_txmem[sc->wi_usb_nummem], M_DEVBUF, 0);
+		free(sc->wi_usb_txmem[sc->wi_usb_nummem], M_DEVBUF,
+		  sc->wi_usb_txmemsize[sc->wi_usb_nummem]);
 		sc->wi_usb_txmem[sc->wi_usb_nummem] = NULL;
+		sc->wi_usb_txmemsize[sc->wi_usb_nummem] = 0;
 	}
 
 	if (sc->wi_usb_ep[WI_USB_ENDPT_INTR] != NULL) {
-		usbd_abort_pipe(sc->wi_usb_ep[WI_USB_ENDPT_INTR]);
 		err = usbd_close_pipe(sc->wi_usb_ep[WI_USB_ENDPT_INTR]);
 		if (err) {
 			printf("%s: close intr pipe failed: %s\n",
@@ -424,7 +424,6 @@ wi_usb_detach(struct device *self, int flags)
 		sc->wi_usb_ep[WI_USB_ENDPT_INTR] = NULL;
 	}
 	if (sc->wi_usb_ep[WI_USB_ENDPT_TX] != NULL) {
-		usbd_abort_pipe(sc->wi_usb_ep[WI_USB_ENDPT_TX]);
 		err = usbd_close_pipe(sc->wi_usb_ep[WI_USB_ENDPT_TX]);
 		if (err) {
 			printf("%s: close tx pipe failed: %s\n",
@@ -433,7 +432,6 @@ wi_usb_detach(struct device *self, int flags)
 		sc->wi_usb_ep[WI_USB_ENDPT_TX] = NULL;
 	}
 	if (sc->wi_usb_ep[WI_USB_ENDPT_RX] != NULL) {
-		usbd_abort_pipe(sc->wi_usb_ep[WI_USB_ENDPT_RX]);
 		err = usbd_close_pipe(sc->wi_usb_ep[WI_USB_ENDPT_RX]);
 		if (err) {
 			printf("%s: close rx pipe failed: %s\n",
@@ -541,8 +539,10 @@ wi_cmd_usb(struct wi_softc *wsc, int cmd, int val0, int val1, int val2)
 		/* free alloc_nicmem regions */
 		while (sc->wi_usb_nummem) {
 			sc->wi_usb_nummem--;
-			free(sc->wi_usb_txmem[sc->wi_usb_nummem], M_DEVBUF, 0);
+			free(sc->wi_usb_txmem[sc->wi_usb_nummem], M_DEVBUF,
+			  sc->wi_usb_txmemsize[sc->wi_usb_nummem]);
 			sc->wi_usb_txmem[sc->wi_usb_nummem] = NULL;
+			sc->wi_usb_txmemsize[sc->wi_usb_nummem] = 0;
 		}
 
 #if 0
@@ -1029,7 +1029,7 @@ wi_usb_do_transmit_sync(struct wi_usb_softc *sc, struct wi_usb_chain *c,
 		err = EIO;
 		goto done;
 	}
-	err = tsleep(ident, PRIBIO, "wiTXsync", hz*1);
+	err = tsleep_nsec(ident, PRIBIO, "wiTXsync", SEC_TO_NSEC(1));
 	if (err) {
 		DPRINTFN(1,("%s: %s: err %x\n",
 		    sc->wi_usb_dev.dv_xname, __func__, err));
@@ -1135,7 +1135,7 @@ wi_usb_txeof_frm(struct usbd_xfer *xfer, void *priv,
 
 	wi_usb_tx_unlock(sc);
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		wi_start_usb(ifp);
 
 	splx(s);
@@ -1810,7 +1810,7 @@ wi_usb_thread(void *arg)
 		if (wi_thread_info->status == 0) {
 			s = splnet();
 			wi_thread_info->idle = 1;
-			tsleep(wi_thread_info, PRIBIO, "wiIDL", 0);
+			tsleep_nsec(wi_thread_info, PRIBIO, "wiIDL", INFSLP);
 			wi_thread_info->idle = 0;
 			splx(s);
 		}
@@ -1851,7 +1851,7 @@ wi_usb_tx_lock(struct wi_usb_softc *sc)
 		sc->wi_lockwait++;
 		DPRINTFN(10,("%s: %s: busy %d\n", sc->wi_usb_dev.dv_xname,
 		__func__, sc->wi_lockwait ));
-		tsleep(&sc->wi_lock, PRIBIO, "witxl", 0);
+		tsleep_nsec(&sc->wi_lock, PRIBIO, "witxl", INFSLP);
 	}
 
 	if (sc->wi_lock != 0)
@@ -1905,7 +1905,7 @@ wi_usb_ctl_lock(struct wi_usb_softc *sc)
 		sc->wi_ctllockwait++;
 		DPRINTFN(10,("%s: %s: busy %d\n", sc->wi_usb_dev.dv_xname,
 		__func__, sc->wi_ctllockwait ));
-		tsleep(&sc->wi_ctllock, PRIBIO, "wiusbthr", 0);
+		tsleep_nsec(&sc->wi_ctllock, PRIBIO, "wiusbthr", INFSLP);
 	}
 
 	if (sc->wi_ctllock != 0)

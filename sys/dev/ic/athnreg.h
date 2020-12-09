@@ -1,4 +1,4 @@
-/*	$OpenBSD: athnreg.h,v 1.21 2017/11/28 04:35:39 stsp Exp $	*/
+/*	$OpenBSD: athnreg.h,v 1.25 2020/04/28 06:58:09 stsp Exp $	*/
 
 /*-
  * Copyright (c) 2009 Damien Bergamini <damien.bergamini@free.fr>
@@ -233,6 +233,7 @@
 #define AR_WOW_EXACT_REG		0x829c
 #define AR_2040_MODE			0x8318
 #define AR_EXTRCCNT			0x8328
+#define AR_PCU_BA_BAR_CTRL		0x8330
 #define AR_SELFGEN_MASK			0x832c
 #define AR_PCU_TXBUF_CTRL		0x8340
 #define AR_PCU_MISC_MODE2		0x8344
@@ -278,6 +279,10 @@
 
 /* Bits for AR_IER. */
 #define AR_IER_ENABLE	0x00000001
+
+/* Bits for AR_MIRT. */
+#define AR_MIRT_RATE_THRES_M	0x0000ffff
+#define AR_MIRT_RATE_THRES_S	0 
 
 /* Bits for AR_TIMT. */
 #define AR_TIMT_LAST_M	0x0000ffff
@@ -1184,6 +1189,14 @@
 #define AR_BT_HOLD_RX_CLEAR	0x00010000
 #define AR_BT_DISABLE_BT_ANT	0x00100000
 
+/* Bits for AR_PCU_BA_BAR_CTRL. */
+#define AR_PCU_BA_BAR_COMRESSED			0x00000100
+#define AR_PCU_BA_BAR_ACK_POLICY		0x00000200
+#define AR_PCU_BA_BAR_ACK_POLICY_OFFSET_M	0x000000f0
+#define AR_PCU_BA_BAR_ACK_POLICY_OFFSET_S	4
+#define AR_PCU_BA_BAR_COMPRESSED_OFFSET_M	0x0000000f
+#define AR_PCU_BA_BAR_COMPRESSED_OFFSET_S	0
+
 /* Bits for AR_PCU_TXBUF_CTRL. */
 #define AR_PCU_TXBUF_CTRL_SIZE_M		0x000007ff
 #define AR_PCU_TXBUF_CTRL_SIZE_S		0
@@ -1276,6 +1289,7 @@
 /*
  * AR9271 specific registers.
  */
+#define AR9271_CLOCK_CONTROL		0x050040
 #define AR9271_RESET_POWER_DOWN_CONTROL	0x050044
 #define AR9271_FIRMWARE			0x501000
 #define AR9271_FIRMWARE_TEXT		0x903000
@@ -1449,7 +1463,7 @@
 #define AR_CTL_2GHT40	7
 #define AR_CTL_5GHT40	8
 
-#define AR_DEFAULT_NOISE_FLOOR (-95)
+#define AR_DEFAULT_NOISE_FLOOR (-100)
 
 /*
  * Macros to access registers.

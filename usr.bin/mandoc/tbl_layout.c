@@ -1,4 +1,4 @@
-/*	$OpenBSD: tbl_layout.c,v 1.31 2017/06/27 18:23:29 schwarze Exp $ */
+/*	$OpenBSD: tbl_layout.c,v 1.36 2020/09/01 18:24:10 schwarze Exp $ */
 /*
  * Copyright (c) 2009, 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
  * Copyright (c) 2012, 2014, 2015, 2017 Ingo Schwarze <schwarze@openbsd.org>
@@ -19,14 +19,16 @@
 
 #include <ctype.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#include "mandoc.h"
 #include "mandoc_aux.h"
+#include "mandoc.h"
+#include "tbl.h"
 #include "libmandoc.h"
-#include "libroff.h"
+#include "tbl_int.h"
 
 struct	tbl_phrase {
 	char		 name;
@@ -61,6 +63,7 @@ mods(struct tbl_node *tbl, struct tbl_cell *cp,
 		int ln, const char *p, int *pos)
 {
 	char		*endptr;
+	unsigned long	 spacing;
 	size_t		 sz;
 
 mod:
@@ -82,15 +85,18 @@ mod:
 			(*pos)++;
 			goto mod;
 		}
-		mandoc_msg(MANDOCERR_TBLLAYOUT_PAR, tbl->parse,
-		    ln, *pos, NULL);
+		mandoc_msg(MANDOCERR_TBLLAYOUT_PAR, ln, *pos, NULL);
 		return;
 	}
 
 	/* Parse numerical spacing from modifier string. */
 
 	if (isdigit((unsigned char)p[*pos])) {
-		cp->spacing = strtoull(p + *pos, &endptr, 10);
+		if ((spacing = strtoul(p + *pos, &endptr, 10)) > 9)
+			mandoc_msg(MANDOCERR_TBLLAYOUT_SPC, ln, *pos,
+			    "%lu", spacing);
+		else
+			cp->spacing = spacing;
 		*pos = endptr - p;
 		goto mod;
 	}
@@ -111,8 +117,7 @@ mod:
 		cp->flags |= TBL_CELL_ITALIC;
 		goto mod;
 	case 'm':
-		mandoc_msg(MANDOCERR_TBLLAYOUT_MOD, tbl->parse,
-		    ln, *pos, "m");
+		mandoc_msg(MANDOCERR_TBLLAYOUT_MOD, ln, *pos, "m");
 		goto mod;
 	case 'p':
 	case 'v':
@@ -155,10 +160,10 @@ mod:
 			cp->vert++;
 		else
 			mandoc_msg(MANDOCERR_TBLLAYOUT_VERT,
-			    tbl->parse, ln, *pos - 1, NULL);
+			    ln, *pos - 1, NULL);
 		goto mod;
 	default:
-		mandoc_vmsg(MANDOCERR_TBLLAYOUT_CHAR, tbl->parse,
+		mandoc_msg(MANDOCERR_TBLLAYOUT_CHAR,
 		    ln, *pos - 1, "%c", p[*pos - 1]);
 		goto mod;
 	}
@@ -171,7 +176,7 @@ mod:
 	/* Support only one-character font-names for now. */
 
 	if (p[*pos] == '\0' || (p[*pos + 1] != ' ' && p[*pos + 1] != '.')) {
-		mandoc_vmsg(MANDOCERR_FT_BAD, tbl->parse,
+		mandoc_msg(MANDOCERR_FT_BAD,
 		    ln, *pos, "TS %s", p + *pos - 1);
 		if (p[*pos] != '\0')
 			(*pos)++;
@@ -193,7 +198,7 @@ mod:
 	case 'R':
 		goto mod;
 	default:
-		mandoc_vmsg(MANDOCERR_FT_BAD, tbl->parse,
+		mandoc_msg(MANDOCERR_FT_BAD,
 		    ln, *pos - 1, "TS f%c", p[*pos - 1]);
 		goto mod;
 	}
@@ -214,7 +219,7 @@ cell(struct tbl_node *tbl, struct tbl_row *rp,
 				rp->vert++;
 			else
 				mandoc_msg(MANDOCERR_TBLLAYOUT_VERT,
-				    tbl->parse, ln, *pos, NULL);
+				    ln, *pos, NULL);
 		}
 		(*pos)++;
 	}
@@ -233,7 +238,7 @@ again:
 			break;
 
 	if (i == KEYS_MAX) {
-		mandoc_vmsg(MANDOCERR_TBLLAYOUT_CHAR, tbl->parse,
+		mandoc_msg(MANDOCERR_TBLLAYOUT_CHAR,
 		    ln, *pos, "%c", p[*pos]);
 		(*pos)++;
 		goto again;
@@ -244,14 +249,12 @@ again:
 
 	if (c == TBL_CELL_SPAN) {
 		if (rp->last == NULL)
-			mandoc_msg(MANDOCERR_TBLLAYOUT_SPAN,
-			    tbl->parse, ln, *pos, NULL);
+			mandoc_msg(MANDOCERR_TBLLAYOUT_SPAN, ln, *pos, NULL);
 		else if (rp->last->pos == TBL_CELL_HORIZ ||
 		    rp->last->pos == TBL_CELL_DHORIZ)
 			c = rp->last->pos;
 	} else if (c == TBL_CELL_DOWN && rp == tbl->first_row)
-		mandoc_msg(MANDOCERR_TBLLAYOUT_DOWN,
-		    tbl->parse, ln, *pos, NULL);
+		mandoc_msg(MANDOCERR_TBLLAYOUT_DOWN, ln, *pos, NULL);
 
 	(*pos)++;
 
@@ -294,7 +297,7 @@ tbl_layout(struct tbl_node *tbl, int ln, const char *p, int pos)
 			}
 			if (tbl->first_row->first == NULL) {
 				mandoc_msg(MANDOCERR_TBLLAYOUT_NONE,
-				    tbl->parse, ln, pos, NULL);
+				    ln, pos, NULL);
 				cell_alloc(tbl, tbl->first_row,
 				    TBL_CELL_LEFT);
 				if (tbl->opts.lvert < tbl->first_row->vert)

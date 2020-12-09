@@ -1,4 +1,4 @@
-/*	$OpenBSD: sys_socket.c,v 1.41 2018/08/20 16:00:22 mpi Exp $	*/
+/*	$OpenBSD: sys_socket.c,v 1.45 2020/02/22 11:58:29 anton Exp $	*/
 /*	$NetBSD: sys_socket.c,v 1.13 1995/08/12 23:59:09 mycroft Exp $	*/
 
 /*
@@ -48,7 +48,7 @@
 #include <net/if.h>
 #include <net/route.h>
 
-struct	fileops socketops = {
+const struct fileops socketops = {
 	.fo_read	= soo_read,
 	.fo_write	= soo_write,
 	.fo_ioctl	= soo_ioctl,
@@ -111,20 +111,16 @@ soo_ioctl(struct file *fp, u_long cmd, caddr_t data, struct proc *p)
 		*(int *)data = so->so_rcv.sb_datacc;
 		break;
 
-	case TIOCSPGRP:
-		/* FALLTHROUGH */
+	case FIOSETOWN:
 	case SIOCSPGRP:
-		so->so_pgid = *(int *)data;
-		so->so_siguid = p->p_ucred->cr_ruid;
-		so->so_sigeuid = p->p_ucred->cr_uid;
+	case TIOCSPGRP:
+		error = sigio_setown(&so->so_sigio, cmd, data);
 		break;
 
-	case TIOCGPGRP:
-		*(int *)data = -so->so_pgid;
-		break;
-
+	case FIOGETOWN:
 	case SIOCGPGRP:
-		*(int *)data = so->so_pgid;
+	case TIOCGPGRP:
+		sigio_getown(&so->so_sigio, cmd, data);
 		break;
 
 	case SIOCATMARK:
@@ -138,13 +134,17 @@ soo_ioctl(struct file *fp, u_long cmd, caddr_t data, struct proc *p)
 		 * different entry since a socket's unnecessary
 		 */
 		if (IOCGROUP(cmd) == 'i') {
+			KERNEL_LOCK();
 			error = ifioctl(so, cmd, data, p);
+			KERNEL_UNLOCK();
 			return (error);
 		}
 		if (IOCGROUP(cmd) == 'r')
 			return (EOPNOTSUPP);
+		KERNEL_LOCK();
 		error = ((*so->so_proto->pr_usrreq)(so, PRU_CONTROL,
 		    (struct mbuf *)cmd, (struct mbuf *)data, NULL, p));
+		KERNEL_UNLOCK();
 		break;
 	}
 

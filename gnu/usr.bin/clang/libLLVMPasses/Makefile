@@ -1,17 +1,12 @@
-# $OpenBSD: Makefile,v 1.2 2017/07/09 15:28:35 espie Exp $
+# $OpenBSD: Makefile,v 1.4 2020/08/03 14:45:26 patrick Exp $
 
 LIB=	LLVMPasses
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Passes
 
-.include <bsd.own.mk>
-SRCS=	PassBuilder.cpp
+SRCS+=	PassBuilder.cpp \
+	PassPlugin.cpp \
+	StandardInstrumentations.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Passes
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Passes

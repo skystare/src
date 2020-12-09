@@ -1,4 +1,4 @@
-/* $OpenBSD: display.c,v 1.54 2018/01/04 17:44:20 deraadt Exp $	 */
+/* $OpenBSD: display.c,v 1.65 2020/08/26 16:21:28 kn Exp $	 */
 
 /*
  *  Top users/processes display for Unix
@@ -57,12 +57,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #include "screen.h"		/* interface to screen package */
 #include "layout.h"		/* defines for screen position layout */
 #include "display.h"
 #include "top.h"
-#include "boolean.h"
 #include "machine.h"		/* we should eliminate this!!! */
 #include "utils.h"
 
@@ -100,10 +100,11 @@ int y_header;
 int y_idlecursor;
 int y_procs;
 extern int ncpu;
+extern int ncpuonline;
 extern int combine_cpus;
 extern struct process_select ps;
 
-int header_status = Yes;
+int header_status = true;
 
 static int
 empty(void)
@@ -125,9 +126,10 @@ static int (*standendp)(void);
 int
 display_resize(void)
 {
-	int display_lines;
-	int cpu_lines = (combine_cpus ? 1 : ncpu);
+	int cpu_lines, display_lines;
 
+	ncpuonline = getncpuonline();
+	cpu_lines = (combine_cpus ? 1 : ncpuonline);
 	y_mem = 2 + cpu_lines;
 	y_header = 4 + cpu_lines;
 	y_procs = 5 + cpu_lines;
@@ -136,7 +138,7 @@ display_resize(void)
 	/* if operating in "dumb" mode, we only need one line */
 	display_lines = smart_terminal ? screen_length - y_procs : 1;
 
-	y_idlecursor = y_message = 3 + (combine_cpus ? 1 : ncpu);
+	y_idlecursor = y_message = 3 + (combine_cpus ? 1 : ncpuonline);
 	if (screen_length <= y_message)
 		y_idlecursor = y_message = screen_length - 1;
 
@@ -307,10 +309,7 @@ i_procstates(int total, int *states, int threads)
 		move(1, 0);
 		clrtoeol();
 		/* write current number of procs and remember the value */
-		if (threads == Yes)
-			printwp("%d threads: ", total);
-		else
-			printwp("%d processes: ", total);
+		printwp("%d %s: ", total, threads ? "threads" : "processes");
 
 		/* format and print the process state summary */
 		summary_format(procstates_buffer, sizeof(procstates_buffer),
@@ -377,9 +376,9 @@ cpustates_tag(int cpu)
 }
 
 void
-i_cpustates(int64_t *ostates)
+i_cpustates(int64_t *ostates, int *online)
 {
-	int i, first, cpu;
+	int i, first, cpu, cpu_line;
 	double value;
 	int64_t *states;
 	char **names, *thisname;
@@ -393,6 +392,8 @@ i_cpustates(int64_t *ostates)
 		}
 		memset(values, 0, num_cpustates * sizeof(*values));
 		for (cpu = 0; cpu < ncpu; cpu++) {
+			if (!online[cpu])
+				continue;
 			names = cpustate_names;
 			states = ostates + (CPUSTATES * cpu);
 			i = 0;
@@ -409,11 +410,11 @@ i_cpustates(int64_t *ostates)
 			first = 0;
 			move(2, 0);
 			clrtoeol();
-			printwp("%-3d CPUs: ", ncpu);
+			printwp("%-3d CPUs: ", ncpuonline);
 
 			while ((thisname = *names++) != NULL) {
 				if (*thisname != '\0') {
-					value = values[i++] / ncpu;
+					value = values[i++] / ncpuonline;
 					/* if percentage is >= 1000, print it as 100% */
 					printwp((value >= 1000 ? "%s%4.0f%% %s" :
 					    "%s%4.1f%% %s"), first++ == 0 ? "" : ", ",
@@ -424,14 +425,18 @@ i_cpustates(int64_t *ostates)
 		}
 		return;
 	}
-	for (cpu = 0; cpu < ncpu; cpu++) {
+	for (cpu = cpu_line = 0; cpu < ncpu; cpu++) {
+		/* skip if offline */
+		if (!online[cpu])
+			continue;
+
 		/* now walk thru the names and print the line */
 		names = cpustate_names;
 		first = 0;
 		states = ostates + (CPUSTATES * cpu);
 
-		if (screen_length > 2 + cpu || !smart_terminal) {
-			move(2 + cpu, 0);
+		if (screen_length > 2 + cpu_line || !smart_terminal) {
+			move(2 + cpu_line, 0);
 			clrtoeol();
 			addstrp(cpustates_tag(cpu));
 
@@ -447,6 +452,7 @@ i_cpustates(int64_t *ostates)
 				}
 			}
 			putn();
+			cpu_line++;
 		}
 	}
 }
@@ -509,7 +515,7 @@ i_message(void)
 void
 i_header(char *text)
 {
-	if (header_status == Yes && (screen_length > y_header
+	if (header_status && (screen_length > y_header
               || !smart_terminal)) {
 		if (!smart_terminal) {
 			putn();
@@ -719,7 +725,7 @@ static void
 summary_format(char *buf, size_t left, int *numbers, char **names)
 {
 	char *p, *thisname;
-	size_t len;
+	int len;
 	int num;
 
 	/* format each number followed by its string */
@@ -741,7 +747,7 @@ summary_format(char *buf, size_t left, int *numbers, char **names)
 				COPYLEFT(p, thisname + 1);
 			} else if (num > 0) {
 				len = snprintf(p, left, "%d%s", num, thisname);
-				if (len == (size_t)-1 || len >= left)
+				if (len < 0 || len >= left)
 					return;
 				p += len;
 				left -= len;
@@ -797,24 +803,30 @@ show_help(void)
 	    "\n"
 	    "^L           - redraw screen\n"
 	    "<space>      - update screen\n"
-	    "+            - reset any g, p, or u filters\n"
+	    "+            - reset any P highlight, g, p, or u filters\n"
 	    "1            - display CPU statistics on a single line\n"
+	    "9 | 0        - scroll up/down the process list by one line\n"
+	    "( | )        - scroll up/down the process list by screen half\n"
 	    "C            - toggle the display of command line arguments\n"
 	    "d count      - show `count' displays, then exit\n"
 	    "e            - list errors generated by last \"kill\" or \"renice\" command\n"
-	    "g string     - filter on command name (g+ selects all commands)\n"
+	    "g|/ string   - filter on command name (g+ or /+ selects all commands)\n"
 	    "h | ?        - help; show this text\n"
 	    "H            - toggle the display of threads\n"
 	    "I | i        - toggle the display of idle processes\n"
-	    "k [-sig] pid - send signal `-sig' to process `pid'\n"
+	    "k [-sig] pid - send signal `-sig' (TERM by default) to process `pid'\n"
 	    "n|# count    - show `count' processes\n"
-	    "o field      - specify sort order (size, res, cpu, time, pri, pid, command)\n"
+	    "o [-]field   - specify sort order (size, res, cpu, time, pri, pid, command)\n"
+	    "               (o -field sorts in reverse)\n"
 	    "P pid        - highlight process `pid' (P+ switches highlighting off)\n"
 	    "p pid        - display process by `pid' (p+ selects all processes)\n"
 	    "q            - quit\n"
 	    "r count pid  - renice process `pid' to nice value `count'\n"
 	    "S            - toggle the display of system processes\n"
 	    "s time       - change delay between displays to `time' seconds\n"
+	    "T [-]rtable  - show processes associated with routing table `rtable'\n"
+	    "               (T+ shows all, T -rtable hides rtable)\n"
+	    "t            - toggle the display of routing tables\n"
 	    "u [-]user    - show processes for `user' (u+ shows all, u -user hides user)\n"
 	    "\n");
 

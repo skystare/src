@@ -1,4 +1,4 @@
-/*	$OpenBSD: aic79xx_openbsd.c,v 1.46 2017/12/12 12:33:36 krw Exp $	*/
+/*	$OpenBSD: aic79xx_openbsd.c,v 1.59 2020/09/22 19:32:52 krw Exp $	*/
 
 /*
  * Copyright (c) 2004 Milos Urbanek, Kenneth R. Westerback & Marco Peereboom
@@ -76,18 +76,13 @@ void	ahd_setup_data(struct ahd_softc *, struct scsi_xfer *,
 		    struct scb *);
 
 void	ahd_adapter_req_set_xfer_mode(struct ahd_softc *, struct scb *);
-void    ahd_minphys(struct buf *, struct scsi_link *);
 
 struct cfdriver ahd_cd = {
 	NULL, "ahd", DV_DULL
 };
 
-static struct scsi_adapter ahd_switch =
-{
-	ahd_action,
-	ahd_minphys,
-	0,
-	0,
+static struct scsi_adapter ahd_switch = {
+	ahd_action, NULL, NULL, NULL, NULL
 };
 
 /*
@@ -104,17 +99,6 @@ ahd_attach(struct ahd_softc *ahd)
 	printf("%s\n", ahd_info);
 	ahd_lock(ahd, &s);
 
-	/*
-	 * fill in the prototype scsi_links.
-	 */
-	ahd->sc_channel.adapter_target = ahd->our_id;
-	if (ahd->features & AHD_WIDE)
-		ahd->sc_channel.adapter_buswidth = 16;
-	ahd->sc_channel.adapter_softc = ahd;
-	ahd->sc_channel.adapter = &ahd_switch;
-	ahd->sc_channel.openings = 16; /* Must ALWAYS be < 256!! */
-	ahd->sc_channel.pool = &ahd->sc_iopool;
-
 	if (bootverbose) {
 		ahd_controller_info(ahd, ahd_info, sizeof ahd_info);
 		printf("%s: %s\n", ahd->sc_dev.dv_xname, ahd_info);
@@ -125,8 +109,15 @@ ahd_attach(struct ahd_softc *ahd)
 	if (ahd->flags & AHD_RESET_BUS_A)
 		ahd_reset_channel(ahd, 'A', TRUE);
 
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &ahd->sc_channel;
+	saa.saa_adapter_target = ahd->our_id;
+	saa.saa_adapter_buswidth = (ahd->features & AHD_WIDE) ? 16 : 8;
+	saa.saa_adapter_softc = ahd;
+	saa.saa_adapter = &ahd_switch;
+	saa.saa_luns = 8;
+	saa.saa_openings = 16; /* Must ALWAYS be < 256!! */
+	saa.saa_pool = &ahd->sc_iopool;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 
 	ahd->sc_child = config_found((void *)&ahd->sc_dev, &saa, scsiprint);
 
@@ -253,22 +244,6 @@ ahd_done(struct ahd_softc *ahd, struct scb *scb)
 }
 
 void
-ahd_minphys(struct buf *bp, struct scsi_link *sl)
-{
-	/*
-	 * Even though the card can transfer up to 16megs per command
-	 * we are limited by the number of segments in the dma segment
-	 * list that we can hold.  The worst case is that all pages are
-	 * discontinuous physically, hence the "page per segment" limit
-	 * enforced here.
-	 */
-	if (bp->b_bcount > ((AHD_NSEG - 1) * PAGE_SIZE)) {
-		bp->b_bcount = ((AHD_NSEG - 1) * PAGE_SIZE);
-	}
-	minphys(bp);
-}
-
-void
 ahd_action(struct scsi_xfer *xs)
 {
 	struct	ahd_softc *ahd;
@@ -281,8 +256,10 @@ ahd_action(struct scsi_xfer *xs)
 	struct	ahd_tmode_tstate *tstate;
 	u_int16_t quirks;
 
-	SC_DEBUG(xs->sc_link, SDEV_DB3, ("ahd_action\n"));
-	ahd = (struct ahd_softc *)xs->sc_link->adapter_softc;
+#ifdef AHD_DEBUG
+	printf("%s: ahd_action\n", ahd_name(ahd));
+#endif
+	ahd = xs->sc_link->bus->sb_adapter_softc;
 
 	target_id = xs->sc_link->target;
 	our_id = SCSI_SCSI_ID(ahd, xs->sc_link);
@@ -309,7 +286,9 @@ ahd_action(struct scsi_xfer *xs)
 	scb->hscb->control = 0;
 	ahd->scb_data.scbindex[SCB_GET_TAG(scb)] = NULL;
 
-	SC_DEBUG(xs->sc_link, SDEV_DB3, ("start scb(%p)\n", scb));
+#ifdef AHD_DEBUG
+	printf("%s: start scb(%p)\n", ahd_name(ahd), scb);
+#endif
 
 	scb->xs = xs;
 	timeout_set(&xs->stimeout, ahd_timeout, scb);
@@ -347,7 +326,7 @@ ahd_execute_scb(void *arg, bus_dma_segment_t *dm_segs, int nsegments)
 	xs = scb->xs;
 	xs->error = CAM_REQ_INPROG;
 	xs->status = 0;
-	ahd = (struct ahd_softc *)xs->sc_link->adapter_softc;
+	ahd = xs->sc_link->bus->sb_adapter_softc;
 
 	if (nsegments != 0) {
 		void *sg;
@@ -456,7 +435,9 @@ ahd_execute_scb(void *arg, bus_dma_segment_t *dm_segs, int nsegments)
 	/*
 	 * If we can't use interrupts, poll for completion
 	 */
-	SC_DEBUG(xs->sc_link, SDEV_DB3, ("cmd_poll\n"));
+#ifdef AHD_DEBUG
+	printf("%s: cmd_poll\n", ahd_name(ahd));
+#endif
 
 	do {
 		if (ahd_poll(ahd, xs->timeout)) {
@@ -505,7 +486,7 @@ ahd_setup_data(struct ahd_softc *ahd, struct scsi_xfer *xs,
 		return;
 	}
 
-	memcpy(hscb->shared_data.idata.cdb, xs->cmd, hscb->cdb_len);
+	memcpy(hscb->shared_data.idata.cdb, &xs->cmd, hscb->cdb_len);
 
 	/* Only use S/G if there is a transfer */
 	if (xs->datalen) {

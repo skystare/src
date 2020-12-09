@@ -1,4 +1,4 @@
-/*	$OpenBSD: bwi.c,v 1.127 2017/10/26 15:00:28 mpi Exp $	*/
+/*	$OpenBSD: bwi.c,v 1.130 2020/07/10 13:26:37 patrick Exp $	*/
 
 /*
  * Copyright (c) 2007 The DragonFly Project.  All rights reserved.
@@ -789,7 +789,7 @@ bwi_attach(struct bwi_softc *sc)
 	ifp->if_watchdog = bwi_watchdog;
 	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST | IFF_MULTICAST;
 	strlcpy(ifp->if_xname, sc->sc_dev.dv_xname, IFNAMSIZ);
-	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
+	ifq_set_maxlen(&ifp->if_snd, IFQ_MAXLEN);
 
 	/* Get locale */
 	sc->sc_locale = __SHIFTOUT(bwi_read_sprom(sc, BWI_SPROM_CARD_INFO),
@@ -7189,7 +7189,7 @@ bwi_start(struct ifnet *ifp)
 			if (ic->ic_state != IEEE80211_S_RUN)
 				break;
 
-			IFQ_DEQUEUE(&ifp->if_snd, m);
+			m = ifq_dequeue(&ifp->if_snd);
 			if (m == NULL)
 				break;
 
@@ -8355,6 +8355,7 @@ bwi_next_scan(void *xsc)
 int
 bwi_rxeof(struct bwi_softc *sc, int end_idx)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct bwi_ring_data *rd = &sc->sc_rx_rdata;
 	struct bwi_rxbuf_data *rbd = &sc->sc_rx_bdata;
 	struct ieee80211com *ic = &sc->sc_ic;
@@ -8455,7 +8456,7 @@ bwi_rxeof(struct bwi_softc *sc, int end_idx)
 
 		rxi.rxi_rssi = hdr->rxh_rssi;
 		rxi.rxi_tstamp = letoh16(hdr->rxh_tsf);
-		ieee80211_input(ifp, m, ni, &rxi);
+		ieee80211_inputm(ifp, m, ni, &rxi, &ml);
 
 		ieee80211_release_node(ic, ni);
 
@@ -8466,6 +8467,7 @@ bwi_rxeof(struct bwi_softc *sc, int end_idx)
 next:
 		idx = (idx + 1) % BWI_RX_NDESC;
 	}
+	if_input(ifp, &ml);
 
 	rbd->rbd_idx = idx;
 	bus_dmamap_sync(sc->sc_dmat, rd->rdata_dmap, 0,

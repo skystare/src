@@ -1,4 +1,4 @@
-/*	$OpenBSD: trap.c,v 1.99 2018/04/12 17:13:44 deraadt Exp $	*/
+/*	$OpenBSD: trap.c,v 1.107 2020/10/23 16:54:35 deraadt Exp $	*/
 /*	$NetBSD: trap.c,v 1.73 2001/08/09 01:03:01 eeh Exp $ */
 
 /*
@@ -348,7 +348,6 @@ trap(struct trapframe64 *tf, unsigned type, vaddr_t pc, long tstate)
 	struct proc *p;
 	struct pcb *pcb;
 	int pstate = (tstate>>TSTATE_PSTATE_SHIFT);
-	vaddr_t sp;
 	u_int64_t s;
 	int64_t n;
 	union sigval sv;
@@ -428,22 +427,6 @@ trap(struct trapframe64 *tf, unsigned type, vaddr_t pc, long tstate)
 	p->p_md.md_tf = tf;	/* for ptrace/signals */
 	refreshcreds(p);
 
-	sp = PROC_STACK(p);
-	if (p->p_vmspace->vm_map.serial != p->p_spserial ||
-	    p->p_spstart == 0 || sp < p->p_spstart ||
-	    sp >= p->p_spend) {
-		KERNEL_LOCK();
-		if (!uvm_map_check_stack_range(p, sp)) {
-			printf("trap [%s]%d/%d type %d: sp %lx not inside %lx-%lx\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid, p->p_tid,
-			    (int)type, sp, p->p_spstart, p->p_spend);
-			sv.sival_ptr = (void *)PROC_PC(p);
-			trapsignal(p, SIGSEGV, type, SEGV_ACCERR, sv);
-		}
-
-		KERNEL_UNLOCK();
-	}
-
 	switch (type) {
 
 	default:
@@ -454,9 +437,7 @@ dopanic:
 			    pc, (long)tf->tf_npc, pstate, PSTATE_BITS);
 			/* NOTREACHED */
 		}
-		KERNEL_LOCK();
 		trapsignal(p, SIGILL, type, ILL_ILLOPC, sv);
-		KERNEL_UNLOCK();
 		break;
 
 	case T_AST:
@@ -476,9 +457,7 @@ dopanic:
 		 */
 		write_user_windows();
 		if (rwindow_save(p) == -1) {
-			KERNEL_LOCK();
 			trapsignal(p, SIGILL, 0, ILL_BADSTK, sv);
-			KERNEL_UNLOCK();
 		}
 		break;
 
@@ -488,9 +467,7 @@ dopanic:
 
 		if (copyin((caddr_t)pc, &ins, sizeof(ins)) != 0) {
 			/* XXX Can this happen? */
-			KERNEL_LOCK();
 			trapsignal(p, SIGILL, 0, ILL_ILLOPC, sv);
-			KERNEL_UNLOCK();
 			break;
 		}
 		if (ins.i_any.i_op == IOP_mem &&
@@ -509,9 +486,7 @@ dopanic:
 				ADVANCE;
 			break;
 		}
-		KERNEL_LOCK();
 		trapsignal(p, SIGILL, 0, ILL_ILLOPC, sv);	/* XXX code? */
-		KERNEL_UNLOCK();
 		break;
 	}
 
@@ -519,9 +494,7 @@ dopanic:
 	case T_TEXTFAULT:
 	case T_PRIVINST:
 	case T_PRIVACT:
-		KERNEL_LOCK();
 		trapsignal(p, SIGILL, 0, ILL_ILLOPC, sv);	/* XXX code? */
-		KERNEL_UNLOCK();
 		break;
 
 	case T_FPDISABLED: {
@@ -572,9 +545,7 @@ dopanic:
 
 		if (copyin((caddr_t)pc, &ins, sizeof(ins)) != 0) {
 			/* XXX Can this happen? */
-			KERNEL_LOCK();
 			trapsignal(p, SIGILL, 0, ILL_ILLOPC, sv);
-			KERNEL_UNLOCK();
 			break;
 		}
 		if (ins.i_any.i_op == IOP_mem &&
@@ -585,9 +556,7 @@ dopanic:
 			if (emul_qf(ins.i_int, p, sv, tf))
 				ADVANCE;
 		} else {
-			KERNEL_LOCK();
 			trapsignal(p, SIGILL, 0, ILL_ILLOPC, sv);
-			KERNEL_UNLOCK();
 		}
 		break;
 	}
@@ -630,9 +599,7 @@ dopanic:
 		}
 
 		/* XXX sv.sival_ptr should be the fault address! */
-		KERNEL_LOCK();
 		trapsignal(p, SIGBUS, 0, BUS_ADRALN, sv);	/* XXX code? */
-		KERNEL_UNLOCK();
 		break;
 
 	case T_FP_IEEE_754:
@@ -667,22 +634,16 @@ dopanic:
 		break;
 
 	case T_TAGOF:
-		KERNEL_LOCK();
 		trapsignal(p, SIGEMT, 0, EMT_TAGOVF, sv);	/* XXX code? */
-		KERNEL_UNLOCK();
 		break;
 
 	case T_BREAKPOINT:
-		KERNEL_LOCK();
 		trapsignal(p, SIGTRAP, 0, TRAP_BRKPT, sv);
-		KERNEL_UNLOCK();
 		break;
 
 	case T_DIV0:
 		ADVANCE;
-		KERNEL_LOCK();
 		trapsignal(p, SIGFPE, 0, FPE_INTDIV, sv);
-		KERNEL_UNLOCK();
 		break;
 
 	case T_CLEANWIN:
@@ -698,27 +659,22 @@ dopanic:
 
 	case T_RANGECHECK:
 		ADVANCE;
-		KERNEL_LOCK();
 		trapsignal(p, SIGILL, 0, ILL_ILLOPN, sv);	/* XXX code? */
-		KERNEL_UNLOCK();
 		break;
 
 	case T_FIXALIGN:
 		uprintf("T_FIXALIGN\n");
 		ADVANCE;
-		KERNEL_LOCK();
 		trapsignal(p, SIGILL, 0, ILL_ILLOPN, sv);	/* XXX code? */
-		KERNEL_UNLOCK();
 		break;
 
 	case T_INTOF:
 		uprintf("T_INTOF\n");		/* XXX */
 		ADVANCE;
-		KERNEL_LOCK();
 		trapsignal(p, SIGFPE, FPE_INTOVF_TRAP, FPE_INTOVF, sv);
-		KERNEL_UNLOCK();
 		break;
 	}
+
 	userret(p);
 	share_fpu(p, tf);
 #undef ADVANCE
@@ -762,6 +718,21 @@ pmap_unuse_final(struct proc *p)
 	p->p_addr->u_pcb.pcb_nsaved = 0;
 }
 
+static inline int
+accesstype(unsigned int type, u_long sfsr)
+{
+	/*
+	 * If it was a FAST_DATA_ACCESS_MMU_MISS we have no idea what the
+	 * access was since the SFSR is not set.  But we should never get
+	 * here from there.
+	 */
+	if (type == T_FDMMU_MISS || (sfsr & SFSR_FV) == 0)
+		return PROT_READ;
+	else if (sfsr & SFSR_W)
+		return PROT_READ | PROT_WRITE;
+	return PROT_READ;
+}
+
 /*
  * This routine handles MMU generated faults.  About half
  * of them could be recoverable through uvm_fault.
@@ -770,40 +741,18 @@ void
 data_access_fault(struct trapframe64 *tf, unsigned type, vaddr_t pc,
     vaddr_t addr, vaddr_t sfva, u_long sfsr)
 {
-	u_int64_t tstate;
-	struct proc *p;
-	struct vmspace *vm;
-	vaddr_t va;
-	int rv;
-	vm_prot_t access_type;
+	struct proc *p = curproc;
+	vaddr_t va = trunc_page(addr);
+	vm_prot_t access_type = accesstype(type, sfsr);
 	vaddr_t onfault;
 	union sigval sv;
+	int signal, sicode, error;
 
 	uvmexp.traps++;
-	if ((p = curproc) == NULL)	/* safety check */
+	if (p == NULL)		/* safety check */
 		p = &proc0;
 
-	tstate = tf->tf_tstate;
-
-	/* Find the faulting va to give to uvm_fault */
-	va = trunc_page(addr);
-
-	/*
-	 * Now munch on protections.
-	 *
-	 * If it was a FAST_DATA_ACCESS_MMU_MISS we have no idea what the
-	 * access was since the SFSR is not set.  But we should never get
-	 * here from there.
-	 */
-	if (type == T_FDMMU_MISS || (sfsr & SFSR_FV) == 0) {
-		/* Punt */
-		access_type = PROT_READ;
-	} else {
-		access_type = (sfsr & SFSR_W) ? PROT_READ | PROT_WRITE
-			: PROT_READ;
-	}
-	if (tstate & TSTATE_PRIV) {
-		KERNEL_LOCK();
+	if (tf->tf_tstate & TSTATE_PRIV) {
 #ifdef DDB
 		extern char Lfsprobe[];
 		/*
@@ -823,23 +772,29 @@ data_access_fault(struct trapframe64 *tf, unsigned type, vaddr_t pc,
 			goto kfault;
 		if (!(addr & TLB_TAG_ACCESS_CTX)) {
 			/* CTXT == NUCLEUS */
-			rv = uvm_fault(kernel_map, va, 0, access_type);
-			if (rv == 0) {
-				KERNEL_UNLOCK();
+
+			KERNEL_LOCK();
+			error = uvm_fault(kernel_map, va, 0, access_type);
+			KERNEL_UNLOCK();
+
+			if (error == 0)
 				return;
-			}
 			goto kfault;
 		}
 	} else {
-		KERNEL_LOCK();
 		p->p_md.md_tf = tf;
+		refreshcreds(p);
+		if (!uvm_map_inentry(p, &p->p_spinentry, PROC_STACK(p),
+		    "[%s]%d/%d sp=%lx inside %lx-%lx: not MAP_STACK\n",
+		    uvm_map_inentry_sp, p->p_vmspace->vm_map.sserial))
+			goto out;
 	}
 
-	vm = p->p_vmspace;
-	/* alas! must call the horrible vm code */
 	onfault = (vaddr_t)p->p_addr->u_pcb.pcb_onfault;
 	p->p_addr->u_pcb.pcb_onfault = NULL;
-	rv = uvm_fault(&vm->vm_map, (vaddr_t)va, 0, access_type);
+	KERNEL_LOCK();
+	error = uvm_fault(&p->p_vmspace->vm_map, (vaddr_t)va, 0, access_type);
+	KERNEL_UNLOCK();
 	p->p_addr->u_pcb.pcb_onfault = (void *)onfault;
 
 	/*
@@ -849,60 +804,54 @@ data_access_fault(struct trapframe64 *tf, unsigned type, vaddr_t pc,
 	 * the current limit and we need to reflect that as an access
 	 * error.
 	 */
-	if (rv == 0 && (caddr_t)va >= vm->vm_maxsaddr)
+	if (error == 0) {
 		uvm_grow(p, va);
-
-	if (rv != 0) {
-		/*
-		 * Pagein failed.  If doing copyin/out, return to onfault
-		 * address.  Any other page fault in kernel, die; if user
-		 * fault, deliver SIGSEGV.
-		 */
-		int signal, sicode;
-
-		if (tstate & TSTATE_PRIV) {
-kfault:
-			onfault = (long)p->p_addr->u_pcb.pcb_onfault;
-			if (!onfault) {
-				(void) splhigh();
-				panic("kernel data fault: pc=%lx addr=%lx",
-				    pc, addr);
-				/* NOTREACHED */
-			}
-			tf->tf_pc = onfault;
-			tf->tf_npc = onfault + 4;
-			KERNEL_UNLOCK();
-			return;
-		}
-
-		if (type == T_FDMMU_MISS || (sfsr & SFSR_FV) == 0)
-			sv.sival_ptr = (void *)va;
-		else
-			sv.sival_ptr = (void *)sfva;
-
-		signal = SIGSEGV;
-		sicode = SEGV_MAPERR;
-		if (rv == ENOMEM) {
-			printf("UVM: pid %d (%s), uid %d killed: out of swap\n",
-			    p->p_p->ps_pid, p->p_p->ps_comm,
-			    p->p_ucred ? (int)p->p_ucred->cr_uid : -1);
-			signal = SIGKILL;
-		}
-		if (rv == EACCES)
-			sicode = SEGV_ACCERR;
-		if (rv == EIO) {
-			signal = SIGBUS;
-			sicode = BUS_OBJERR;
-		}
-		trapsignal(p, signal, access_type, sicode, sv);
+		goto out;
 	}
 
-	if ((tstate & TSTATE_PRIV) == 0) {
-		KERNEL_UNLOCK();
+	/*
+	 * Pagein failed.  If doing copyin/out, return to onfault
+	 * address.  Any other page fault in kernel, die; if user
+	 * fault, deliver SIGSEGV.
+	 */
+	if (tf->tf_tstate & TSTATE_PRIV) {
+kfault:
+		onfault = (long)p->p_addr->u_pcb.pcb_onfault;
+		if (!onfault) {
+			(void) splhigh();
+			panic("kernel data fault: pc=%lx addr=%lx",
+			    pc, addr);
+			/* NOTREACHED */
+		}
+		tf->tf_pc = onfault;
+		tf->tf_npc = onfault + 4;
+		return;
+	}
+
+	if (type == T_FDMMU_MISS || (sfsr & SFSR_FV) == 0)
+		sv.sival_ptr = (void *)va;
+	else
+		sv.sival_ptr = (void *)sfva;
+
+	signal = SIGSEGV;
+	sicode = SEGV_MAPERR;
+	if (error == ENOMEM) {
+		printf("UVM: pid %d (%s), uid %d killed: out of swap\n",
+		    p->p_p->ps_pid, p->p_p->ps_comm,
+		    p->p_ucred ? (int)p->p_ucred->cr_uid : -1);
+		signal = SIGKILL;
+	} else if (error == EACCES)
+		sicode = SEGV_ACCERR;
+	else if (error == EIO) {
+		signal = SIGBUS;
+		sicode = BUS_OBJERR;
+	}
+	trapsignal(p, signal, access_type, sicode, sv);
+
+out:
+	if ((tf->tf_tstate & TSTATE_PRIV) == 0) {
 		userret(p);
 		share_fpu(p, tf);
-	} else {
-		KERNEL_UNLOCK();
 	}
 }
 
@@ -917,17 +866,14 @@ void
 data_access_error(struct trapframe64 *tf, unsigned type, vaddr_t afva,
     u_long afsr, vaddr_t sfva, u_long sfsr)
 {
+	struct proc *p = curproc;
 	u_long pc;
-	u_int64_t tstate;
-	struct proc *p;
 	vaddr_t onfault;
 	union sigval sv;
 
 	uvmexp.traps++;
-	if ((p = curproc) == NULL)	/* safety check */
+	if (p == NULL)		/* safety check */
 		p = &proc0;
-
-	tstate = tf->tf_tstate;
 
 	/*
 	 * Catch PCI config space reads.
@@ -939,19 +885,16 @@ data_access_error(struct trapframe64 *tf, unsigned type, vaddr_t afva,
 
 	pc = tf->tf_pc;
 
-	sv.sival_ptr = (void *)pc;
-
 	onfault = (long)p->p_addr->u_pcb.pcb_onfault;
 	printf("data error type %x sfsr=%lx sfva=%lx afsr=%lx afva=%lx tf=%p\n",
-		type, sfsr, sfva, afsr, afva, tf);
+	    type, sfsr, sfva, afsr, afva, tf);
 
 	if (afsr == 0 && sfsr == 0) {
 		printf("data_access_error: no fault\n");
 		goto out;	/* No fault. Why were we called? */
 	}
 
-	if (tstate & TSTATE_PRIV) {
-
+	if (tf->tf_tstate & TSTATE_PRIV) {
 		if (!onfault) {
 			(void) splhigh();
 			panic("data fault: pc=%lx addr=%lx sfsr=%lb",
@@ -973,12 +916,11 @@ data_access_error(struct trapframe64 *tf, unsigned type, vaddr_t afva,
 		return;
 	}
 
-	KERNEL_LOCK();
+	sv.sival_ptr = (void *)pc;
 	trapsignal(p, SIGSEGV, PROT_READ | PROT_WRITE, SEGV_MAPERR, sv);
-	KERNEL_UNLOCK();
-out:
 
-	if ((tstate & TSTATE_PRIV) == 0) {
+out:
+	if ((tf->tf_tstate & TSTATE_PRIV) == 0) {
 		userret(p);
 		share_fpu(p, tf);
 	}
@@ -992,39 +934,34 @@ void
 text_access_fault(struct trapframe64 *tf, unsigned type, vaddr_t pc,
     u_long sfsr)
 {
-	u_int64_t tstate;
-	struct proc *p;
-	struct vmspace *vm;
-	vaddr_t va;
-	int rv;
-	vm_prot_t access_type;
+	struct proc *p = curproc;
+	vaddr_t va = trunc_page(pc);
+	vm_prot_t access_type = PROT_EXEC;
 	union sigval sv;
+	int signal, sicode, error;
+
+	uvmexp.traps++;
+	if (p == NULL)		/* safety check */
+		panic("text_access_fault: no curproc");
 
 	sv.sival_ptr = (void *)pc;
 
-	uvmexp.traps++;
-	if ((p = curproc) == NULL)	/* safety check */
-		panic("text_access_fault: no curproc");
-
-	tstate = tf->tf_tstate;
-
-	va = trunc_page(pc);
-
-	/* Now munch on protections... */
-
-	access_type = PROT_EXEC;
-	if (tstate & TSTATE_PRIV) {
+	if (tf->tf_tstate & TSTATE_PRIV) {
 		(void) splhigh();
 		panic("kernel text_access_fault: pc=%lx va=%lx", pc, va);
 		/* NOTREACHED */
-	} else
-		p->p_md.md_tf = tf;
+	}
+
+	p->p_md.md_tf = tf;
+	refreshcreds(p);
+	if (!uvm_map_inentry(p, &p->p_spinentry, PROC_STACK(p),
+	    "[%s]%d/%d sp=%lx inside %lx-%lx: not MAP_STACK\n",
+	    uvm_map_inentry_sp, p->p_vmspace->vm_map.sserial))
+		goto out;
 
 	KERNEL_LOCK();
-
-	vm = p->p_vmspace;
-	/* alas! must call the horrible vm code */
-	rv = uvm_fault(&vm->vm_map, va, 0, access_type);
+	error = uvm_fault(&p->p_vmspace->vm_map, va, 0, access_type);
+	KERNEL_UNLOCK();
 
 	/*
 	 * If this was a stack access we keep track of the maximum
@@ -1033,36 +970,33 @@ text_access_fault(struct trapframe64 *tf, unsigned type, vaddr_t pc,
 	 * the current limit and we need to reflect that as an access
 	 * error.
 	 */
-	if (rv == 0 && (caddr_t)va >= vm->vm_maxsaddr)
+	if (error == 0) {
 		uvm_grow(p, va);
-
-	if (rv != 0) {
-		/*
-		 * Pagein failed. Any other page fault in kernel, die; if user
-		 * fault, deliver SIGSEGV.
-		 */
-		int signal, sicode;
-
-		if (tstate & TSTATE_PRIV) {
-			(void) splhigh();
-			panic("kernel text fault: pc=%llx", (unsigned long long)pc);
-			/* NOTREACHED */
-		}
-
-		signal = SIGSEGV;
-		sicode = SEGV_MAPERR;
-		if (rv == EACCES)
-			sicode = SEGV_ACCERR;
-		if (rv == EIO) {
-			signal = SIGBUS;
-			sicode = BUS_OBJERR;
-		}
-		trapsignal(p, signal, access_type, sicode, sv);
+		goto out;
 	}
 
-	KERNEL_UNLOCK();
+	/*
+	 * Pagein failed. Any other page fault in kernel, die; if user
+	 * fault, deliver SIGSEGV.
+	 */
+	if (tf->tf_tstate & TSTATE_PRIV) {
+		(void) splhigh();
+		panic("kernel text fault: pc=%llx", (unsigned long long)pc);
+		/* NOTREACHED */
+	}
 
-	if ((tstate & TSTATE_PRIV) == 0) {
+	signal = SIGSEGV;
+	sicode = SEGV_MAPERR;
+	if (error == EACCES)
+		sicode = SEGV_ACCERR;
+	else if (error == EIO) {
+		signal = SIGBUS;
+		sicode = BUS_OBJERR;
+	}
+	trapsignal(p, signal, access_type, sicode, sv);
+
+out:
+	if ((tf->tf_tstate & TSTATE_PRIV) == 0) {
 		userret(p);
 		share_fpu(p, tf);
 	}
@@ -1080,55 +1014,50 @@ void
 text_access_error(struct trapframe64 *tf, unsigned type, vaddr_t pc,
     u_long sfsr, vaddr_t afva, u_long afsr)
 {
-	int64_t tstate;
-	struct proc *p;
-	struct vmspace *vm;
-	vaddr_t va;
-	int rv;
-	vm_prot_t access_type;
+	struct proc *p = curproc;
+	vaddr_t va = trunc_page(pc);
+	vm_prot_t access_type = PROT_EXEC;
 	union sigval sv;
+	int signal, sicode, error;
 
-	sv.sival_ptr = (void *)pc;
 	uvmexp.traps++;
-	if ((p = curproc) == NULL)	/* safety check */
+	if (p == NULL)		/* safety check */
 		p = &proc0;
 
-	tstate = tf->tf_tstate;
+	sv.sival_ptr = (void *)pc;
 
 	if ((afsr) != 0) {
 		printf("text_access_error: memory error...\n");
-		printf("text memory error type %d sfsr=%lx sfva=%lx afsr=%lx afva=%lx tf=%p\n",
-		       type, sfsr, pc, afsr, afva, tf);
+		printf("type %d sfsr=%lx sfva=%lx afsr=%lx afva=%lx tf=%p\n",
+		    type, sfsr, pc, afsr, afva, tf);
 
-		if (tstate & TSTATE_PRIV)
+		if (tf->tf_tstate & TSTATE_PRIV)
 			panic("text_access_error: kernel memory error");
 
 		/* User fault -- Berr */
-		KERNEL_LOCK();
 		trapsignal(p, SIGBUS, 0, BUS_ADRALN, sv);
-		KERNEL_UNLOCK();
 	}
 
 	if ((sfsr & SFSR_FV) == 0 || (sfsr & SFSR_FT) == 0)
 		goto out;	/* No fault. Why were we called? */
 
-	va = trunc_page(pc);
-
-	/* Now munch on protections... */
-	access_type = PROT_EXEC;
-	if (tstate & TSTATE_PRIV) {
+	if (tf->tf_tstate & TSTATE_PRIV) {
 		(void) splhigh();
 		panic("kernel text error: pc=%lx sfsr=%lb", pc,
 		    sfsr, SFSR_BITS);
 		/* NOTREACHED */
-	} else
-		p->p_md.md_tf = tf;
+	}
+
+	p->p_md.md_tf = tf;
+	refreshcreds(p);
+	if (!uvm_map_inentry(p, &p->p_spinentry, PROC_STACK(p),
+	    "[%s]%d/%d sp=%lx inside %lx-%lx: not MAP_STACK\n",
+	    uvm_map_inentry_sp, p->p_vmspace->vm_map.sserial))
+		goto out;
 
 	KERNEL_LOCK();
-
-	vm = p->p_vmspace;
-	/* alas! must call the horrible vm code */
-	rv = uvm_fault(&vm->vm_map, va, 0, access_type);
+	error = uvm_fault(&p->p_vmspace->vm_map, va, 0, access_type);
+	KERNEL_UNLOCK();
 
 	/*
 	 * If this was a stack access we keep track of the maximum
@@ -1137,40 +1066,35 @@ text_access_error(struct trapframe64 *tf, unsigned type, vaddr_t pc,
 	 * the current limit and we need to reflect that as an access
 	 * error.
 	 */
-	if (rv == 0 && (caddr_t)va >= vm->vm_maxsaddr) {
+	if (error == 0) {
 		uvm_grow(p, va);
+		goto out;
 	}
 
-	if (rv != 0) {
-		/*
-		 * Pagein failed.  If doing copyin/out, return to onfault
-		 * address.  Any other page fault in kernel, die; if user
-		 * fault, deliver SIGSEGV.
-		 */
-		int signal, sicode;
-
-		if (tstate & TSTATE_PRIV) {
-			(void) splhigh();
-			panic("kernel text error: pc=%lx sfsr=%lb", pc,
-			    sfsr, SFSR_BITS);
-			/* NOTREACHED */
-		}
-
-		signal = SIGSEGV;
-		sicode = SEGV_MAPERR;
-		if (rv == EACCES)
-			sicode = SEGV_ACCERR;
-		if (rv == EIO) {
-			signal = SIGBUS;
-			sicode = BUS_OBJERR;
-		}
-		trapsignal(p, signal, access_type, sicode, sv);
+	/*
+	 * Pagein failed.  If doing copyin/out, return to onfault
+	 * address.  Any other page fault in kernel, die; if user
+	 * fault, deliver SIGSEGV.
+	 */
+	if (tf->tf_tstate & TSTATE_PRIV) {
+		(void) splhigh();
+		panic("kernel text error: pc=%lx sfsr=%lb", pc,
+		    sfsr, SFSR_BITS);
+		/* NOTREACHED */
 	}
 
-	KERNEL_UNLOCK();
+	signal = SIGSEGV;
+	sicode = SEGV_MAPERR;
+	if (error == EACCES)
+		sicode = SEGV_ACCERR;
+	else if (error == EIO) {
+		signal = SIGBUS;
+		sicode = BUS_OBJERR;
+	}
+	trapsignal(p, signal, access_type, sicode, sv);
 
 out:
-	if ((tstate & TSTATE_PRIV) == 0) {
+	if ((tf->tf_tstate & TSTATE_PRIV) == 0) {
 		userret(p);
 		share_fpu(p, tf);
 	}

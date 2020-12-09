@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmctl.c,v 1.58 2018/09/16 02:43:11 millert Exp $	*/
+/*	$OpenBSD: vmctl.c,v 1.75 2020/09/02 19:57:33 tb Exp $	*/
 
 /*
  * Copyright (c) 2014 Mike Larkin <mlarkin@openbsd.org>
@@ -39,13 +39,15 @@
 #include <grp.h>
 
 #include "vmd.h"
+#include "virtio.h"
 #include "vmctl.h"
 #include "atomicio.h"
 
 extern char *__progname;
 uint32_t info_id;
 char info_name[VMM_MAX_NAME_LEN];
-int info_console;
+enum actions info_action;
+unsigned int info_flags;
 
 /*
  * vm_start
@@ -71,7 +73,7 @@ int info_console;
 int
 vm_start(uint32_t start_id, const char *name, int memsize, int nnics,
     char **nics, int ndisks, char **disks, int *disktypes, char *kernel,
-    char *iso, char *instance)
+    char *iso, char *instance, unsigned int bootdevice)
 {
 	struct vmop_create_params *vmc;
 	struct vm_create_params *vcp;
@@ -182,6 +184,7 @@ vm_start(uint32_t start_id, const char *name, int memsize, int nnics,
 		if (strlcpy(vmc->vmc_instance, instance,
 		    sizeof(vmc->vmc_instance)) >= sizeof(vmc->vmc_instance))
 			errx(1, "instance vm name too long");
+	vmc->vmc_bootdevice = bootdevice;
 
 	imsg_compose(ibuf, IMSG_VMDOP_START_VM_REQUEST, 0, 0, -1,
 	    vmc, sizeof(struct vmop_create_params));
@@ -232,11 +235,6 @@ vm_start_complete(struct imsg *imsg, int *ret, int autoconnect)
 				warnx("could not open disk image(s)");
 				*ret = ENOENT;
 				break;
-			case VMD_DISK_INVALID:
-				warnx("specified disk image(s) are "
-				    "not regular files");
-				*ret = ENOENT;
-				break;
 			case VMD_CDROM_MISSING:
 				warnx("could not find specified iso image");
 				*ret = ENOENT;
@@ -245,6 +243,10 @@ vm_start_complete(struct imsg *imsg, int *ret, int autoconnect)
 				warnx("specified iso image is not a regular "
 				    "file");
 				*ret = ENOENT;
+				break;
+			case VMD_PARENT_INVALID:
+				warnx("invalid template");
+				*ret = EINVAL;
 				break;
 			default:
 				errno = res;
@@ -440,8 +442,12 @@ terminate_vm(uint32_t terminate_id, const char *name, unsigned int flags)
 
 	memset(&vid, 0, sizeof(vid));
 	vid.vid_id = terminate_id;
-	if (name != NULL)
+	if (name != NULL) {
 		(void)strlcpy(vid.vid_name, name, sizeof(vid.vid_name));
+		fprintf(stderr, "stopping vm %s: ", name);
+	} else {
+		fprintf(stderr, "stopping vm: ");
+	}
 
 	vid.vid_flags = flags & (VMOP_FORCE|VMOP_WAIT);
 
@@ -453,7 +459,7 @@ terminate_vm(uint32_t terminate_id, const char *name, unsigned int flags)
  * terminate_vm_complete
  *
  * Callback function invoked when we are expecting an
- * IMSG_VMDOP_TERMINATE_VMM_RESPONSE message indicating the completion of
+ * IMSG_VMDOP_TERMINATE_VM_RESPONSE message indicating the completion of
  * a terminate vm operation.
  *
  * Parameters:
@@ -482,33 +488,106 @@ terminate_vm_complete(struct imsg *imsg, int *ret, unsigned int flags)
 		if (res) {
 			switch (res) {
 			case VMD_VM_STOP_INVALID:
-				warnx("cannot stop vm that is not running");
+				fprintf(stderr,
+				    "cannot stop vm that is not running\n");
 				*ret = EINVAL;
 				break;
 			case ENOENT:
-				warnx("vm not found");
+				fprintf(stderr, "vm not found\n");
+				*ret = EIO;
+				break;
+			case EINTR:
+				fprintf(stderr, "interrupted call\n");
 				*ret = EIO;
 				break;
 			default:
 				errno = res;
-				warn("terminate vm command failed");
+				fprintf(stderr, "failed: %s\n",
+				    strerror(res));
 				*ret = EIO;
 			}
 		} else if (flags & VMOP_WAIT) {
-			warnx("terminated vm %d", vmr->vmr_id);
+			fprintf(stderr, "terminated vm %d\n", vmr->vmr_id);
 		} else if (flags & VMOP_FORCE) {
-			warnx("requested to terminate vm %d", vmr->vmr_id);
+			fprintf(stderr, "forced to terminate vm %d\n",
+			    vmr->vmr_id);
 		} else {
-			warnx("requested to shutdown vm %d", vmr->vmr_id);
+			fprintf(stderr, "requested to shutdown vm %d\n",
+			    vmr->vmr_id);
 			*ret = 0;
 		}
 	} else {
-		warnx("unexpected response received from vmd");
+		fprintf(stderr, "unexpected response received from vmd\n");
 		*ret = EINVAL;
 	}
 	errno = *ret;
 
 	return (1);
+}
+
+/*
+ * terminate_all
+ *
+ * Request to stop all VMs gracefully
+ *
+ * Parameters
+ *  list: the vm information (consolidated) returned from vmd via imsg
+ *  ct  : the size (number of elements in 'list') of the result
+ *  flags: VMOP_FORCE or VMOP_WAIT flags
+ */
+void
+terminate_all(struct vmop_info_result *list, size_t ct, unsigned int flags)
+{
+	struct vm_info_result *vir;
+	struct vmop_info_result *vmi;
+	struct parse_result res;
+	size_t i;
+
+	for (i = 0; i < ct; i++) {
+		vmi = &list[i];
+		vir = &vmi->vir_info;
+
+		/* The VM is already stopped */
+		if (vir->vir_creator_pid == 0 || vir->vir_id == 0)
+			continue;
+
+		memset(&res, 0, sizeof(res));
+		res.action = CMD_STOP;
+		res.id = 0;
+		res.flags = info_flags;
+
+		if ((res.name = strdup(vir->vir_name)) == NULL)
+			errx(1, "strdup");
+
+		vmmaction(&res);
+	}
+}
+
+/*
+ * waitfor_vm
+ *
+ * Wait until vmd stopped the indicated VM
+ *
+ * Parameters:
+ *  terminate_id: ID of the vm to be terminated
+ *  name: optional name of the VM to be terminated
+ */
+void
+waitfor_vm(uint32_t terminate_id, const char *name)
+{
+	struct vmop_id vid;
+
+	memset(&vid, 0, sizeof(vid));
+	vid.vid_id = terminate_id;
+	if (name != NULL) {
+		(void)strlcpy(vid.vid_name, name, sizeof(vid.vid_name));
+		fprintf(stderr, "waiting for vm %s: ", name);
+	} else {
+		fprintf(stderr, "waiting for vm: ");
+	}
+
+	imsg_compose(ibuf, IMSG_VMDOP_WAIT_VM_REQUEST,
+	    0, 0, -1, &vid, sizeof(vid));
 }
 
 /*
@@ -519,17 +598,20 @@ terminate_vm_complete(struct imsg *imsg, int *ret, unsigned int flags)
  * Parameters:
  *  id: optional ID of a VM to list
  *  name: optional name of a VM to list
- *  console: if true, open the console of the selected VM (by name or ID)
+ *  action: if CMD_CONSOLE or CMD_STOP open a console or terminate the VM.
+ *  flags: optional flags used by the CMD_STOP action.
  *
  * Request a list of running VMs from vmd
  */
 void
-get_info_vm(uint32_t id, const char *name, int console)
+get_info_vm(uint32_t id, const char *name, enum actions action,
+    unsigned int flags)
 {
 	info_id = id;
 	if (name != NULL)
 		(void)strlcpy(info_name, name, sizeof(info_name));
-	info_console = console;
+	info_action = action;
+	info_flags = flags;
 	imsg_compose(ibuf, IMSG_VMDOP_GET_INFO_VM_REQUEST, 0, 0, -1, NULL, 0);
 }
 
@@ -574,7 +656,7 @@ check_info_id(const char *name, uint32_t id)
  *          to the "list vm" data. The caller should check the value of
  *          'ret' to determine which case occurred.
  *
- * This function does not return if a VM is found and info_console is set.
+ * This function does not return if a VM is found and info_action is CMD_CONSOLE
  *
  *  The function also sets 'ret' to the error code as follows:
  *   0     : Message successfully processed
@@ -599,10 +681,17 @@ add_info(struct imsg *imsg, int *ret)
 		*ret = 0;
 		return (0);
 	} else if (imsg->hdr.type == IMSG_VMDOP_GET_INFO_VM_END_DATA) {
-		if (info_console)
+		switch (info_action) {
+		case CMD_CONSOLE:
 			vm_console(vir, ct);
-		else
+			break;
+		case CMD_STOPALL:
+			terminate_all(vir, ct, info_flags);
+			break;
+		default:
 			print_vm_info(vir, ct);
+			break;
+		}
 		free(vir);
 		*ret = 0;
 		return (1);
@@ -610,6 +699,34 @@ add_info(struct imsg *imsg, int *ret)
 		*ret = EINVAL;
 		return (1);
 	}
+}
+
+/*
+ * vm_state
+ *
+ * Returns a string representing the current VM state, note that the order
+ * matters. A paused VM does have the VM_STATE_RUNNING bit set, but
+ * VM_STATE_PAUSED is more significant to report.
+ *
+ * Parameters
+ *  vm_state: mask indicating the vm state
+ */
+const char *
+vm_state(unsigned int mask)
+{
+	if (mask & VM_STATE_PAUSED)
+		return "paused";
+	else if (mask & VM_STATE_WAITING)
+		return "waiting";
+	else if (mask & VM_STATE_RUNNING)
+		return "running";
+	else if (mask & VM_STATE_SHUTDOWN)
+		return "stopping";
+	/* Presence of absence of other flags */
+	else if (!mask || (mask & VM_STATE_DISABLED))
+		return "stopped";
+
+	return "unknown";
 }
 
 /*
@@ -626,19 +743,21 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 {
 	struct vm_info_result *vir;
 	struct vmop_info_result *vmi;
-	size_t i, j;
-	char *vcpu_state, *tty;
+	size_t i;
+	char *tty;
 	char curmem[FMT_SCALED_STRSIZE];
 	char maxmem[FMT_SCALED_STRSIZE];
 	char user[16], group[16];
 	const char *name;
+	int running;
 
-	printf("%5s %5s %5s %7s %7s %7s %12s %s\n", "ID", "PID", "VCPUS",
-	    "MAXMEM", "CURMEM", "TTY", "OWNER", "NAME");
+	printf("%5s %5s %5s %7s %7s %7s %12s %8s %s\n", "ID", "PID", "VCPUS",
+	    "MAXMEM", "CURMEM", "TTY", "OWNER", "STATE", "NAME");
 
 	for (i = 0; i < ct; i++) {
 		vmi = &list[i];
 		vir = &vmi->vir_info;
+		running = (vir->vir_creator_pid != 0 && vir->vir_id != 0);
 		if (check_info_id(vir->vir_name, vir->vir_id)) {
 			/* get user name */
 			name = user_from_uid(vmi->vir_uid, 1);
@@ -649,8 +768,6 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 				(void)strlcpy(user, name, sizeof(user));
 			/* get group name */
 			if (vmi->vir_gid != -1) {
-				if (vmi->vir_uid == 0)
-					*user = '\0';
 				name = group_from_gid(vmi->vir_gid, 1);
 				if (name == NULL)
 					(void)snprintf(group, sizeof(group),
@@ -667,42 +784,29 @@ print_vm_info(struct vmop_info_result *list, size_t ct)
 			(void)fmt_scaled(vir->vir_memory_size * 1024 * 1024,
 			    maxmem);
 
-			if (vir->vir_creator_pid != 0 && vir->vir_id != 0) {
+			if (running) {
 				if (*vmi->vir_ttyname == '\0')
 					tty = "-";
 				/* get tty - skip /dev/ path */
 				else if ((tty = strrchr(vmi->vir_ttyname,
-				    '/')) == NULL || ++tty == '\0')
+				    '/')) == NULL || *++tty == '\0')
 					tty = list[i].vir_ttyname;
 
 				(void)fmt_scaled(vir->vir_used_size, curmem);
 
 				/* running vm */
-				printf("%5u %5u %5zd %7s %7s %7s %12s %s\n",
+				printf("%5u %5u %5zd %7s %7s %7s %12s %8s %s\n",
 				    vir->vir_id, vir->vir_creator_pid,
 				    vir->vir_ncpus, maxmem, curmem,
-				    tty, user, vir->vir_name);
+				    tty, user, vm_state(vmi->vir_state),
+				    vir->vir_name);
 			} else {
 				/* disabled vm */
-				printf("%5u %5s %5zd %7s %7s %7s %12s %s\n",
+				printf("%5u %5s %5zd %7s %7s %7s %12s %8s %s\n",
 				    vir->vir_id, "-",
 				    vir->vir_ncpus, maxmem, curmem,
-				    "-", user, vir->vir_name);
-			}
-		}
-		if (check_info_id(vir->vir_name, vir->vir_id) > 0) {
-			for (j = 0; j < vir->vir_ncpus; j++) {
-				if (vir->vir_vcpu_state[j] ==
-				    VCPU_STATE_STOPPED)
-					vcpu_state = "STOPPED";
-				else if (vir->vir_vcpu_state[j] ==
-				    VCPU_STATE_RUNNING)
-					vcpu_state = "RUNNING";
-				else
-					vcpu_state = "UNKNOWN";
-
-				printf(" VCPU: %2zd STATE: %s\n",
-				    j, vcpu_state);
+				    "-", user, vm_state(vmi->vir_state),
+				    vir->vir_name);
 			}
 		}
 	}
@@ -737,158 +841,112 @@ vm_console(struct vmop_info_result *list, size_t ct)
 }
 
 /*
- * create_raw_imagefile
+ * open_imagefile
  *
- * Create an empty imagefile with the specified path and size.
+ * Open an imagefile with the specified type, path and size.
  *
  * Parameters:
+ *  type        : format of the image file
  *  imgfile_path: path to the image file to create
- *  imgsize     : size of the image file to create (in MB)
+ *  flags       : flags for open(2), e.g. O_RDONLY
+ *  file        : file structure
+ *  sz		: size of the image file
  *
  * Return:
- *  EEXIST: The requested image file already exists
- *  0     : Image file successfully created
- *  Exxxx : Various other Exxxx errno codes due to other I/O errors
+ *  fd          : Returns file descriptor of the new image file
+ *  -1          : Operation failed.  errno is set.
  */
 int
-create_raw_imagefile(const char *imgfile_path, long imgsize)
+open_imagefile(int type, const char *imgfile_path, int flags,
+    struct virtio_backing *file, off_t *sz)
 {
-	int fd, ret;
+	int	 fd, ret, basefd[VM_MAX_BASE_PER_DISK], nfd, i;
+	char	 path[PATH_MAX];
 
-	/* Refuse to overwrite an existing image */
-	fd = open(imgfile_path, O_RDWR | O_CREAT | O_TRUNC | O_EXCL,
-	    S_IRUSR | S_IWUSR);
-	if (fd == -1)
-		return (errno);
+	*sz = 0;
+	if ((fd = open(imgfile_path, flags)) == -1)
+		return (-1);
 
-	/* Extend to desired size */
-	if (ftruncate(fd, (off_t)imgsize * 1024 * 1024) == -1) {
-		ret = errno;
-		close(fd);
-		unlink(imgfile_path);
-		return (ret);
+	basefd[0] = fd;
+	nfd = 1;
+
+	errno = 0;
+	switch (type) {
+	case VMDF_QCOW2:
+		if (strlcpy(path, imgfile_path, sizeof(path)) >= sizeof(path))
+			return (-1);
+		for (i = 0; i < VM_MAX_BASE_PER_DISK - 1; i++, nfd++) {
+			if ((ret = virtio_qcow2_get_base(basefd[i],
+			    path, sizeof(path), imgfile_path)) == -1) {
+				log_debug("%s: failed to get base %d", __func__, i);
+				return -1;
+			} else if (ret == 0)
+				break;
+
+			/*
+			 * This might be called after unveil is already
+			 * locked but it is save to ignore the EPERM error
+			 * here as the subsequent open would fail as well.
+			 */
+			if ((ret = unveil(path, "r")) != 0 &&
+			    (ret != EPERM))
+				err(1, "unveil");
+			if ((basefd[i + 1] = open(path, O_RDONLY)) == -1) {
+				log_warn("%s: failed to open base %s",
+				    __func__, path);
+				return (-1);
+			}
+		}
+		ret = virtio_qcow2_init(file, sz, basefd, nfd);
+		break;
+	default:
+		ret = virtio_raw_init(file, sz, &fd, 1);
+		break;
 	}
 
-	ret = close(fd);
-	return (ret);
+	if (ret == -1) {
+		for (i = 0; i < nfd; i++)
+			close(basefd[i]);
+		return (-1);
+	}
+
+	return (fd);
 }
 
 /*
  * create_imagefile
  *
- * Create an empty qcow2 imagefile with the specified path and size.
+ * Create an empty imagefile with the specified type, path and size.
  *
  * Parameters:
+ *  type        : format of the image file
  *  imgfile_path: path to the image file to create
+ *  base_path   : path to the qcow2 base image
  *  imgsize     : size of the image file to create (in MB)
+ *  format      : string identifying the format
  *
  * Return:
  *  EEXIST: The requested image file already exists
  *  0     : Image file successfully created
  *  Exxxx : Various other Exxxx errno codes due to other I/O errors
  */
-#define ALIGN(sz, align) \
-	((sz + align - 1) & ~(align - 1))
 int
-create_qc2_imagefile(const char *imgfile_path, long imgsize)
+create_imagefile(int type, const char *imgfile_path, const char *base_path,
+    long imgsize, const char **format)
 {
-	struct qcheader {
-		char magic[4];
-		uint32_t version;
-		uint64_t backingoff;
-		uint32_t backingsz;
-		uint32_t clustershift;
-		uint64_t disksz;
-		uint32_t cryptmethod;
-		uint32_t l1sz;
-		uint64_t l1off;
-		uint64_t refoff;
-		uint32_t refsz;
-		uint32_t snapcount;
-		uint64_t snapsz;
-		/* v3 additions */
-		uint64_t incompatfeatures;
-		uint64_t compatfeatures;
-		uint64_t autoclearfeatures;
-		uint32_t reforder;
-		uint32_t headersz;
-	} __packed hdr;
-	int fd, ret;
-	uint64_t l1sz, refsz, disksz, initsz, clustersz;
-	uint64_t l1off, refoff, v, i;
-	uint16_t refs;
+	int	 ret;
 
-	disksz = 1024*1024*imgsize;
-	clustersz = (1<<16);
-	l1off = ALIGN(sizeof hdr, clustersz);
-	l1sz = disksz / (clustersz*clustersz/8);
-	if (l1sz == 0)
-		l1sz = 1;
-
-	refoff = ALIGN(l1off + 8*l1sz, clustersz);
-	refsz = disksz / (clustersz*clustersz*clustersz/2);
-	if (refsz == 0)
-		refsz = 1;
-
-	initsz = ALIGN(refoff + refsz*clustersz, clustersz);
-
-	memcpy(hdr.magic, "QFI\xfb", 4);
-	hdr.version		= htobe32(3);
-	hdr.backingoff		= htobe64(0);
-	hdr.backingsz		= htobe32(0);
-	hdr.clustershift	= htobe32(16);
-	hdr.disksz		= htobe64(disksz);
-	hdr.cryptmethod		= htobe32(0);
-	hdr.l1sz		= htobe32(l1sz);
-	hdr.l1off		= htobe64(l1off);
-	hdr.refoff		= htobe64(refoff);
-	hdr.refsz		= htobe32(refsz);
-	hdr.snapcount		= htobe32(0);
-	hdr.snapsz		= htobe64(0);
-	hdr.incompatfeatures	= htobe64(0);
-	hdr.compatfeatures	= htobe64(0);
-	hdr.autoclearfeatures	= htobe64(0);
-	hdr.reforder		= htobe32(4);
-	hdr.headersz		= htobe32(sizeof hdr);
-
-	/* Refuse to overwrite an existing image */
-	fd = open(imgfile_path, O_RDWR | O_CREAT | O_TRUNC | O_EXCL,
-	    S_IRUSR | S_IWUSR);
-	if (fd == -1)
-		return (errno);
-
-	/* Write out the header */
-	if (write(fd, &hdr, sizeof hdr) != sizeof hdr)
-		goto error;
-
-	/* Extend to desired size, and add one refcount cluster */
-	if (ftruncate(fd, (off_t)initsz + clustersz) == -1)
-		goto error;
-
-	/* 
-	 * Paranoia: if our disk image takes more than one cluster
-	 * to refcount the initial image, fail.
-	 */
-	if (initsz/clustersz > clustersz/2) {
-		errno = ERANGE;
-		goto error;
+	switch (type) {
+	case VMDF_QCOW2:
+		*format = "qcow2";
+		ret = virtio_qcow2_create(imgfile_path, base_path, imgsize);
+		break;
+	default:
+		*format = "raw";
+		ret = virtio_raw_create(imgfile_path, imgsize);
+		break;
 	}
 
-	/* Add a refcount block, and refcount ourselves. */
-	v = htobe64(initsz);
-	if (pwrite(fd, &v, 8, refoff) != 8)
-		goto error;
-	for (i = 0; i < initsz/clustersz + 1; i++) {
-		refs = htobe16(1);
-		if (pwrite(fd, &refs, 2, initsz + 2*i) != 2)
-			goto error;
-	}
-
-	ret = close(fd);
 	return (ret);
-error:
-	ret = errno;
-	close(fd);
-	unlink(imgfile_path);
-	return (errno);
 }
+

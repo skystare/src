@@ -1,14 +1,12 @@
-# $OpenBSD: Makefile,v 1.6 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.12 2020/08/03 14:45:27 patrick Exp $
 
 LIB=	LLVMScalarOpts
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Transforms
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Transforms/Scalar
 
-.include <bsd.own.mk>
-SRCS=	ADCE.cpp \
+SRCS+=	ADCE.cpp \
 	AlignmentFromAssumptions.cpp \
 	BDCE.cpp \
 	CallSiteSplitting.cpp \
@@ -28,12 +26,15 @@ SRCS=	ADCE.cpp \
 	IVUsersPrinter.cpp \
 	InductiveRangeCheckElimination.cpp \
 	IndVarSimplify.cpp \
+	InferAddressSpaces.cpp \
+	InstSimplifyPass.cpp \
 	JumpThreading.cpp \
 	LICM.cpp \
 	LoopAccessAnalysisPrinter.cpp \
 	LoopDataPrefetch.cpp \
 	LoopDeletion.cpp \
 	LoopDistribute.cpp \
+	LoopFuse.cpp \
 	LoopIdiomRecognize.cpp \
 	LoopInstSimplify.cpp \
 	LoopInterchange.cpp \
@@ -45,12 +46,17 @@ SRCS=	ADCE.cpp \
 	LoopSimplifyCFG.cpp \
 	LoopSink.cpp \
 	LoopStrengthReduce.cpp \
+	LoopUnrollAndJamPass.cpp \
 	LoopUnrollPass.cpp \
 	LoopUnswitch.cpp \
 	LoopVersioningLICM.cpp \
 	LowerAtomic.cpp \
+	LowerConstantIntrinsics.cpp \
 	LowerExpectIntrinsic.cpp \
 	LowerGuardIntrinsic.cpp \
+	LowerMatrixIntrinsics.cpp \
+	LowerWidenableCondition.cpp \
+	MakeGuardsExplicit.cpp \
 	MemCpyOptimizer.cpp \
 	MergeICmps.cpp \
 	MergedLoadStoreMotion.cpp \
@@ -61,7 +67,7 @@ SRCS=	ADCE.cpp \
 	Reassociate.cpp \
 	Reg2Mem.cpp \
 	RewriteStatepointsForGC.cpp \
-	SCCP.cpp \
+	ScalarSCCP.cpp \
 	SROA.cpp \
 	Scalar.cpp \
 	Scalarizer.cpp \
@@ -73,11 +79,12 @@ SRCS=	ADCE.cpp \
 	SpeculativeExecution.cpp \
 	StraightLineStrengthReduce.cpp \
 	StructurizeCFG.cpp \
-	TailRecursionElimination.cpp
+	TailRecursionElimination.cpp \
+	WarnMissedTransforms.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Transforms/Scalar
+ScalarSCCP.cpp:
+	ln -s ${LLVM_SRCS}/lib/Transforms/Scalar/SCCP.cpp $@
 
-install:
-	@# Nothing here so far ...
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Transforms/Scalar
 
-.include <bsd.lib.mk>
+CLEANFILES+= ScalarSCCP.cpp

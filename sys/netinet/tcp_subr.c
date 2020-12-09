@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_subr.c,v 1.172 2018/06/14 01:24:08 yasuoka Exp $	*/
+/*	$OpenBSD: tcp_subr.c,v 1.175 2020/07/24 20:39:03 cheloha Exp $	*/
 /*	$NetBSD: tcp_subr.c,v 1.22 1996/02/13 23:44:00 christos Exp $	*/
 
 /*
@@ -518,7 +518,7 @@ tcp_close(struct tcpcb *tp)
 
 	m_free(tp->t_template);
 	/* Free tcpcb after all pending timers have been run. */
-	TCP_TIMER_ARM(tp, TCPT_REAPER, 0);
+	TCP_TIMER_ARM(tp, TCPT_REAPER, 1);
 
 	inp->inp_ppcb = NULL;
 	soisdisconnected(so);

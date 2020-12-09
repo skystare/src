@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip_input.c,v 1.341 2018/09/11 21:04:03 bluhm Exp $	*/
+/*	$OpenBSD: ip_input.c,v 1.352 2020/11/16 06:44:38 gnezdo Exp $	*/
 /*	$NetBSD: ip_input.c,v 1.30 1996/03/16 23:53:58 christos Exp $	*/
 
 /*
@@ -61,6 +61,7 @@
 #include <netinet/in_var.h>
 #include <netinet/ip_var.h>
 #include <netinet/ip_icmp.h>
+#include <net/if_types.h>
 
 #ifdef INET6
 #include <netinet6/ip6protosw.h>
@@ -80,7 +81,6 @@
 #endif /* IPSEC */
 
 #if NCARP > 0
-#include <net/if_types.h>
 #include <netinet/ip_carp.h>
 #endif
 
@@ -107,9 +107,29 @@ LIST_HEAD(, ipq) ipq;
 int	ip_maxqueue = 300;
 int	ip_frags = 0;
 
-int *ipctl_vars[IPCTL_MAXID] = IPCTL_VARS;
+#ifdef MROUTING
+extern int ip_mrtproto;
+#endif
 
-struct niqueue ipintrq = NIQUEUE_INITIALIZER(IPQ_MAXLEN, NETISR_IP);
+const struct sysctl_bounded_args ipctl_vars[] = {
+#ifdef MROUTING
+	{ IPCTL_MRTPROTO, &ip_mrtproto, 1, 0 },
+#endif
+	{ IPCTL_FORWARDING, &ipforwarding, 0, 1 },
+	{ IPCTL_SENDREDIRECTS, &ipsendredirects, 0, 1 },
+	{ IPCTL_DEFTTL, &ip_defttl, 0, 255 },
+	{ IPCTL_DIRECTEDBCAST, &ip_directedbcast, 0, 1 },
+	{ IPCTL_IPPORT_FIRSTAUTO, &ipport_firstauto, 0, 65535 },
+	{ IPCTL_IPPORT_LASTAUTO, &ipport_lastauto, 0, 65535 },
+	{ IPCTL_IPPORT_HIFIRSTAUTO, &ipport_hifirstauto, 0, 65535 },
+	{ IPCTL_IPPORT_HILASTAUTO, &ipport_hilastauto, 0, 65535 },
+	{ IPCTL_IPPORT_MAXQUEUE, &ip_maxqueue, 0, 10000 },
+	{ IPCTL_MFORWARDING, &ipmforwarding, 0, 1 },
+	{ IPCTL_MULTIPATH, &ipmultipath, 0, 1 },
+	{ IPCTL_ARPQUEUED, &la_hold_total, 0, 1000 },
+	{ IPCTL_ARPTIMEOUT, &arpt_keep, 0, INT_MAX },
+	{ IPCTL_ARPDOWN, &arpt_down, 0, INT_MAX },
+};
 
 struct pool ipqent_pool;
 struct pool ipq_pool;
@@ -120,8 +140,9 @@ int ip_sysctl_ipstat(void *, size_t *, void *);
 
 static struct mbuf_queue	ipsend_mq;
 
+extern struct niqueue		arpinq;
+
 int	ip_ours(struct mbuf **, int *, int, int);
-int	ip_local(struct mbuf **, int *, int, int);
 int	ip_dooptions(struct mbuf *, struct ifnet *);
 int	in_ouraddr(struct mbuf *, struct ifnet *, struct rtentry **);
 
@@ -200,43 +221,6 @@ ip_init(void)
 #ifdef IPSEC
 	ipsec_init();
 #endif
-}
-
-/*
- * Enqueue packet for local delivery.  Queuing is used as a boundary
- * between the network layer (input/forward path) running without
- * KERNEL_LOCK() and the transport layer still needing it.
- */
-int
-ip_ours(struct mbuf **mp, int *offp, int nxt, int af)
-{
-	/* We are already in a IPv4/IPv6 local deliver loop. */
-	if (af != AF_UNSPEC)
-		return ip_local(mp, offp, nxt, af);
-
-	niq_enqueue(&ipintrq, *mp);
-	*mp = NULL;
-	return IPPROTO_DONE;
-}
-
-/*
- * Dequeue and process locally delivered packets.
- */
-void
-ipintr(void)
-{
-	struct mbuf *m;
-	int off, nxt;
-
-	while ((m = niq_dequeue(&ipintrq)) != NULL) {
-#ifdef DIAGNOSTIC
-		if ((m->m_flags & M_PKTHDR) == 0)
-			panic("ipintr no HDR");
-#endif
-		off = 0;
-		nxt = ip_local(&m, &off, IPPROTO_IPV4, AF_UNSPEC);
-		KASSERT(nxt == IPPROTO_DONE);
-	}
 }
 
 /*
@@ -379,7 +363,10 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
 		goto out;
 	}
 
-	if (in_ouraddr(m, ifp, &rt)) {
+	switch(in_ouraddr(m, ifp, &rt)) {
+	case 2:
+		goto bad;
+	case 1:
 		nxt = ip_ours(mp, offp, nxt, af);
 		goto out;
 	}
@@ -495,7 +482,7 @@ ip_input_if(struct mbuf **mp, int *offp, int nxt, int af, struct ifnet *ifp)
  * If fragmented try to reassemble.  Pass to next level.
  */
 int
-ip_local(struct mbuf **mp, int *offp, int nxt, int af)
+ip_ours(struct mbuf **mp, int *offp, int nxt, int af)
 {
 	struct mbuf *m = *mp;
 	struct ip *ip = mtod(m, struct ip *);
@@ -654,20 +641,6 @@ ip_deliver(struct mbuf **mp, int *offp, int nxt, int af)
 			goto bad;
 		}
 
-#ifdef INET6
-		/* draft-itojun-ipv6-tcp-to-anycast */
-		if (af == AF_INET6 &&
-		    ISSET((*mp)->m_flags, M_ACAST) && (nxt == IPPROTO_TCP)) {
-			if ((*mp)->m_len >= sizeof(struct ip6_hdr)) {
-				icmp6_error(*mp, ICMP6_DST_UNREACH,
-					ICMP6_DST_UNREACH_ADDR,
-					offsetof(struct ip6_hdr, ip6_dst));
-				*mp = NULL;
-			}
-			goto bad;
-		}
-#endif /* INET6 */
-
 #ifdef IPSEC
 		if (ipsec_in_use) {
 			if (ipsec_local_check(*mp, *offp, nxt, af) != 0) {
@@ -787,6 +760,28 @@ in_ouraddr(struct mbuf *m, struct ifnet *ifp, struct rtentry **prt)
 				break;
 			}
 		}
+	} else if (ipforwarding == 0 && rt->rt_ifidx != ifp->if_index &&
+	    !((ifp->if_flags & IFF_LOOPBACK) || (ifp->if_type == IFT_ENC) ||
+	    (m->m_pkthdr.pf.flags & PF_TAG_TRANSLATE_LOCALHOST))) {
+		/* received on wrong interface. */
+#if NCARP > 0
+		struct ifnet *out_if;
+
+		/*
+		 * Virtual IPs on carp interfaces need to be checked also
+		 * against the parent interface and other carp interfaces
+		 * sharing the same parent.
+		 */
+		out_if = if_get(rt->rt_ifidx);
+		if (!(out_if && carp_strict_addr_chk(out_if, ifp))) {
+			ipstat_inc(ips_wrongif);
+			match = 2;
+		}
+		if_put(out_if);
+#else
+		ipstat_inc(ips_wrongif);
+		match = 2;
+#endif
 	}
 
 	return (match);
@@ -1574,12 +1569,12 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 {
 	int error;
 #ifdef MROUTING
-	extern int ip_mrtproto;
 	extern struct mrtstat mrtstat;
 #endif
 
 	/* Almost all sysctl names at this level are terminal. */
-	if (namelen != 1 && name[0] != IPCTL_IFQUEUE)
+	if (namelen != 1 && name[0] != IPCTL_IFQUEUE &&
+	    name[0] != IPCTL_ARPQUEUE)
 		return (ENOTDIR);
 
 	switch (name[0]) {
@@ -1637,16 +1632,16 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		    newlen));
 #endif
 	case IPCTL_IFQUEUE:
+		return (EOPNOTSUPP);
+	case IPCTL_ARPQUEUE:
 		return (sysctl_niq(name + 1, namelen - 1,
-		    oldp, oldlenp, newp, newlen, &ipintrq));
+		    oldp, oldlenp, newp, newlen, &arpinq));
 	case IPCTL_STATS:
 		return (ip_sysctl_ipstat(oldp, oldlenp, newp));
 #ifdef MROUTING
 	case IPCTL_MRTSTATS:
 		return (sysctl_rdstruct(oldp, oldlenp, newp,
 		    &mrtstat, sizeof(mrtstat)));
-	case IPCTL_MRTPROTO:
-		return (sysctl_rdint(oldp, oldlenp, newp, ip_mrtproto));
 	case IPCTL_MRTMFC:
 		if (newp)
 			return (EPERM);
@@ -1669,14 +1664,11 @@ ip_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (EOPNOTSUPP);
 #endif
 	default:
-		if (name[0] < IPCTL_MAXID) {
-			NET_LOCK();
-			error = sysctl_int_arr(ipctl_vars, name, namelen,
-			    oldp, oldlenp, newp, newlen);
-			NET_UNLOCK();
-			return (error);
-		}
-		return (EOPNOTSUPP);
+		NET_LOCK();
+		error = sysctl_bounded_arr(ipctl_vars, nitems(ipctl_vars),
+		    name, namelen, oldp, oldlenp, newp, newlen);
+		NET_UNLOCK();
+		return (error);
 	}
 	/* NOTREACHED */
 }
@@ -1706,7 +1698,7 @@ ip_savecontrol(struct inpcb *inp, struct mbuf **mp, struct ip *ip,
 	if (inp->inp_socket->so_options & SO_TIMESTAMP) {
 		struct timeval tv;
 
-		microtime(&tv);
+		m_microtime(m, &tv);
 		*mp = sbcreatecontrol((caddr_t) &tv, sizeof(tv),
 		    SCM_TIMESTAMP, SOL_SOCKET);
 		if (*mp)
@@ -1794,11 +1786,11 @@ ip_send_dispatch(void *xmq)
 	if (ml_empty(&ml))
 		return;
 
-	NET_RLOCK();
+	NET_LOCK();
 	while ((m = ml_dequeue(&ml)) != NULL) {
 		ip_output(m, NULL, NULL, 0, NULL, NULL, 0);
 	}
-	NET_RUNLOCK();
+	NET_UNLOCK();
 }
 
 void

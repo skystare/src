@@ -3615,6 +3615,19 @@ elf64_x86_64_additional_program_headers (bfd *abfd)
   return count;
 }
 
+/* Return TRUE if symbol should be hashed in the `.gnu.hash' section.  */
+
+static bfd_boolean
+elf64_x86_64_hash_symbol (struct elf_link_hash_entry *h)
+{
+  if (h->plt.offset != (bfd_vma) -1
+      && !h->def_regular
+      && !h->pointer_equality_needed)
+    return FALSE;
+
+  return _bfd_elf_hash_symbol (h);
+}
+
 static const struct bfd_elf_special_section 
   elf64_x86_64_special_sections[]=
 {
@@ -3631,7 +3644,7 @@ static const struct bfd_elf_special_section
 #define TARGET_LITTLE_NAME		    "elf64-x86-64"
 #define ELF_ARCH			    bfd_arch_i386
 #define ELF_MACHINE_CODE		    EM_X86_64
-#define ELF_MAXPAGESIZE			    0x100000
+#define ELF_MAXPAGESIZE			    0x1000
 
 #define elf_backend_can_gc_sections	    1
 #define elf_backend_can_refcount	    1
@@ -3686,5 +3699,7 @@ static const struct bfd_elf_special_section
   elf64_x86_64_special_sections
 #define elf_backend_additional_program_headers \
   elf64_x86_64_additional_program_headers
+#define elf_backend_hash_symbol \
+  elf64_x86_64_hash_symbol
 
 #include "elf64-target.h"

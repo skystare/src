@@ -1,4 +1,4 @@
-/*	$OpenBSD: umodem.c,v 1.64 2018/08/29 20:18:14 kettenis Exp $ */
+/*	$OpenBSD: umodem.c,v 1.66 2020/07/31 10:49:33 mglocker Exp $ */
 /*	$NetBSD: umodem.c,v 1.45 2002/09/23 05:51:23 simonb Exp $	*/
 
 /*
@@ -306,10 +306,10 @@ umodem_attach(struct device *parent, struct device *self, void *aux)
 			goto bad;
 		}
 		if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN &&
-		    (ed->bmAttributes & UE_XFERTYPE) == UE_BULK) {
+		    UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK) {
                         uca.bulkin = ed->bEndpointAddress;
                 } else if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_OUT &&
-			   (ed->bmAttributes & UE_XFERTYPE) == UE_BULK) {
+			   UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK) {
                         uca.bulkout = ed->bEndpointAddress;
                 }
         }
@@ -361,7 +361,7 @@ umodem_attach(struct device *parent, struct device *self, void *aux)
 			continue;
 
 		if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN &&
-		    (ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT) {
+		    UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT) {
 			printf("%s: status change notification available\n",
 			       sc->sc_dev.dv_xname);
 			sc->sc_ctl_notify = ed->bEndpointAddress;
@@ -424,7 +424,6 @@ umodem_close(void *addr, int portno)
 	DPRINTF(("umodem_close: sc=%p\n", sc));
 
 	if (sc->sc_notify_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_notify_pipe);
 		err = usbd_close_pipe(sc->sc_notify_pipe);
 		if (err)
 			printf("%s: close notify pipe failed: %s\n",
@@ -702,7 +701,6 @@ umodem_detach(struct device *self, int flags)
 	DPRINTF(("umodem_detach: sc=%p flags=%d\n", sc, flags));
 
 	if (sc->sc_notify_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_notify_pipe);
 		usbd_close_pipe(sc->sc_notify_pipe);
 		sc->sc_notify_pipe = NULL;
 	}

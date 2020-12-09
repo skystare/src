@@ -1,4 +1,4 @@
-/*	$OpenBSD: sdmmcvar.h,v 1.30 2018/08/09 13:52:36 patrick Exp $	*/
+/*	$OpenBSD: sdmmcvar.h,v 1.34 2020/08/14 14:49:04 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2006 Uwe Stuehler <uwe@openbsd.org>
@@ -36,6 +36,7 @@ struct sdmmc_csd {
 	int	capacity;	/* total number of sectors */
 	int	sector_size;	/* sector size in bytes */
 	int	read_bl_len;	/* block length for reads */
+	int	tran_speed;	/* transfer speed (kbit/s) */
 	int	ccc;		/* Card Command Class for SD */
 	/* ... */
 };
@@ -177,10 +178,11 @@ struct sdmmc_softc {
 #define SMF_SD_MODE		0x0001	/* host in SD mode (MMC otherwise) */
 #define SMF_IO_MODE		0x0002	/* host in I/O mode (SD mode only) */
 #define SMF_MEM_MODE		0x0004	/* host in memory mode (SD or MMC) */
-#define SMF_CARD_PRESENT	0x0010	/* card presence noticed */
-#define SMF_CARD_ATTACHED	0x0020	/* card driver(s) attached */
-#define	SMF_STOP_AFTER_MULTIPLE	0x0040	/* send a stop after a multiple cmd */
-#define SMF_CONFIG_PENDING	0x0080	/* config_pending_incr() called */
+#define SMF_UHS_MODE		0x0010	/* host in UHS mode */
+#define SMF_CARD_PRESENT	0x0020	/* card presence noticed */
+#define SMF_CARD_ATTACHED	0x0040	/* card driver(s) attached */
+#define SMF_STOP_AFTER_MULTIPLE	0x0080	/* send a stop after a multiple cmd */
+#define SMF_CONFIG_PENDING	0x0100	/* config_pending_incr() called */
 
 	uint32_t sc_caps;		/* host capability */
 #define SMC_CAPS_AUTO_STOP	0x0001	/* send CMD12 automagically by host */
@@ -200,6 +202,7 @@ struct sdmmc_softc {
 #define SMC_CAPS_MMC_DDR52	0x2000  /* eMMC DDR52 timing */
 #define SMC_CAPS_MMC_HS200	0x4000	/* eMMC HS200 timing */
 #define SMC_CAPS_MMC_HS400	0x8000	/* eMMC HS400 timing */
+#define SMC_CAPS_NONREMOVABLE	0x10000	/* non-removable devices */
 
 	int sc_function_count;		/* number of I/O functions (SDIO) */
 	struct sdmmc_function *sc_card;	/* selected card */
@@ -213,6 +216,7 @@ struct sdmmc_softc {
 	struct rwlock sc_lock;		/* lock around host controller */
 	void *sc_scsibus;		/* SCSI bus emulation softc */
 	TAILQ_HEAD(, sdmmc_intr_handler) sc_intrq; /* interrupt handlers */
+	long sc_max_seg;		/* maximum segment size */
 	long sc_max_xfer;		/* maximum transfer size */
 	void *sc_cookies[SDMMC_MAX_FUNCTIONS]; /* pass extra info from bus to dev */
 };
@@ -221,8 +225,8 @@ struct sdmmc_softc {
  * Attach devices at the sdmmc bus.
  */
 struct sdmmc_attach_args {
-	struct scsi_link *scsi_link;	/* XXX */
-	struct sdmmc_function *sf;
+	struct scsibus_attach_args	 saa;
+	struct sdmmc_function		*sf;
 };
 
 #define IPL_SDMMC	IPL_BIO

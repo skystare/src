@@ -1,4 +1,4 @@
-/*	$OpenBSD: azalia_codec.c,v 1.172 2017/03/28 04:54:44 ratchov Exp $	*/
+/*	$OpenBSD: azalia_codec.c,v 1.182 2020/10/25 02:54:38 jsg Exp $	*/
 /*	$NetBSD: azalia_codec.c,v 1.8 2006/05/10 11:17:27 kent Exp $	*/
 
 /*-
@@ -35,6 +35,8 @@
 #include <sys/malloc.h>
 #include <sys/systm.h>
 #include <dev/pci/azalia.h>
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcidevs.h>
 
 #define XNAME(co)	(((struct device *)co->az)->dv_xname)
 #define MIXER_DELTA(n)	(AUDIO_MAX_GAIN / (n))
@@ -83,6 +85,28 @@ azalia_codec_init_vtbl(codec_t *this)
 		this->name = "Realtek ALC221";
 		this->qrks |= AZ_QRK_WID_CDIN_1C | AZ_QRK_WID_BEEP_1D;
 		break;
+	case 0x10ec0225:
+		this->name = "Realtek ALC225";
+		break;
+	case 0x10ec0233:
+	case 0x10ec0235:
+		this->name = "Realtek ALC233";
+		break;
+	case 0x10ec0236:
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_DELL)
+			this->name = "Realtek ALC3204";
+		else
+			this->name = "Realtek ALC236";
+		break;
+	case 0x10ec0255:
+		this->name = "Realtek ALC255";
+		break;
+	case 0x10ec0256:
+		this->name = "Realtek ALC256";
+		break;
+	case 0x10ec0257:
+		this->name = "Realtek ALC257";
+		break;
 	case 0x10ec0260:
 		this->name = "Realtek ALC260";
 		if (this->subid == 0x008f1025)
@@ -117,12 +141,30 @@ azalia_codec_init_vtbl(codec_t *this)
 		    this->subid == 0x220817aa)
 			this->qrks |= AZ_QRK_WID_TPDOCK1;
 		break;
+	case 0x10ec0270:
+		this->name = "Realtek ALC270";
+		break;
 	case 0x10ec0272:
 		this->name = "Realtek ALC272";
+		break;
+	case 0x10ec0275:
+		this->name = "Realtek ALC275";
+		break;
+	case 0x10ec0280:
+		this->name = "Realtek ALC280";
 		break;
 	case 0x10ec0282:
 		this->name = "Realtek ALC282";
 		this->qrks |= AZ_QRK_WID_CDIN_1C | AZ_QRK_WID_BEEP_1D;
+		break;
+	case 0x10ec0283:
+		this->name = "Realtek ALC283";
+		break;
+	case 0x10ec0285:
+		this->name = "Realtek ALC285";
+		if (this->subid == 0x229217aa)		 /* Thinkpad X1 Carbon 7 */
+			this->qrks |= AZ_QRK_ROUTE_SPKR2_DAC |
+			    AZ_QRK_WID_CLOSE_PCBEEP;
 		break;
 	case 0x10ec0292:
 		this->name = "Realtek ALC292";
@@ -153,6 +195,27 @@ azalia_codec_init_vtbl(codec_t *this)
 		    this->subid == 0x503c17aa)
 			this->qrks |= AZ_QRK_WID_TPDOCK2;
 		break;
+	case 0x10ec0293:
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_DELL)
+			this->name = "Realtek ALC3235";
+		else
+			this->name = "Realtek ALC293";
+		break;
+	case 0x10ec0295:
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_DELL)
+			this->name = "Realtek ALC3254";
+		else
+			this->name = "Realtek ALC295";
+		break;
+	case 0x10ec0298:
+		this->name = "Realtek ALC298";
+		if (this->subid == 0x320019e5 ||
+		    this->subid == 0x320119e5)		/* Huawei Matebook X */
+			this->qrks |= AZ_QRK_DOLBY_ATMOS;
+		break;
+	case 0x10ec0299:
+		this->name = "Realtek ALC299";
+		break;
 	case 0x10ec0660:
 		this->name = "Realtek ALC660";
 		if (this->subid == 0x13391043) {	/* ASUS_G2K */
@@ -165,6 +228,18 @@ azalia_codec_init_vtbl(codec_t *this)
 		break;
 	case 0x10ec0663:
 		this->name = "Realtek ALC663";
+		break;
+	case 0x10ec0668:
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_DELL)
+			this->name = "Realtek ALC3661";
+		else
+			this->name = "Realtek ALC668";
+		break;
+	case 0x10ec0671:
+		this->name = "Realtek ALC671";
+		break;
+	case 0x10ec0700:
+		this->name = "Realtek ALC700";
 		break;
 	case 0x10ec0861:
 		this->name = "Realtek ALC861";
@@ -210,12 +285,29 @@ azalia_codec_init_vtbl(codec_t *this)
 		    this->subid == 0x00a0106b)
 			this->qrks |= AZ_QRK_WID_OVREF50;
 		break;
+	case 0x10ec0887:
+		this->name = "Realtek ALC887";
+		this->qrks |= AZ_QRK_WID_CDIN_1C | AZ_QRK_WID_BEEP_1D;
+		break;
 	case 0x10ec0888:
 		this->name = "Realtek ALC888";
 		this->qrks |= AZ_QRK_WID_CDIN_1C | AZ_QRK_WID_BEEP_1D;
 		break;
+	case 0x10ec0889:
+		this->name = "Realtek ALC889";
+		break;
+	case 0x10ec0892:
+		this->name = "Realtek ALC892";
+		break;
 	case 0x10ec0900:
 		this->name = "Realtek ALC1150";
+		break;
+	case 0x10ec0b00:
+		this->name = "Realtek ALC1200";
+		break;
+	case 0x10ec1168:
+	case 0x10ec1220:
+		this->name = "Realtek ALC1220";
 		break;
 	case 0x11060398:
 	case 0x11061398:
@@ -229,9 +321,8 @@ azalia_codec_init_vtbl(codec_t *this)
 		break;
 	case 0x111d7603:
 		this->name = "IDT 92HD75B3/4";
-		if ((this->subid & 0x0000ffff) == 0x0000103c) {	/* HP */
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_HP)
 			this->qrks |= AZ_QRK_GPIO_UNMUTE_0;
-		}
 		break;
 	case 0x111d7604:
 		this->name = "IDT 92HD83C1X";
@@ -241,18 +332,16 @@ azalia_codec_init_vtbl(codec_t *this)
 		break;
 	case 0x111d7608:
 		this->name = "IDT 92HD75B1/2";
-		if ((this->subid & 0x0000ffff) == 0x0000103c) {	/* HP */
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_HP)
 			this->qrks |= AZ_QRK_GPIO_UNMUTE_0;
-		}
 		break;
 	case 0x111d7674:
 		this->name = "IDT 92HD73D1";
 		break;
 	case 0x111d7675:
 		this->name = "IDT 92HD73C1";	/* aka 92HDW74C1 */
-		if ((this->subid & 0x0000ffff) == 0x00001028) {	/* DELL */
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_DELL)
 			this->qrks |= AZ_QRK_GPIO_UNMUTE_0;
-		}
 		break;
 	case 0x111d7676:
 		this->name = "IDT 92HD73E1";	/* aka 92HDW74E1 */
@@ -262,10 +351,9 @@ azalia_codec_init_vtbl(codec_t *this)
 		break;
 	case 0x111d76b2:
 		this->name = "IDT 92HD71B7";
-		if ((this->subid & 0x0000ffff) == 0x00001028 || /* DELL */
-		    (this->subid & 0x0000ffff) == 0x0000103c) { /* HP */
+		if (PCI_VENDOR(this->subid) == PCI_VENDOR_DELL ||
+		    PCI_VENDOR(this->subid) == PCI_VENDOR_HP)
 			this->qrks |= AZ_QRK_GPIO_UNMUTE_0;
-		}
 		break;
 	case 0x111d76b6:
 		this->name = "IDT 92HD71B5";
@@ -1342,7 +1430,7 @@ azalia_mixer_ensure_capacity(codec_t *this, size_t newsize)
 		return ENOMEM;
 	}
 	bcopy(this->mixers, newbuf, this->maxmixers * sizeof(mixer_item_t));
-	free(this->mixers, M_DEVBUF, 0);
+	free(this->mixers, M_DEVBUF, this->maxmixers * sizeof(mixer_item_t));
 	this->mixers = newbuf;
 	this->maxmixers = newmax;
 	return 0;
@@ -2592,5 +2680,89 @@ azalia_codec_widget_quirks(codec_t *this, nid_t nid)
 		azalia_ampcap_ov(w, COP_OUTPUT_AMPCAP, 31, 33, 6, 30, 1);
 	}
 
+	if ((this->qrks & AZ_QRK_WID_CLOSE_PCBEEP) && (nid == 0x20))  {
+		/* Close PC beep passthrough to avoid headphone noise */
+		azalia_comresp(this, nid, CORB_SET_COEFFICIENT_INDEX, 0x36,
+		    NULL);
+		azalia_comresp(this, nid, CORB_SET_PROCESSING_COEFFICIENT,
+		    0x57d7, NULL);
+	}
+
 	return(0);
+}
+
+/* Magic init sequence to make the right speaker work (reverse-engineered) */
+void
+azalia_codec_init_dolby_atmos(codec_t *this)
+{
+	static uint16_t atmos_init[] = {
+		0x06, 0x73e, 0x00, 0x06, 0x73e, 0x80,
+		0x20, 0x500, 0x26, 0x20, 0x4f0, 0x00,
+		0x20, 0x500, 0x22, 0x20, 0x400, 0x31,
+		0x20, 0x500, 0x23, 0x20, 0x400, 0x0b,
+		0x20, 0x500, 0x25, 0x20, 0x400, 0x00,
+		0x20, 0x500, 0x26, 0x20, 0x4b0, 0x10,
+	};
+	static struct {
+		unsigned char v23;
+		unsigned char v25;
+	} atmos_v23_v25[] = {
+		{ 0x0c, 0x00 }, { 0x0d, 0x00 }, { 0x0e, 0x00 }, { 0x0f, 0x00 },
+		{ 0x10, 0x00 }, { 0x1a, 0x40 }, { 0x1b, 0x82 }, { 0x1c, 0x00 },
+		{ 0x1d, 0x00 }, { 0x1e, 0x00 }, { 0x1f, 0x00 }, { 0x20, 0xc2 },
+		{ 0x21, 0xc8 }, { 0x22, 0x26 }, { 0x23, 0x24 }, { 0x27, 0xff },
+		{ 0x28, 0xff }, { 0x29, 0xff }, { 0x2a, 0x8f }, { 0x2b, 0x02 },
+		{ 0x2c, 0x48 }, { 0x2d, 0x34 }, { 0x2e, 0x00 }, { 0x2f, 0x00 },
+		{ 0x30, 0x00 }, { 0x31, 0x00 }, { 0x32, 0x00 }, { 0x33, 0x00 },
+		{ 0x34, 0x00 }, { 0x35, 0x01 }, { 0x36, 0x93 }, { 0x37, 0x0c },
+		{ 0x38, 0x00 }, { 0x39, 0x00 }, { 0x3a, 0xf8 }, { 0x38, 0x80 },
+	};
+	int i;
+
+	for (i = 0; i < nitems(atmos_init) / 3; i++) {
+		if (azalia_comresp(this, atmos_init[i * 3],
+		    atmos_init[(i * 3) + 1], atmos_init[(i * 3) + 2], NULL))
+			return;
+	}
+
+	for (i = 0; i < nitems(atmos_v23_v25); i++) {
+		if (azalia_comresp(this, 0x06, 0x73e, 0x00, NULL))
+			return;
+		if (azalia_comresp(this, 0x20, 0x500, 0x26, NULL))
+			return;
+		if (azalia_comresp(this, 0x20, 0x4b0, 0x00, NULL))
+			return;
+		if (i == 0) {
+			if (azalia_comresp(this, 0x21, 0xf09, 0x00, NULL))
+				return;
+		}
+		if (i != 20) {
+			if (azalia_comresp(this, 0x06, 0x73e, 0x80, NULL))
+				return;
+		}
+
+		if (azalia_comresp(this, 0x20, 0x500, 0x26, NULL))
+			return;
+		if (azalia_comresp(this, 0x20, 0x4f0, 0x00, NULL))
+			return;
+		if (azalia_comresp(this, 0x20, 0x500, 0x23, NULL))
+			return;
+
+		if (azalia_comresp(this, 0x20, 0x400,
+		    atmos_v23_v25[i].v23, NULL))
+			return;
+
+		if (atmos_v23_v25[i].v23 != 0x1e) {
+			if (azalia_comresp(this, 0x20, 0x500, 0x25, NULL))
+				return;
+			if (azalia_comresp(this, 0x20, 0x400,
+			    atmos_v23_v25[i].v25, NULL))
+				return;
+		}
+
+		if (azalia_comresp(this, 0x20, 0x500, 0x26, NULL))
+			return;
+		if (azalia_comresp(this, 0x20, 0x4b0, 0x10, NULL))
+			return;
+	}
 }

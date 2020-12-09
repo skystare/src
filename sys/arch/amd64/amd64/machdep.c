@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.250 2018/07/30 09:04:52 jmatthew Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.270 2020/11/08 20:37:22 mpi Exp $	*/
 /*	$NetBSD: machdep.c,v 1.3 2003/05/07 22:58:18 fvdl Exp $	*/
 
 /*-
@@ -155,9 +155,7 @@ char machine[] = MACHINE;
 /*
  * switchto vectors
  */
-void (*cpu_idle_leave_fcn)(void) = NULL;
 void (*cpu_idle_cycle_fcn)(void) = NULL;
-void (*cpu_idle_enter_fcn)(void) = NULL;
 
 /* the following is used externally for concurrent handlers */
 int setperf_prio = 0;
@@ -192,6 +190,7 @@ paddr_t tramp_pdirpa;
 
 int kbd_reset;
 int lid_action = 1;
+int pwr_action = 1;
 int forceukbd;
 
 /*
@@ -278,6 +277,7 @@ cpu_startup(void)
 
 	printf("%s", version);
 	startclocks();
+	rtcinit();
 
 	printf("real mem = %lu (%luMB)\n", ptoa((psize_t)physmem),
 	    ptoa((psize_t)physmem)/1024/1024);
@@ -315,7 +315,10 @@ cpu_startup(void)
 
 #ifndef SMALL_KERNEL
 	cpu_ucode_setup();
+	cpu_ucode_apply(&cpu_info_primary);
 #endif
+	cpu_tsx_disable(&cpu_info_primary);
+
 	/* enter the IDT and trampoline code in the u-k maps */
 	enter_shared_special_pages();
 
@@ -466,6 +469,11 @@ bios_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	/* NOTREACHED */
 }
 
+const struct sysctl_bounded_args cpuctl_vars[] = {
+	{ CPU_LIDACTION, &lid_action, 0, 2 },
+	{ CPU_PWRACTION, &pwr_action, 0, 2 },
+};
+
 /*
  * machine dependent system variables.
  */
@@ -478,7 +486,6 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	extern int amd64_has_xcrypt;
 	dev_t consdev;
 	dev_t dev;
-	int val, error;
 
 	switch (name[0]) {
 	case CPU_CONSDEV:
@@ -526,18 +533,11 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 #endif
 	case CPU_XCRYPT:
 		return (sysctl_rdint(oldp, oldlenp, newp, amd64_has_xcrypt));
-	case CPU_LIDACTION:
-		val = lid_action;
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &val);
-		if (!error) {
-			if (val < 0 || val > 2)
-				error = EINVAL;
-			else
-				lid_action = val;
-		}
-		return (error);
 #if NPCKBC > 0 && NUKBD > 0
 	case CPU_FORCEUKBD:
+		{
+		int error;
+
 		if (forceukbd)
 			return (sysctl_rdint(oldp, oldlenp, newp, forceukbd));
 
@@ -545,13 +545,15 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		if (forceukbd)
 			pckbc_release_console();
 		return (error);
+		}
 #endif
 	case CPU_TSCFREQ:
 		return (sysctl_rdquad(oldp, oldlenp, newp, tsc_frequency));
 	case CPU_INVARIANTTSC:
 		return (sysctl_rdint(oldp, oldlenp, newp, tsc_is_invariant));
 	default:
-		return (EOPNOTSUPP);
+		return (sysctl_bounded_arr(cpuctl_vars, nitems(cpuctl_vars),
+		    name, namelen, oldp, oldlenp, newp, newlen));
 	}
 	/* NOTREACHED */
 }
@@ -564,7 +566,7 @@ cpu_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
  * signal mask, the stack, and the frame pointer, it returns to the
  * user specified pc.
  */
-void
+int
 sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 {
 	struct proc *p = curproc;
@@ -616,7 +618,7 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 	sp -= fpu_save_len;
 	ksc.sc_fpstate = (struct fxsave64 *)sp;
 	if (copyout(sfp, (void *)sp, fpu_save_len))
-		sigexit(p, SIGILL);
+		return 1;
 
 	/* Now reset the FPU state in PCB */
 	memcpy(&p->p_addr->u_pcb.pcb_savefpu,
@@ -628,13 +630,13 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 		sss += (sizeof(*ksip) + 15) & ~15;
 
 		if (copyout(ksip, (void *)sip, sizeof(*ksip)))
-			sigexit(p, SIGILL);
+			return 1;
 	}
 	scp = sp - sss;
 
 	ksc.sc_cookie = (long)scp ^ p->p_p->ps_sigcookie;
 	if (copyout(&ksc, (void *)scp, sizeof(ksc)))
-		sigexit(p, SIGILL);
+		return 1;
 
 	/*
 	 * Build context to run handler in.
@@ -652,6 +654,8 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 
 	/* The reset state _is_ the userspace state for this thread now */
 	curcpu()->ci_flags |= CPUF_USERXSTATE;
+
+	return 0;
 }
 
 /*
@@ -816,6 +820,9 @@ boot(int howto)
 	if ((howto & RB_POWERDOWN) != 0)
 		lid_action = 0;
 
+	if ((howto & RB_RESET) != 0)
+		goto doreset;
+
 	if (cold) {
 		if ((howto & RB_USERREQ) == 0)
 			howto |= RB_HALT;
@@ -867,6 +874,7 @@ haltsys:
 		cnpollc(0);
 	}
 
+doreset:
 	printf("rebooting...\n");
 	if (cpureset_delay > 0)
 		delay(cpureset_delay * 1000);
@@ -914,7 +922,7 @@ cpu_dump(void)
 	/*
 	 * Add the machine-dependent header info.
 	 */
-	cpuhdrp->ptdpaddr = PTDpaddr;
+	cpuhdrp->ptdpaddr = proc0.p_addr->u_pcb.pcb_cr3;
 	cpuhdrp->nmemsegs = mem_cluster_cnt;
 
 	/*
@@ -1284,11 +1292,11 @@ cpu_init_extents(void)
 	already_done = 1;
 }
 
-#if defined(MULTIPROCESSOR) || \
-    (NACPI > 0 && !defined(SMALL_KERNEL))
 void
 map_tramps(void)
 {
+#if defined(MULTIPROCESSOR) || \
+    (NACPI > 0 && !defined(SMALL_KERNEL))
 	struct pmap *kmp = pmap_kernel();
 	extern paddr_t tramp_pdirpa;
 #ifdef MULTIPROCESSOR
@@ -1299,20 +1307,19 @@ map_tramps(void)
 	extern u_int32_t mp_pdirpa;
 #endif
 
-	pmap_kenter_pa(lo32_vaddr, lo32_paddr, PROT_READ | PROT_WRITE);
-
 	/*
 	 * The initial PML4 pointer must be below 4G, so if the
 	 * current one isn't, use a "bounce buffer" and save it
 	 * for tramps to use.
 	 */
 	if (kmp->pm_pdirpa > 0xffffffff) {
+		pmap_kenter_pa(lo32_vaddr, lo32_paddr, PROT_READ | PROT_WRITE);
 		memcpy((void *)lo32_vaddr, kmp->pm_pdir, PAGE_SIZE);
 		tramp_pdirpa = lo32_paddr;
+		pmap_kremove(lo32_vaddr, PAGE_SIZE);
 	} else
 		tramp_pdirpa = kmp->pm_pdirpa;
 
-	pmap_kremove(lo32_vaddr, PAGE_SIZE);
 
 #ifdef MULTIPROCESSOR
 	/* Map MP tramp code and data pages RW for copy */
@@ -1343,12 +1350,14 @@ map_tramps(void)
 	pmap_kremove(MP_TRAMPOLINE, PAGE_SIZE);
 	pmap_kremove(MP_TRAMP_DATA, PAGE_SIZE);
 #endif /* MULTIPROCESSOR */
-}
 #endif
+}
 
 #define	IDTVEC(name)	__CONCAT(X, name)
 typedef void (vector)(void);
 extern vector *IDTVEC(exceptions)[];
+
+paddr_t early_pte_pages;
 
 void
 init_x86_64(paddr_t first_avail)
@@ -1356,6 +1365,16 @@ init_x86_64(paddr_t first_avail)
 	struct region_descriptor region;
 	bios_memmap_t *bmp;
 	int x, ist;
+	uint64_t max_dm_size = ((uint64_t)512 * NUM_L4_SLOT_DIRECT) << 30;
+
+	/*
+	 * locore0 mapped 3 pages for use before the pmap is initialized
+	 * starting at first_avail. These pages are currently used by
+	 * efifb to create early-use VAs for the framebuffer before efifb
+	 * is attached.
+	 */
+	early_pte_pages = first_avail;
+	first_avail += 3 * NBPG;
 
 	cpu_init_msrs(&cpu_info_primary);
 
@@ -1365,11 +1384,6 @@ init_x86_64(paddr_t first_avail)
 	x86_bus_space_init();
 
 	i8254_startclock();
-
-	/*
-	 * Attach the glass console early in case we need to display a panic.
-	 */
-	cninit();
 
 	/*
 	 * Initialize PAGE_SIZE-dependent variables.
@@ -1392,6 +1406,8 @@ init_x86_64(paddr_t first_avail)
 		getbootinfo(bootinfo, bootinfo_size);
 	} else
 		panic("invalid /boot");
+
+	cninit();
 
 /*
  * Memory on the AMD64 port is described by three different things.
@@ -1486,11 +1502,11 @@ init_x86_64(paddr_t first_avail)
 		}
 
 		/*
-		 * The direct map is limited to 512GB of memory, so
-		 * discard anything above that.
+		 * The direct map is limited to 512GB * NUM_L4_SLOT_DIRECT of
+		 * memory, so discard anything above that.
 		 */
-		if (e1 >= (uint64_t)512*1024*1024*1024) {
-			e1 = (uint64_t)512*1024*1024*1024;
+		if (e1 >= max_dm_size) {
+			e1 = max_dm_size;
 			if (s1 > e1)
 				continue;
 		}
@@ -1666,11 +1682,6 @@ init_x86_64(paddr_t first_avail)
 
 	pmap_kenter_pa(idt_vaddr, idt_paddr, PROT_READ | PROT_WRITE);
 
-#if defined(MULTIPROCESSOR) || \
-    (NACPI > 0 && !defined(SMALL_KERNEL))
-	map_tramps();
-#endif
-
 	idt = (struct gate_descriptor *)idt_vaddr;
 	cpu_info_primary.ci_tss = &cpu_info_full_primary.cif_tss;
 	cpu_info_primary.ci_gdt = &cpu_info_full_primary.cif_gdt;
@@ -1711,6 +1722,7 @@ init_x86_64(paddr_t first_avail)
 	cpu_init_idt();
 
 	intr_default_setup();
+
 	fpuinit(&cpu_info_primary);
 
 	softintr_init();
@@ -1903,8 +1915,6 @@ getbootinfo(char *bootinfo, int bootinfo_size)
 	bios_ddb_t *bios_ddb;
 	bios_bootduid_t *bios_bootduid;
 	bios_bootsr_t *bios_bootsr;
-	int docninit = 0;
-
 #undef BOOTINFO_DEBUG
 #ifdef BOOTINFO_DEBUG
 	printf("bootargv:");
@@ -1943,9 +1953,9 @@ getbootinfo(char *bootinfo, int bootinfo_size)
 		case BOOTARG_CONSDEV:
 			if (q->ba_size >= sizeof(bios_consdev_t) +
 			    offsetof(struct _boot_args32, ba_arg)) {
+#if NCOM > 0
 				bios_consdev_t *cdp =
 				    (bios_consdev_t*)q->ba_arg;
-#if NCOM > 0
 				static const int ports[] =
 				    { 0x3f8, 0x2f8, 0x3e8, 0x2e8 };
 				int unit = minor(cdp->consdev);
@@ -1959,9 +1969,6 @@ getbootinfo(char *bootinfo, int bootinfo_size)
 					comconsaddr = consaddr;
 					comconsrate = cdp->conspeed;
 					comconsiot = X86_BUS_SPACE_IO;
-
-					/* Probe the serial port this time. */
-					docninit++;
 				}
 #endif
 #ifdef BOOTINFO_DEBUG
@@ -1999,8 +2006,6 @@ getbootinfo(char *bootinfo, int bootinfo_size)
 
 		case BOOTARG_EFIINFO:
 			bios_efiinfo = (bios_efiinfo_t *)q->ba_arg;
-			if (bios_efiinfo->fb_addr != 0)
-				docninit++;
 			break;
 
 		case BOOTARG_UCODE:
@@ -2015,8 +2020,6 @@ getbootinfo(char *bootinfo, int bootinfo_size)
 			break;
 		}
 	}
-	if (docninit > 0)
-		cninit();
 #ifdef BOOTINFO_DEBUG
 	printf("\n");
 #endif

@@ -1,4 +1,4 @@
-/*	$OpenBSD: inet.c,v 1.163 2018/08/13 14:36:54 mpi Exp $	*/
+/*	$OpenBSD: inet.c,v 1.168 2020/01/15 14:02:37 mpi Exp $	*/
 /*	$NetBSD: inet.c,v 1.14 1995/10/03 21:42:37 thorpej Exp $	*/
 
 /*
@@ -225,6 +225,7 @@ netdomainpr(struct kinfo_file *kf, int proto)
 	int addrlen = 22;
 	int isany = 0;
 	int istcp = 0;
+	int isudp = 0;
 	int isip6 = 0;
 
 	/* XXX should fix kinfo_file instead but not now */
@@ -282,6 +283,7 @@ netdomainpr(struct kinfo_file *kf, int proto)
 	case IPPROTO_UDP:
 		name = "udp";
 		name6 = "udp6";
+		isudp = 1;
 		break;
 	case IPPROTO_DIVERT:
 		name = "divert";
@@ -303,6 +305,9 @@ netdomainpr(struct kinfo_file *kf, int proto)
 	if (!aflag && lflag && istcp &&
 	    kf->t_state != TCPS_LISTEN)
 		return;
+	if (!aflag && lflag && isudp &&
+	    (kf->inp_lport == 0 || kf->inp_fport != 0))
+		return;
 
 	if (af != kf->so_family || type != kf->so_type) {
 		af = kf->so_family;
@@ -310,7 +315,7 @@ netdomainpr(struct kinfo_file *kf, int proto)
 		printf("Active Internet connections");
 		if (aflag)
 			printf(" (including servers)");
-		else if (lflag)
+		else if (lflag && (istcp || isudp))
 			printf(" (only servers)");
 		putchar('\n');
 		if (Aflag) {
@@ -491,9 +496,9 @@ tcp_stats(char *name)
 		"\t\t%llu segment rexmit%s in SACK recovery episodes\n");
 	p(tcps_sack_rexmit_bytes,
 		"\t\t%llu byte rexmit%s in SACK recovery episodes\n");
-	p(tcps_sack_rcv_opts,
-		"\t%llu SACK option%s received\n");
+	p(tcps_sack_rcv_opts, "\t%llu SACK option%s received\n");
 	p(tcps_sack_snd_opts, "\t%llu SACK option%s sent\n");
+	p(tcps_sack_drop_opts, "\t%llu SACK option%s dropped\n");
 
 #undef p
 #undef p1
@@ -607,6 +612,7 @@ ip_stats(char *name)
 	p(ips_inswcsum, "\t%lu input datagram%s software-checksummed\n");
 	p(ips_outswcsum, "\t%lu output datagram%s software-checksummed\n");
 	p(ips_notmember, "\t%lu multicast packet%s which we don't join\n");
+	p(ips_wrongif, "\t%lu packet%s received on wrong interface\n");
 #undef p
 #undef p1
 }
@@ -1311,9 +1317,7 @@ socket_dump(u_long off)
 	p("%d", so_qlimit, "\n ");
 	p("%d", so_timeo, "\n ");
 	p("%u", so_error, "\n ");
-	p("%d", so_pgid, ", ");
-	p("%u", so_siguid, ", ");
-	p("%u", so_sigeuid, "\n ");
+	p("%p", so_sigio.sir_sigio, "\n ");
 	p("%lu", so_oobmark, "\n ");
 	if (so.so_sp)
 		sosplice_dump((u_long)so.so_sp);
@@ -1375,7 +1379,7 @@ sockbuf_dump(struct sockbuf *sb, const char *name)
 	printf("%s ", name);
 	p("%#.8x", sb_flagsintr, ", ");
 	p("%#.4x", sb_flags, ", ");
-	p("%u", sb_timeo, "\n ");
+	p("%llu", sb_timeo_nsecs, "\n ");
 #undef	p
 }
 

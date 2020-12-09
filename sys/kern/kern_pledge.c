@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_pledge.c,v 1.243 2018/09/13 07:49:33 mestre Exp $	*/
+/*	$OpenBSD: kern_pledge.c,v 1.267 2020/10/29 21:15:27 denis Exp $	*/
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicm@openbsd.org>
@@ -43,6 +43,7 @@
 #include <sys/dkio.h>
 #include <sys/mtio.h>
 #include <sys/audioio.h>
+#include <sys/videoio.h>
 #include <net/bpf.h>
 #include <net/route.h>
 #include <net/if.h>
@@ -69,9 +70,10 @@
 #include "audio.h"
 #include "bpfilter.h"
 #include "pf.h"
+#include "video.h"
 #include "pty.h"
 
-#if defined(__amd64__) || defined(__i386__)
+#if defined(__amd64__)
 #include "vmm.h"
 #if NVMM > 0
 #include <machine/conf.h>
@@ -109,6 +111,7 @@ const uint64_t pledge_syscalls[SYS_MAXSYSCALL] = {
 	 */
 	[SYS_exit] = PLEDGE_ALWAYS,
 	[SYS_kbind] = PLEDGE_ALWAYS,
+	[SYS_msyscall] = PLEDGE_ALWAYS,
 	[SYS___get_tcb] = PLEDGE_ALWAYS,
 	[SYS___set_tcb] = PLEDGE_ALWAYS,
 	[SYS_pledge] = PLEDGE_ALWAYS,
@@ -251,6 +254,7 @@ const uint64_t pledge_syscalls[SYS_MAXSYSCALL] = {
 	[SYS_stat] = PLEDGE_STDIO,
 	[SYS_access] = PLEDGE_STDIO,
 	[SYS_readlink] = PLEDGE_STDIO,
+	[SYS___realpath] = PLEDGE_STDIO,
 
 	[SYS_adjtime] = PLEDGE_STDIO,   /* setting requires "settime" */
 	[SYS_adjfreq] = PLEDGE_SETTIME,
@@ -313,7 +317,9 @@ const uint64_t pledge_syscalls[SYS_MAXSYSCALL] = {
 	[SYS_mkdirat] = PLEDGE_CPATH,
 
 	[SYS_mkfifo] = PLEDGE_DPATH,
+	[SYS_mkfifoat] = PLEDGE_DPATH,
 	[SYS_mknod] = PLEDGE_DPATH,
+	[SYS_mknodat] = PLEDGE_DPATH,
 
 	[SYS_revoke] = PLEDGE_TTY,	/* also requires PLEDGE_RPATH */
 
@@ -396,6 +402,7 @@ static const struct {
 	{ "tty",		PLEDGE_TTY },
 	{ "unix",		PLEDGE_UNIX },
 	{ "unveil",		PLEDGE_UNVEIL },
+	{ "video",		PLEDGE_VIDEO },
 	{ "vminfo",		PLEDGE_VMINFO },
 	{ "vmm",		PLEDGE_VMM },
 	{ "wpath",		PLEDGE_WPATH },
@@ -481,7 +488,7 @@ sys_pledge(struct proc *p, void *v, register_t *retval)
 
 	if (SCARG(uap, promises)) {
 		pr->ps_pledge = promises;
-		pr->ps_flags |= PS_PLEDGE;
+		atomic_setbits_int(&pr->ps_flags, PS_PLEDGE);
 		/*
 		 * Kill off unveil and drop unveil vnode refs if we no
 		 * longer are holding any path-accessing pledge
@@ -493,7 +500,7 @@ sys_pledge(struct proc *p, void *v, register_t *retval)
 	}
 	if (SCARG(uap, execpromises)) {
 		pr->ps_execpledge = execpromises;
-		pr->ps_flags |= PS_EXECPLEDGE;
+		atomic_setbits_int(&pr->ps_flags, PS_EXECPLEDGE);
 	}
 	return (0);
 }
@@ -520,9 +527,8 @@ pledge_syscall(struct proc *p, int code, uint64_t *tval)
 int
 pledge_fail(struct proc *p, int error, uint64_t code)
 {
-	char *codes = "";
+	const char *codes = "";
 	int i;
-	struct sigaction sa;
 
 	/* Print first matching pledge */
 	for (i = 0; code && pledgenames[i].bits != 0; i++)
@@ -543,11 +549,7 @@ pledge_fail(struct proc *p, int error, uint64_t code)
 	p->p_p->ps_acflag |= APLEDGE;
 
 	/* Send uncatchable SIGABRT for coredump */
-	memset(&sa, 0, sizeof sa);
-	sa.sa_handler = SIG_DFL;
-	setsigvec(p, SIGABRT, &sa);
-	atomic_clearbits_int(&p->p_sigmask, sigmask(SIGABRT));
-	psignal(p, SIGABRT);
+	sigabort(p);
 
 	p->p_p->ps_pledge = 0;		/* Disable all PLEDGE_ flags */
 	KERNEL_UNLOCK();
@@ -617,7 +619,8 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 		/* when avoiding YP mode, getpw* functions touch this */
 		if (ni->ni_pledge == PLEDGE_RPATH &&
 		    strcmp(path, "/var/run/ypbind.lock") == 0) {
-			if (p->p_p->ps_pledge & PLEDGE_GETPW) {
+			if ((p->p_p->ps_pledge & PLEDGE_GETPW) ||
+			    (ni->ni_unveil == UNVEIL_INSPECT)) {
 				ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
 				return (0);
 			} else
@@ -659,7 +662,7 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 			}
 		}
 
-		/* DNS needs /etc/{resolv.conf,hosts,services}. */
+		/* DNS needs /etc/{resolv.conf,hosts,services,protocols}. */
 		if ((ni->ni_pledge == PLEDGE_RPATH) &&
 		    (p->p_p->ps_pledge & PLEDGE_DNS)) {
 			if (strcmp(path, "/etc/resolv.conf") == 0) {
@@ -671,6 +674,10 @@ pledge_namei(struct proc *p, struct nameidata *ni, char *origpath)
 				return (0);
 			}
 			if (strcmp(path, "/etc/services") == 0) {
+				ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
+				return (0);
+			}
+			if (strcmp(path, "/etc/protocols") == 0) {
 				ni->ni_cnd.cn_flags |= BYPASSUNVEIL;
 				return (0);
 			}
@@ -821,7 +828,7 @@ pledge_sysctl(struct proc *p, int miblen, int *mib, void *new)
 		    mib[0] == CTL_NET && mib[1] == PF_ROUTE &&
 		    mib[2] == 0 &&
 		    (mib[3] == 0 || mib[3] == AF_INET6 || mib[3] == AF_INET) &&
-		    mib[4] == NET_RT_TABLE)
+		    (mib[4] == NET_RT_TABLE || mib[4] == NET_RT_SOURCE))
 			return (0);
 
 		if (miblen == 7 &&		/* exposes MACs */
@@ -855,6 +862,9 @@ pledge_sysctl(struct proc *p, int miblen, int *mib, void *new)
 		if (miblen == 3 &&			/* kern.cptime2 */
 		    mib[0] == CTL_KERN && mib[1] == KERN_CPTIME2)
 			return (0);
+		if (miblen == 3 &&			/* kern.cpustats */
+		    mib[0] == CTL_KERN && mib[1] == KERN_CPUSTATS)
+			return (0);
 	}
 
 	if ((p->p_p->ps_pledge & PLEDGE_PS)) {
@@ -867,9 +877,6 @@ pledge_sysctl(struct proc *p, int miblen, int *mib, void *new)
 			return (0);
 		if (miblen == 3 &&		/* kern.proc_cwd.* */
 		    mib[0] == CTL_KERN && mib[1] == KERN_PROC_CWD)
-			return (0);
-		if (miblen == 2 &&		/* hw.physmem */
-		    mib[0] == CTL_HW && mib[1] == HW_PHYSMEM64)
 			return (0);
 		if (miblen == 2 &&		/* kern.ccpu */
 		    mib[0] == CTL_KERN && mib[1] == KERN_CCPU)
@@ -886,6 +893,12 @@ pledge_sysctl(struct proc *p, int miblen, int *mib, void *new)
 		if (miblen == 3 &&		/* vfs.generic.bcachestat */
 		    mib[0] == CTL_VFS && mib[1] == VFS_GENERIC &&
 		    mib[2] == VFS_BCACHESTAT)
+			return (0);
+	}
+
+	if ((p->p_p->ps_pledge & PLEDGE_INET)) {
+		if (miblen == 2 &&		/* kern.somaxconn */
+		    mib[0] == CTL_KERN && mib[1] == KERN_SOMAXCONN)
 			return (0);
 	}
 
@@ -918,59 +931,53 @@ pledge_sysctl(struct proc *p, int miblen, int *mib, void *new)
 	if (miblen >= 3 &&			/* ntpd(8) to read sensors */
 	    mib[0] == CTL_HW && mib[1] == HW_SENSORS)
 		return (0);
-
-	if (miblen == 2 &&		/* getdomainname() */
-	    mib[0] == CTL_KERN && mib[1] == KERN_DOMAINNAME)
-		return (0);
-	if (miblen == 2 &&		/* gethostname() */
-	    mib[0] == CTL_KERN && mib[1] == KERN_HOSTNAME)
-		return (0);
+	
 	if (miblen == 6 &&		/* if_nameindex() */
 	    mib[0] == CTL_NET && mib[1] == PF_ROUTE &&
 	    mib[2] == 0 && mib[3] == 0 && mib[4] == NET_RT_IFNAMES)
 		return (0);
-	if (miblen == 2 &&		/* uname() */
-	    mib[0] == CTL_KERN && mib[1] == KERN_OSTYPE)
-		return (0);
-	if (miblen == 2 &&		/* uname() */
-	    mib[0] == CTL_KERN && mib[1] == KERN_OSRELEASE)
-		return (0);
-	if (miblen == 2 &&		/* uname() */
-	    mib[0] == CTL_KERN && mib[1] == KERN_OSVERSION)
-		return (0);
-	if (miblen == 2 &&		/* uname() */
-	    mib[0] == CTL_KERN && mib[1] == KERN_VERSION)
-		return (0);
-	if (miblen == 2 &&		/* kern.clockrate */
-	    mib[0] == CTL_KERN && mib[1] == KERN_CLOCKRATE)
-		return (0);
-	if (miblen == 2 &&		/* kern.argmax */
-	    mib[0] == CTL_KERN && mib[1] == KERN_ARGMAX)
-		return (0);
-	if (miblen == 2 &&		/* kern.ngroups */
-	    mib[0] == CTL_KERN && mib[1] == KERN_NGROUPS)
-		return (0);
-	if (miblen == 2 &&		/* kern.sysvshm */
-	    mib[0] == CTL_KERN && mib[1] == KERN_SYSVSHM)
-		return (0);
-	if (miblen == 2 &&		/* kern.posix1version */
-	    mib[0] == CTL_KERN && mib[1] == KERN_POSIX1)
-		return (0);
-	if (miblen == 2 &&		/* uname() */
-	    mib[0] == CTL_HW && mib[1] == HW_MACHINE)
-		return (0);
-	if (miblen == 2 &&		/* getpagesize() */
-	    mib[0] == CTL_HW && mib[1] == HW_PAGESIZE)
-		return (0);
-	if (miblen == 2 &&		/* setproctitle() */
-	    mib[0] == CTL_VM && mib[1] == VM_PSSTRINGS)
-		return (0);
-	if (miblen == 2 &&		/* hw.ncpu / hw.ncpuonline */
-	    mib[0] == CTL_HW && (mib[1] == HW_NCPU || mib[1] == HW_NCPUONLINE))
-		return (0);
-	if (miblen == 2 &&		/* vm.loadavg / getloadavg(3) */
-	    mib[0] == CTL_VM && mib[1] == VM_LOADAVG)
-		return (0);
+
+	if (miblen == 2) {
+		switch (mib[0]) {
+		case CTL_KERN:
+			switch (mib[1]) {
+			case KERN_DOMAINNAME:	/* getdomainname() */
+			case KERN_HOSTNAME:	/* gethostname() */
+			case KERN_OSTYPE:	/* uname() */
+			case KERN_OSRELEASE:	/* uname() */
+			case KERN_OSVERSION:	/* uname() */
+			case KERN_VERSION:	/* uname() */
+			case KERN_CLOCKRATE:	/* kern.clockrate */
+			case KERN_ARGMAX:	/* kern.argmax */
+			case KERN_NGROUPS:	/* kern.ngroups */
+			case KERN_SYSVSHM:	/* kern.sysvshm */
+			case KERN_POSIX1:	/* kern.posix1version */
+				return (0);
+			}
+			break;
+		case CTL_HW:
+			switch (mib[1]) {
+			case HW_MACHINE: 	/* uname() */
+			case HW_PAGESIZE: 	/* getpagesize() */
+			case HW_PHYSMEM64:	/* hw.physmem */
+			case HW_NCPU:		/* hw.ncpu */
+			case HW_NCPUONLINE:	/* hw.ncpuonline */
+				return (0);
+			}
+			break;
+		case CTL_VM:
+			switch (mib[1]) {
+			case VM_PSSTRINGS:	/* setproctitle() */
+			case VM_LOADAVG:	/* vm.loadavg / getloadavg(3) */
+			case VM_MALLOC_CONF:	/* vm.malloc_conf */
+				return (0);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
 #ifdef CPU_SSE
 	if (miblen == 2 &&		/* i386 libm tests for SSE */
 	    mib[0] == CTL_MACHDEP && mib[1] == CPU_SSE)
@@ -1037,6 +1044,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 {
 	struct vnode *vp = NULL;
 	int error = EPERM;
+	uint64_t pl = p->p_p->ps_pledge;
 
 	if ((p->p_p->ps_flags & PS_PLEDGE) == 0)
 		return (0);
@@ -1059,7 +1067,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 			return (ENOTTY);
 	}
 
-	if ((p->p_p->ps_pledge & PLEDGE_INET)) {
+	if ((pl & PLEDGE_INET)) {
 		switch (com) {
 		case SIOCATMARK:
 		case SIOCGIFGROUP:
@@ -1070,7 +1078,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	}
 
 #if NBPFILTER > 0
-	if ((p->p_p->ps_pledge & PLEDGE_BPF)) {
+	if ((pl & PLEDGE_BPF)) {
 		switch (com) {
 		case BIOCGSTATS:	/* bpf: tcpdump privsep on ^C */
 			if (fp->f_type == DTYPE_VNODE &&
@@ -1083,7 +1091,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	}
 #endif /* NBPFILTER > 0 */
 
-	if ((p->p_p->ps_pledge & PLEDGE_TAPE)) {
+	if ((pl & PLEDGE_TAPE)) {
 		switch (com) {
 		case MTIOCGET:
 		case MTIOCTOP:
@@ -1100,7 +1108,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	}
 
 #if NDRM > 0
-	if ((p->p_p->ps_pledge & PLEDGE_DRM)) {
+	if ((pl & PLEDGE_DRM)) {
 		if ((fp->f_type == DTYPE_VNODE) &&
 		    (vp->v_type == VCHR) &&
 		    (cdevsw[major(vp->v_rdev)].d_open == drmopen)) {
@@ -1112,13 +1120,16 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 #endif /* NDRM > 0 */
 
 #if NAUDIO > 0
-	if ((p->p_p->ps_pledge & PLEDGE_AUDIO)) {
+	if ((pl & PLEDGE_AUDIO)) {
 		switch (com) {
 		case AUDIO_GETPOS:
 		case AUDIO_GETPAR:
 		case AUDIO_SETPAR:
 		case AUDIO_START:
 		case AUDIO_STOP:
+		case AUDIO_MIXER_DEVINFO:
+		case AUDIO_MIXER_READ:
+		case AUDIO_MIXER_WRITE:
 			if (fp->f_type == DTYPE_VNODE &&
 			    vp->v_type == VCHR &&
 			    cdevsw[major(vp->v_rdev)].d_open == audioopen)
@@ -1127,7 +1138,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	}
 #endif /* NAUDIO > 0 */
 
-	if ((p->p_p->ps_pledge & PLEDGE_DISKLABEL)) {
+	if ((pl & PLEDGE_DISKLABEL)) {
 		switch (com) {
 		case DIOCGDINFO:
 		case DIOCGPDINFO:
@@ -1153,8 +1164,50 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 		}
 	}
 
+#if NVIDEO > 0
+	if ((pl & PLEDGE_VIDEO)) {
+		switch (com) {
+		case VIDIOC_QUERYCAP:
+		case VIDIOC_TRY_FMT:
+		case VIDIOC_ENUM_FMT:
+		case VIDIOC_S_FMT:
+		case VIDIOC_QUERYCTRL:
+		case VIDIOC_G_CTRL:
+		case VIDIOC_S_CTRL:
+		case VIDIOC_G_PARM:
+		case VIDIOC_S_PARM:
+		case VIDIOC_REQBUFS:
+		case VIDIOC_QBUF:
+		case VIDIOC_DQBUF:
+		case VIDIOC_QUERYBUF:
+		case VIDIOC_STREAMON:
+		case VIDIOC_STREAMOFF:
+		case VIDIOC_ENUM_FRAMESIZES:
+		case VIDIOC_ENUM_FRAMEINTERVALS:
+		case VIDIOC_DQEVENT:
+		case VIDIOC_ENCODER_CMD:
+		case VIDIOC_EXPBUF:
+		case VIDIOC_G_CROP:
+		case VIDIOC_G_EXT_CTRLS:
+		case VIDIOC_G_FMT:
+		case VIDIOC_G_SELECTION:
+		case VIDIOC_QUERYMENU:
+		case VIDIOC_SUBSCRIBE_EVENT:
+		case VIDIOC_S_EXT_CTRLS:
+		case VIDIOC_S_SELECTION:
+		case VIDIOC_TRY_DECODER_CMD:
+		case VIDIOC_TRY_ENCODER_CMD:
+			if (fp->f_type == DTYPE_VNODE &&
+			    vp->v_type == VCHR &&
+			    cdevsw[major(vp->v_rdev)].d_open == videoopen)
+				return (0);
+			break;
+		}
+	}
+#endif
+
 #if NPF > 0
-	if ((p->p_p->ps_pledge & PLEDGE_PF)) {
+	if ((pl & PLEDGE_PF)) {
 		switch (com) {
 		case DIOCADDRULE:
 		case DIOCGETSTATUS:
@@ -1177,13 +1230,13 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	}
 #endif
 
-	if ((p->p_p->ps_pledge & PLEDGE_TTY)) {
+	if ((pl & PLEDGE_TTY)) {
 		switch (com) {
 #if NPTY > 0
 		case PTMGET:
-			if ((p->p_p->ps_pledge & PLEDGE_RPATH) == 0)
+			if ((pl & PLEDGE_RPATH) == 0)
 				break;
-			if ((p->p_p->ps_pledge & PLEDGE_WPATH) == 0)
+			if ((pl & PLEDGE_WPATH) == 0)
 				break;
 			if (fp->f_type != DTYPE_VNODE || vp->v_type != VCHR)
 				break;
@@ -1191,16 +1244,16 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 				break;
 			return (0);
 		case TIOCUCNTL:		/* vmd */
-			if ((p->p_p->ps_pledge & PLEDGE_RPATH) == 0)
+			if ((pl & PLEDGE_RPATH) == 0)
 				break;
-			if ((p->p_p->ps_pledge & PLEDGE_WPATH) == 0)
+			if ((pl & PLEDGE_WPATH) == 0)
 				break;
 			if (cdevsw[major(vp->v_rdev)].d_open != ptcopen)
 				break;
 			return (0);
 #endif /* NPTY > 0 */
 		case TIOCSPGRP:
-			if ((p->p_p->ps_pledge & PLEDGE_PROC) == 0)
+			if ((pl & PLEDGE_PROC) == 0)
 				break;
 			/* FALLTHROUGH */
 		case TIOCFLUSH:		/* getty, telnet */
@@ -1229,7 +1282,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 		}
 	}
 
-	if ((p->p_p->ps_pledge & PLEDGE_ROUTE)) {
+	if ((pl & PLEDGE_ROUTE)) {
 		switch (com) {
 		case SIOCGIFADDR:
 		case SIOCGIFAFLAG_IN6:
@@ -1251,9 +1304,10 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 		}
 	}
 
-	if ((p->p_p->ps_pledge & PLEDGE_WROUTE)) {
+	if ((pl & PLEDGE_WROUTE)) {
 		switch (com) {
 		case SIOCAIFADDR_IN6:
+		case SIOCDIFADDR_IN6:
 			if (fp->f_type == DTYPE_SOCKET)
 				return (0);
 			break;
@@ -1265,7 +1319,7 @@ pledge_ioctl(struct proc *p, long com, struct file *fp)
 	}
 
 #if NVMM > 0
-	if ((p->p_p->ps_pledge & PLEDGE_VMM)) {
+	if ((pl & PLEDGE_VMM)) {
 		if ((fp->f_type == DTYPE_VNODE) &&
 		    (vp->v_type == VCHR) &&
 		    (cdevsw[major(vp->v_rdev)].d_open == vmmopen)) {
@@ -1294,6 +1348,16 @@ pledge_sockopt(struct proc *p, int set, int level, int optname)
 			return 0;
 		}
 		break;
+	}
+
+	if ((p->p_p->ps_pledge & PLEDGE_WROUTE)) {
+		switch (level) {
+		case SOL_SOCKET:
+			switch (optname) {
+			case SO_RTABLE:
+				return (0);
+			}
+		}
 	}
 
 	if ((p->p_p->ps_pledge & (PLEDGE_INET|PLEDGE_UNIX|PLEDGE_DNS|PLEDGE_YPACTIVE)) == 0)

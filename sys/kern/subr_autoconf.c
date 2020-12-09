@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_autoconf.c,v 1.92 2016/03/14 23:08:06 krw Exp $	*/
+/*	$OpenBSD: subr_autoconf.c,v 1.94 2019/12/30 23:56:26 jsg Exp $	*/
 /*	$NetBSD: subr_autoconf.c,v 1.21 1996/04/04 06:06:18 cgd Exp $	*/
 
 /*
@@ -154,13 +154,15 @@ mapply(struct matchinfo *m, struct cfdata *cf)
 		    pri);
 
 	if (pri > m->pri) {
-		if (m->indirect && m->match)
-			free(m->match, M_DEVBUF, 0);
+		if (m->indirect && m->match) {
+			cf = ((struct device *)m->match)->dv_cfdata;
+			free(m->match, M_DEVBUF, cf->cf_attach->ca_devsize);
+		}
 		m->match = match;
 		m->pri = pri;
 	} else {
 		if (m->indirect)
-			free(match, M_DEVBUF, 0);
+			free(match, M_DEVBUF, cf->cf_attach->ca_devsize);
 	}
 }
 
@@ -341,8 +343,8 @@ config_attach(struct device *parent, void *match, void *aux, cfprint_t print)
 
 	mtx_enter(&autoconf_attdet_mtx);
 	while (autoconf_attdet < 0)
-		msleep(&autoconf_attdet, &autoconf_attdet_mtx,
-		    PWAIT, "autoconf", 0);
+		msleep_nsec(&autoconf_attdet, &autoconf_attdet_mtx,
+		    PWAIT, "autoconf", INFSLP);
 	autoconf_attdet++;
 	mtx_leave(&autoconf_attdet_mtx);
 
@@ -471,7 +473,7 @@ config_make_softc(struct device *parent, struct cfdata *cf)
 			    old != 0 ? "expand" : "creat");
 		if (old != 0) {
 			bcopy(cd->cd_devs, nsp, old * sizeof(void *));
-			free(cd->cd_devs, M_DEVBUF, 0);
+			free(cd->cd_devs, M_DEVBUF, old * sizeof(void *));
 		}
 		cd->cd_devs = nsp;
 	}
@@ -508,8 +510,8 @@ config_detach(struct device *dev, int flags)
 
 	mtx_enter(&autoconf_attdet_mtx);
 	while (autoconf_attdet > 0)
-		msleep(&autoconf_attdet, &autoconf_attdet_mtx,
-		    PWAIT, "autoconf", 0);
+		msleep_nsec(&autoconf_attdet, &autoconf_attdet_mtx,
+		    PWAIT, "autoconf", INFSLP);
 	autoconf_attdet--;
 	mtx_leave(&autoconf_attdet_mtx);
 
@@ -613,7 +615,7 @@ config_detach(struct device *dev, int flags)
 		if (cd->cd_devs[i] != NULL)
 			break;
 	if (i == cd->cd_ndevs) {		/* nothing found; deallocate */
-		free(cd->cd_devs, M_DEVBUF, 0);
+		free(cd->cd_devs, M_DEVBUF, cd->cd_ndevs * sizeof(void *));
 		cd->cd_devs = NULL;
 		cd->cd_ndevs = 0;
 		cf->cf_unit = 0;

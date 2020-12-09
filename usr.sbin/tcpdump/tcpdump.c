@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcpdump.c,v 1.87 2018/07/06 07:13:21 dlg Exp $	*/
+/*	$OpenBSD: tcpdump.c,v 1.95 2020/12/04 11:36:13 mvs Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997
@@ -61,6 +61,7 @@
 
 int Aflag;			/* dump ascii */
 int aflag;			/* translate network and broadcast addresses */
+int Bflag;			/* BPF fildrop setting */
 int dflag;			/* print filter code */
 int eflag;			/* print ethernet header */
 int fflag;			/* don't translate "foreign" IP address */
@@ -187,7 +188,7 @@ pcap_list_linktypes(pcap_t *p)
 	if (fd < 0)
 		error("Invalid bpf descriptor");
 
-	if (ioctl(fd, BIOCGDLTLIST, &dl) < 0)
+	if (ioctl(fd, BIOCGDLTLIST, &dl) == -1)
 		err(1, "BIOCGDLTLIST");
 
 	if (dl.bfl_len > MAXDLT)
@@ -231,7 +232,7 @@ main(int argc, char **argv)
 
 	opterr = 0;
 	while ((op = getopt(argc, argv,
-	    "Aac:D:deE:fF:i:IlLnNOopqr:s:StT:vw:xXy:Y")) != -1)
+	    "AaB:c:D:deE:fF:i:IlLnNOopqr:s:StT:vw:xXy:")) != -1)
 		switch (op) {
 
 		case 'A':
@@ -241,6 +242,19 @@ main(int argc, char **argv)
 
 		case 'a':
 			aflag = 1;
+			break;
+
+		case 'B':
+			if (strcasecmp(optarg, "pass") == 0)
+				Bflag = BPF_FILDROP_PASS;
+			else if (strcasecmp(optarg, "capture") == 0)
+				Bflag = BPF_FILDROP_CAPTURE;
+			else if (strcasecmp(optarg, "drop") == 0)
+				Bflag = BPF_FILDROP_DROP;
+			else {
+				error("invalid BPF fildrop option: %s",
+				    optarg);
+			}
 			break;
 
 		case 'c':
@@ -351,10 +365,16 @@ main(int argc, char **argv)
 				packettype = PT_GRE;
 			else if (strcasecmp(optarg, "vxlan") == 0)
 				packettype = PT_VXLAN;
+			else if (strcasecmp(optarg, "geneve") == 0)
+				packettype = PT_GENEVE;
+			else if (strcasecmp(optarg, "erspan") == 0)
+				packettype = PT_ERSPAN;
 			else if (strcasecmp(optarg, "mpls") == 0)
 				packettype = PT_MPLS;
 			else if (strcasecmp(optarg, "tftp") == 0)
 				packettype = PT_TFTP;
+			else if (strcasecmp(optarg, "wg") == 0)
+				packettype = PT_WIREGUARD;
 			else if (strcasecmp(optarg, "sack") == 0)
 				/*
 				 * kept for compatibility; DEFAULT_SNAPLEN
@@ -372,15 +392,7 @@ main(int argc, char **argv)
 		case 'w':
 			WFileName = optarg;
 			break;
-#ifdef YYDEBUG
-		case 'Y':
-			{
-			/* Undocumented flag */
-			extern int yydebug;
-			yydebug = 1;
-			}
-			break;
-#endif
+
 		case 'y':
 			i = pcap_datalink_name_to_val(optarg);
 			if (i < 0)
@@ -440,7 +452,7 @@ main(int argc, char **argv)
 				error("%s", ebuf);
 		}
 		pd = priv_pcap_live(device, snaplen, !pflag, 1000, ebuf,
-		    dlt, dirfilt);
+		    dlt, dirfilt, Bflag);
 		if (pd == NULL)
 			error("%s", ebuf);
 
@@ -471,6 +483,8 @@ main(int argc, char **argv)
 		bpf_dump(fcode, dflag);
 		exit(0);
 	}
+	if (oflag)
+		oflag = init_pfosfp();
 	init_addrtoname(localnet, netmask);
 
 	if (WFileName) {
@@ -500,8 +514,6 @@ main(int argc, char **argv)
 		(void)fflush(stderr);
 	}
 
-	if (oflag)
-		oflag = init_pfosfp();
 	if (tflag > 0)
 		thiszone = gmt2local(0);
 
@@ -640,14 +652,14 @@ default_print_unaligned(const u_char *cp, u_int length)
 		i = 0;
 		while (--nshorts >= 0) {
 			if ((i++ % 8) == 0)
-				(void)printf("\n\t\t\t");
+				printf("\n\t\t\t");
 			s = *cp++;
-			(void)printf(" %02x%02x", s, *cp++);
+			printf(" %02x%02x", s, *cp++);
 		}
 		if (length & 1) {
 			if ((i % 8) == 0)
-				(void)printf("\n\t\t\t");
-			(void)printf(" %02x", *cp);
+				printf("\n\t\t\t");
+			printf(" %02x", *cp);
 		}
 	}
 }
@@ -676,13 +688,13 @@ default_print(const u_char *bp, u_int length)
 		i = 0;
 		while (--nshorts >= 0) {
 			if ((i++ % 8) == 0)
-				(void)printf("\n\t\t\t");
-			(void)printf(" %04x", ntohs(*sp++));
+				printf("\n\t\t\t");
+			printf(" %04x", ntohs(*sp++));
 		}
 		if (length & 1) {
 			if ((i % 8) == 0)
-				(void)printf("\n\t\t\t");
-			(void)printf(" %02x", *(u_char *)sp);
+				printf("\n\t\t\t");
+			printf(" %02x", *(u_char *)sp);
 		}
 	}
 }
@@ -700,7 +712,7 @@ __dead void
 usage(void)
 {
 	(void)fprintf(stderr,
-"Usage: %s [-AadefILlNnOopqStvXx] [-c count] [-D direction]\n",
+"Usage: %s [-AadefILlNnOopqStvXx] [-B fildrop] [-c count] [-D direction]\n",
 	    program_name);
 	(void)fprintf(stderr,
 "\t       [-E [espalg:]espkey] [-F file] [-i interface] [-r file]\n");

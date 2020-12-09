@@ -1,7 +1,7 @@
-/*	$OpenBSD: tree.c,v 1.46 2018/08/14 01:26:12 schwarze Exp $ */
+/* $OpenBSD: tree.c,v 1.56 2020/04/08 11:54:14 schwarze Exp $ */
 /*
+ * Copyright (c) 2013-2015, 2017-2020 Ingo Schwarze <schwarze@openbsd.org>
  * Copyright (c) 2008, 2009, 2011, 2014 Kristaps Dzonsons <kristaps@bsd.lv>
- * Copyright (c) 2013,2014,2015,2017,2018 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,6 +14,9 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ * Formatting module to let mandoc(1) show
+ * a human readable representation of the syntax tree.
  */
 #include <sys/types.h>
 
@@ -27,9 +30,13 @@
 #include "roff.h"
 #include "mdoc.h"
 #include "man.h"
+#include "tbl.h"
+#include "eqn.h"
 #include "main.h"
 
+static	void	print_attr(const struct roff_node *);
 static	void	print_box(const struct eqn_box *, int);
+static	void	print_cellt(enum tbl_cellt);
 static	void	print_man(const struct roff_node *, int);
 static	void	print_meta(const struct roff_meta *);
 static	void	print_mdoc(const struct roff_node *, int);
@@ -37,18 +44,18 @@ static	void	print_span(const struct tbl_span *, int);
 
 
 void
-tree_mdoc(void *arg, const struct roff_man *mdoc)
+tree_mdoc(void *arg, const struct roff_meta *mdoc)
 {
-	print_meta(&mdoc->meta);
+	print_meta(mdoc);
 	putchar('\n');
 	print_mdoc(mdoc->first->child, 0);
 }
 
 void
-tree_man(void *arg, const struct roff_man *man)
+tree_man(void *arg, const struct roff_meta *man)
 {
-	print_meta(&man->meta);
-	if (man->meta.hasbody == 0)
+	print_meta(man);
+	if (man->hasbody == 0)
 		puts("body  = empty");
 	putchar('\n');
 	print_man(man->first->child, 0);
@@ -183,26 +190,8 @@ print_mdoc(const struct roff_node *n, int indent)
 			if (argv[i].sz > 0)
 				printf(" ]");
 		}
-
-		putchar(' ');
-		if (NODE_DELIMO & n->flags)
-			putchar('(');
-		if (NODE_LINE & n->flags)
-			putchar('*');
-		printf("%d:%d", n->line, n->pos + 1);
-		if (NODE_DELIMC & n->flags)
-			putchar(')');
-		if (NODE_EOS & n->flags)
-			putchar('.');
-		if (NODE_BROKEN & n->flags)
-			printf(" BROKEN");
-		if (NODE_NOSRC & n->flags)
-			printf(" NOSRC");
-		if (NODE_NOPRT & n->flags)
-			printf(" NOPRT");
-		putchar('\n');
+		print_attr(n);
 	}
-
 	if (n->eqn)
 		print_box(n->eqn->first, indent + 4);
 	if (n->child)
@@ -283,17 +272,9 @@ print_man(const struct roff_node *n, int indent)
 	} else {
 		for (i = 0; i < indent; i++)
 			putchar(' ');
-		printf("%s (%s) ", p, t);
-		if (NODE_LINE & n->flags)
-			putchar('*');
-		printf("%d:%d", n->line, n->pos + 1);
-		if (NODE_DELIMC & n->flags)
-			putchar(')');
-		if (NODE_EOS & n->flags)
-			putchar('.');
-		putchar('\n');
+		printf("%s (%s)", p, t);
+		print_attr(n);
 	}
-
 	if (n->eqn)
 		print_box(n->eqn->first, indent + 4);
 	if (n->child)
@@ -301,6 +282,40 @@ print_man(const struct roff_node *n, int indent)
 		    (n->type == ROFFT_BLOCK ? 2 : 4));
 	if (n->next)
 		print_man(n->next, indent);
+}
+
+static void
+print_attr(const struct roff_node *n)
+{
+	putchar(' ');
+	if (n->flags & NODE_DELIMO)
+		putchar('(');
+	if (n->flags & NODE_LINE)
+		putchar('*');
+	printf("%d:%d", n->line, n->pos + 1);
+	if (n->flags & NODE_DELIMC)
+		putchar(')');
+	if (n->flags & NODE_EOS)
+		putchar('.');
+	if (n->flags & NODE_ID) {
+		printf(" ID");
+		if (n->flags & NODE_HREF)
+			printf("=HREF");
+	} else if (n->flags & NODE_HREF)
+		printf(" HREF");
+	else if (n->tag != NULL)
+		printf(" STRAYTAG");
+	if (n->tag != NULL)
+		printf("=%s", n->tag);
+	if (n->flags & NODE_BROKEN)
+		printf(" BROKEN");
+	if (n->flags & NODE_NOFILL)
+		printf(" NOFILL");
+	if (n->flags & NODE_NOSRC)
+		printf(" NOSRC");
+	if (n->flags & NODE_NOPRT)
+		printf(" NOPRT");
+	putchar('\n');
 }
 
 static void
@@ -366,10 +381,71 @@ print_box(const struct eqn_box *ep, int indent)
 }
 
 static void
+print_cellt(enum tbl_cellt pos)
+{
+	switch(pos) {
+	case TBL_CELL_LEFT:
+		putchar('L');
+		break;
+	case TBL_CELL_LONG:
+		putchar('a');
+		break;
+	case TBL_CELL_CENTRE:
+		putchar('c');
+		break;
+	case TBL_CELL_RIGHT:
+		putchar('r');
+		break;
+	case TBL_CELL_NUMBER:
+		putchar('n');
+		break;
+	case TBL_CELL_SPAN:
+		putchar('s');
+		break;
+	case TBL_CELL_DOWN:
+		putchar('^');
+		break;
+	case TBL_CELL_HORIZ:
+		putchar('-');
+		break;
+	case TBL_CELL_DHORIZ:
+		putchar('=');
+		break;
+	case TBL_CELL_MAX:
+		putchar('#');
+		break;
+	}
+}
+
+static void
 print_span(const struct tbl_span *sp, int indent)
 {
 	const struct tbl_dat *dp;
+	const struct tbl_cell *cp;
 	int		 i;
+
+	if (sp->prev == NULL) {
+		for (i = 0; i < indent; i++)
+			putchar(' ');
+		printf("%d", sp->opts->cols);
+		if (sp->opts->opts & TBL_OPT_CENTRE)
+			fputs(" center", stdout);
+		if (sp->opts->opts & TBL_OPT_EXPAND)
+			fputs(" expand", stdout);
+		if (sp->opts->opts & TBL_OPT_ALLBOX)
+			fputs(" allbox", stdout);
+		if (sp->opts->opts & TBL_OPT_BOX)
+			fputs(" box", stdout);
+		if (sp->opts->opts & TBL_OPT_DBOX)
+			fputs(" doublebox", stdout);
+		if (sp->opts->opts & TBL_OPT_NOKEEP)
+			fputs(" nokeep", stdout);
+		if (sp->opts->opts & TBL_OPT_NOSPACE)
+			fputs(" nospaces", stdout);
+		if (sp->opts->opts & TBL_OPT_NOWARN)
+			fputs(" nowarn", stdout);
+		printf(" (tbl options) %d:1\n", sp->line);
+	}
 
 	for (i = 0; i < indent; i++)
 		putchar(' ');
@@ -377,35 +453,62 @@ print_span(const struct tbl_span *sp, int indent)
 	switch (sp->pos) {
 	case TBL_SPAN_HORIZ:
 		putchar('-');
-		return;
+		putchar(' ');
+		break;
 	case TBL_SPAN_DHORIZ:
 		putchar('=');
-		return;
+		putchar(' ');
+		break;
 	default:
+		for (cp = sp->layout->first; cp != NULL; cp = cp->next)
+			print_cellt(cp->pos);
+		putchar(' ');
+		for (dp = sp->first; dp; dp = dp->next) {
+			if ((cp = dp->layout) == NULL)
+				putchar('*');
+			else {
+				printf("%d", cp->col);
+				print_cellt(dp->layout->pos);
+				if (cp->flags & TBL_CELL_BOLD)
+					putchar('b');
+				if (cp->flags & TBL_CELL_ITALIC)
+					putchar('i');
+				if (cp->flags & TBL_CELL_TALIGN)
+					putchar('t');
+				if (cp->flags & TBL_CELL_UP)
+					putchar('u');
+				if (cp->flags & TBL_CELL_BALIGN)
+					putchar('d');
+				if (cp->flags & TBL_CELL_WIGN)
+					putchar('z');
+				if (cp->flags & TBL_CELL_EQUAL)
+					putchar('e');
+				if (cp->flags & TBL_CELL_WMAX)
+					putchar('x');
+			}
+			switch (dp->pos) {
+			case TBL_DATA_HORIZ:
+			case TBL_DATA_NHORIZ:
+				putchar('-');
+				break;
+			case TBL_DATA_DHORIZ:
+			case TBL_DATA_NDHORIZ:
+				putchar('=');
+				break;
+			default:
+				putchar(dp->block ? '{' : '[');
+				if (dp->string != NULL)
+					fputs(dp->string, stdout);
+				putchar(dp->block ? '}' : ']');
+				break;
+			}
+			if (dp->hspans)
+				printf(">%d", dp->hspans);
+			if (dp->vspans)
+				printf("v%d", dp->vspans);
+			putchar(' ');
+		}
 		break;
 	}
-
-	for (dp = sp->first; dp; dp = dp->next) {
-		switch (dp->pos) {
-		case TBL_DATA_HORIZ:
-		case TBL_DATA_NHORIZ:
-			putchar('-');
-			continue;
-		case TBL_DATA_DHORIZ:
-		case TBL_DATA_NDHORIZ:
-			putchar('=');
-			continue;
-		default:
-			break;
-		}
-		printf("[\"%s\"", dp->string ? dp->string : "");
-		if (dp->spans)
-			printf("(%d)", dp->spans);
-		if (NULL == dp->layout)
-			putchar('*');
-		putchar(']');
-		putchar(' ');
-	}
-
 	printf("(tbl) %d:1\n", sp->line);
 }

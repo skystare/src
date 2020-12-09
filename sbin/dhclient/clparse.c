@@ -1,4 +1,4 @@
-/*	$OpenBSD: clparse.c,v 1.168 2018/02/10 23:25:15 krw Exp $	*/
+/*	$OpenBSD: clparse.c,v 1.200 2020/12/06 19:51:03 krw Exp $	*/
 
 /* Parser for dhclient config and lease files. */
 
@@ -42,6 +42,7 @@
 
 #include <sys/queue.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #include <net/if.h>
@@ -52,12 +53,14 @@
 
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "dhcp.h"
 #include "dhcpd.h"
@@ -66,39 +69,47 @@
 
 void	parse_conf_decl(FILE *, char *);
 int	parse_hex_octets(FILE *, unsigned int *, uint8_t **);
+int	parse_domain_list(FILE *, int *, char **);
 int	parse_option_list(FILE *, int *, uint8_t *);
 int	parse_interface(FILE *, char *);
-int	parse_lease(FILE *, char *,struct client_lease **);
-void	parse_lease_decl(FILE *,struct client_lease *, char *);
+int	parse_lease(FILE *, struct client_lease **);
+void	parse_lease_decl(FILE *, struct client_lease *);
 int	parse_option(FILE *, int *, struct option_data *);
 int	parse_reject_statement(FILE *);
 
-/*
- * conf-decls :==
- *	  <nil>
- *	| conf-decl
- *	| conf-decls conf-decl
- */
+void	apply_ignore_list(char *);
+void	set_default_client_identifier(struct ether_addr *);
+void	set_default_hostname(void);
+
 void
-read_conf(char *name)
+init_config(void)
 {
 	struct option_data	*option;
-	FILE			*cfile;
-	int			 token;
 	uint32_t		 expiry;
 
-	new_parse(path_dhclient_conf);
+	config = calloc(1, sizeof(*config));
+	if (config == NULL)
+		fatal("config");
 
 	TAILQ_INIT(&config->reject_list);
 
 	/* Set some defaults. */
 	config->link_timeout = 10;	/* secs before going daemon w/o lease */
-	config->timeout = 30;		/* secs to wait for an OFFER */
 	config->select_interval = 0;	/* secs to wait for other OFFERs */
-	config->reboot_timeout = 1;	/* secs before giving up on reboot */
 	config->retry_interval = 1;	/* secs before asking for OFFER */
+#ifdef SMALL
+	config->backoff_cutoff = 2;	/* max secs between packet retries */
+	config->reboot_timeout = 5;	/* secs before giving up on reboot */
+	config->timeout = 10;		/* secs to wait for an OFFER */
+#else
 	config->backoff_cutoff = 10;	/* max secs between packet retries */
+	config->reboot_timeout = 1;	/* secs before giving up on reboot */
+	config->timeout = 30;		/* secs to wait for an OFFER */
+#endif
 	config->initial_interval = 1;	/* secs before 1st retry */
+
+	/* All leases must supply a subnet mask. Classful defaults are dead, Jim. */
+	config->required_options[config->required_option_count++] = DHO_SUBNET_MASK;
 
 	/*
 	 * Set default lease length, which will determine default renewal
@@ -141,8 +152,27 @@ read_conf(char *name)
 	    [config->requested_option_count++] = DHO_BOOTFILE_NAME;
 	config->requested_options
 	    [config->requested_option_count++] = DHO_TFTP_SERVER;
+}
 
-	if ((cfile = fopen(path_dhclient_conf, "r")) != NULL) {
+/*
+ * conf-decls :==
+ *	  <nil>
+ *	| conf-decl
+ *	| conf-decls conf-decl
+ */
+void
+read_conf(char *name, char *ignore_list, struct ether_addr *hwaddr)
+{
+	FILE			*cfile;
+	int			 token;
+
+	init_config();
+
+	if (path_dhclient_conf != NULL) {
+		cfile = fopen(path_dhclient_conf, "r");
+		if (cfile == NULL)
+			fatal("fopen(%s)", path_dhclient_conf);
+		new_parse(path_dhclient_conf);
 		for (;;) {
 			token = peek_token(NULL, cfile);
 			if (token == EOF)
@@ -151,6 +181,10 @@ read_conf(char *name)
 		}
 		fclose(cfile);
 	}
+
+	set_default_client_identifier(hwaddr);
+	set_default_hostname();
+	apply_ignore_list(ignore_list);
 }
 
 /*
@@ -160,48 +194,47 @@ read_conf(char *name)
  *	| leases lease
  */
 void
-read_lease_db(char *name, struct client_lease_tq *tq)
+read_lease_db(struct client_lease_tq *lease_db)
 {
 	struct client_lease	*lease, *lp, *nlp;
 	FILE			*cfile;
+	int			 i;
 
-	TAILQ_INIT(tq);
+	TAILQ_INIT(lease_db);
 
 	if ((cfile = fopen(path_lease_db, "r")) == NULL)
 		return;
 
 	new_parse(path_lease_db);
 
-	for (;;) {
-		if (parse_lease(cfile, name, &lease) == 1) {
-			/*
-			 * The new lease will supersede a lease with the same ssid
-			 * AND the same Client Identifier AND the same
-			 * IP address.
-			 */
-			TAILQ_FOREACH_SAFE(lp, tq, next, nlp) {
-				if (lp->ssid_len != lease->ssid_len)
-					continue;
-				if (memcmp(lp->ssid, lease->ssid, lp->ssid_len) != 0)
-					continue;
-				if ((lease->options[DHO_DHCP_CLIENT_IDENTIFIER].len != 0) &&
-				    ((lp->options[DHO_DHCP_CLIENT_IDENTIFIER].len !=
-				    lease->options[DHO_DHCP_CLIENT_IDENTIFIER].len) ||
-				    memcmp(lp->options[DHO_DHCP_CLIENT_IDENTIFIER].data,
-				    lease->options[DHO_DHCP_CLIENT_IDENTIFIER].data,
-				    lp->options[DHO_DHCP_CLIENT_IDENTIFIER].len)))
-					continue;
-				if (lp->address.s_addr != lease->address.s_addr)
-					continue;
+	i = DHO_DHCP_CLIENT_IDENTIFIER;
+	while (feof(cfile) == 0) {
+		if (parse_lease(cfile, &lease) == 0)
+			continue;
 
-				TAILQ_REMOVE(tq, lp, next);
-				free_client_lease(lp);
-			}
+		/*
+		 * The new lease will supersede a lease with the same
+		 * ssid AND the same Client Identifier AND the same
+		 * IP address.
+		 */
+		TAILQ_FOREACH_SAFE(lp, lease_db, next, nlp) {
+			if (lp->ssid_len != lease->ssid_len)
+				continue;
+			if (memcmp(lp->ssid, lease->ssid, lp->ssid_len) != 0)
+				continue;
+			if ((lease->options[i].len != 0) &&
+			    ((lp->options[i].len != lease->options[i].len) ||
+			    memcmp(lp->options[i].data, lease->options[i].data,
+			    lp->options[i].len) != 0))
+				continue;
+			if (lp->address.s_addr != lease->address.s_addr)
+				continue;
 
-			TAILQ_INSERT_TAIL(tq, lease, next);
+			TAILQ_REMOVE(lease_db, lp, next);
+			free_client_lease(lp);
 		}
-		if (feof(cfile) != 0)
-			break;
+
+		TAILQ_INSERT_TAIL(lease_db, lease, next);
 	}
 
 	fclose(cfile);
@@ -236,147 +269,157 @@ parse_conf_decl(FILE *cfile, char *name)
 {
 	uint8_t			 list[DHO_COUNT];
 	char			*val;
-	int			 i, count, token;
-	uint32_t		 t;
+	enum actions 		*p;
+	int			 action, count, i, token;
 
 	token = next_token(NULL, cfile);
 
 	switch (token) {
 	case TOK_APPEND:
-		if (parse_option(cfile, &i, config->defaults) == 1) {
-			config->default_actions[i] = ACTION_APPEND;
-			parse_semi(cfile);
-		}
+		if (parse_option(cfile, &i, config->defaults) == 0)
+			return;
+		action = code_to_action(i, ACTION_APPEND);
+		if (action == ACTION_DEFAULT)
+			parse_warn("'append' treated as 'default'");
+		config->default_actions[i] = action;
 		break;
 	case TOK_BACKOFF_CUTOFF:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->backoff_cutoff = ntohl(t);
-			parse_semi(cfile);
-		}
+		if (parse_number(cfile, &config->backoff_cutoff, 0, INT32_MAX)
+		    == 0)
+			return;
 		break;
 	case TOK_DEFAULT:
-		if (parse_option(cfile, &i, config->defaults) == 1) {
-			config->default_actions[i] = ACTION_DEFAULT;
-			parse_semi(cfile);
-		}
+		if (parse_option(cfile, &i, config->defaults) == 0)
+			return;
+		config->default_actions[i] = ACTION_DEFAULT;
 		break;
 	case TOK_FILENAME:
-		if (parse_string(cfile, NULL, &val) == 1) {
-			free(config->filename);
-			config->filename = val;
-			parse_semi(cfile);
-		}
+		if (parse_string(cfile, &val) == 0)
+			return;
+		free(config->filename);
+		config->filename = val;
 		break;
 	case TOK_FIXED_ADDR:
-		if (parse_ip_addr(cfile, &config->address) == 1)
-			parse_semi(cfile);
+		if (parse_ip_addr(cfile, &config->address) == 0)
+			return;
 		break;
 	case TOK_IGNORE:
 		memset(list, 0, sizeof(list));
 		count = 0;
-		if (parse_option_list(cfile, &count, list) == 1) {
-			enum actions *p = config->default_actions;
-			if (count == 0) {
-				for (i = 0; i < DHO_COUNT; i++)
-					if (p[i] == ACTION_IGNORE)
-						p[i] = ACTION_NONE;
-			} else {
-				for (i = 0; i < count; i++)
-					p[list[i]] = ACTION_IGNORE;
-			}
-			parse_semi(cfile);
+		if (parse_option_list(cfile, &count, list) == 0)
+			return;
+		p = config->default_actions;
+		if (count == 0) {
+			for (i = 0; i < DHO_COUNT; i++)
+				if (p[i] == ACTION_IGNORE)
+					p[i] = ACTION_USELEASE;
+		} else {
+			for (i = 0; i < count; i++)
+				p[list[i]] = ACTION_IGNORE;
 		}
 		break;
 	case TOK_INITIAL_INTERVAL:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->initial_interval = ntohl(t);
-			parse_semi(cfile);
-		}
+		if (parse_number(cfile, &config->initial_interval, 0, INT32_MAX)
+		    == 0)
+			return;
 		break;
 	case TOK_INTERFACE:
-		if (parse_interface(cfile, name) == 1)
-			;
-		break;
-	case TOK_LEASE:
-		skip_to_semi(cfile);
-		break;
+		parse_interface(cfile, name);
+		return;
 	case TOK_LINK_TIMEOUT:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->link_timeout = ntohl(t);
-			parse_semi(cfile);
-		}
+		if (parse_number(cfile, &config->link_timeout, 0, INT32_MAX)
+		    == 0)
+			return;
 		break;
 	case TOK_NEXT_SERVER:
-		if (parse_ip_addr(cfile, &config->next_server) == 1)
-			parse_semi(cfile);
+		if (parse_ip_addr(cfile, &config->next_server) == 0)
+			return;
 		break;
 	case TOK_PREPEND:
-		if (parse_option(cfile, &i, config->defaults) == 1) {
-			config->default_actions[i] = ACTION_PREPEND;
-			parse_semi(cfile);
-		}
+		if (parse_option(cfile, &i, config->defaults) == 0)
+			return;
+		action = code_to_action(i, ACTION_PREPEND);
+		if (action == ACTION_SUPERSEDE)
+			parse_warn("'prepend' treated as 'supersede'");
+		config->default_actions[i] = action;
 		break;
 	case TOK_REBOOT:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->reboot_timeout = ntohl(t);
-			parse_semi(cfile);
-		}
+		if (parse_number(cfile, &config->reboot_timeout, 0, INT32_MAX)
+		    == 0)
+			return;
 		break;
 	case TOK_REJECT:
-		if (parse_reject_statement(cfile) == 1)
-			parse_semi(cfile);
+		if (parse_reject_statement(cfile) == 0)
+			return;
 		break;
 	case TOK_REQUEST:
 		if (parse_option_list(cfile, &config->requested_option_count,
-		    config->requested_options) == 1)
-			parse_semi(cfile);
+		    config->requested_options) == 0)
+			return;
 		break;
 	case TOK_REQUIRE:
 		if (parse_option_list(cfile, &config->required_option_count,
-		    config->required_options) == 1)
-			parse_semi(cfile);
+		    config->required_options) == 0)
+			return;
 		break;
 	case TOK_RETRY:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->retry_interval = ntohl(t);
-			parse_semi(cfile);
-		}
+		if (parse_number(cfile, &config->retry_interval, 0, INT32_MAX)
+		    == 0)
+			return;
 		break;
 	case TOK_SELECT_TIMEOUT:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->select_interval = ntohl(t);
-			parse_semi(cfile);
-		}
+		if (parse_number(cfile, &config->select_interval, 0, INT32_MAX)
+		    == 0)
+			return;
 		break;
 	case TOK_SEND:
-		if (parse_option(cfile, &i, config->send_options) == 1)
-			parse_semi(cfile);
+		if (parse_option(cfile, &i, config->send_options) == 0)
+			return;
 		break;
 	case TOK_SERVER_NAME:
-		if (parse_string(cfile, NULL, &val) == 1) {
-			free(config->server_name);
-			config->server_name = val;
-			parse_semi(cfile);
-		}
+		if (parse_string(cfile, &val) == 0)
+			return;
+		free(config->server_name);
+		config->server_name = val;
 		break;
 	case TOK_SUPERSEDE:
-		if (parse_option(cfile, &i, config->defaults) == 1) {
-			config->default_actions[i] = ACTION_SUPERSEDE;
-			parse_semi(cfile);
-		}
+		if (parse_option(cfile, &i, config->defaults) == 0)
+			return;
+		config->default_actions[i] = ACTION_SUPERSEDE;
 		break;
 	case TOK_TIMEOUT:
-		if (parse_number(cfile, (unsigned char *)&t, 'L') == 1) {
-			config->timeout = ntohl(t);
-			parse_semi(cfile);
+		if (parse_number(cfile, &config->timeout, 0, INT32_MAX) == 0)
+			return;
+		break;
+	case TOK_USELEASE:
+		memset(list, 0, sizeof(list));
+		count = 0;
+		if (parse_option_list(cfile, &count, list) == 0)
+			return;
+		p = config->default_actions;
+		if (count == 0) {
+			for (i = 0; i < DHO_COUNT; i++) {
+				free(config->defaults[i].data);
+				config->defaults[i].data = NULL;
+				config->defaults[i].len = 0;
+				p[i] = ACTION_USELEASE;
+			}
+		} else {
+			for (i = 0; i < count; i++) {
+				free(config->defaults[list[i]].data);
+				config->defaults[list[i]].data = NULL;
+				config->defaults[list[i]].len = 0;
+				p[list[i]] = ACTION_USELEASE;
+			}
 		}
 		break;
 	default:
 		parse_warn("expecting statement.");
-		if (token != ';')
-			skip_to_semi(cfile);
-		break;
+		skip_to_semi(cfile);
+		return;
 	}
+
+	parse_semi(cfile);
 }
 
 int
@@ -414,6 +457,52 @@ parse_hex_octets(FILE *cfile, unsigned int *len, uint8_t **buf)
 	} while (token == ':');
 
 	parse_warn("expecting colon delimited list of hex octets.");
+
+	if (token != ';')
+		skip_to_semi(cfile);
+
+	return 0;
+}
+
+int
+parse_domain_list(FILE *cfile, int *len, char **dp)
+{
+	uint8_t		 buf[DHCP_DOMAIN_SEARCH_LEN];
+	char		*domain;
+	int		 count, token;
+
+	memset(buf, 0, sizeof(buf));
+	count = 0;
+
+	do {
+		if (parse_string(cfile, &domain) == 0)
+			return 0;
+
+		count++;
+		if (count > DHCP_DOMAIN_SEARCH_CNT) {
+			parse_warn("more than 6 search domains");
+			break;
+		}
+
+		if (count > 1)
+			strlcat(buf, " ", sizeof(buf));
+		if (strlcat(buf, domain, sizeof(buf)) >= sizeof(buf)) {
+			parse_warn("domain list too long");
+			break;
+		}
+
+		token = peek_token(NULL, cfile);
+		if (token == ';') {
+			*dp = strdup(buf);
+			if (*dp == NULL)
+				fatal("domain name list");
+			*len = strlen(*dp);
+			return 1;
+		}
+		token = next_token(NULL, cfile);
+		if (token != ',')
+			parse_warn("';' or ',' expected");
+	} while (token == ',');
 
 	if (token != ';')
 		skip_to_semi(cfile);
@@ -531,8 +620,7 @@ parse_interface(FILE *cfile, char *name)
  *	| lease-decls lease-decl
  */
 int
-parse_lease(FILE *cfile, char *name,
-    struct client_lease **lp)
+parse_lease(FILE *cfile, struct client_lease **lp)
 {
 	struct client_lease	*lease;
 	int			 token;
@@ -571,7 +659,7 @@ parse_lease(FILE *cfile, char *name,
 			*lp = lease;
 			return 1;
 		}
-		parse_lease_decl(cfile, lease, name);
+		parse_lease_decl(cfile, lease);
 	}
 
 	return 0;
@@ -593,7 +681,7 @@ parse_lease(FILE *cfile, char *name,
  *	| SSID		string SEMI
  */
 void
-parse_lease_decl(FILE *cfile, struct client_lease *lease, char *name)
+parse_lease_decl(FILE *cfile, struct client_lease *lease)
 {
 	char		*val;
 	unsigned int	 len;
@@ -606,17 +694,16 @@ parse_lease_decl(FILE *cfile, struct client_lease *lease, char *name)
 		/* 'bootp' is just a comment. See BOOTP_LEASE(). */
 		break;
 	case TOK_EPOCH:
-		if (parse_number(cfile, (unsigned char *)&lease->epoch, 't')
+		if (parse_number(cfile, &lease->epoch, INT64_MIN, INT64_MAX)
 		    == 0)
 			return;
-		lease->epoch = betoh64(lease->epoch);
 		break;
 	case TOK_EXPIRE:
 		/* 'expire' is just a comment. See 'epoch'. */
 		skip_to_semi(cfile);
 		return;
 	case TOK_FILENAME:
-		if (parse_string(cfile, NULL, &val) == 0)
+		if (parse_string(cfile, &val) == 0)
 			return;
 		free(lease->filename);
 		lease->filename = val;
@@ -643,14 +730,15 @@ parse_lease_decl(FILE *cfile, struct client_lease *lease, char *name)
 		skip_to_semi(cfile);
 		return;
 	case TOK_SERVER_NAME:
-		if (parse_string(cfile, NULL, &val) == 0)
+		if (parse_string(cfile, &val) == 0)
 			return;
 		free(lease->server_name);
 		lease->server_name = val;
 		break;
 	case TOK_SSID:
-		if (parse_string(cfile, &len, &val) == 0)
+		if (parse_string(cfile, &val) == 0)
 			return;
+		len = strlen(val);
 		if (len > sizeof(lease->ssid)) {
 			free(val);
 			parse_warn("ssid > 32 bytes");
@@ -664,13 +752,12 @@ parse_lease_decl(FILE *cfile, struct client_lease *lease, char *name)
 		break;
 	default:
 		parse_warn("expecting lease declaration.");
-		if (token != ';')
-			skip_to_semi(cfile);
+		skip_to_semi(cfile);
 		return;
 	}
 
 	parse_semi(cfile);
- }
+}
 
 /*
  * option :==
@@ -697,9 +784,9 @@ parse_option(FILE *cfile, int *code, struct option_data *options)
 	struct in_addr		 ip_addr;
 	uint8_t			*dp;
 	char			*fmt, *val;
+	long long		 number;
 	unsigned int		 hunkix = 0;
 	int			 i, freedp, len, token;
-	int			 nul_term = 0;
 
 	token = next_token(&val, cfile);
 	i = name_to_code(val);
@@ -718,18 +805,19 @@ parse_option(FILE *cfile, int *code, struct option_data *options)
 			switch (*fmt) {
 			case 'X':
 				if (peek_token(NULL, cfile) == TOK_STRING) {
-					if (parse_string(cfile, &len,
-					    (char **)&dp) == 0)
+					if (parse_string(cfile, (char **)&dp)
+					    == 0)
 						return 0;
+					len = strlen(dp);
 				} else if (parse_hex_octets(cfile, &len, &dp)
 				    == 0)
 					return 0;
 				freedp = 1;
 				break;
 			case 't': /* Text string. */
-				if (parse_string(cfile, &len, (char **)&dp)
-				    == 0)
+				if (parse_string(cfile, (char **)&dp) == 0)
 					return 0;
+				len = strlen(dp);
 				freedp = 1;
 				break;
 			case 'I': /* IP address. */
@@ -739,26 +827,34 @@ parse_option(FILE *cfile, int *code, struct option_data *options)
 				dp = (uint8_t *)&ip_addr;
 				break;
 			case 'l':	/* Signed 32-bit integer. */
-				if (parse_number(cfile, buf, 'l') == 0)
+				if (parse_number(cfile, &number, INT32_MIN,
+				    INT32_MAX) == 0)
 					return 0;
-				len = 4;
+				number = htobe64(number);
+				len = sizeof(int32_t);
+				memcpy(buf, (char *)&number + (sizeof(number) - len), len);
 				dp = buf;
 				break;
 			case 'L':	/* Unsigned 32-bit integer. */
-				if (parse_number(cfile, buf, 'L') == 0)
+				if (parse_number(cfile, &number, 0, UINT32_MAX) == 0)
 					return 0;
-				len = 4;
+				number = htobe64(number);
+				len = sizeof(uint32_t);
+				memcpy(buf, (char *)&number + (sizeof(number) - len), len);
 				dp = buf;
 				break;
 			case 'S':	/* Unsigned 16-bit integer. */
-				if (parse_number(cfile, buf, 'S') == 0)
+				if (parse_number(cfile, &number, 0, UINT16_MAX) == 0)
 					return 0;
-				len = 2;
+				number = htobe64(number);
+				len = sizeof(uint16_t);
+				memcpy(buf, (char *)&number + (sizeof(number) - len), len);
 				dp = buf;
 				break;
 			case 'B':	/* Unsigned 8-bit integer. */
-				if (parse_number(cfile, buf, 'B') == 0)
+				if (parse_number(cfile, &number, 0, UINT8_MAX) == 0)
 					return 0;
+				buf[0] = number;
 				len = 1;
 				dp = buf;
 				break;
@@ -773,6 +869,24 @@ parse_option(FILE *cfile, int *code, struct option_data *options)
 					return 0;
 				len = 1 + (cidr[0] + 7) / 8;
 				dp = cidr;
+				break;
+			case 'D':
+				if (peek_token(NULL, cfile) == TOK_STRING) {
+					if (parse_domain_list(cfile, &len,
+					    (char **)&dp) == 0)
+						return 0;
+				} else {
+					if (parse_hex_octets(cfile, &len, &dp)
+					    == 0)
+						return 0;
+					val = rfc1035_as_string(dp, len);
+					free(dp);
+					dp = strdup(val);
+					if (dp == NULL)
+						fatal("RFC1035 hex octets");
+					len = strlen(dp);
+				}
+				freedp = 1;
 				break;
 			default:
 				log_warnx("%s: bad format %c in "
@@ -801,10 +915,10 @@ parse_option(FILE *cfile, int *code, struct option_data *options)
 	} while (*fmt == 'A' && token == ',');
 
 	free(options[i].data);
-	options[i].data = malloc(hunkix + nul_term);
+	options[i].data = malloc(hunkix);
 	if (options[i].data == NULL)
 		fatal("option data");
-	memcpy(options[i].data, hunkbuf, hunkix + nul_term);
+	memcpy(options[i].data, hunkbuf, hunkix);
 	options[i].len = hunkix;
 
 	*code = i;
@@ -833,4 +947,107 @@ parse_reject_statement(FILE *cfile)
 	TAILQ_INSERT_TAIL(&config->reject_list, elem, next);
 
 	return 1;
+}
+
+/*
+ * Apply the list of options to be ignored that was provided on the
+ * command line. This will override any ignore list obtained from
+ * dhclient.conf.
+ */
+void
+apply_ignore_list(char *ignore_list)
+{
+	uint8_t		 list[DHO_COUNT];
+	char		*p;
+	int		 ix, i, j;
+
+	if (ignore_list == NULL)
+		return;
+
+	memset(list, 0, sizeof(list));
+	ix = 0;
+
+	for (p = strsep(&ignore_list, ", "); p != NULL;
+	     p = strsep(&ignore_list, ", ")) {
+		if (*p == '\0')
+			continue;
+
+		i = name_to_code(p);
+		if (i == DHO_END) {
+			log_debug("%s: invalid option name: '%s'", log_procname,
+			    p);
+			return;
+		}
+
+		/* Avoid storing duplicate options in the list. */
+		for (j = 0; j < ix && list[j] != i; j++)
+			;
+		if (j == ix)
+			list[ix++] = i;
+	}
+
+	for (i = 0; i < ix; i++) {
+		j = list[i];
+		config->default_actions[j] = ACTION_IGNORE;
+		free(config->defaults[j].data);
+		config->defaults[j].data = NULL;
+		config->defaults[j].len = 0;
+	}
+}
+
+void
+set_default_client_identifier(struct ether_addr *hwaddr)
+{
+	struct option_data	*opt;
+
+	/*
+	 * Check both len && data so
+	 *
+	 *     send dhcp-client-identifier "";
+	 *
+	 * can be used to suppress sending the default client
+	 * identifier.
+	 */
+	opt = &config->send_options[DHO_DHCP_CLIENT_IDENTIFIER];
+	if (opt->len == 0 && opt->data == NULL) {
+		opt->data = calloc(1, ETHER_ADDR_LEN + 1);
+		if (opt->data == NULL)
+			fatal("default client identifier");
+		opt->data[0] = HTYPE_ETHER;
+		memcpy(&opt->data[1], hwaddr->ether_addr_octet,
+		    ETHER_ADDR_LEN);
+		opt->len = ETHER_ADDR_LEN + 1;
+	}
+}
+
+void
+set_default_hostname(void)
+{
+	char			 hn[HOST_NAME_MAX + 1], *p;
+	struct option_data	*opt;
+	int			 rslt;
+
+	/*
+	 * Check both len && data so
+	 *
+	 *     send host-name "";
+	 *
+	 * can be used to suppress sending the default host
+	 * name.
+	 */
+	opt = &config->send_options[DHO_HOST_NAME];
+	if (opt->len == 0 && opt->data == NULL) {
+		rslt = gethostname(hn, sizeof(hn));
+		if (rslt == -1) {
+			log_warn("host-name");
+			return;
+		}
+		p = strchr(hn, '.');
+		if (p != NULL)
+			*p = '\0';
+		opt->data = strdup(hn);
+		if (opt->data == NULL)
+			fatal("default host-name");
+		opt->len = strlen(opt->data);
+	}
 }

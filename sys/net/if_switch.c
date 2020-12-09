@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_switch.c,v 1.23 2018/02/19 08:59:52 mpi Exp $	*/
+/*	$OpenBSD: if_switch.c,v 1.38 2020/08/28 12:01:48 mvs Exp $	*/
 
 /*
  * Copyright (c) 2016 Kazuya GODA <goda@openbsd.org>
@@ -68,7 +68,8 @@ int	 switch_port_add(struct switch_softc *, struct ifbreq *);
 void	 switch_port_detach(void *);
 int	 switch_port_del(struct switch_softc *, struct ifbreq *);
 int	 switch_port_list(struct switch_softc *, struct ifbifconf *);
-int	 switch_input(struct ifnet *, struct mbuf *, void *);
+struct mbuf *
+	 switch_input(struct ifnet *, struct mbuf *, void *);
 struct mbuf
 	*switch_port_ingress(struct switch_softc *, struct ifnet *,
 	    struct mbuf *);
@@ -119,6 +120,11 @@ struct rwlock switch_ifs_lk = RWLOCK_INITIALIZER("switchifs");
 
 struct pool swfcl_pool;
 
+const struct ether_brport switch_brport = {
+	switch_input,
+	NULL,
+};
+
 void
 switchattach(int n)
 {
@@ -159,10 +165,11 @@ switch_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_start = NULL;
 	ifp->if_type = IFT_BRIDGE;
 	ifp->if_hdrlen = ETHER_HDR_LEN;
+	ifp->if_xflags = IFXF_CLONED;
 	TAILQ_INIT(&sc->sc_swpo_list);
 
 	sc->sc_unit = unit;
-	sc->sc_stp = bstp_create(&sc->sc_if);
+	sc->sc_stp = bstp_create();
 	if (!sc->sc_stp) {
 		free(sc, M_DEVBUF, sizeof(*sc));
 		return (ENOMEM);
@@ -221,6 +228,7 @@ switchintr(void)
 		return;
 
 	while ((m = ml_dequeue(&ml)) != NULL) {
+		KASSERT(m->m_flags & M_PKTHDR);
 		ifp = if_get(m->m_pkthdr.ph_ifidx);
 		if (ifp == NULL) {
 			m_freem(m);
@@ -433,13 +441,22 @@ switch_ioctl(struct ifnet *ifp, unsigned long cmd, caddr_t data)
 		}
 		breq->ifbr_ifsflags = swpo->swpo_flags;
 		breq->ifbr_portno = swpo->swpo_port_no;
+		breq->ifbr_protected = swpo->swpo_protected;
 		break;
 	case SIOCSIFFLAGS:
-		if ((ifp->if_flags & IFF_UP) == IFF_UP)
-			ifp->if_flags |= IFF_RUNNING;
+		if ((ifp->if_flags & IFF_UP) == IFF_UP) {
+			if ((ifp->if_flags & IFF_RUNNING) == 0) {
+				ifp->if_flags |= IFF_RUNNING;
+				bstp_enable(sc->sc_stp, ifp->if_index);
+			}
+		}
 
-		if ((ifp->if_flags & IFF_UP) == 0)
-			ifp->if_flags &= ~IFF_RUNNING;
+		if ((ifp->if_flags & IFF_UP) == 0) {
+			if ((ifp->if_flags & IFF_RUNNING) == IFF_RUNNING) {
+				ifp->if_flags &= ~IFF_RUNNING;
+				bstp_disable(sc->sc_stp);
+			}
+		}
 
 		break;
 	case SIOCBRDGRTS:
@@ -452,7 +469,7 @@ switch_ioctl(struct ifnet *ifp, unsigned long cmd, caddr_t data)
 		if ((bp = bs->bs_root_port) == NULL)
 			brop->ifbop_root_port = 0;
 		else
-			brop->ifbop_root_port = bp->bp_ifp->if_index;
+			brop->ifbop_root_port = bp->bp_ifindex;
 		brop->ifbop_maxage = bs->bs_bridge_max_age >> 8;
 		brop->ifbop_hellotime = bs->bs_bridge_htime >> 8;
 		brop->ifbop_fwddelay = bs->bs_bridge_fdelay >> 8;
@@ -465,6 +482,19 @@ switch_ioctl(struct ifnet *ifp, unsigned long cmd, caddr_t data)
 		brop->ifbop_desg_bridge = bs->bs_root_pv.pv_dbridge_id;
 		brop->ifbop_last_tc_time.tv_sec = bs->bs_last_tc_time.tv_sec;
 		brop->ifbop_last_tc_time.tv_usec = bs->bs_last_tc_time.tv_usec;
+		break;
+	case SIOCBRDGSIFPROT:
+		ifs = ifunit(breq->ifbr_ifsname);
+		if (ifs == NULL) {
+			error = ENOENT;
+			break;
+		}
+		swpo = (struct switch_port *)ifs->if_switchport;
+		if (swpo == NULL || swpo->swpo_switch != sc) {
+			error = ESRCH;
+			break;
+		}
+		swpo->swpo_protected = breq->ifbr_protected;
 		break;
 	case SIOCSWGDPID:
 	case SIOCSWSDPID:
@@ -491,8 +521,8 @@ switch_port_add(struct switch_softc *sc, struct ifbreq *req)
 	if ((ifs = ifunit(req->ifbr_ifsname)) == NULL)
 		return (ENOENT);
 
-	if (ifs->if_bridgeport != NULL)
-		return (EBUSY);
+	if (ifs->if_type != IFT_ETHER)
+		return (EPROTONOSUPPORT);
 
 	if (ifs->if_switchport != NULL) {
 		swpo = (struct switch_port *)ifs->if_switchport;
@@ -502,24 +532,28 @@ switch_port_add(struct switch_softc *sc, struct ifbreq *req)
 			return (EBUSY);
 	}
 
-	if (ifs->if_type == IFT_ETHER) {
-		if ((error = ifpromisc(ifs, 1)) != 0)
-			return (error);
+	if ((error = ifpromisc(ifs, 1)) != 0)
+		return (error);
+
+	error = ether_brport_isset(ifs);
+	if (error != 0) {
+		ifpromisc(ifs, 0);
+		return (error);
 	}
 
 	swpo = malloc(sizeof(*swpo), M_DEVBUF, M_NOWAIT|M_ZERO);
 	if (swpo == NULL) {
-		if (ifs->if_type == IFT_ETHER)
-			ifpromisc(ifs, 0);
+		ifpromisc(ifs, 0);
 		return (ENOMEM);
 	}
+
 	swpo->swpo_switch = sc;
 	swpo->swpo_ifindex = ifs->if_index;
 	ifs->if_switchport = (caddr_t)swpo;
-	if_ih_insert(ifs, switch_input, NULL);
+	ether_brport_set(ifs, &switch_brport);
 	swpo->swpo_port_no = swofp_assign_portno(sc, ifs->if_index);
-	swpo->swpo_dhcookie = hook_establish(ifs->if_detachhooks, 0,
-	    switch_port_detach, ifs);
+	task_set(&swpo->swpo_dtask, switch_port_detach, ifs);
+	if_detachhook_add(ifs, &swpo->swpo_dtask);
 
 	nanouptime(&swpo->swpo_appended);
 
@@ -539,8 +573,10 @@ switch_port_list(struct switch_softc *sc, struct ifbifconf *bifc)
 	TAILQ_FOREACH(swpo, &sc->sc_swpo_list, swpo_list_next)
 		total++;
 
-	if (bifc->ifbic_len == 0)
+	if (bifc->ifbic_len == 0) {
+		n = total;
 		goto done;
+	}
 
 	TAILQ_FOREACH(swpo, &sc->sc_swpo_list, swpo_list_next) {
 		memset(&breq, 0, sizeof(breq));
@@ -559,7 +595,7 @@ switch_port_list(struct switch_softc *sc, struct ifbifconf *bifc)
 		strlcpy(breq.ifbr_name, sc->sc_if.if_xname, IFNAMSIZ);
 		breq.ifbr_ifsflags = swpo->swpo_flags;
 		breq.ifbr_portno = swpo->swpo_port_no;
-
+		breq.ifbr_protected = swpo->swpo_protected;
 		if ((error = copyout((caddr_t)&breq,
 		    (caddr_t)(bifc->ifbic_req + n), sizeof(breq))) != 0)
 			goto done;
@@ -586,9 +622,9 @@ switch_port_detach(void *arg)
 		switch_port_unset_local(sc, swpo);
 
 	ifp->if_switchport = NULL;
-	hook_disestablish(ifp->if_detachhooks, swpo->swpo_dhcookie);
+	if_detachhook_del(ifp, &swpo->swpo_dtask);
 	ifpromisc(ifp, 0);
-	if_ih_remove(ifp, switch_input, NULL);
+	ether_brport_clr(ifp);
 	TAILQ_REMOVE(&sc->sc_swpo_list, swpo, swpo_list_next);
 	free(swpo, M_DEVBUF, sizeof(*swpo));
 }
@@ -618,19 +654,19 @@ switch_port_del(struct switch_softc *sc, struct ifbreq *req)
 	return (error);
 }
 
-int
-switch_input(struct ifnet *ifp, struct mbuf *m, void *cookie)
+struct mbuf *
+switch_input(struct ifnet *ifp, struct mbuf *m, void *null)
 {
 	KASSERT(m->m_flags & M_PKTHDR);
 
 	if (m->m_flags & M_PROTO1) {
 		m->m_flags &= ~M_PROTO1;
-		return (0);
+		return (m);
 	}
 
 	niq_enqueue(&switchintrq, m);
 
-	return (1);
+	return (NULL);
 }
 
 
@@ -638,10 +674,7 @@ struct mbuf *
 switch_port_ingress(struct switch_softc *sc, struct ifnet *src_if,
     struct mbuf *m)
 {
-	struct switch_port	*swpo;
 	struct ether_header	 eh;
-
-	swpo = (struct switch_port *)src_if->if_switchport;
 
 	sc->sc_if.if_ipackets++;
 	sc->sc_if.if_ibytes += m->m_pkthdr.len;
@@ -718,8 +751,7 @@ switch_port_egress(struct switch_softc *sc, struct switch_fwdp_queue *fwdp_q,
 		 */
 		if (!(swpo->swpo_flags & IFBIF_LOCAL) &&
 		    ((len - ETHER_HDR_LEN) > dst_if->if_mtu))
-			bridge_fragment((struct bridge_softc *)sc,
-			    dst_if, &eh, mc);
+			bridge_fragment(&sc->sc_if, dst_if, &eh, mc);
 		else
 			switch_ifenqueue(sc, dst_if, mc,
 			    (swpo->swpo_flags & IFBIF_LOCAL));
@@ -742,6 +774,7 @@ switch_ifenqueue(struct switch_softc *sc, struct ifnet *ifp,
 	/* Loop prevention. */
 	m->m_flags |= M_PROTO1;
 
+	KASSERT(m->m_flags & M_PKTHDR);
 	len = m->m_pkthdr.len;
 
 	if (local) {
@@ -767,7 +800,7 @@ switch_port_ifb_start(struct ifnet *ifp)
 	struct mbuf_list	 ml = MBUF_LIST_INITIALIZER();
 
 	for (;;) {
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			return;
 
@@ -1476,34 +1509,39 @@ switch_flow_classifier_dump(struct switch_softc *sc,
 int
 switch_mtap(caddr_t arg, struct mbuf *m, int dir, uint64_t datapath_id)
 {
+#if NBPFILTER > 0
 	struct dlt_openflow_hdr	 of;
 
 	of.of_datapath_id = htobe64(datapath_id);
 	of.of_direction = htonl(dir == BPF_DIRECTION_IN ?
 	    DLT_OPENFLOW_TO_SWITCH : DLT_OPENFLOW_TO_CONTROLLER);
 
-	return (bpf_mtap_hdr(arg, (caddr_t)&of, sizeof(of), m, dir, NULL));
+	return (bpf_mtap_hdr(arg, (caddr_t)&of, sizeof(of), m, dir));
+#else
+	return (0);
+#endif
 }
 
 int
 ofp_split_mbuf(struct mbuf *m, struct mbuf **mtail)
 {
-	struct ofp_header	*oh;
 	uint16_t		 ohlen;
 
 	*mtail = NULL;
 
  again:
 	/* We need more data. */
-	if (m->m_pkthdr.len < sizeof(*oh))
+	KASSERT(m->m_flags & M_PKTHDR);
+	if (m->m_pkthdr.len < sizeof(struct ofp_header))
 		return (-1);
 
-	oh = mtod(m, struct ofp_header *);
-	ohlen = ntohs(oh->oh_length);
+	m_copydata(m, offsetof(struct ofp_header, oh_length), sizeof(ohlen),
+	    (caddr_t)&ohlen);
+	ohlen = ntohs(ohlen);
 
 	/* We got an invalid packet header, skip it. */
-	if (ohlen < sizeof(*oh)) {
-		m_adj(m, sizeof(*oh));
+	if (ohlen < sizeof(struct ofp_header)) {
+		m_adj(m, sizeof(struct ofp_header));
 		goto again;
 	}
 

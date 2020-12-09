@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.42 2018/07/03 01:34:43 mortimer Exp $	*/
+/*	$OpenBSD: config.c,v 1.51 2019/12/18 10:00:39 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -60,6 +60,7 @@ config_default(void)
 	conf->sc_maxsize = DEFAULT_MAX_BODY_SIZE;
 	conf->sc_subaddressing_delim = SUBADDRESSING_DELIMITER;
 	conf->sc_ttl = SMTPD_QUEUE_EXPIRY;
+	conf->sc_srs_ttl = SMTPD_QUEUE_EXPIRY / 86400;
 
 	conf->sc_mta_max_deferred = 100;
 	conf->sc_scheduler_max_inflight = 5000;
@@ -88,7 +89,9 @@ config_default(void)
 	conf->sc_ssl_dict = calloc(1, sizeof(*conf->sc_ssl_dict));
 	conf->sc_limits_dict = calloc(1, sizeof(*conf->sc_limits_dict));
 	conf->sc_mda_wrappers = calloc(1, sizeof(*conf->sc_mda_wrappers));
+	conf->sc_filter_processes_dict = calloc(1, sizeof(*conf->sc_filter_processes_dict));
 	conf->sc_dispatcher_bounce = calloc(1, sizeof(*conf->sc_dispatcher_bounce));
+	conf->sc_filters_dict = calloc(1, sizeof(*conf->sc_filters_dict));
 	limits = calloc(1, sizeof(*limits));
 
 	if (conf->sc_tables_dict == NULL	||
@@ -100,7 +103,9 @@ config_default(void)
 	    conf->sc_ssl_dict == NULL		||
 	    conf->sc_limits_dict == NULL        ||
 	    conf->sc_mda_wrappers == NULL	||
+	    conf->sc_filter_processes_dict == NULL	||
 	    conf->sc_dispatcher_bounce == NULL	||
+	    conf->sc_filters_dict == NULL	||
 	    limits == NULL)
 		goto error;
 
@@ -111,6 +116,7 @@ config_default(void)
 	dict_init(conf->sc_ssl_dict);
 	dict_init(conf->sc_tables_dict);
 	dict_init(conf->sc_limits_dict);
+	dict_init(conf->sc_filter_processes_dict);
 
 	limit_mta_set_defaults(limits);
 
@@ -118,6 +124,7 @@ config_default(void)
 
 	TAILQ_INIT(conf->sc_listeners);
 	TAILQ_INIT(conf->sc_rules);
+
 
 	/* bounce dispatcher */
 	conf->sc_dispatcher_bounce->type = DISPATCHER_BOUNCE;
@@ -127,15 +134,14 @@ config_default(void)
 	 */
 	set_local(conf, conf->sc_hostname);
 
-	t = table_create(conf, "static", "<anydestination>", NULL, NULL);
-	t->t_type = T_LIST;
+	t = table_create(conf, "static", "<anydestination>", NULL);
 	table_add(t, "*", NULL);
 
 	hostname[strcspn(hostname, ".")] = '\0';
 	if (strcmp(conf->sc_hostname, hostname) != 0)
 		table_add(t, hostname, NULL);
 
-	table_create(conf, "getpwnam", "<getpwnam>", NULL, NULL);
+	table_create(conf, "getpwnam", "<getpwnam>", NULL);
 
 	return conf;
 
@@ -149,7 +155,9 @@ error:
 	free(conf->sc_ssl_dict);
 	free(conf->sc_limits_dict);
 	free(conf->sc_mda_wrappers);
+	free(conf->sc_filter_processes_dict);
 	free(conf->sc_dispatcher_bounce);
+	free(conf->sc_filters_dict);
 	free(limits);
 	free(conf);
 	return NULL;
@@ -160,8 +168,7 @@ set_local(struct smtpd *conf, const char *hostname)
 {
 	struct table	*t;
 
-	t = table_create(conf, "static", "<localnames>", NULL, NULL);
-	t->t_type = T_LIST;
+	t = table_create(conf, "static", "<localnames>", NULL);
 	table_add(t, "localhost", NULL);
 	table_add(t, hostname, NULL);
 
@@ -178,7 +185,7 @@ set_localaddrs(struct smtpd *conf, struct table *localnames)
 	struct table		*t;
 	char buf[NI_MAXHOST + 5];
 
-	t = table_create(conf, "static", "<anyhost>", NULL, NULL);
+	t = table_create(conf, "static", "<anyhost>", NULL);
 	table_add(t, "local", NULL);
 	table_add(t, "0.0.0.0/0", NULL);
 	table_add(t, "::/0", NULL);
@@ -186,7 +193,7 @@ set_localaddrs(struct smtpd *conf, struct table *localnames)
 	if (getifaddrs(&ifap) == -1)
 		fatal("getifaddrs");
 
-	t = table_create(conf, "static", "<localhost>", NULL, NULL);
+	t = table_create(conf, "static", "<localhost>", NULL);
 	table_add(t, "local", NULL);
 
 	for (p = ifap; p != NULL; p = p->ifa_next) {

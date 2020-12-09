@@ -1,4 +1,4 @@
-/*	$OpenBSD: lapic.c,v 1.52 2018/07/27 21:11:31 kettenis Exp $	*/
+/*	$OpenBSD: lapic.c,v 1.57 2020/09/06 20:50:00 cheloha Exp $	*/
 /* $NetBSD: lapic.c,v 1.2 2003/05/08 01:04:35 fvdl Exp $ */
 
 /*-
@@ -235,7 +235,6 @@ lapic_map(paddr_t lapic_base)
 	 * Meltdown (needed in the interrupt stub to acknowledge the
 	 * incoming interrupt). On CPUs unaffected by Meltdown,
 	 * pmap_enter_special is a no-op.
-	 * XXX - need to map this PG_N
 	 */
 	pmap_enter_special(va, lapic_base, PROT_READ | PROT_WRITE);
 	DPRINTF("%s: entered lapic page va 0x%llx pa 0x%llx\n", __func__,
@@ -361,11 +360,17 @@ lapic_boot_init(paddr_t lapic_base)
 	idt_allocmap[LAPIC_IPI_VECTOR] = 1;
 	idt_vec_set(LAPIC_IPI_VECTOR, Xintr_lapic_ipi);
 	idt_allocmap[LAPIC_IPI_INVLTLB] = 1;
-	idt_vec_set(LAPIC_IPI_INVLTLB, Xipi_invltlb);
 	idt_allocmap[LAPIC_IPI_INVLPG] = 1;
-	idt_vec_set(LAPIC_IPI_INVLPG, Xipi_invlpg);
 	idt_allocmap[LAPIC_IPI_INVLRANGE] = 1;
-	idt_vec_set(LAPIC_IPI_INVLRANGE, Xipi_invlrange);
+	if (!pmap_use_pcid) {
+		idt_vec_set(LAPIC_IPI_INVLTLB, Xipi_invltlb);
+		idt_vec_set(LAPIC_IPI_INVLPG, Xipi_invlpg);
+		idt_vec_set(LAPIC_IPI_INVLRANGE, Xipi_invlrange);
+	} else {
+		idt_vec_set(LAPIC_IPI_INVLTLB, Xipi_invltlb_pcid);
+		idt_vec_set(LAPIC_IPI_INVLPG, Xipi_invlpg_pcid);
+		idt_vec_set(LAPIC_IPI_INVLRANGE, Xipi_invlrange_pcid);
+	}
 #endif
 	idt_allocmap[LAPIC_SPURIOUS_VECTOR] = 1;
 	idt_vec_set(LAPIC_SPURIOUS_VECTOR, Xintrspurious);
@@ -403,10 +408,40 @@ u_int32_t lapic_tval;
 /*
  * this gets us up to a 4GHz busclock....
  */
-u_int32_t lapic_per_second;
+u_int32_t lapic_per_second = 0;
 u_int32_t lapic_frac_usec_per_cycle;
 u_int64_t lapic_frac_cycle_per_usec;
 u_int32_t lapic_delaytab[26];
+
+void lapic_timer_oneshot(uint32_t, uint32_t);
+void lapic_timer_periodic(uint32_t, uint32_t);
+
+/*
+ * Start the local apic countdown timer.
+ *
+ * First set the mode, mask, and vector.  Then set the
+ * divisor.  Last, set the cycle count: this restarts
+ * the countdown.
+ */
+static inline void
+lapic_timer_start(uint32_t mode, uint32_t mask, uint32_t cycles)
+{
+	lapic_writereg(LAPIC_LVTT, mode | mask | LAPIC_TIMER_VECTOR);
+	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
+	lapic_writereg(LAPIC_ICR_TIMER, cycles);
+}
+
+void
+lapic_timer_oneshot(uint32_t mask, uint32_t cycles)
+{
+	lapic_timer_start(LAPIC_LVTT_TM_ONESHOT, mask, cycles);
+}
+
+void
+lapic_timer_periodic(uint32_t mask, uint32_t cycles)
+{
+	lapic_timer_start(LAPIC_LVTT_TM_PERIODIC, mask, cycles);
+}
 
 void
 lapic_clockintr(void *arg, struct intrframe frame)
@@ -425,17 +460,7 @@ lapic_clockintr(void *arg, struct intrframe frame)
 void
 lapic_startclock(void)
 {
-	/*
-	 * Start local apic countdown timer running, in repeated mode.
-	 *
-	 * Mask the clock interrupt and set mode,
-	 * then set divisor,
-	 * then unmask and set the vector.
-	 */
-	lapic_writereg(LAPIC_LVTT, LAPIC_LVTT_TM|LAPIC_LVTT_M);
-	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
-	lapic_writereg(LAPIC_ICR_TIMER, lapic_tval);
-	lapic_writereg(LAPIC_LVTT, LAPIC_LVTT_TM|LAPIC_TIMER_VECTOR);
+	lapic_timer_periodic(0, lapic_tval);
 }
 
 void
@@ -464,6 +489,8 @@ wait_next_cycle(void)
 	}
 }
 
+extern void tsc_delay(int);
+
 /*
  * Calibrate the local apic count-down timer (which is running at
  * bus-clock speed) vs. the i8254 counter/timer (which is running at
@@ -483,6 +510,9 @@ lapic_calibrate_timer(struct cpu_info *ci)
 	u_long s;
 	int i;
 
+	if (lapic_per_second)
+		goto skip_calibration;
+
 	if (mp_verbose)
 		printf("%s: calibrating local timer\n", ci->ci_dev->dv_xname);
 
@@ -490,9 +520,7 @@ lapic_calibrate_timer(struct cpu_info *ci)
 	 * Configure timer to one-shot, interrupt masked,
 	 * large positive number.
 	 */
-	lapic_writereg(LAPIC_LVTT, LAPIC_LVTT_M);
-	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
-	lapic_writereg(LAPIC_ICR_TIMER, 0x80000000);
+	lapic_timer_oneshot(LAPIC_LVTT_M, 0x80000000);
 
 	s = intr_disable();
 
@@ -520,8 +548,9 @@ lapic_calibrate_timer(struct cpu_info *ci)
 
 	lapic_per_second = tmp;
 
-	printf("%s: apic clock running at %lldMHz\n",
-	    ci->ci_dev->dv_xname, tmp / (1000 * 1000));
+skip_calibration:
+	printf("%s: apic clock running at %dMHz\n",
+	    ci->ci_dev->dv_xname, lapic_per_second / (1000 * 1000));
 
 	if (lapic_per_second != 0) {
 		/*
@@ -531,10 +560,7 @@ lapic_calibrate_timer(struct cpu_info *ci)
 		lapic_tval = (lapic_per_second * 2) / hz;
 		lapic_tval = (lapic_tval / 2) + (lapic_tval & 0x1);
 
-		lapic_writereg(LAPIC_LVTT, LAPIC_LVTT_TM | LAPIC_LVTT_M |
-		    LAPIC_TIMER_VECTOR);
-		lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
-		lapic_writereg(LAPIC_ICR_TIMER, lapic_tval);
+		lapic_timer_periodic(LAPIC_LVTT_M, lapic_tval);
 
 		/*
 		 * Compute fixed-point ratios between cycles and
@@ -560,7 +586,8 @@ lapic_calibrate_timer(struct cpu_info *ci)
 		 * Now that the timer's calibrated, use the apic timer routines
 		 * for all our timing needs..
 		 */
-		delay_func = lapic_delay;
+		if (delay_func != tsc_delay)
+			delay_func = lapic_delay;
 		initclock_func = lapic_initclocks;
 	}
 }

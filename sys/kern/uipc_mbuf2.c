@@ -1,11 +1,11 @@
-/*	$OpenBSD: uipc_mbuf2.c,v 1.42 2015/11/13 10:12:39 mpi Exp $	*/
+/*	$OpenBSD: uipc_mbuf2.c,v 1.44 2019/07/16 21:41:37 bluhm Exp $	*/
 /*	$KAME: uipc_mbuf2.c,v 1.29 2001/02/14 13:42:10 itojun Exp $	*/
 /*	$NetBSD: uipc_mbuf.c,v 1.40 1999/04/01 00:23:25 thorpej Exp $	*/
 
 /*
  * Copyright (C) 1999 WIDE Project.
  * All rights reserved.
- * 
+ *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
  * are met:
@@ -17,7 +17,7 @@
  * 3. Neither the name of the project nor the names of its contributors
  *    may be used to endorse or promote products derived from this software
  *    without specific prior written permission.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
@@ -81,7 +81,7 @@ static struct mbuf *m_dup1(struct mbuf *, int, int, int);
  *
  * on error return (NULL return value), original "m" will be freed.
  *
- * XXX M_TRAILINGSPACE/M_LEADINGSPACE on shared cluster (sharedcluster)
+ * XXX m_trailingspace/m_leadingspace on shared cluster (sharedcluster)
  */
 struct mbuf *
 m_pulldown(struct mbuf *m, int off, int len, int *offp)
@@ -156,14 +156,14 @@ m_pulldown(struct mbuf *m, int off, int len, int *offp)
 	 * easy cases first.
 	 * we need to use m_copydata() to get data from <n->m_next, 0>.
 	 */
-	if ((off == 0 || offp) && M_TRAILINGSPACE(n) >= tlen &&
+	if ((off == 0 || offp) && m_trailingspace(n) >= tlen &&
 	    !sharedcluster) {
 		m_copydata(n->m_next, 0, tlen, mtod(n, caddr_t) + n->m_len);
 		n->m_len += tlen;
 		m_adj(n->m_next, tlen);
 		goto ok;
 	}
-	if ((off == 0 || offp) && M_LEADINGSPACE(n->m_next) >= hlen &&
+	if ((off == 0 || offp) && m_leadingspace(n->m_next) >= hlen &&
 	    !sharedcluster && n->m_next->m_len >= tlen) {
 		n->m_next->m_data -= hlen;
 		n->m_next->m_len += hlen;

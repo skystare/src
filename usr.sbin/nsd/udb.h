@@ -52,9 +52,9 @@ typedef struct udb_alloc udb_alloc;
 typedef uint64_t udb_void;
 
 /** convert relptr to usable pointer */
-#define UDB_REL(base, relptr) ((base) + (relptr))
+#define UDB_REL(base, relptr) ((void*)((char*)(base) + (relptr)))
 /** from system pointer to relative pointer */
-#define UDB_SYSTOREL(base, ptr) ((udb_void)((void*)(ptr) - (base)))
+#define UDB_SYSTOREL(base, ptr) ((udb_void)((char*)(ptr) - (char*)(base)))
 
 /** MAX 2**x exponent of alloced chunks, for 1Mbytes.  The smallest
  * chunk is 16bytes (8preamble+8data), so 0-3 is unused. */
@@ -165,7 +165,9 @@ struct udb_glob_d {
 	volatile uint64_t rb_size;
 	/** segment of move rollback, for an XL chunk that overlaps. */
 	volatile uint64_t rb_seg;
-	/** linked list for content-listing, 0 if empty */
+	/** linked list for content-listing, 0 if empty;
+	 * this pointer is unused; and could be removed if the database
+	 * format is modified or updated. */
 	udb_rel_ptr content_list;
 	/** user global data pointer */
 	udb_rel_ptr user_global;

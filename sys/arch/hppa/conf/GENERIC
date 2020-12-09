@@ -1,4 +1,4 @@
-#	$OpenBSD: GENERIC,v 1.177 2018/08/22 15:38:46 mpi Exp $
+#	$OpenBSD: GENERIC,v 1.180 2019/12/17 13:08:55 reyk Exp $
 #
 # For further information on compiling OpenBSD kernels, see the config(8)
 # man page.
@@ -78,9 +78,8 @@ lpt0	at ssio?
 # CardBus bus support
 cbb*		at pci?
 cardslot*	at cbb?
-option		CARDBUS_DEBUG,CARDSLOT_DEBUG,CARDBUS_MAP_DEBUG
 cardbus*	at cardslot?
-option		PCMCIADEBUG,PCMCIAVERBOSE
+option		PCMCIAVERBOSE
 pcmcia*		at cardslot?
 
 # PCI USB Controllers
@@ -111,6 +110,7 @@ wsmouse* at ums? mux 0
 ukbd*	at uhidev?		# USB keyboard
 wskbd*	at ukbd? mux 1
 uhid*	at uhidev?		# USB generic HID support
+fido*	at uhidev?		# FIDO/U2F security key support
 upd*	at uhidev?		# USB Power Devices sensors
 aue*	at uhub?		# ADMtek AN986 Pegasus Ethernet
 url*	at uhub?		# Realtek RTL8150L based adapters
@@ -134,6 +134,8 @@ uslcom*	at uhub?		# Silicon Laboratories CP210x serial
 ucom*	at uslcom?
 uscom*	at uhub?		# Simple USB serial adapters
 ucom*	at uscom?
+ucrcom*	at uhub?		# Chromebook serial
+ucom*	at ucrcom?
 uipaq*	at uhub?		# iPAQ serial adapter
 ucom*	at uipaq?
 umsm*	at uhub?		# Qualcomm MSM EVDO

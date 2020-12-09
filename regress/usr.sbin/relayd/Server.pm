@@ -1,4 +1,4 @@
-#	$OpenBSD: Server.pm,v 1.12 2017/01/31 18:02:54 bluhm Exp $
+#	$OpenBSD: Server.pm,v 1.14 2020/11/07 16:02:20 bluhm Exp $
 
 # Copyright (c) 2010-2015 Alexander Bluhm <bluhm@openbsd.org>
 #
@@ -21,7 +21,7 @@ package Server;
 use parent 'Proc';
 use Carp;
 use Config;
-use Socket;
+use Socket qw(:DEFAULT IPPROTO_TCP TCP_NODELAY);
 use Socket6;
 use IO::Socket;
 use IO::Socket::INET6;
@@ -59,7 +59,7 @@ sub new {
 		    or die ref($self), " set SO_RCVBUF failed: $!";
 	}
 	my $packstr = $Config{longsize} == 8 ? 'ql!' :
-	    $Config{byteorder} == 1234 ? 'lxxxxl!' : 'xxxxll!';
+	    $Config{byteorder} == 1234 ? 'lxxxxl!xxxx' : 'xxxxll!';
 	if ($self->{sndtimeo}) {
 		setsockopt($ls, SOL_SOCKET, SO_SNDTIMEO,
 		    pack($packstr, $self->{sndtimeo}, 0))
@@ -70,6 +70,8 @@ sub new {
 		    pack($packstr, $self->{rcvtimeo}, 0))
 		    or die ref($self), " set SO_RCVTIMEO failed: $!";
 	}
+	setsockopt($ls, IPPROTO_TCP, TCP_NODELAY, pack('i', 1))
+	    or die ref($self), " set TCP_NODELAY failed: $!";
 	listen($ls, 1)
 	    or die ref($self), " socket listen failed: $!";
 	my $log = $self->{log};

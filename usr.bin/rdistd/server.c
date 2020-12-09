@@ -1,4 +1,4 @@
-/*	$OpenBSD: server.c,v 1.44 2018/09/09 13:53:11 millert Exp $	*/
+/*	$OpenBSD: server.c,v 1.47 2019/06/28 13:35:03 deraadt Exp $	*/
 
 /*
  * Copyright (c) 1983 Regents of the University of California.
@@ -131,7 +131,7 @@ setownership(char *file, int fd, uid_t uid, gid_t gid, int islink)
 		status = fchownat(AT_FDCWD, file, uid, gid,
 		    AT_SYMLINK_NOFOLLOW);
 
-	if (status < 0) {
+	if (status == -1) {
 		if (uid == (uid_t)-1)
 			message(MT_NOTICE, "%s: chgrp %d failed: %s",
 				target, gid, SYSERR);
@@ -161,10 +161,10 @@ setfilemode(char *file, int fd, int mode, int islink)
 	if (fd != -1 && !islink)
 		status = fchmod(fd, mode);
 
-	if (status < 0 && !islink)
+	if (status == -1 && !islink)
 		status = chmod(file, mode);
 
-	if (status < 0) {
+	if (status == -1) {
 		message(MT_NOTICE, "%s: chmod failed: %s", target, SYSERR);
 		return(-1);
 	}
@@ -177,7 +177,6 @@ setfilemode(char *file, int fd, int mode, int islink)
 static int
 fchog(int fd, char *file, char *owner, char *group, int mode)
 {
-	static struct group *gr = NULL;
 	int i;
 	struct stat st;
 	uid_t uid;
@@ -189,9 +188,7 @@ fchog(int fd, char *file, char *owner, char *group, int mode)
 		if (*owner == ':') {
 			uid = (uid_t) atoi(owner + 1);
 		} else if (strcmp(owner, locuser) != 0) {
-			struct passwd *pw;
-
-			if ((pw = getpwnam(owner)) == NULL) {
+			if (uid_from_user(owner, &uid) == -1) {
 				if (mode != -1 && IS_ON(mode, S_ISUID)) {
 					message(MT_NOTICE,
 			      "%s: unknown login name \"%s\", clearing setuid",
@@ -202,8 +199,7 @@ fchog(int fd, char *file, char *owner, char *group, int mode)
 					message(MT_NOTICE,
 					"%s: unknown login name \"%s\"",
 						target, owner);
-			} else
-				uid = pw->pw_uid;
+			}
 		} else {
 			uid = userid;
 			primegid = groupid;
@@ -213,8 +209,6 @@ fchog(int fd, char *file, char *owner, char *group, int mode)
 			goto ok;
 		}
 	} else {	/* not root, setuid only if user==owner */
-		struct passwd *lupw;
-
 		if (mode != -1) {
 			if (IS_ON(mode, S_ISUID) && 
 			    strcmp(locuser, owner) != 0)
@@ -222,35 +216,29 @@ fchog(int fd, char *file, char *owner, char *group, int mode)
 			if (mode)
 				mode &= ~S_ISVTX; /* and strip sticky too */
 		}
-
-		if ((lupw = getpwnam(locuser)) != NULL)
-			primegid = lupw->pw_gid;
+		primegid = groupid;
 	}
 
 	gid = (gid_t)-1;
-	if (gr == NULL || strcmp(group, gr->gr_name) != 0) {
-		if ((*group == ':' && 
-		     (getgrgid(gid = atoi(group + 1)) == NULL))
-		    || ((gr = (struct group *)getgrnam(group)) == NULL)) {
-			if (mode != -1 && IS_ON(mode, S_ISGID)) {
-				message(MT_NOTICE, 
-				"%s: unknown group \"%s\", clearing setgid",
-					target, group);
-				mode &= ~S_ISGID;
-			} else
-				message(MT_NOTICE, 
-					"%s: unknown group \"%s\"",
-					target, group);
+	if (*group == ':') {
+		gid = (gid_t) atoi(group + 1);
+	} else if (gid_from_group(group, &gid) == -1) {
+		if (mode != -1 && IS_ON(mode, S_ISGID)) {
+			message(MT_NOTICE, 
+			"%s: unknown group \"%s\", clearing setgid",
+				target, group);
+			mode &= ~S_ISGID;
 		} else
-			gid = gr->gr_gid;
-	} else
-		gid = gr->gr_gid;
+			message(MT_NOTICE, 
+				"%s: unknown group \"%s\"",
+				target, group);
+	}
 
 	if (userid && gid != (gid_t)-1 && gid != primegid) {
-		if (gr)
-			for (i = 0; gr->gr_mem[i] != NULL; i++)
-				if (strcmp(locuser, gr->gr_mem[i]) == 0)
-					goto ok;
+		for (i = 0; i < gidsetlen; i++) {
+			if (gid == gidset[i])
+				goto ok;
+		}
 		if (mode != -1 && IS_ON(mode, S_ISGID)) {
 			message(MT_NOTICE, 
 				"%s: user %s not in group %s, clearing setgid",
@@ -308,7 +296,7 @@ removefile(struct stat *statb, int silent)
 	case S_IFBLK:
 	case S_IFSOCK:
 	case S_IFIFO:
-		if (unlink(target) < 0) {
+		if (unlink(target) == -1) {
 			if (errno == ETXTBSY) {
 				if (!silent)
 					message(MT_REMOTE|MT_NOTICE, 
@@ -356,7 +344,7 @@ removefile(struct stat *statb, int silent)
 		while ((*ptarget++ = *cp++) != '\0')
 			continue;
 		ptarget--;
-		if (lstat(target, &stb) < 0) {
+		if (lstat(target, &stb) == -1) {
 			if (!silent)
 				message(MT_REMOTE|MT_WARNING,
 					"%s: lstat failed: %s", 
@@ -373,7 +361,7 @@ removefile(struct stat *statb, int silent)
 	if (failures)
 		return(-1);
 
-	if (rmdir(target) < 0) {
+	if (rmdir(target) == -1) {
 		error("%s: rmdir failed: %s", target, SYSERR);
 		return(-1);
 	}
@@ -437,7 +425,7 @@ doclean(char *cp)
 		while ((*ptarget++ = *cp++) != '\0')
 			continue;
 		ptarget--;
-		if (lstat(target, &stb) < 0) {
+		if (lstat(target, &stb) == -1) {
 			message(MT_REMOTE|MT_WARNING, "%s: lstat failed: %s", 
 				target, SYSERR);
 			continue;
@@ -615,7 +603,7 @@ query(char *xname)
 	 * If stbvalid is false, "stb" is not valid because the stat()
 	 * by is_*_mounted() either failed or does not match "target".
 	 */
-	if (!stbvalid && lstat(target, &stb) < 0) {
+	if (!stbvalid && lstat(target, &stb) == -1) {
 		if (errno == ENOENT)
 			(void) sendcmd(QC_NO, NULL);
 		else
@@ -661,7 +649,7 @@ chkparent(char *name, opt_t opts)
 
 	*cp = CNULL;
 
-	if (lstat(name, &stb) < 0) {
+	if (lstat(name, &stb) == -1) {
 		if (errno == ENOENT && chkparent(name, opts) >= 0) {
 			if (mkdir(name, 0777 & ~oumask) == 0) {
 				message(MT_NOTICE, "%s: mkdir", name);
@@ -752,7 +740,7 @@ recvfile(char *new, opt_t opts, int mode, char *owner, char *group,
 	/*
 	 * Create temporary file
 	 */
-	if (chkparent(new, opts) < 0 || (f = mkstemp(new)) < 0) {
+	if (chkparent(new, opts) < 0 || (f = mkstemp(new)) == -1) {
 		error("%s: create failed: %s", new, SYSERR);
 		return;
 	}
@@ -898,7 +886,7 @@ recvfile(char *new, opt_t opts, int mode, char *owner, char *group,
 	/*
 	 * Install new (temporary) file as the actual target
 	 */
-	if (rename(new, target) < 0) {
+	if (rename(new, target) == -1) {
 		static const char fmt[] = "%s -> %s: rename failed: %s";
 		struct stat stb;
 		/*
@@ -910,10 +898,10 @@ recvfile(char *new, opt_t opts, int mode, char *owner, char *group,
 			/* Save the target */
 			if ((savefile = savetarget(target, opts)) != NULL) {
 				/* Retry installing new file as target */
-				if (rename(new, target) < 0) {
+				if (rename(new, target) == -1) {
 					error(fmt, new, target, SYSERR);
 					/* Try to put back save file */
-					if (rename(savefile, target) < 0)
+					if (rename(savefile, target) == -1)
 						error(fmt,
 						      savefile, target, SYSERR);
 					(void) unlink(new);
@@ -980,7 +968,7 @@ recvdir(opt_t opts, int mode, char *owner, char *group)
 				message(MT_NOTICE, "%s: need to remove",
 					target);
 			else {
-				if (unlink(target) < 0) {
+				if (unlink(target) == -1) {
 					error("%s: remove failed: %s",
 					      target, SYSERR);
 					return;
@@ -1161,7 +1149,7 @@ recvlink(char *new, opt_t opts, int mode, off_t size)
 	 * Make new symlink using a temporary name
 	 */
 	if (chkparent(new, opts) < 0 || mktemp(new) == NULL ||
-	    symlink(dbuf, new) < 0) {
+	    symlink(dbuf, new) == -1) {
 		error("%s -> %s: symlink failed: %s", new, dbuf, SYSERR);
 		return;
 	}
@@ -1187,7 +1175,7 @@ recvlink(char *new, opt_t opts, int mode, off_t size)
 	/*
 	 * Install link as the target
 	 */
-	if (rename(new, target) < 0) {
+	if (rename(new, target) == -1) {
 		error("%s -> %s: symlink rename failed: %s",
 		      new, target, SYSERR);
 		(void) unlink(new);
@@ -1271,11 +1259,11 @@ hardlink(char *cmd)
 		error("%s: no parent: %s ", target, SYSERR);
 		return;
 	}
-	if (exists && (unlink(target) < 0)) {
+	if (exists && (unlink(target) == -1)) {
 		error("%s: unlink failed: %s", target, SYSERR);
 		return;
 	}
-	if (linkat(AT_FDCWD, expbuf, AT_FDCWD, target, 0) < 0) {
+	if (linkat(AT_FDCWD, expbuf, AT_FDCWD, target, 0) == -1) {
 		error("%s: cannot link to %s: %s", target, oldname, SYSERR);
 		return;
 	}

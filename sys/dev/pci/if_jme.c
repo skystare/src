@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_jme.c,v 1.50 2017/09/08 05:36:52 deraadt Exp $	*/
+/*	$OpenBSD: if_jme.c,v 1.54 2020/07/10 13:26:38 patrick Exp $	*/
 /*-
  * Copyright (c) 2008, Pyun YongHyeon <yongari@FreeBSD.org>
  * All rights reserved.
@@ -233,7 +233,7 @@ jme_miibus_statchg(struct device *dev)
 	 * Disabling Rx/Tx MACs have a side-effect of resetting
 	 * JME_TXNDA/JME_RXNDA register to the first address of
 	 * Tx/Rx descriptor address. So driver should reset its
-	 * internal procucer/consumer pointer and reclaim any
+	 * internal producer/consumer pointer and reclaim any
 	 * allocated resources.  Note, just saving the value of
 	 * JME_TXNDA and JME_RXNDA registers before stopping MAC
 	 * and restoring JME_TXNDA/JME_RXNDA register is not
@@ -277,7 +277,7 @@ jme_miibus_statchg(struct device *dev)
 
 	/*
 	 * Reuse configured Rx descriptors and reset
-	 * procuder/consumer index.
+	 * producer/consumer index.
 	 */
 	sc->jme_cdata.jme_rx_cons = 0;
 
@@ -550,7 +550,7 @@ jme_attach(struct device *parent, struct device *self, void *aux)
 	 * JMC250 supports both memory mapped and I/O register space
 	 * access.  Because I/O register access should use different
 	 * BARs to access registers it's waste of time to use I/O
-	 * register spce access.  JMC250 uses 16K to map entire memory
+	 * register space access.  JMC250 uses 16K to map entire memory
 	 * space.
 	 */
 
@@ -662,7 +662,7 @@ jme_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_ioctl = jme_ioctl;
 	ifp->if_start = jme_start;
 	ifp->if_watchdog = jme_watchdog;
-	IFQ_SET_MAXLEN(&ifp->if_snd, JME_TX_RING_CNT - 1);
+	ifq_set_maxlen(&ifp->if_snd, JME_TX_RING_CNT - 1);
 	strlcpy(ifp->if_xname, sc->sc_dev.dv_xname, IFNAMSIZ);
 
 	ifp->if_capabilities = IFCAP_VLAN_MTU | IFCAP_CSUM_IPv4 |
@@ -984,7 +984,7 @@ jme_dma_free(struct jme_softc *sc)
 /*
  * Unlike other ethernet controllers, JMC250 requires
  * explicit resetting link speed to 10/100Mbps as gigabit
- * link will cunsume more power than 375mA.
+ * link will consume more power than 375mA.
  * Note, we reset the link speed to 10/100Mbps with
  * auto-negotiation but we don't know whether that operation
  * would succeed or not as we have no control after powering
@@ -1169,7 +1169,7 @@ jme_encap(struct jme_softc *sc, struct mbuf *m)
 	sc->jme_cdata.jme_tx_prod = prod;
 	/*
 	 * Finally request interrupt and give the first descriptor
-	 * owenership to hardware.
+	 * ownership to hardware.
 	 */
 	desc = txd->tx_desc;
 	desc->flags |= htole32(JME_TD_OWN | JME_TD_INTR);
@@ -1205,7 +1205,7 @@ jme_start(struct ifnet *ifp)
 		return;
 	if ((sc->jme_flags & JME_FLAG_LINK) == 0)
 		return;  
-	if (IFQ_IS_EMPTY(&ifp->if_snd))
+	if (ifq_empty(&ifp->if_snd))
 		return;
 
 	for (;;) {
@@ -1219,7 +1219,7 @@ jme_start(struct ifnet *ifp)
 			break;
 		}
 
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 
@@ -1534,7 +1534,7 @@ jme_txeof(struct jme_softc *sc)
 		/*
 		 * Only the first descriptor of multi-descriptor
 		 * transmission is updated so driver have to skip entire
-		 * chained buffers for the transmiited frame. In other
+		 * chained buffers for the transmitted frame. In other
 		 * words, JME_TD_OWN bit is valid only at the first
 		 * descriptor of a multi-descriptor transmission.
 		 */
@@ -1738,7 +1738,7 @@ jme_rxeof(struct jme_softc *sc)
 		pktlen = JME_RX_BYTES(letoh32(desc->buflen));
 		if (nsegs != howmany(pktlen, MCLBYTES)) {
 			printf("%s: RX fragment count(%d) "
-			    "and packet size(%d) mismach\n",
+			    "and packet size(%d) mismatch\n",
 			     sc->sc_dev.dv_xname, nsegs, pktlen);
 			break;
 		}
@@ -2110,7 +2110,7 @@ jme_stop_rx(struct jme_softc *sc)
 			break;
 	}
 	if (i == 0)
-		printf("%s: stopping recevier timeout!\n", sc->sc_dev.dv_xname);
+		printf("%s: stopping receiver timeout!\n", sc->sc_dev.dv_xname);
 }
 
 void

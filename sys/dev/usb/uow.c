@@ -1,4 +1,4 @@
-/*	$OpenBSD: uow.c,v 1.35 2016/11/06 12:58:01 mpi Exp $	*/
+/*	$OpenBSD: uow.c,v 1.37 2020/07/31 10:49:33 mglocker Exp $	*/
 
 /*
  * Copyright (c) 2006 Alexander Yurchenko <grange@openbsd.org>
@@ -245,18 +245,12 @@ uow_detach(struct device *self, int flags)
 
 	s = splusb();
 
-	if (sc->sc_ph_ibulk != NULL) {
-		usbd_abort_pipe(sc->sc_ph_ibulk);
+	if (sc->sc_ph_ibulk != NULL)
 		usbd_close_pipe(sc->sc_ph_ibulk);
-	}
-	if (sc->sc_ph_obulk != NULL) {
-		usbd_abort_pipe(sc->sc_ph_obulk);
+	if (sc->sc_ph_obulk != NULL)
 		usbd_close_pipe(sc->sc_ph_obulk);
-	}
-	if (sc->sc_ph_intr != NULL) {
-		usbd_abort_pipe(sc->sc_ph_intr);
+	if (sc->sc_ph_intr != NULL)
 		usbd_close_pipe(sc->sc_ph_intr);
-	}
 
 	if (sc->sc_xfer_in != NULL)
 		usbd_free_xfer(sc->sc_xfer_in);
@@ -424,8 +418,8 @@ uow_cmd(struct uow_softc *sc, int type, int cmd, int param)
 	}
 
 again:
-	if (tsleep(sc->sc_regs, PRIBIO, "uowcmd",
-	    (UOW_TIMEOUT * hz) / 1000) != 0) {
+	if (tsleep_nsec(sc->sc_regs, PRIBIO, "uowcmd",
+	    MSEC_TO_NSEC(UOW_TIMEOUT)) != 0) {
 		printf("%s: cmd timeout, type 0x%02x, cmd 0x%04x, "
 		    "param 0x%04x\n", sc->sc_dev.dv_xname, type, cmd,
 		    param);

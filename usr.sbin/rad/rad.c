@@ -1,4 +1,4 @@
-/*	$OpenBSD: rad.c,v 1.16 2018/09/16 08:53:02 bluhm Exp $	*/
+/*	$OpenBSD: rad.c,v 1.24 2020/12/01 17:31:37 florian Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -36,6 +36,7 @@
 #include <err.h>
 #include <errno.h>
 #include <event.h>
+#include <fcntl.h>
 #include <imsg.h>
 #include <netdb.h>
 #include <pwd.h>
@@ -60,6 +61,7 @@ static pid_t	start_child(int, char *, int, int, int);
 
 void	main_dispatch_frontend(int, short, void *);
 void	main_dispatch_engine(int, short, void *);
+void	open_icmp6sock(int);
 
 static int	main_imsg_send_ipc_sockets(struct imsgbuf *, struct imsgbuf *);
 static int	main_imsg_send_config(struct rad_conf *);
@@ -82,8 +84,6 @@ uint32_t cmd_opts;
 void
 main_sig_handler(int sig, short event, void *arg)
 {
-	struct rad_conf	empty_conf;
-
 	/*
 	 * Normal signal handler rules don't apply because libevent
 	 * decouples for us.
@@ -92,9 +92,7 @@ main_sig_handler(int sig, short event, void *arg)
 	switch (sig) {
 	case SIGTERM:
 	case SIGINT:
-		memset(&empty_conf, 0, sizeof(empty_conf));
-		(void)main_imsg_send_config(&empty_conf);
-		(void)main_imsg_compose_frontend(IMSG_SHUTDOWN, 0, NULL, 0);
+		main_shutdown();
 		break;
 	case SIGHUP:
 		if (main_reload() == -1)
@@ -121,14 +119,13 @@ int
 main(int argc, char *argv[])
 {
 	struct event		 ev_sigint, ev_sigterm, ev_sighup;
-	struct icmp6_filter	 filt;
 	int			 ch;
 	int			 debug = 0, engine_flag = 0, frontend_flag = 0;
 	char			*saved_argv0;
 	int			 pipe_main2frontend[2];
 	int			 pipe_main2engine[2];
-	int			 icmp6sock, on = 1, off = 0;
 	int			 frontend_routesock, rtfilter;
+	int			 rtable_any = RTABLE_ANY;
 	int			 control_fd;
 	char			*csock;
 
@@ -262,52 +259,31 @@ main(int argc, char *argv[])
 	if (main_imsg_send_ipc_sockets(&iev_frontend->ibuf, &iev_engine->ibuf))
 		fatal("could not establish imsg links");
 
-	if ((icmp6sock = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC,
-	    IPPROTO_ICMPV6)) < 0)
-		fatal("ICMPv6 socket");
-
-	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on,
-	    sizeof(on)) < 0)
-		fatal("IPV6_RECVPKTINFO");
-
-	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on,
-	    sizeof(on)) < 0)
-		fatal("IPV6_RECVHOPLIMIT");
-
-	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &off,
-	    sizeof(off)) < 0)
-		fatal("IPV6_RECVHOPLIMIT");
-
-	/* only router advertisements and solicitations */
-	ICMP6_FILTER_SETBLOCKALL(&filt);
-	ICMP6_FILTER_SETPASS(ND_ROUTER_ADVERT, &filt);
-	ICMP6_FILTER_SETPASS(ND_ROUTER_SOLICIT, &filt);
-	if (setsockopt(icmp6sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filt,
-	    sizeof(filt)) == -1)
-		fatal("ICMP6_FILTER");
-
-	if ((frontend_routesock = socket(PF_ROUTE, SOCK_RAW | SOCK_CLOEXEC,
-	    AF_INET6)) < 0)
+	if ((frontend_routesock = socket(AF_ROUTE, SOCK_RAW | SOCK_CLOEXEC,
+	    AF_INET6)) == -1)
 		fatal("route socket");
 
 	rtfilter = ROUTE_FILTER(RTM_IFINFO) | ROUTE_FILTER(RTM_NEWADDR) |
-	    ROUTE_FILTER(RTM_DELADDR);
-	if (setsockopt(frontend_routesock, PF_ROUTE, ROUTE_MSGFILTER,
-	    &rtfilter, sizeof(rtfilter)) < 0)
+	    ROUTE_FILTER(RTM_DELADDR) | ROUTE_FILTER(RTM_CHGADDRATTR);
+	if (setsockopt(frontend_routesock, AF_ROUTE, ROUTE_MSGFILTER,
+	    &rtfilter, sizeof(rtfilter)) == -1)
 		fatal("setsockopt(ROUTE_MSGFILTER)");
+	if (setsockopt(frontend_routesock, AF_ROUTE, ROUTE_TABLEFILTER,
+	    &rtable_any, sizeof(rtable_any)) == -1)
+		fatal("setsockopt(ROUTE_TABLEFILTER)");
 
 	if ((control_fd = control_init(csock)) == -1)
 		fatalx("control socket setup failed");
 
-	main_imsg_compose_frontend_fd(IMSG_ICMP6SOCK, 0, icmp6sock);
-	main_imsg_compose_frontend_fd(IMSG_ROUTESOCK, 0, frontend_routesock);
-	main_imsg_compose_frontend_fd(IMSG_CONTROLFD, 0, control_fd);
+	main_imsg_compose_frontend(IMSG_ROUTESOCK, frontend_routesock,
+	    NULL, 0);
+	main_imsg_compose_frontend(IMSG_CONTROLFD, control_fd, NULL, 0);
 	main_imsg_send_config(main_conf);
 
-	if (pledge("stdio rpath sendfd", NULL) == -1)
+	if (pledge("stdio inet rpath sendfd mcast wroute", NULL) == -1)
 		fatal("pledge");
 
-	main_imsg_compose_frontend(IMSG_STARTUP, 0, NULL, 0);
+	main_imsg_compose_frontend(IMSG_STARTUP, -1, NULL, 0);
 
 	event_dispatch();
 
@@ -365,7 +341,10 @@ start_child(int p, char *argv0, int fd, int debug, int verbose)
 		return (pid);
 	}
 
-	if (dup2(fd, 3) == -1)
+	if (fd != 3) {
+		if (dup2(fd, 3) == -1)
+			fatal("cannot setup imsg fd");
+	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
 	argv[argc++] = argv0;
@@ -397,6 +376,7 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	struct imsg		 imsg;
 	ssize_t			 n;
 	int			 shut = 0, verbose;
+	int			 rdomain;
 
 	ibuf = &iev->ibuf;
 
@@ -420,9 +400,13 @@ main_dispatch_frontend(int fd, short event, void *bula)
 			break;
 
 		switch (imsg.hdr.type) {
-		case IMSG_STARTUP_DONE:
-			if (pledge("stdio rpath", NULL) == -1)
-				fatal("pledge");
+		case IMSG_OPEN_ICMP6SOCK:
+			log_debug("IMSG_OPEN_ICMP6SOCK");
+			if (IMSG_DATA_SIZE(imsg) != sizeof(rdomain))
+				fatalx("%s: IMSG_OPEN_ICMP6SOCK wrong length: "
+				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
+			memcpy(&rdomain, imsg.data, sizeof(rdomain));
+			open_icmp6sock(rdomain);
 			break;
 		case IMSG_CTL_RELOAD:
 			if (main_reload() == -1)
@@ -431,12 +415,11 @@ main_dispatch_frontend(int fd, short event, void *bula)
 				log_warnx("configuration reloaded");
 			break;
 		case IMSG_CTL_LOG_VERBOSE:
-			/* Already checked by frontend. */
+			if (IMSG_DATA_SIZE(imsg) != sizeof(verbose))
+				fatalx("%s: IMSG_CTL_LOG_VERBOSE wrong length: "
+				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
 			memcpy(&verbose, imsg.data, sizeof(verbose));
 			log_setverbose(verbose);
-			break;
-		case IMSG_SHUTDOWN:
-			shut = 1;
 			break;
 		default:
 			log_debug("%s: error handling imsg %d", __func__,
@@ -501,21 +484,15 @@ main_dispatch_engine(int fd, short event, void *bula)
 	}
 }
 
-void
-main_imsg_compose_frontend(int type, pid_t pid, void *data, uint16_t datalen)
+int
+main_imsg_compose_frontend(int type, int fd, void *data, uint16_t datalen)
 {
 	if (iev_frontend)
-		imsg_compose_event(iev_frontend, type, 0, pid, -1, data,
-		    datalen);
+		return (imsg_compose_event(iev_frontend, type, 0, 0, fd, data,
+		    datalen));
+	else
+		return (-1);
 }
-
-void
-main_imsg_compose_frontend_fd(int type, pid_t pid, int fd)
-{
-	if (iev_frontend)
-		imsg_compose_event(iev_frontend, type, 0, pid, fd, NULL, 0);
-}
-
 
 void
 main_imsg_compose_engine(int type, pid_t pid, void *data, uint16_t datalen)
@@ -704,8 +681,6 @@ void
 merge_config(struct rad_conf *conf, struct rad_conf *xconf)
 {
 	struct ra_iface_conf	*ra_iface_conf;
-	struct ra_rdnss_conf	*ra_rdnss;
-	struct ra_dnssl_conf	*ra_dnssl;
 
 	/* Remove & discard existing interfaces. */
 	while ((ra_iface_conf = SIMPLEQ_FIRST(&conf->ra_iface_list)) != NULL) {
@@ -719,24 +694,13 @@ merge_config(struct rad_conf *conf, struct rad_conf *xconf)
 	SIMPLEQ_INIT(&conf->ra_options.ra_dnssl_list);
 
 	/* Add new interfaces. */
-	while ((ra_iface_conf = SIMPLEQ_FIRST(&xconf->ra_iface_list)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&xconf->ra_iface_list, entry);
-		SIMPLEQ_INSERT_TAIL(&conf->ra_iface_list, ra_iface_conf, entry);
-	}
+	SIMPLEQ_CONCAT(&conf->ra_iface_list, &xconf->ra_iface_list);
 
 	/* Add dns options */
-	while ((ra_rdnss = SIMPLEQ_FIRST(&xconf->ra_options.ra_rdnss_list))
-	    != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&xconf->ra_options.ra_rdnss_list, entry);
-		SIMPLEQ_INSERT_TAIL(&conf->ra_options.ra_rdnss_list, ra_rdnss,
-		    entry);
-	}
-	while ((ra_dnssl = SIMPLEQ_FIRST(&xconf->ra_options.ra_dnssl_list))
-	    != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&xconf->ra_options.ra_dnssl_list, entry);
-		SIMPLEQ_INSERT_TAIL(&conf->ra_options.ra_dnssl_list, ra_dnssl,
-		    entry);
-	}
+	SIMPLEQ_CONCAT(&conf->ra_options.ra_rdnss_list,
+	    &xconf->ra_options.ra_rdnss_list);
+	SIMPLEQ_CONCAT(&conf->ra_options.ra_dnssl_list,
+	    &xconf->ra_options.ra_dnssl_list);
 	free(xconf);
 }
 
@@ -755,7 +719,7 @@ config_new_empty(void)
 	xconf->ra_options.cur_hl = 0;
 	xconf->ra_options.m_flag = 0;
 	xconf->ra_options.o_flag = 0;
-	xconf->ra_options.router_lifetime = 1800;
+	xconf->ra_options.router_lifetime = ADV_DEFAULT_LIFETIME;
 	xconf->ra_options.reachable_time = 0;
 	xconf->ra_options.retrans_timer = 0;
 	xconf->ra_options.mtu = 0;
@@ -823,4 +787,39 @@ in6_to_str(struct in6_addr *in6)
 	sin6.sin6_addr = *in6;
 
 	return (sin6_to_str(&sin6));
+}
+
+void
+open_icmp6sock(int rdomain)
+{
+	int			 icmp6sock, on = 1, off = 0;
+
+	log_debug("%s: %d", __func__, rdomain);
+
+	if ((icmp6sock = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC,
+	    IPPROTO_ICMPV6)) == -1)
+		fatal("ICMPv6 socket");
+
+	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on,
+	    sizeof(on)) == -1)
+		fatal("IPV6_RECVPKTINFO");
+
+	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on,
+	    sizeof(on)) == -1)
+		fatal("IPV6_RECVHOPLIMIT");
+
+	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &off,
+	    sizeof(off)) == -1)
+		fatal("IPV6_RECVHOPLIMIT");
+
+	if (setsockopt(icmp6sock, SOL_SOCKET, SO_RTABLE, &rdomain,
+	    sizeof(rdomain)) == -1) {
+		/* we might race against removal of the rdomain */
+		log_warn("setsockopt SO_RTABLE");
+		close(icmp6sock);
+		return;
+	}
+
+	main_imsg_compose_frontend(IMSG_ICMP6SOCK, icmp6sock, &rdomain,
+	    sizeof(rdomain));
 }

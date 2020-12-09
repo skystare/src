@@ -1,16 +1,15 @@
-# $OpenBSD: Makefile,v 1.5 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.8 2020/08/03 14:45:28 patrick Exp $
 
 LIB=	clangDriver
 NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	${CLANG_INCLUDES}
-CPPFLAGS+=	-I${LLVM_SRCS}/tools/clang/lib/Driver
+CPPFLAGS+=	-I${CLANG_SRCS}/lib/Driver
 
 .include <bsd.own.mk>
-SRCS=	AArch64.cpp \
+SRCS=	AIX.cpp \
 	AMDGPU.cpp \
-	ARM.cpp \
 	AVR.cpp \
 	Action.cpp \
 	Ananas.cpp \
@@ -23,46 +22,49 @@ SRCS=	AArch64.cpp \
 	CrossWindows.cpp \
 	Cuda.cpp \
 	Darwin.cpp \
+	DarwinSDKInfo.cpp \
 	Distro.cpp \
 	DragonFly.cpp \
 	Driver.cpp \
 	DriverOptions.cpp \
+	Flang.cpp \
 	FreeBSD.cpp \
 	Fuchsia.cpp \
 	Gnu.cpp \
+	HIP.cpp \
 	Haiku.cpp \
 	Hexagon.cpp \
+	Hurd.cpp \
+	InterfaceStubs.cpp \
 	Job.cpp \
 	Linux.cpp \
+	MSP430.cpp \
 	MSVC.cpp \
 	MinGW.cpp \
 	Minix.cpp \
-	Mips.cpp \
 	MipsLinux.cpp \
 	Multilib.cpp \
 	Myriad.cpp \
 	NaCl.cpp \
 	NetBSD.cpp \
 	OpenBSD.cpp \
-	PPC.cpp \
+	OptionUtils.cpp \
+	PPCLinux.cpp \
 	PS4CPU.cpp \
 	Phases.cpp \
+	RISCVToolchain.cpp \
 	SanitizerArgs.cpp \
 	Solaris.cpp \
-	Sparc.cpp \
-	SystemZ.cpp \
 	TCE.cpp \
 	Tool.cpp \
 	ToolChain.cpp \
 	Types.cpp \
 	WebAssembly.cpp \
-	X86.cpp \
 	XCore.cpp \
 	XRayArgs.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/tools/clang/lib/Driver
-.PATH:	${.CURDIR}/../../../llvm/tools/clang/lib/Driver/ToolChains
-.PATH:	${.CURDIR}/../../../llvm/tools/clang/lib/Driver/ToolChains/Arch
+.PATH:	${.CURDIR}/../../../llvm/clang/lib/Driver
+.PATH:	${.CURDIR}/../../../llvm/clang/lib/Driver/ToolChains
 
 install:
 	@# Nothing here so far ...

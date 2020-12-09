@@ -1,4 +1,4 @@
-/*	$OpenBSD: slaacd.c,v 1.31 2018/08/19 12:29:03 florian Exp $	*/
+/*	$OpenBSD: slaacd.c,v 1.53 2020/12/01 18:08:53 florian Exp $	*/
 
 /*
  * Copyright (c) 2017 Florian Obser <florian@openbsd.org>
@@ -36,6 +36,7 @@
 
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <event.h>
 #include <imsg.h>
 #include <netdb.h>
@@ -62,16 +63,19 @@ static pid_t	start_child(int, char *, int, int, int);
 
 void	main_dispatch_frontend(int, short, void *);
 void	main_dispatch_engine(int, short, void *);
-void	handle_proposal(struct imsg_proposal *);
+void	open_icmp6sock(int);
 void	configure_interface(struct imsg_configure_address *);
+void	delete_address(struct imsg_configure_address *);
 void	configure_gateway(struct imsg_configure_dfr *, uint8_t);
 void	add_gateway(struct imsg_configure_dfr *);
 void	delete_gateway(struct imsg_configure_dfr *);
+#ifndef	SMALL
+void	send_rdns_proposal(struct imsg_propose_rdns *);
+#endif	/* SMALL */
 int	get_soiikey(uint8_t *);
 
 static int	main_imsg_send_ipc_sockets(struct imsgbuf *, struct imsgbuf *);
-int		main_imsg_compose_frontend(int, pid_t, void *, uint16_t);
-int		main_imsg_compose_frontend_fd(int, pid_t, int);
+int		main_imsg_compose_frontend(int, int, void *, uint16_t);
 int		main_imsg_compose_engine(int, pid_t, void *, uint16_t);
 
 struct imsgev		*iev_frontend;
@@ -94,9 +98,6 @@ main_sig_handler(int sig, short event, void *arg)
 	case SIGTERM:
 	case SIGINT:
 		main_shutdown();
-	case SIGHUP:
-		log_debug("sighub received");
-		break;
 	default:
 		fatalx("unexpected signal");
 	}
@@ -115,18 +116,18 @@ usage(void)
 int
 main(int argc, char *argv[])
 {
-	struct event		 ev_sigint, ev_sigterm, ev_sighup;
-	struct icmp6_filter	 filt;
+	struct event		 ev_sigint, ev_sigterm;
 	int			 ch;
 	int			 debug = 0, engine_flag = 0, frontend_flag = 0;
 	int			 verbose = 0;
 	char			*saved_argv0;
 	int			 pipe_main2frontend[2];
 	int			 pipe_main2engine[2];
-	int			 icmp6sock, on = 1;
 	int			 frontend_routesock, rtfilter;
+	int			 rtable_any = RTABLE_ANY;
 	char			*csock = SLAACD_SOCKET;
 #ifndef SMALL
+	struct imsg_propose_rdns rdns;
 	int			 control_fd;
 #endif /* SMALL */
 
@@ -183,8 +184,6 @@ main(int argc, char *argv[])
 	if (!debug)
 		daemon(0, 0);
 
-	log_info("startup");
-
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
 	    PF_UNSPEC, pipe_main2frontend) == -1)
 		fatal("main2frontend socketpair");
@@ -202,8 +201,8 @@ main(int argc, char *argv[])
 
 	log_procinit(log_procnames[slaacd_process]);
 
-	if ((routesock = socket(PF_ROUTE, SOCK_RAW | SOCK_CLOEXEC |
-	    SOCK_NONBLOCK, AF_INET6)) < 0)
+	if ((routesock = socket(AF_ROUTE, SOCK_RAW | SOCK_CLOEXEC |
+	    SOCK_NONBLOCK, AF_INET6)) == -1)
 		fatal("route socket");
 	shutdown(SHUT_RD, routesock);
 
@@ -212,11 +211,10 @@ main(int argc, char *argv[])
 	/* Setup signal handler. */
 	signal_set(&ev_sigint, SIGINT, main_sig_handler, NULL);
 	signal_set(&ev_sigterm, SIGTERM, main_sig_handler, NULL);
-	signal_set(&ev_sighup, SIGHUP, main_sig_handler, NULL);
 	signal_add(&ev_sigint, NULL);
 	signal_add(&ev_sigterm, NULL);
-	signal_add(&ev_sighup, NULL);
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGHUP, SIG_IGN);
 
 	/* Setup pipes to children. */
 
@@ -242,56 +240,46 @@ main(int argc, char *argv[])
 	if (main_imsg_send_ipc_sockets(&iev_frontend->ibuf, &iev_engine->ibuf))
 		fatal("could not establish imsg links");
 
-	if ((ioctl_sock = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0)
+	if ((ioctl_sock = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0)) == -1)
 		fatal("socket");
 
-	if ((icmp6sock = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC,
-	    IPPROTO_ICMPV6)) < 0)
-		fatal("ICMPv6 socket");
-
-	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on,
-	    sizeof(on)) < 0)
-		fatal("IPV6_RECVPKTINFO");
-
-	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on,
-	    sizeof(on)) < 0)
-		fatal("IPV6_RECVHOPLIMIT");
-
-	/* only router advertisements */
-	ICMP6_FILTER_SETBLOCKALL(&filt);
-	ICMP6_FILTER_SETPASS(ND_ROUTER_ADVERT, &filt);
-	if (setsockopt(icmp6sock, IPPROTO_ICMPV6, ICMP6_FILTER, &filt,
-	    sizeof(filt)) == -1)
-		fatal("ICMP6_FILTER");
-
-	if ((frontend_routesock = socket(PF_ROUTE, SOCK_RAW | SOCK_CLOEXEC,
-	    AF_INET6)) < 0)
+	if ((frontend_routesock = socket(AF_ROUTE, SOCK_RAW | SOCK_CLOEXEC,
+	    AF_INET6)) == -1)
 		fatal("route socket");
 
 	rtfilter = ROUTE_FILTER(RTM_IFINFO) | ROUTE_FILTER(RTM_NEWADDR) |
-	    ROUTE_FILTER(RTM_DELADDR) | ROUTE_FILTER(RTM_PROPOSAL) |
-	    ROUTE_FILTER(RTM_DELETE) | ROUTE_FILTER(RTM_CHGADDRATTR);
-	if (setsockopt(frontend_routesock, PF_ROUTE, ROUTE_MSGFILTER,
-	    &rtfilter, sizeof(rtfilter)) < 0)
+	    ROUTE_FILTER(RTM_DELADDR) | ROUTE_FILTER(RTM_DELETE) |
+	    ROUTE_FILTER(RTM_CHGADDRATTR) | ROUTE_FILTER(RTM_PROPOSAL);
+	if (setsockopt(frontend_routesock, AF_ROUTE, ROUTE_MSGFILTER,
+	    &rtfilter, sizeof(rtfilter)) == -1)
 		fatal("setsockopt(ROUTE_MSGFILTER)");
+	if (setsockopt(frontend_routesock, AF_ROUTE, ROUTE_TABLEFILTER,
+	    &rtable_any, sizeof(rtable_any)) == -1)
+		fatal("setsockopt(ROUTE_TABLEFILTER)");
 
 #ifndef SMALL
 	if ((control_fd = control_init(csock)) == -1)
 		fatalx("control socket setup failed");
 #endif /* SMALL */
 
-	if (pledge("stdio sendfd wroute", NULL) == -1)
+	if (pledge("stdio inet sendfd wroute", NULL) == -1)
 		fatal("pledge");
 
-	main_imsg_compose_frontend_fd(IMSG_ICMP6SOCK, 0, icmp6sock);
-
-	main_imsg_compose_frontend_fd(IMSG_ROUTESOCK, 0, frontend_routesock);
+	main_imsg_compose_frontend(IMSG_ROUTESOCK, frontend_routesock, NULL, 0);
 
 #ifndef SMALL
-	main_imsg_compose_frontend_fd(IMSG_CONTROLFD, 0, control_fd);
+	main_imsg_compose_frontend(IMSG_CONTROLFD, control_fd, NULL, 0);
 #endif /* SMALL */
 
-	main_imsg_compose_frontend(IMSG_STARTUP, 0, NULL, 0);
+	main_imsg_compose_frontend(IMSG_STARTUP, -1, NULL, 0);
+
+#ifndef SMALL
+	/* we are taking over, clear all previos slaac proposals */
+	memset(&rdns, 0, sizeof(rdns));
+	rdns.if_index = 0;
+	rdns.rdns_count = 0;
+	send_rdns_proposal(&rdns);
+#endif /* SMALL */
 
 	event_dispatch();
 
@@ -347,7 +335,10 @@ start_child(int p, char *argv0, int fd, int debug, int verbose)
 		return (pid);
 	}
 
-	if (dup2(fd, 3) == -1)
+	if (fd != 3) {
+		if (dup2(fd, 3) == -1)
+			fatal("cannot setup imsg fd");
+	} else if (fcntl(fd, F_SETFD, 0) == -1)
 		fatal("cannot setup imsg fd");
 
 	argv[argc++] = argv0;
@@ -382,6 +373,7 @@ main_dispatch_frontend(int fd, short event, void *bula)
 	struct imsg_ifinfo	 imsg_ifinfo;
 	ssize_t			 n;
 	int			 shut = 0;
+	int			 rdomain;
 #ifndef	SMALL
 	struct imsg_addrinfo	 imsg_addrinfo;
 	struct imsg_link_state	 imsg_link_state;
@@ -410,31 +402,36 @@ main_dispatch_frontend(int fd, short event, void *bula)
 			break;
 
 		switch (imsg.hdr.type) {
-		case IMSG_STARTUP_DONE:
-			if (pledge("stdio wroute", NULL) == -1)
-				fatal("pledge");
+		case IMSG_OPEN_ICMP6SOCK:
+			log_debug("IMSG_OPEN_ICMP6SOCK");
+			if (IMSG_DATA_SIZE(imsg) != sizeof(rdomain))
+				fatalx("%s: IMSG_OPEN_ICMP6SOCK wrong length: "
+				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
+			memcpy(&rdomain, imsg.data, sizeof(rdomain));
+			open_icmp6sock(rdomain);
 			break;
 #ifndef	SMALL
 		case IMSG_CTL_LOG_VERBOSE:
-			/* Already checked by frontend. */
+			if (IMSG_DATA_SIZE(imsg) != sizeof(verbose))
+				fatalx("%s: IMSG_CTL_LOG_VERBOSE wrong length: "
+				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
 			memcpy(&verbose, imsg.data, sizeof(verbose));
 			log_setverbose(verbose);
 			break;
 		case IMSG_UPDATE_ADDRESS:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(imsg_addrinfo))
-				fatal("%s: IMSG_UPDATE_ADDRESS wrong length: "
-				    "%d", __func__, imsg.hdr.len);
+			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_addrinfo))
+				fatalx("%s: IMSG_UPDATE_ADDRESS wrong length: "
+				    "%lu", __func__, IMSG_DATA_SIZE(imsg));
 			memcpy(&imsg_addrinfo, imsg.data,
 			    sizeof(imsg_addrinfo));
 			main_imsg_compose_engine(IMSG_UPDATE_ADDRESS, 0,
 			    &imsg_addrinfo, sizeof(imsg_addrinfo));
 			break;
 		case IMSG_UPDATE_LINK_STATE:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(imsg_link_state))
-				fatal("%s: IMSG_UPDATE_LINK_STATE wrong "
-				    "length: %d", __func__, imsg.hdr.len);
+			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_link_state))
+				fatalx("%s: IMSG_UPDATE_LINK_STATE wrong "
+				    "length: %lu", __func__,
+				    IMSG_DATA_SIZE(imsg));
 			memcpy(&imsg_link_state, imsg.data,
 			    sizeof(imsg_link_state));
 			main_imsg_compose_engine(IMSG_UPDATE_LINK_STATE, 0,
@@ -442,10 +439,9 @@ main_dispatch_frontend(int fd, short event, void *bula)
 			break;
 #endif	/* SMALL */
 		case IMSG_UPDATE_IF:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(imsg_ifinfo))
-				fatal("%s: IMSG_UPDATE_IF wrong length: %d",
-				    __func__, imsg.hdr.len);
+			if (IMSG_DATA_SIZE(imsg) != sizeof(imsg_ifinfo))
+				fatalx("%s: IMSG_UPDATE_IF wrong length: %lu",
+				    __func__, IMSG_DATA_SIZE(imsg));
 			memcpy(&imsg_ifinfo, imsg.data, sizeof(imsg_ifinfo));
 			if (get_soiikey(imsg_ifinfo.soiikey) == -1)
 				log_warn("get_soiikey");
@@ -475,9 +471,11 @@ main_dispatch_engine(int fd, short event, void *bula)
 	struct imsgev			*iev = bula;
 	struct imsgbuf			*ibuf;
 	struct imsg			 imsg;
-	struct imsg_proposal		 proposal;
 	struct imsg_configure_address	 address;
 	struct imsg_configure_dfr	 dfr;
+#ifndef	SMALL
+	struct imsg_propose_rdns	 rdns;
+#endif	/* SMALL */
 	ssize_t				 n;
 	int				 shut = 0;
 
@@ -503,34 +501,52 @@ main_dispatch_engine(int fd, short event, void *bula)
 			break;
 
 		switch (imsg.hdr.type) {
-		case IMSG_PROPOSAL:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(proposal))
-				fatal("%s: IMSG_PROPOSAL wrong "
-				    "length: %d", __func__, imsg.hdr.len);
-			memcpy(&proposal, imsg.data, sizeof(proposal));
-			handle_proposal(&proposal);
-			break;
 		case IMSG_CONFIGURE_ADDRESS:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(address))
-				fatal("%s: IMSG_CONFIGURE_ADDRESS wrong "
-				    "length: %d", __func__, imsg.hdr.len);
+			if (IMSG_DATA_SIZE(imsg) != sizeof(address))
+				fatalx("%s: IMSG_CONFIGURE_ADDRESS wrong "
+				    "length: %lu", __func__,
+				    IMSG_DATA_SIZE(imsg));
 			memcpy(&address, imsg.data, sizeof(address));
 			configure_interface(&address);
 			break;
+		case IMSG_WITHDRAW_ADDRESS:
+			if (IMSG_DATA_SIZE(imsg) != sizeof(address))
+				fatalx("%s: IMSG_WITHDRAW_ADDRESS wrong "
+				    "length: %lu", __func__,
+				    IMSG_DATA_SIZE(imsg));
+			memcpy(&address, imsg.data, sizeof(address));
+			delete_address(&address);
+			break;
 		case IMSG_CONFIGURE_DFR:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(dfr))
-				fatal("%s: IMSG_CONFIGURE_DFR wrong "
-				    "length: %d", __func__, imsg.hdr.len);
+			if (IMSG_DATA_SIZE(imsg) != sizeof(dfr))
+				fatalx("%s: IMSG_CONFIGURE_DFR wrong "
+				    "length: %lu", __func__,
+				    IMSG_DATA_SIZE(imsg));
 			memcpy(&dfr, imsg.data, sizeof(dfr));
 			add_gateway(&dfr);
 			break;
 		case IMSG_WITHDRAW_DFR:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE + sizeof(dfr))
-				fatal("%s: IMSG_WITHDRAW_DFR wrong "
-				    "length: %d", __func__, imsg.hdr.len);
+			if (IMSG_DATA_SIZE(imsg) != sizeof(dfr))
+				fatalx("%s: IMSG_WITHDRAW_DFR wrong "
+				    "length: %lu", __func__,
+				    IMSG_DATA_SIZE(imsg));
 			memcpy(&dfr, imsg.data, sizeof(dfr));
 			delete_gateway(&dfr);
 			break;
+#ifndef	SMALL
+		case IMSG_PROPOSE_RDNS:
+			if (IMSG_DATA_SIZE(imsg) != sizeof(rdns))
+				fatalx("%s: IMSG_PROPOSE_RDNS wrong "
+				    "length: %lu", __func__,
+				    IMSG_DATA_SIZE(imsg));
+			memcpy(&rdns, imsg.data, sizeof(rdns));
+			if ((2 + rdns.rdns_count * sizeof(struct in6_addr)) >
+			    sizeof(struct sockaddr_rtdns))
+				fatalx("%s: rdns_count too big: %d", __func__,
+				    rdns.rdns_count);
+			send_rdns_proposal(&rdns);
+			break;
+#endif	/* SMALL */
 		default:
 			log_debug("%s: error handling imsg %d", __func__,
 			    imsg.hdr.type);
@@ -548,21 +564,11 @@ main_dispatch_engine(int fd, short event, void *bula)
 }
 
 int
-main_imsg_compose_frontend(int type, pid_t pid, void *data, uint16_t datalen)
+main_imsg_compose_frontend(int type, int fd, void *data, uint16_t datalen)
 {
 	if (iev_frontend)
-		return (imsg_compose_event(iev_frontend, type, 0, pid, -1, data,
+		return (imsg_compose_event(iev_frontend, type, 0, 0, fd, data,
 		    datalen));
-	else
-		return (-1);
-}
-
-int
-main_imsg_compose_frontend_fd(int type, pid_t pid, int fd)
-{
-	if (iev_frontend)
-		return (imsg_compose_event(iev_frontend, type, 0, pid, fd,
-		    NULL, 0));
 	else
 		return (-1);
 }
@@ -623,93 +629,6 @@ main_imsg_send_ipc_sockets(struct imsgbuf *frontend_buf,
 	return (0);
 }
 
-#define	ROUNDUP(a)	\
-    (((a) & (sizeof(long) - 1)) ? (1 + ((a) | (sizeof(long) - 1))) : (a))
-
-void
-handle_proposal(struct imsg_proposal *proposal)
-{
-	struct rt_msghdr		 rtm;
-	struct sockaddr_in6		 ifa, mask;
-	struct sockaddr_rtlabel		 rl;
-	struct iovec			 iov[13];
-	long				 pad = 0;
-	int				 iovcnt = 0, padlen;
-
-	memset(&rtm, 0, sizeof(rtm));
-
-	rtm.rtm_version = RTM_VERSION;
-	rtm.rtm_type = RTM_PROPOSAL;
-	rtm.rtm_msglen = sizeof(rtm);
-	rtm.rtm_tableid = 0; /* XXX imsg->rdomain; */
-	rtm.rtm_index = proposal->if_index;
-	rtm.rtm_seq = ++rtm_seq;
-	rtm.rtm_priority = RTP_PROPOSAL_SLAAC;
-	rtm.rtm_addrs = (proposal->rtm_addrs & (RTA_NETMASK | RTA_IFA)) |
-	    RTA_LABEL;
-	rtm.rtm_flags = RTF_UP;
-
-	iov[iovcnt].iov_base = &rtm;
-	iov[iovcnt++].iov_len = sizeof(rtm);
-
-	if (rtm.rtm_addrs & RTA_NETMASK) {
-		memset(&mask, 0, sizeof(mask));
-		mask.sin6_family = AF_INET6;
-		mask.sin6_len = sizeof(struct sockaddr_in6);
-		mask.sin6_addr = proposal->mask;
-
-		iov[iovcnt].iov_base = &mask;
-		iov[iovcnt++].iov_len = sizeof(mask);
-		rtm.rtm_msglen += sizeof(mask);
-		padlen = ROUNDUP(sizeof(mask)) - sizeof(mask);
-		if (padlen > 0) {
-			iov[iovcnt].iov_base = &pad;
-			iov[iovcnt++].iov_len = padlen;
-			rtm.rtm_msglen += padlen;
-		}
-	}
-
-	if (rtm.rtm_addrs & RTA_IFA) {
-		memcpy(&ifa, &proposal->addr, sizeof(ifa));
-
-		if (ifa.sin6_family != AF_INET6 || ifa.sin6_len !=
-		    sizeof(struct sockaddr_in6)) {
-			log_warnx("%s: invalid address", __func__);
-			return;
-		}
-
-		iov[iovcnt].iov_base = &ifa;
-		iov[iovcnt++].iov_len = sizeof(ifa);
-		rtm.rtm_msglen += sizeof(ifa);
-		padlen = ROUNDUP(sizeof(ifa)) - sizeof(ifa);
-		if (padlen > 0) {
-			iov[iovcnt].iov_base = &pad;
-			iov[iovcnt++].iov_len = padlen;
-			rtm.rtm_msglen += padlen;
-		}
-	}
-
-	rl.sr_len = sizeof(rl);
-	rl.sr_family = AF_UNSPEC;
-	if (snprintf(rl.sr_label, sizeof(rl.sr_label), "%s: %lld %d",
-	    SLAACD_RTA_LABEL, proposal->id, (int32_t)proposal->pid) >=
-	    (ssize_t)sizeof(rl.sr_label))
-		log_warnx("route label truncated");
-
-	iov[iovcnt].iov_base = &rl;
-	iov[iovcnt++].iov_len = sizeof(rl);
-	rtm.rtm_msglen += sizeof(rl);
-	padlen = ROUNDUP(sizeof(rl)) - sizeof(rl);
-	if (padlen > 0) {
-		iov[iovcnt].iov_base = &pad;
-		iov[iovcnt++].iov_len = padlen;
-		rtm.rtm_msglen += padlen;
-	}
-
-	if (writev(routesock, iov, iovcnt) == -1)
-		log_warn("failed to send proposal");
-}
-
 void
 configure_interface(struct imsg_configure_address *address)
 {
@@ -746,25 +665,54 @@ configure_interface(struct imsg_configure_address *address)
 	in6_addreq.ifra_flags |= IN6_IFF_AUTOCONF;
 
 	if (address->privacy)
-		in6_addreq.ifra_flags |= IN6_IFF_PRIVACY;
+		in6_addreq.ifra_flags |= IN6_IFF_TEMPORARY;
 
 	log_debug("%s: %s", __func__, if_name);
 
-	if (ioctl(ioctl_sock, SIOCAIFADDR_IN6, &in6_addreq) < 0)
+	if (ioctl(ioctl_sock, SIOCAIFADDR_IN6, &in6_addreq) == -1)
 		fatal("SIOCAIFADDR_IN6");
 
 	if (address->mtu) {
 		struct ifreq	 ifr;
 
-		(void)strlcpy(ifr.ifr_name, in6_addreq.ifra_name,
+		strlcpy(ifr.ifr_name, in6_addreq.ifra_name,
 		    sizeof(ifr.ifr_name));
 		ifr.ifr_mtu = address->mtu;
 		log_debug("Setting MTU to %d", ifr.ifr_mtu);
 
-		if (ioctl(ioctl_sock, SIOCSIFMTU, &ifr) < 0)
+		if (ioctl(ioctl_sock, SIOCSIFMTU, &ifr) == -1)
 		    log_warn("failed to set MTU");
 	}
 }
+
+void
+delete_address(struct imsg_configure_address *address)
+{
+
+	struct in6_ifreq	 in6_ridreq;
+	char			*if_name;
+
+	memset(&in6_ridreq, 0, sizeof(in6_ridreq));
+
+	if_name = if_indextoname(address->if_index, in6_ridreq.ifr_name);
+	if (if_name == NULL) {
+		log_warnx("%s: cannot find interface %d", __func__,
+		    address->if_index);
+		return;
+	}
+
+	memcpy(&in6_ridreq.ifr_addr, &address->addr,
+	    sizeof(in6_ridreq.ifr_addr));
+
+	log_debug("%s: %s", __func__, if_name);
+
+	if (ioctl(ioctl_sock, SIOCDIFADDR_IN6, &in6_ridreq) == -1)
+		log_warn("%s: cannot remove address", __func__);
+
+}
+
+#define	ROUNDUP(a)							\
+    (((a) & (sizeof(long) - 1)) ? (1 + ((a) | (sizeof(long) - 1))) : (a))
 
 void
 configure_gateway(struct imsg_configure_dfr *dfr, uint8_t rtm_type)
@@ -781,10 +729,10 @@ configure_gateway(struct imsg_configure_dfr *dfr, uint8_t rtm_type)
 	rtm.rtm_version = RTM_VERSION;
 	rtm.rtm_type = rtm_type;
 	rtm.rtm_msglen = sizeof(rtm);
-	rtm.rtm_tableid = 0; /* XXX imsg->rdomain; */
+	rtm.rtm_tableid = dfr->rdomain;
 	rtm.rtm_index = dfr->if_index;
 	rtm.rtm_seq = ++rtm_seq;
-	rtm.rtm_priority = RTP_DEFAULT;
+	rtm.rtm_priority = RTP_NONE;
 	rtm.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK | RTA_LABEL;
 	rtm.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC | RTF_MPATH;
 
@@ -864,6 +812,49 @@ delete_gateway(struct imsg_configure_dfr *dfr)
 }
 
 #ifndef	SMALL
+void
+send_rdns_proposal(struct imsg_propose_rdns *rdns)
+{
+	struct rt_msghdr		 rtm;
+	struct sockaddr_rtdns		 rtdns;
+	struct iovec			 iov[3];
+	long				 pad = 0;
+	int				 iovcnt = 0, padlen;
+
+	memset(&rtm, 0, sizeof(rtm));
+
+	rtm.rtm_version = RTM_VERSION;
+	rtm.rtm_type = RTM_PROPOSAL;
+	rtm.rtm_msglen = sizeof(rtm);
+	rtm.rtm_tableid = rdns->rdomain;
+	rtm.rtm_index = rdns->if_index;
+	rtm.rtm_seq = ++rtm_seq;
+	rtm.rtm_priority = RTP_PROPOSAL_SLAAC;
+	rtm.rtm_addrs = RTA_DNS;
+	rtm.rtm_flags = RTF_UP;
+
+	iov[iovcnt].iov_base = &rtm;
+	iov[iovcnt++].iov_len = sizeof(rtm);
+
+	memset(&rtdns, 0, sizeof(rtdns));
+	rtdns.sr_family = AF_INET6;
+	rtdns.sr_len = 2 + rdns->rdns_count * sizeof(struct in6_addr);
+	memcpy(rtdns.sr_dns, rdns->rdns, sizeof(rtdns.sr_dns));
+
+	iov[iovcnt].iov_base = &rtdns;
+	iov[iovcnt++].iov_len = sizeof(rtdns);
+	rtm.rtm_msglen += sizeof(rtdns);
+	padlen = ROUNDUP(sizeof(rtdns)) - sizeof(rtdns);
+	if (padlen > 0) {
+		iov[iovcnt].iov_base = &pad;
+		iov[iovcnt++].iov_len = padlen;
+		rtm.rtm_msglen += padlen;
+	}
+
+	if (writev(routesock, iov, iovcnt) == -1)
+		log_warn("failed to send route message");
+}
+
 const char*
 sin6_to_str(struct sockaddr_in6 *sin6)
 {
@@ -887,4 +878,35 @@ get_soiikey(uint8_t *key)
 	size_t	 size = SLAACD_SOIIKEY_LEN;
 
 	return sysctl(mib, sizeof(mib) / sizeof(mib[0]), key, &size, NULL, 0);
+}
+
+void
+open_icmp6sock(int rdomain)
+{
+	int			 icmp6sock, on = 1;
+
+	log_debug("%s: %d", __func__, rdomain);
+
+	if ((icmp6sock = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC,
+	    IPPROTO_ICMPV6)) == -1)
+		fatal("ICMPv6 socket");
+
+	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &on,
+	    sizeof(on)) == -1)
+		fatal("IPV6_RECVPKTINFO");
+
+	if (setsockopt(icmp6sock, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on,
+	    sizeof(on)) == -1)
+		fatal("IPV6_RECVHOPLIMIT");
+
+	if (setsockopt(icmp6sock, SOL_SOCKET, SO_RTABLE, &rdomain,
+	    sizeof(rdomain)) == -1) {
+		/* we might race against removal of the rdomain */
+		log_warn("setsockopt SO_RTABLE");
+		close(icmp6sock);
+		return;
+	}
+
+	main_imsg_compose_frontend(IMSG_ICMP6SOCK, icmp6sock, &rdomain,
+	    sizeof(rdomain));
 }

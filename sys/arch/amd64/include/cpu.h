@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.127 2018/08/21 19:04:40 deraadt Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.137 2020/06/03 06:54:04 dlg Exp $	*/
 /*	$NetBSD: cpu.h,v 1.1 2003/04/26 18:39:39 fvdl Exp $	*/
 
 /*-
@@ -51,6 +51,7 @@
 #include <sys/device.h>
 #include <sys/sched.h>
 #include <sys/sensors.h>
+#include <sys/srp.h>
 
 #ifdef _KERNEL
 
@@ -115,6 +116,10 @@ struct cpu_info {
 	u_int64_t ci_kern_rsp;	/* kernel-only stack */
 	u_int64_t ci_intr_rsp;	/* U<-->K trampoline stack */
 	u_int64_t ci_user_cr3;	/* U-K page table */
+
+	/* bits for mitigating Micro-architectural Data Sampling */
+	char		ci_mds_tmp[32];		/* 32byte aligned */
+	void		*ci_mds_buf;
 
 	struct pcb *ci_curpcb;
 	struct pcb *ci_idle_pcb;
@@ -201,6 +206,8 @@ struct cpu_info {
 	union		vmm_cpu_cap ci_vmm_cap;
 	paddr_t		ci_vmxon_region_pa;
 	struct vmxon_region *ci_vmxon_region;
+
+	int64_t		ci_tsc_skew;		/* counter skew vs cpu0 */
 };
 
 #define CPUF_BSP	0x0001		/* CPU is the original BSP */
@@ -216,6 +223,7 @@ struct cpu_info {
 #define CPUF_INVAR_TSC	0x0100		/* CPU has invariant TSC */
 #define CPUF_USERXSTATE	0x0200		/* CPU has curproc's xsave state */
 
+#define CPUF_SYNCTSC	0x0800		/* Synchronize TSC */
 #define CPUF_PRESENT	0x1000		/* CPU is present */
 #define CPUF_RUNNING	0x2000		/* CPU is running */
 #define CPUF_PAUSE	0x4000		/* CPU is paused in DDB */
@@ -296,6 +304,16 @@ void cpu_unidle(struct cpu_info *);
 #include <machine/cpufunc.h>
 #include <machine/psl.h>
 
+static inline unsigned int
+cpu_rnd_messybits(void)
+{
+	unsigned int hi, lo;
+
+	__asm volatile("rdtsc" : "=d" (hi), "=a" (lo));
+
+	return (hi ^ lo);
+}
+
 #endif /* _KERNEL */
 
 #ifdef MULTIPROCESSOR
@@ -367,12 +385,9 @@ int	cpu_amd64speed(int *);
 void	dumpconf(void);
 void	cpu_reset(void);
 void	x86_64_proc0_tss_ldt_init(void);
-void	x86_64_bufinit(void);
 void	cpu_proc_fork(struct proc *, struct proc *);
 int	amd64_pa_used(paddr_t);
-extern void (*cpu_idle_enter_fcn)(void);
 extern void (*cpu_idle_cycle_fcn)(void);
-extern void (*cpu_idle_leave_fcn)(void);
 
 struct region_descriptor;
 void	lgdt(struct region_descriptor *);
@@ -385,6 +400,7 @@ void	proc_trampoline(void);
 /* clock.c */
 extern void (*initclock_func)(void);
 void	startclocks(void);
+void	rtcinit(void);
 void	rtcstart(void);
 void	rtcstop(void);
 void	i8254_delay(int);
@@ -396,9 +412,8 @@ void	i8254_inittimecounter_simple(void);
 /* i8259.c */
 void	i8259_default_setup(void);
 
-
 void cpu_init_msrs(struct cpu_info *);
-
+void cpu_tsx_disable(struct cpu_info *);
 
 /* dkcsum.c */
 void	dkcsumattach(void);
@@ -442,7 +457,8 @@ void mp_setperf_init(void);
 #define CPU_FORCEUKBD		15	/* Force ukbd(4) as console keyboard */
 #define CPU_TSCFREQ		16	/* TSC frequency */
 #define CPU_INVARIANTTSC	17	/* has invariant TSC */
-#define CPU_MAXID		18	/* number of valid machdep ids */
+#define CPU_PWRACTION		18	/* action caused by power button */
+#define CPU_MAXID		19	/* number of valid machdep ids */
 
 #define	CTL_MACHDEP_NAMES { \
 	{ 0, 0 }, \
@@ -463,6 +479,7 @@ void mp_setperf_init(void);
 	{ "forceukbd", CTLTYPE_INT }, \
 	{ "tscfreq", CTLTYPE_QUAD }, \
 	{ "invarianttsc", CTLTYPE_INT }, \
+	{ "pwraction", CTLTYPE_INT }, \
 }
 
 #endif /* !_MACHINE_CPU_H_ */

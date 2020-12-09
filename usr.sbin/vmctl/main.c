@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.42 2018/09/13 03:53:33 ccardenas Exp $	*/
+/*	$OpenBSD: main.c,v 1.62 2020/01/03 05:32:00 pd Exp $	*/
 
 /*
  * Copyright (c) 2015 Reyk Floeter <reyk@openbsd.org>
@@ -30,13 +30,19 @@
 #include <stdint.h>
 #include <limits.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <util.h>
 #include <imsg.h>
 
 #include "vmd.h"
+#include "virtio.h"
 #include "proc.h"
 #include "vmctl.h"
+
+#define RAW_FMT		"raw"
+#define QCOW2_FMT	"qcow2"
 
 static const char	*socket_name = SOCKET_NAME;
 static int		 ctl_sock = -1;
@@ -48,6 +54,7 @@ __dead void	 ctl_usage(struct ctl_command *);
 int		 vmm_action(struct parse_result *);
 
 int		 ctl_console(struct parse_result *, int, char *[]);
+int		 ctl_convert(const char *, const char *, int, size_t);
 int		 ctl_create(struct parse_result *, int, char *[]);
 int		 ctl_load(struct parse_result *, int, char *[]);
 int		 ctl_log(struct parse_result *, int, char *[]);
@@ -56,6 +63,7 @@ int		 ctl_reset(struct parse_result *, int, char *[]);
 int		 ctl_start(struct parse_result *, int, char *[]);
 int		 ctl_status(struct parse_result *, int, char *[]);
 int		 ctl_stop(struct parse_result *, int, char *[]);
+int		 ctl_waitfor(struct parse_result *, int, char *[]);
 int		 ctl_pause(struct parse_result *, int, char *[]);
 int		 ctl_unpause(struct parse_result *, int, char *[]);
 int		 ctl_send(struct parse_result *, int, char *[]);
@@ -63,22 +71,23 @@ int		 ctl_receive(struct parse_result *, int, char *[]);
 
 struct ctl_command ctl_commands[] = {
 	{ "console",	CMD_CONSOLE,	ctl_console,	"id" },
-	{ "create",	CMD_CREATE,	ctl_create,	
-		"\"path\" -s size [-f fmt]", 1 },
-	{ "load",	CMD_LOAD,	ctl_load,	"\"path\"" },
-	{ "log",	CMD_LOG,	ctl_log,	"(verbose|brief)" },
-	{ "reload",	CMD_RELOAD,	ctl_reload,	"" },
-	{ "reset",	CMD_RESET,	ctl_reset,	"[all|vms|switches]" },
-	{ "show",	CMD_STATUS,	ctl_status,	"[id]" },
-	{ "start",	CMD_START,	ctl_start,	"\"name\""
-	    " [-Lc] [-b image] [-r image] [-m size]\n"
-	    "\t\t[-n switch] [-i count] [-d disk]* [-t name]" },
-	{ "status",	CMD_STATUS,	ctl_status,	"[id]" },
-	{ "stop",	CMD_STOP,	ctl_stop,	"id [-fw]" },
+	{ "create",	CMD_CREATE,	ctl_create,
+		"[-b base | -i disk] [-s size] disk", 1 },
+	{ "load",	CMD_LOAD,	ctl_load,	"filename" },
+	{ "log",	CMD_LOG,	ctl_log,	"[brief | verbose]" },
 	{ "pause",	CMD_PAUSE,	ctl_pause,	"id" },
-	{ "unpause",	CMD_UNPAUSE,	ctl_unpause,	"id" },
+	{ "receive",	CMD_RECEIVE,	ctl_receive,	"name" ,	1},
+	{ "reload",	CMD_RELOAD,	ctl_reload,	"" },
+	{ "reset",	CMD_RESET,	ctl_reset,	"[all | switches | vms]" },
 	{ "send",	CMD_SEND,	ctl_send,	"id",	1},
-	{ "receive",	CMD_RECEIVE,	ctl_receive,	"id" ,	1},
+	{ "show",	CMD_STATUS,	ctl_status,	"[id]" },
+	{ "start",	CMD_START,	ctl_start,
+	    "[-cL] [-B device] [-b path] [-d disk] [-i count]\n"
+	    "\t\t[-m size] [-n switch] [-r path] [-t name] id | name" },
+	{ "status",	CMD_STATUS,	ctl_status,	"[id]" },
+	{ "stop",	CMD_STOP,	ctl_stop,	"[-fw] [id | -a]" },
+	{ "unpause",	CMD_UNPAUSE,	ctl_unpause,	"id" },
+	{ "wait",	CMD_WAITFOR,	ctl_waitfor,	"id" },
 	{ NULL }
 };
 
@@ -88,7 +97,7 @@ usage(void)
 	extern char	*__progname;
 	int		 i;
 
-	fprintf(stderr, "usage:\t%s command [arg ...]\n",
+	fprintf(stderr, "usage:\t%s [-v] command [arg ...]\n",
 	    __progname);
 	for (i = 0; ctl_commands[i].name != NULL; i++) {
 		fprintf(stderr, "\t%s %s %s\n", __progname,
@@ -102,7 +111,7 @@ ctl_usage(struct ctl_command *ctl)
 {
 	extern char	*__progname;
 
-	fprintf(stderr, "usage:\t%s %s %s\n", __progname,
+	fprintf(stderr, "usage:\t%s [-v] %s %s\n", __progname,
 	    ctl->name, ctl->usage);
 	exit(1);
 }
@@ -110,10 +119,13 @@ ctl_usage(struct ctl_command *ctl)
 int
 main(int argc, char *argv[])
 {
-	int	 ch;
+	int	 ch, verbose = 1;
 
-	while ((ch = getopt(argc, argv, "")) != -1) {
+	while ((ch = getopt(argc, argv, "v")) != -1) {
 		switch (ch) {
+		case 'v':
+			verbose = 2;
+			break;
 		default:
 			usage();
 			/* NOTREACHED */
@@ -122,9 +134,12 @@ main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 	optreset = 1;
+	optind = 1;
 
 	if (argc < 1)
 		usage();
+
+	log_init(verbose, LOG_DAEMON);
 
 	return (parse(argc, argv));
 }
@@ -165,7 +180,7 @@ parse(int argc, char *argv[])
 			err(1, "pledge");
 	}
 	if (ctl->main(&res, argc, argv) != 0)
-		err(1, "failed");
+		exit(1);
 
 	if (ctl_sock != -1) {
 		close(ibuf->fd);
@@ -209,7 +224,7 @@ vmmaction(struct parse_result *res)
 	case CMD_START:
 		ret = vm_start(res->id, res->name, res->size, res->nifs,
 		    res->nets, res->ndisks, res->disks, res->disktypes,
-		    res->path, res->isopath, res->instance);
+		    res->path, res->isopath, res->instance, res->bootdevice);
 		if (ret) {
 			errno = ret;
 			err(1, "start VM operation failed");
@@ -219,10 +234,9 @@ vmmaction(struct parse_result *res)
 		terminate_vm(res->id, res->name, res->flags);
 		break;
 	case CMD_STATUS:
-		get_info_vm(res->id, res->name, 0);
-		break;
 	case CMD_CONSOLE:
-		get_info_vm(res->id, res->name, 1);
+	case CMD_STOPALL:
+		get_info_vm(res->id, res->name, res->action, res->flags);
 		break;
 	case CMD_LOAD:
 		imsg_compose(ibuf, IMSG_VMDOP_LOAD, 0, 0, -1,
@@ -239,6 +253,9 @@ vmmaction(struct parse_result *res)
 		imsg_compose(ibuf, IMSG_CTL_RESET, 0, 0, -1,
 		    &res->mode, sizeof(res->mode));
 		break;
+	case CMD_WAITFOR:
+		waitfor_vm(res->id, res->name);
+		break;
 	case CMD_PAUSE:
 		pause_vm(res->id, res->name);
 		break;
@@ -248,12 +265,15 @@ vmmaction(struct parse_result *res)
 	case CMD_SEND:
 		send_vm(res->id, res->name);
 		done = 1;
+		ret = 0;
 		break;
 	case CMD_RECEIVE:
 		vm_receive(res->id, res->name);
 		break;
 	case CMD_CREATE:
 	case NONE:
+		/* The action is not expected here */
+		errx(1, "invalid action %u", res->action);
 		break;
 	}
 
@@ -296,12 +316,16 @@ vmmaction(struct parse_result *res)
 				done = vm_start_complete(&imsg, &ret,
 				    tty_autoconnect);
 				break;
+			case CMD_WAITFOR:
+				flags = VMOP_WAIT;
+				/* FALLTHROUGH */
 			case CMD_STOP:
 				done = terminate_vm_complete(&imsg, &ret,
 				    flags);
 				break;
 			case CMD_CONSOLE:
 			case CMD_STATUS:
+			case CMD_STOPALL:
 				done = add_info(&imsg, &ret);
 				break;
 			case CMD_PAUSE:
@@ -322,7 +346,10 @@ vmmaction(struct parse_result *res)
 		}
 	}
 
-	return (0);
+	if (ret)
+		return (1);
+	else
+		return (0);
 }
 
 void
@@ -347,9 +374,9 @@ parse_ifs(struct parse_result *res, char *word, int val)
 	const char	*error;
 
 	if (word != NULL) {
-		val = strtonum(word, 0, INT_MAX, &error);
+		val = strtonum(word, 1, INT_MAX, &error);
 		if (error != NULL)  {
-			warnx("invalid count \"%s\": %s", word, error);
+			warnx("count is %s: %s", error, word);
 			return (-1);
 		}
 	}
@@ -381,8 +408,10 @@ parse_network(struct parse_result *res, char *word)
 }
 
 int
-parse_size(struct parse_result *res, char *word, long long val)
+parse_size(struct parse_result *res, char *word)
 {
+	long long val = 0;
+
 	if (word != NULL) {
 		if (scan_scaled(word, &val) != 0) {
 			warn("invalid size: %s", word);
@@ -402,22 +431,53 @@ parse_size(struct parse_result *res, char *word, long long val)
 	return (0);
 }
 
-#define RAW_FMT_PREFIX		"raw:"
-#define QCOW2_FMT_PREFIX	"qcow2:"
-
 int
-parse_disktype(char *s, char **ret)
+parse_disktype(const char *s, const char **ret)
 {
+	char		 buf[BUFSIZ];
+	const char	*ext;
+	int		 fd;
+	ssize_t		 len;
+
 	*ret = s;
-	if (strstr(s, RAW_FMT_PREFIX) == s) {
-		*ret = s + strlen(RAW_FMT_PREFIX);
-		return VMDF_RAW;
+
+	/* Try to parse the explicit format (qcow2:disk.qc2) */
+	if (strstr(s, RAW_FMT) == s && *(s + strlen(RAW_FMT)) == ':') {
+		*ret = s + strlen(RAW_FMT) + 1;
+		return (VMDF_RAW);
 	}
-	if (strstr(s, QCOW2_FMT_PREFIX) == s) {
-		*ret = s + strlen(QCOW2_FMT_PREFIX);
-		return VMDF_QCOW2;
+	if (strstr(s, QCOW2_FMT) == s && *(s + strlen(QCOW2_FMT)) == ':') {
+		*ret = s + strlen(QCOW2_FMT) + 1;
+		return (VMDF_QCOW2);
 	}
-	return VMDF_RAW;
+
+	/* Or try to derive the format from the file signature */
+	if ((fd = open(s, O_RDONLY)) != -1) {
+		len = read(fd, buf, sizeof(buf));
+		close(fd);
+
+		if (len >= (ssize_t)strlen(VM_MAGIC_QCOW) &&
+		    strncmp(buf, VM_MAGIC_QCOW,
+		    strlen(VM_MAGIC_QCOW)) == 0) {
+			/* Return qcow2, the version will be checked later */
+			return (VMDF_QCOW2);
+		}
+	}
+
+	/*
+	 * Use the extension as a last option.  This is needed for
+	 * 'vmctl create' as the file, and the signature, doesn't
+	 * exist yet.
+	 */
+	if ((ext = strrchr(s, '.')) != NULL && *(++ext) != '\0') {
+		if (strcasecmp(ext, RAW_FMT) == 0)
+			return (VMDF_RAW);
+		else if (strcasecmp(ext, QCOW2_FMT) == 0)
+			return (VMDF_QCOW2);
+	}
+
+	/* Fallback to raw */
+	return (VMDF_RAW);
 }
 
 int
@@ -460,6 +520,10 @@ parse_vmid(struct parse_result *res, char *word, int needname)
 		warnx("missing vmid argument");
 		return (-1);
 	}
+	if (*word == '-') {
+		/* don't print a warning to allow command line options */
+		return (-1);
+	}
 	id = strtonum(word, 0, UINT32_MAX, &error);
 	if (error == NULL) {
 		if (needname) {
@@ -499,54 +563,198 @@ parse_instance(struct parse_result *res, char *word)
 int
 ctl_create(struct parse_result *res, int argc, char *argv[])
 {
-	int		 ch, ret;
-	const char	*paths[2], *format;
+	int		 ch, ret, type;
+	const char	*disk, *format, *base = NULL, *input = NULL;
 
-	if (argc < 2)
-		ctl_usage(res->ctl);
-
-	paths[0] = argv[1];
-	paths[1] = NULL;
-	format = "raw";
-
-	if (unveil(paths[0], "rwc") == -1)
-		err(1, "unveil");
-
-	if (pledge("stdio rpath wpath cpath", NULL) == -1)
-		err(1, "pledge");
-	argc--;
-	argv++;
-
-	while ((ch = getopt(argc, argv, "s:f:")) != -1) {
+	while ((ch = getopt(argc, argv, "b:i:s:")) != -1) {
 		switch (ch) {
-		case 's':
-			if (parse_size(res, optarg, 0) != 0)
-				errx(1, "invalid size: %s", optarg);
+		case 'b':
+			base = optarg;
+			if (unveil(base, "r") == -1)
+				err(1, "unveil");
 			break;
-		case 'f':
-			format = optarg;
+		case 'i':
+			input = optarg;
+			if (unveil(input, "r") == -1)
+				err(1, "unveil");
+			break;
+		case 's':
+			if (parse_size(res, optarg) != 0)
+				errx(1, "invalid size: %s", optarg);
 			break;
 		default:
 			ctl_usage(res->ctl);
 			/* NOTREACHED */
 		}
 	}
+	argc -= optind;
+	argv += optind;
 
-	if (res->size == 0) {
-		fprintf(stderr, "missing size argument\n");
+	if (argc < 1)
+		ctl_usage(res->ctl);
+
+	type = parse_disktype(argv[0], &disk);
+
+	if (pledge("stdio rpath wpath cpath unveil", NULL) == -1)
+		err(1, "pledge");
+	if (unveil(disk, "rwc") == -1)
+		err(1, "unveil");
+
+	if (input) {
+		if (base && input)
+			errx(1, "conflicting -b and -i arguments");
+		return ctl_convert(input, disk, type, res->size);
+	}
+
+	if (unveil(NULL, NULL))
+		err(1, "unveil");
+
+	if (base && type != VMDF_QCOW2)
+		errx(1, "base images require qcow2 disk format");
+	if (res->size == 0 && !base) {
+		fprintf(stderr, "could not create %s: missing size argument\n",
+		    disk);
 		ctl_usage(res->ctl);
 	}
-	if (strcmp(format, "raw") == 0)
-		ret = create_raw_imagefile(paths[0], res->size);
-	else if (strcmp(format, "qcow2") == 0)
-		ret = create_qc2_imagefile(paths[0], res->size);
-	else
-		errx(1, "unknown image format %s", format);
-	if (ret != 0) {
+
+	if ((ret = create_imagefile(type, disk, base, res->size, &format)) != 0) {
 		errno = ret;
 		err(1, "create imagefile operation failed");
 	} else
-		warnx("imagefile created");
+		warnx("%s imagefile created", format);
+
+	return (0);
+}
+
+int
+ctl_convert(const char *srcfile, const char *dstfile, int dsttype, size_t dstsize)
+{
+	struct {
+		int			 fd;
+		int			 type;
+		struct virtio_backing	 file;
+		const char		*disk;
+		off_t			 size;
+	}	 src, dst;
+	int		 ret;
+	const char	*format, *errstr = NULL;
+	uint8_t		*buf = NULL, *zerobuf = NULL;
+	size_t		 buflen;
+	ssize_t		 len, rlen;
+	off_t		 off;
+
+	memset(&src, 0, sizeof(src));
+	memset(&dst, 0, sizeof(dst));
+
+	src.type = parse_disktype(srcfile, &src.disk);
+	dst.type = dsttype;
+	dst.disk = dstfile;
+
+	if ((src.fd = open_imagefile(src.type, src.disk, O_RDONLY,
+	    &src.file, &src.size)) == -1) {
+		errstr = "failed to open source image file";
+		goto done;
+	}
+
+	/* We can only lock unveil after opening the disk and all base images */
+	if (unveil(NULL, NULL))
+		err(1, "unveil");
+
+	if (dstsize == 0)
+		dstsize = src.size;
+	else
+		dstsize *= 1048576;
+	if (dstsize < (size_t)src.size) {
+		errstr = "size cannot be smaller than input disk size";
+		goto done;
+	}
+
+	/* align to megabytes */
+	dst.size = ALIGNSZ(dstsize, 1048576);
+
+	if ((ret = create_imagefile(dst.type, dst.disk, NULL,
+	   dst.size / 1048576, &format)) != 0) {
+		errno = ret;
+		errstr = "failed to create destination image file";
+		goto done;
+	}
+
+	if ((dst.fd = open_imagefile(dst.type, dst.disk, O_RDWR,
+	    &dst.file, &dst.size)) == -1) {
+		errstr = "failed to open destination image file";
+		goto done;
+	}
+
+	if (pledge("stdio", NULL) == -1)
+		err(1, "pledge");
+
+	/*
+	 * Use 64k buffers by default.  This could also be adjusted to
+	 * the backend cluster size.
+	 */
+	buflen = 1 << 16;
+	if ((buf = calloc(1, buflen)) == NULL ||
+	    (zerobuf = calloc(1, buflen)) == NULL) {
+		errstr = "failed to allocated buffers";
+		goto done;
+	}
+
+	for (off = 0; off < dst.size; off += len) {
+		/* Read input from the source image */
+		if (off < src.size) {
+			len = MIN((off_t)buflen, src.size - off);
+			if ((rlen = src.file.pread(src.file.p,
+			    buf, (size_t)len, off)) != len) {
+				errno = EIO;
+				errstr = "failed to read from source";
+				goto done;
+			}
+		} else
+			len = 0;
+
+		/* and pad the remaining bytes */
+		if (len < (ssize_t)buflen) {
+			log_debug("%s: padding %zd zero bytes at offset %lld",
+			    format, buflen - len, off + len);
+			memset(buf + len, 0, buflen - len);
+			len = buflen;
+		}
+
+		/*
+		 * No need to copy empty buffers.  This allows the backend,
+		 * sparse files or QCOW2 images, to save space in the
+		 * destination file.
+		 */
+		if (memcmp(buf, zerobuf, buflen) == 0)
+			continue;
+
+		log_debug("%s: writing %zd of %lld bytes at offset %lld",
+		    format, len, dst.size, off);
+
+		if ((rlen = dst.file.pwrite(dst.file.p,
+		    buf, (size_t)len, off)) != len) {
+			errno = EIO;
+			errstr = "failed to write to destination";
+			goto done;
+		}
+	}
+
+	if (dstsize < (size_t)dst.size)
+		warnx("destination size rounded to %lld megabytes",
+		    dst.size / 1048576);
+
+ done:
+	free(buf);
+	free(zerobuf);
+	if (src.file.p != NULL)
+		src.file.close(src.file.p, 0);
+	if (dst.file.p != NULL)
+		dst.file.close(dst.file.p, 0);
+	if (errstr != NULL)
+		errx(1, "%s", errstr);
+	else
+		warnx("%s imagefile created", format);
+
 	return (0);
 }
 
@@ -624,18 +832,10 @@ int
 ctl_start(struct parse_result *res, int argc, char *argv[])
 {
 	int		 ch, i, type;
-	char		 path[PATH_MAX], *s;
+	char		 path[PATH_MAX];
+	const char	*s;
 
-	if (argc < 2)
-		ctl_usage(res->ctl);
-
-	if (parse_vmid(res, argv[1], 0) == -1)
-		errx(1, "invalid id: %s", argv[1]);
-
-	argc--;
-	argv++;
-
-	while ((ch = getopt(argc, argv, "b:r:cLm:n:d:i:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "b:B:cd:i:Lm:n:r:t:")) != -1) {
 		switch (ch) {
 		case 'b':
 			if (res->path)
@@ -644,6 +844,18 @@ ctl_start(struct parse_result *res, int argc, char *argv[])
 				err(1, "invalid boot image path");
 			if ((res->path = strdup(path)) == NULL)
 				errx(1, "strdup");
+			break;
+		case 'B':
+			if (res->bootdevice)
+				errx(1, "boot device specified multiple times");
+			if (strcmp("disk", optarg) == 0)
+				res->bootdevice = VMBOOTDEV_DISK;
+			else if (strcmp("cdrom", optarg) == 0)
+				res->bootdevice = VMBOOTDEV_CDROM;
+			else if (strcmp("net", optarg) == 0)
+				res->bootdevice = VMBOOTDEV_NET;
+			else
+				errx(1, "unknown boot device %s", optarg);
 			break;
 		case 'r':
 			if (res->isopath)
@@ -663,7 +875,7 @@ ctl_start(struct parse_result *res, int argc, char *argv[])
 		case 'm':
 			if (res->size)
 				errx(1, "memory specified multiple times");
-			if (parse_size(res, optarg, 0) != 0)
+			if (parse_size(res, optarg) != 0)
 				errx(1, "invalid memory size: %s", optarg);
 			break;
 		case 'n':
@@ -692,6 +904,14 @@ ctl_start(struct parse_result *res, int argc, char *argv[])
 			/* NOTREACHED */
 		}
 	}
+	argc -= optind;
+	argv += optind;
+
+	if (argc != 1)
+		ctl_usage(res->ctl);
+
+	if (parse_vmid(res, argv[0], 0) == -1)
+		errx(1, "invalid id: %s", argv[0]);
 
 	for (i = res->nnets; i < res->nifs; i++) {
 		/* Add interface that is not attached to a switch */
@@ -707,18 +927,9 @@ ctl_start(struct parse_result *res, int argc, char *argv[])
 int
 ctl_stop(struct parse_result *res, int argc, char *argv[])
 {
-	int		 ch;
+	int		 ch, ret;
 
-	if (argc < 2)
-		ctl_usage(res->ctl);
-
-	if (parse_vmid(res, argv[1], 0) == -1)
-		errx(1, "invalid id: %s", argv[1]);
-
-	argc--;
-	argv++;
-
-	while ((ch = getopt(argc, argv, "fw")) != -1) {
+	while ((ch = getopt(argc, argv, "afw")) != -1) {
 		switch (ch) {
 		case 'f':
 			res->flags |= VMOP_FORCE;
@@ -726,17 +937,49 @@ ctl_stop(struct parse_result *res, int argc, char *argv[])
 		case 'w':
 			res->flags |= VMOP_WAIT;
 			break;
+		case 'a':
+			res->action = CMD_STOPALL;
+			break;
 		default:
 			ctl_usage(res->ctl);
 			/* NOTREACHED */
 		}
 	}
+	argc -= optind;
+	argv += optind;
+
+	if (argc == 0) {
+		if (res->action != CMD_STOPALL)
+			ctl_usage(res->ctl);
+	} else if (argc > 1)
+		ctl_usage(res->ctl);
+	else if (argc == 1)
+		ret = parse_vmid(res, argv[0], 0);
+	else
+		ret = -1;
+
+	/* VM id is only expected without the -a flag */
+	if ((res->action != CMD_STOPALL && ret == -1) ||
+	    (res->action == CMD_STOPALL && ret != -1))
+		errx(1, "invalid id: %s", argv[1]);
 
 	return (vmmaction(res));
 }
 
 int
 ctl_console(struct parse_result *res, int argc, char *argv[])
+{
+	if (argc == 2) {
+		if (parse_vmid(res, argv[1], 0) == -1)
+			errx(1, "invalid id: %s", argv[1]);
+	} else if (argc != 2)
+		ctl_usage(res->ctl);
+
+	return (vmmaction(res));
+}
+
+int
+ctl_waitfor(struct parse_result *res, int argc, char *argv[])
 {
 	if (argc == 2) {
 		if (parse_vmid(res, argv[1], 0) == -1)
@@ -805,6 +1048,7 @@ ctl_openconsole(const char *name)
 	closefrom(STDERR_FILENO + 1);
 	if (unveil(VMCTL_CU, "x") == -1)
 		err(1, "unveil");
-	execl(VMCTL_CU, VMCTL_CU, "-l", name, "-s", "115200", (char *)NULL);
+	execl(VMCTL_CU, VMCTL_CU, "-r", "-l", name, "-s", "115200",
+	    (char *)NULL);
 	err(1, "failed to open the console");
 }

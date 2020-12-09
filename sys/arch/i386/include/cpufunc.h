@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpufunc.h,v 1.31 2018/08/23 14:47:52 jsg Exp $	*/
+/*	$OpenBSD: cpufunc.h,v 1.33 2020/09/13 11:53:16 jsg Exp $	*/
 /*	$NetBSD: cpufunc.h,v 1.8 1994/10/27 04:15:59 cgd Exp $	*/
 
 /*
@@ -194,8 +194,19 @@ intr_restore(u_long ef)
 static __inline void
 wbinvd(void)
 {
-        __asm volatile("wbinvd");
+	__asm volatile("wbinvd" : : : "memory");
 }
+
+#ifdef MULTIPROCESSOR
+int wbinvd_on_all_cpus(void);
+#else
+static inline int
+wbinvd_on_all_cpus(void)
+{
+	wbinvd();
+	return 0;
+}
+#endif
 
 static __inline void
 clflush(u_int32_t addr)

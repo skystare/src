@@ -1,7 +1,4 @@
-BEGINTEST
-<div class="Pp"></div>
-We are using the html device.
-<div class="Pp"></div>
-The device name can be overridden.
-<div class="Pp"></div>
-ENDTEST
+<p class="Pp">We are using the html device. It can also be written as the html
+    device.</p>
+<p class="Pp">The device name can be overridden. Both escape forms work for the
+    name.</p>

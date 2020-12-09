@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_trunk.c,v 1.137 2018/08/12 23:50:31 ccardenas Exp $	*/
+/*	$OpenBSD: if_trunk.c,v 1.150 2020/09/12 20:12:09 kn Exp $	*/
 
 /*
  * Copyright (c) 2005, 2006, 2007 Reyk Floeter <reyk@openbsd.org>
@@ -33,6 +33,7 @@
 #include <net/if_dl.h>
 #include <net/if_media.h>
 #include <net/if_types.h>
+#include <net/route.h>
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
@@ -75,7 +76,7 @@ int	 trunk_ether_delmulti(struct trunk_softc *, struct ifreq *);
 void	 trunk_ether_purgemulti(struct trunk_softc *);
 int	 trunk_ether_cmdmulti(struct trunk_port *, u_long);
 int	 trunk_ioctl_allports(struct trunk_softc *, u_long, caddr_t);
-int	 trunk_input(struct ifnet *, struct mbuf *, void *);
+void	 trunk_input(struct ifnet *, struct mbuf *);
 void	 trunk_start(struct ifnet *);
 void	 trunk_init(struct ifnet *);
 void	 trunk_stop(struct ifnet *);
@@ -158,7 +159,6 @@ trunk_clone_create(struct if_clone *ifc, int unit)
 	int i, error = 0;
 
 	tr = malloc(sizeof(*tr), M_DEVBUF, M_WAITOK|M_ZERO);
-	tr->tr_unit = unit;
 	tr->tr_proto = TRUNK_PROTO_NONE;
 	for (i = 0; trunk_protos[i].ti_proto != TRUNK_PROTO_NONE; i++) {
 		if (trunk_protos[i].ti_proto == TRUNK_PROTO_DEFAULT) {
@@ -184,8 +184,7 @@ trunk_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_ioctl = trunk_ioctl;
 	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST | IFF_MULTICAST;
 	ifp->if_capabilities = trunk_capabilities(tr);
-
-	IFQ_SET_MAXLEN(&ifp->if_snd, 1);
+	ifp->if_xflags = IFXF_CLONED;
 
 	snprintf(ifp->if_xname, sizeof(ifp->if_xname), "%s%d",
 	    ifc->ifc_name, unit);
@@ -194,6 +193,7 @@ trunk_clone_create(struct if_clone *ifc, int unit)
 	 * Attach as an ordinary ethernet device, children will be attached
 	 * as special device IFT_IEEE8023ADLAG.
 	 */
+	if_counters_alloc(ifp);
 	if_attach(ifp);
 	ether_ifattach(ifp);
 
@@ -284,6 +284,7 @@ trunk_port_create(struct trunk_softc *tr, struct ifnet *ifp)
 {
 	struct trunk_softc *tr_ptr;
 	struct trunk_port *tp;
+	struct arpcom *ac0;
 	int error = 0;
 
 	/* Limit the maximal number of trunk ports */
@@ -298,13 +299,17 @@ trunk_port_create(struct trunk_softc *tr, struct ifnet *ifp)
 	if (ifp->if_type != IFT_ETHER)
 		return (EPROTONOSUPPORT);
 
+	ac0 = (struct arpcom *)ifp;
+	if (ac0->ac_trunkport != NULL)
+		return (EBUSY);
+
 	/* Take MTU from the first member port */
 	if (SLIST_EMPTY(&tr->tr_ports)) {
 		if (tr->tr_ifflags & IFF_DEBUG)
 			printf("%s: first port, setting trunk mtu %u\n",
 			    tr->tr_ifname, ifp->if_mtu);
 		tr->tr_ac.ac_if.if_mtu = ifp->if_mtu;
-		tr->tr_ac.ac_if.if_hardmtu = ifp->if_mtu;
+		tr->tr_ac.ac_if.if_hardmtu = ifp->if_hardmtu;
 	} else if (tr->tr_ac.ac_if.if_mtu != ifp->if_mtu) {
 		printf("%s: adding %s failed, MTU %u != %u\n", tr->tr_ifname,
 		    ifp->if_xname, ifp->if_mtu, tr->tr_ac.ac_if.if_mtu);
@@ -366,18 +371,21 @@ trunk_port_create(struct trunk_softc *tr, struct ifnet *ifp)
 	trunk_ether_cmdmulti(tp, SIOCADDMULTI);
 
 	/* Register callback for physical link state changes */
-	tp->lh_cookie = hook_establish(ifp->if_linkstatehooks, 1,
-	    trunk_port_state, tp);
+	task_set(&tp->tp_ltask, trunk_port_state, tp);
+	if_linkstatehook_add(ifp, &tp->tp_ltask);
 
 	/* Register callback if parent wants to unregister */
-	tp->dh_cookie = hook_establish(ifp->if_detachhooks, 0,
-	    trunk_port_ifdetach, tp);
+	task_set(&tp->tp_dtask, trunk_port_ifdetach, tp);
+	if_detachhook_add(ifp, &tp->tp_dtask);
 
 	if (tr->tr_port_create != NULL)
 		error = (*tr->tr_port_create)(tp);
 
 	/* Change input handler of the physical interface. */
-	if_ih_insert(ifp, trunk_input, tp);
+	tp->tp_input = ifp->if_input;
+	NET_ASSERT_LOCKED();
+	ac0->ac_trunkport = tp;
+	ifp->if_input = trunk_input;
 
 	return (error);
 }
@@ -405,16 +413,15 @@ trunk_port_destroy(struct trunk_port *tp)
 	struct trunk_softc *tr = (struct trunk_softc *)tp->tp_trunk;
 	struct trunk_port *tp_ptr;
 	struct ifnet *ifp = tp->tp_if;
+	struct arpcom *ac0 = (struct arpcom *)ifp;
 
 	/* Restore previous input handler. */
-	if_ih_remove(ifp, trunk_input, tp);
+	NET_ASSERT_LOCKED();
+	ifp->if_input = tp->tp_input;
+	ac0->ac_trunkport = NULL;
 
 	/* Remove multicast addresses from this port */
 	trunk_ether_cmdmulti(tp, SIOCDELMULTI);
-
-	/* Port has to be down */
-	if (ifp->if_flags & IFF_UP)
-		if_down(ifp);
 
 	ifpromisc(ifp, 0);
 
@@ -427,8 +434,8 @@ trunk_port_destroy(struct trunk_port *tp)
 	ifp->if_ioctl = tp->tp_ioctl;
 	ifp->if_output = tp->tp_output;
 
-	hook_disestablish(ifp->if_linkstatehooks, tp->lh_cookie);
-	hook_disestablish(ifp->if_detachhooks, tp->dh_cookie);
+	if_detachhook_del(ifp, &tp->tp_dtask);
+	if_linkstatehook_del(ifp, &tp->tp_ltask);
 
 	/* Finally, remove the port from the trunk */
 	SLIST_REMOVE(&tr->tr_ports, tp, trunk_port, tp_entries);
@@ -642,15 +649,24 @@ trunk_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 			error = EPROTONOSUPPORT;
 			break;
 		}
+
 		/*
+		 * Use of ifp->if_input and ac->ac_trunkport is
+		 * protected by NET_LOCK, but that may not be true
+		 * in the future. The below comment and code flow is
+		 * maintained to help in that future.
+		 *
 		 * Serialize modifications to the trunk and trunk
 		 * ports via the ifih SRP: detaching trunk_input
 		 * from the trunk port will require all currently
 		 * running trunk_input's on this port to finish
 		 * granting us an exclusive access to it.
 		 */
-		SLIST_FOREACH(tp, &tr->tr_ports, tp_entries)
-			if_ih_remove(tp->tp_if, trunk_input, tp);
+		NET_ASSERT_LOCKED();
+		SLIST_FOREACH(tp, &tr->tr_ports, tp_entries) {
+			/* if_ih_remove(tp->tp_if, trunk_input, tp); */
+			tp->tp_if->if_input = tp->tp_input;
+		}
 		if (tr->tr_proto != TRUNK_PROTO_NONE)
 			error = tr->tr_detach(tr);
 		if (error != 0)
@@ -664,9 +680,11 @@ trunk_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 				tr->tr_proto = trunk_protos[i].ti_proto;
 				if (tr->tr_proto != TRUNK_PROTO_NONE)
 					error = trunk_protos[i].ti_attach(tr);
-				SLIST_FOREACH(tp, &tr->tr_ports, tp_entries)
-					if_ih_insert(tp->tp_if,
-					    trunk_input, tp);
+				SLIST_FOREACH(tp, &tr->tr_ports, tp_entries) {
+					/* if_ih_insert(tp->tp_if,
+					    trunk_input, tp); */
+					tp->tp_if->if_input = trunk_input;
+				}
 				/* Update trunk capabilities */
 				tr->tr_capabilities = trunk_capabilities(tr);
 				goto out;
@@ -1002,7 +1020,7 @@ trunk_start(struct ifnet *ifp)
 	int error;
 
 	for (;;) {
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 
@@ -1038,8 +1056,8 @@ trunk_hashmbuf(struct mbuf *m, SIPHASH_KEY *key)
 #endif
 	SIPHASH_CTX ctx;
 
-	if (m->m_pkthdr.ph_flowid & M_FLOWID_VALID)
-		return (m->m_pkthdr.ph_flowid & M_FLOWID_MASK);
+	if (m->m_pkthdr.csum_flags & M_FLOWID)
+		return (m->m_pkthdr.ph_flowid);
 
 	SipHash24_Init(&ctx, key);
 	off = sizeof(*eh);
@@ -1111,14 +1129,17 @@ trunk_stop(struct ifnet *ifp)
 		(*tr->tr_stop)(tr);
 }
 
-int
-trunk_input(struct ifnet *ifp, struct mbuf *m, void *cookie)
+void
+trunk_input(struct ifnet *ifp, struct mbuf *m)
 {
-	struct trunk_softc *tr;
+	struct arpcom *ac0 = (struct arpcom *)ifp;
 	struct trunk_port *tp;
+	struct trunk_softc *tr;
 	struct ifnet *trifp = NULL;
 	struct ether_header *eh;
-	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
+
+	if (m->m_len < sizeof(*eh))
+		goto bad;
 
 	eh = mtod(m, struct ether_header *);
 	if (ETHER_IS_MULTICAST(eh->ether_dhost))
@@ -1128,7 +1149,7 @@ trunk_input(struct ifnet *ifp, struct mbuf *m, void *cookie)
 	if (ifp->if_type != IFT_IEEE8023ADLAG)
 		goto bad;
 
-	tp = (struct trunk_port *)cookie;
+	tp = (struct trunk_port *)ac0->ac_trunkport;
 	if ((tr = (struct trunk_softc *)tp->tp_trunk) == NULL)
 		goto bad;
 
@@ -1141,7 +1162,7 @@ trunk_input(struct ifnet *ifp, struct mbuf *m, void *cookie)
 		 * We stop here if the packet has been consumed
 		 * by the protocol routine.
 		 */
-		return (1);
+		return;
 	}
 
 	if ((trifp->if_flags & (IFF_UP|IFF_RUNNING)) != (IFF_UP|IFF_RUNNING))
@@ -1157,20 +1178,18 @@ trunk_input(struct ifnet *ifp, struct mbuf *m, void *cookie)
 		if (bcmp(&tr->tr_ac.ac_enaddr, eh->ether_dhost,
 		    ETHER_ADDR_LEN)) {
 			m_freem(m);
-			return (1);
+			return;
 		}
 	}
 
 
-	ml_enqueue(&ml, m);
-	if_input(trifp, &ml);
-	return (1);
+	if_vinput(trifp, m);
+	return;
 
  bad:
 	if (trifp != NULL)
 		trifp->if_ierrors++;
 	m_freem(m);
-	return (1);
 }
 
 int
@@ -1213,6 +1232,7 @@ trunk_port_state(void *arg)
 	if (tr->tr_linkstate != NULL)
 		(*tr->tr_linkstate)(tp);
 	trunk_link_active(tr, tp);
+	rtm_ifchg(&tr->tr_ac.ac_if);
 }
 
 struct trunk_port *

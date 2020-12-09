@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_zyd.c,v 1.118 2017/04/08 02:57:25 deraadt Exp $	*/
+/*	$OpenBSD: if_zyd.c,v 1.125 2020/07/31 10:49:33 mglocker Exp $	*/
 
 /*-
  * Copyright (c) 2006 by Damien Bergamini <damien.bergamini@free.fr>
@@ -217,7 +217,8 @@ void		zyd_set_chan(struct zyd_softc *, struct ieee80211_channel *);
 int		zyd_set_beacon_interval(struct zyd_softc *, int);
 uint8_t		zyd_plcp_signal(int);
 void		zyd_intr(struct usbd_xfer *, void *, usbd_status);
-void		zyd_rx_data(struct zyd_softc *, const uint8_t *, uint16_t);
+void		zyd_rx_data(struct zyd_softc *, const uint8_t *, uint16_t,
+		    struct mbuf_list *);
 void		zyd_rxeof(struct usbd_xfer *, void *, usbd_status);
 void		zyd_txeof(struct usbd_xfer *, void *, usbd_status);
 int		zyd_tx(struct zyd_softc *, struct mbuf *,
@@ -238,7 +239,7 @@ zyd_match(struct device *parent, void *match, void *aux)
 {
 	struct usb_attach_arg *uaa = aux;
 
-	if (!uaa->iface)
+	if (uaa->iface == NULL || uaa->configno != ZYD_CONFIG_NO)
 		return UMATCH_NONE;
 
 	return (zyd_lookup(uaa->vendor, uaa->product) != NULL) ?
@@ -282,6 +283,7 @@ zyd_attach(struct device *parent, struct device *self, void *aux)
 	usb_device_descriptor_t* ddesc;
 
 	sc->sc_udev = uaa->device;
+	sc->sc_iface = uaa->iface;
 
 	sc->mac_rev = zyd_lookup(uaa->vendor, uaa->product)->rev;
 
@@ -432,13 +434,13 @@ zyd_detach(struct device *self, int flags)
 		return 0;
 	}
 
+	zyd_free_rx_list(sc);
+	zyd_free_tx_list(sc);
+
 	if (ifp->if_softc != NULL) {
 		ieee80211_ifdetach(ifp);
 		if_detach(ifp);
 	}
-
-	zyd_free_rx_list(sc);
-	zyd_free_tx_list(sc);
 
 	sc->attached = 0;
 
@@ -516,7 +518,6 @@ zyd_close_pipes(struct zyd_softc *sc)
 
 	for (i = 0; i < ZYD_ENDPT_CNT; i++) {
 		if (sc->zyd_ep[i] != NULL) {
-			usbd_abort_pipe(sc->zyd_ep[i]);
 			usbd_close_pipe(sc->zyd_ep[i]);
 			sc->zyd_ep[i] = NULL;
 		}
@@ -645,9 +646,9 @@ zyd_media_change(struct ifnet *ifp)
 		return error;
 
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING))
-		zyd_init(ifp);
+		error = zyd_init(ifp);
 
-	return 0;
+	return error;
 }
 
 /*
@@ -783,7 +784,8 @@ zyd_cmd_read(struct zyd_softc *sc, const void *reg, size_t regsize, int olen)
 
 	if (!sc->odone) {
 		/* wait for ZYD_NOTIF_IORD interrupt */
-		if (tsleep(sc, PWAIT, "zydcmd", ZYD_INTR_TIMEOUT) != 0)
+		if (tsleep_nsec(sc, PWAIT, "zydcmd",
+		    MSEC_TO_NSEC(ZYD_INTR_TIMEOUT)) != 0)
 			printf("%s: read command failed\n",
 			    sc->sc_dev.dv_xname);
 	}
@@ -1893,7 +1895,8 @@ zyd_intr(struct usbd_xfer *xfer, void *priv, usbd_status status)
 }
 
 void
-zyd_rx_data(struct zyd_softc *sc, const uint8_t *buf, uint16_t len)
+zyd_rx_data(struct zyd_softc *sc, const uint8_t *buf, uint16_t len,
+    struct mbuf_list *ml)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -1979,7 +1982,7 @@ zyd_rx_data(struct zyd_softc *sc, const uint8_t *buf, uint16_t len)
 	rxi.rxi_flags = 0;
 	rxi.rxi_rssi = stat->rssi;
 	rxi.rxi_tstamp = 0;	/* unused */
-	ieee80211_input(ifp, m, ni, &rxi);
+	ieee80211_inputm(ifp, m, ni, &rxi, ml);
 
 	/* node is no longer needed */
 	ieee80211_release_node(ic, ni);
@@ -1990,6 +1993,7 @@ zyd_rx_data(struct zyd_softc *sc, const uint8_t *buf, uint16_t len)
 void
 zyd_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct zyd_rx_data *data = priv;
 	struct zyd_softc *sc = data->sc;
 	struct ieee80211com *ic = &sc->sc_ic;
@@ -2029,15 +2033,16 @@ zyd_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 			if (len == 0 || p + len >= end)
 				break;
 
-			zyd_rx_data(sc, p, len);
+			zyd_rx_data(sc, p, len, &ml);
 			/* next frame is aligned on a 32-bit boundary */
 			p += (len + 3) & ~3;
 		}
 	} else {
 		DPRINTFN(3, ("received single-frame transfer\n"));
 
-		zyd_rx_data(sc, data->buf, len);
+		zyd_rx_data(sc, data->buf, len, &ml);
 	}
+	if_input(ifp, &ml);
 
 skip:	/* setup a new transfer */
 	usbd_setup_xfer(xfer, sc->zyd_ep[ZYD_ENDPT_BIN], data, NULL,
@@ -2210,6 +2215,7 @@ zyd_tx(struct zyd_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	    ZYD_TX_TIMEOUT, zyd_txeof);
 	error = usbd_transfer(data->xfer);
 	if (error != USBD_IN_PROGRESS && error != 0) {
+		data->ni = NULL;
 		ifp->if_oerrors++;
 		return EIO;
 	}
@@ -2244,7 +2250,7 @@ zyd_start(struct ifnet *ifp)
 			break;
 
 		/* encapsulate and send data frames */
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 #if NBPFILTER > 0

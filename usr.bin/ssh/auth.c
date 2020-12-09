@@ -1,4 +1,4 @@
-/* $OpenBSD: auth.c,v 1.133 2018/09/12 01:19:12 djm Exp $ */
+/* $OpenBSD: auth.c,v 1.149 2020/10/18 11:32:01 djm Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  *
@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <login_cap.h>
@@ -39,6 +40,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <netdb.h>
+#include <time.h>
 
 #include "xmalloc.h"
 #include "match.h"
@@ -59,13 +61,13 @@
 #endif
 #include "authfile.h"
 #include "monitor_wrap.h"
-#include "authfile.h"
 #include "ssherr.h"
 #include "compat.h"
 #include "channels.h"
 
 /* import */
 extern ServerOptions options;
+extern struct include_list includes;
 extern int use_privsep;
 extern struct sshauthopt *auth_opts;
 
@@ -82,9 +84,8 @@ static struct sshbuf *auth_debug;
  * Otherwise true is returned.
  */
 int
-allowed_user(struct passwd * pw)
+allowed_user(struct ssh *ssh, struct passwd * pw)
 {
-	struct ssh *ssh = active_state; /* XXX */
 	struct stat st;
 	const char *hostname = NULL, *ipaddr = NULL;
 	int r;
@@ -103,7 +104,7 @@ allowed_user(struct passwd * pw)
 		char *shell = xstrdup((pw->pw_shell[0] == '\0') ?
 		    _PATH_BSHELL : pw->pw_shell); /* empty = /bin/sh */
 
-		if (stat(shell, &st) != 0) {
+		if (stat(shell, &st) == -1) {
 			logit("User %.100s not allowed because shell %.100s "
 			    "does not exist", pw->pw_name, shell);
 			free(shell);
@@ -238,10 +239,10 @@ format_method_key(Authctxt *authctxt)
 }
 
 void
-auth_log(Authctxt *authctxt, int authenticated, int partial,
+auth_log(struct ssh *ssh, int authenticated, int partial,
     const char *method, const char *submethod)
 {
-	struct ssh *ssh = active_state; /* XXX */
+	Authctxt *authctxt = (Authctxt *)ssh->authctxt;
 	int level = SYSLOG_LEVEL_VERBOSE;
 	const char *authmsg;
 	char *extra = NULL;
@@ -283,9 +284,9 @@ auth_log(Authctxt *authctxt, int authenticated, int partial,
 }
 
 void
-auth_maxtries_exceeded(Authctxt *authctxt)
+auth_maxtries_exceeded(struct ssh *ssh)
 {
-	struct ssh *ssh = active_state; /* XXX */
+	Authctxt *authctxt = (Authctxt *)ssh->authctxt;
 
 	error("maximum authentication attempts exceeded for "
 	    "%s%.100s from %.200s port %d ssh2",
@@ -293,7 +294,7 @@ auth_maxtries_exceeded(Authctxt *authctxt)
 	    authctxt->user,
 	    ssh_remote_ipaddr(ssh),
 	    ssh_remote_port(ssh));
-	packet_disconnect("Too many authentication failures");
+	ssh_packet_disconnect(ssh, "Too many authentication failures");
 	/* NOTREACHED */
 }
 
@@ -347,7 +348,7 @@ expand_authorized_keys(const char *filename, struct passwd *pw)
 	 * Ensure that filename starts anchored. If not, be backward
 	 * compatible and prepend the '%h/'
 	 */
-	if (*file == '/')
+	if (path_absolute(file))
 		return (file);
 
 	i = snprintf(ret, sizeof(ret), "%s/%s", pw->pw_dir, file);
@@ -399,12 +400,12 @@ check_key_in_hostfiles(struct passwd *pw, struct sshkey *key, const char *host,
 	host_status = check_key_in_hostkeys(hostkeys, key, &found);
 	if (host_status == HOST_REVOKED)
 		error("WARNING: revoked key for %s attempted authentication",
-		    found->host);
+		    host);
 	else if (host_status == HOST_OK)
-		debug("%s: key for %s found at %s:%ld", __func__,
+		debug_f("key for %s found at %s:%ld",
 		    found->host, found->file, found->line);
 	else
-		debug("%s: key for host %s not found", __func__, host);
+		debug_f("key for host %s not found", host);
 
 	free_hostkeys(hostkeys);
 
@@ -427,7 +428,7 @@ auth_openfile(const char *file, struct passwd *pw, int strict_modes,
 		return NULL;
 	}
 
-	if (fstat(fd, &st) < 0) {
+	if (fstat(fd, &st) == -1) {
 		close(fd);
 		return NULL;
 	}
@@ -468,17 +469,21 @@ auth_openprincipals(const char *file, struct passwd *pw, int strict_modes)
 }
 
 struct passwd *
-getpwnamallow(const char *user)
+getpwnamallow(struct ssh *ssh, const char *user)
 {
-	struct ssh *ssh = active_state; /* XXX */
 	extern login_cap_t *lc;
 	auth_session_t *as;
 	struct passwd *pw;
-	struct connection_info *ci = get_connection_info(1, options.use_dns);
+	struct connection_info *ci;
+	u_int i;
 
+	ci = get_connection_info(ssh, 1, options.use_dns);
 	ci->user = user;
-	parse_server_match_config(&options, ci);
+	parse_server_match_config(&options, &includes, ci);
 	log_change_level(options.log_level);
+	log_verbose_reset();
+	for (i = 0; i < options.num_log_verbose; i++)
+		log_verbose_add(options.log_verbose[i]);
 	process_permitopen(ssh, &options);
 
 	pw = getpwnam(user);
@@ -487,7 +492,7 @@ getpwnamallow(const char *user)
 		    user, ssh_remote_ipaddr(ssh), ssh_remote_port(ssh));
 		return (NULL);
 	}
-	if (!allowed_user(pw))
+	if (!allowed_user(ssh, pw))
 		return (NULL);
 	if ((lc = login_getclass(pw->pw_class)) == NULL) {
 		debug("unable to get login class: %s", user);
@@ -517,7 +522,7 @@ auth_key_is_revoked(struct sshkey *key)
 	if ((fp = sshkey_fingerprint(key, options.fingerprint_hash,
 	    SSH_FP_DEFAULT)) == NULL) {
 		r = SSH_ERR_ALLOC_FAIL;
-		error("%s: fingerprint key: %s", __func__, ssh_err(r));
+		error_fr(r, "fingerprint key");
 		goto out;
 	}
 
@@ -530,9 +535,9 @@ auth_key_is_revoked(struct sshkey *key)
 		    sshkey_type(key), fp, options.revoked_keys_file);
 		goto out;
 	default:
-		error("Error checking authentication key %s %s in "
-		    "revoked keys file %s: %s", sshkey_type(key), fp,
-		    options.revoked_keys_file, ssh_err(r));
+		error_r(r, "Error checking authentication key %s %s in "
+		    "revoked keys file %s", sshkey_type(key), fp,
+		    options.revoked_keys_file);
 		goto out;
 	}
 
@@ -558,13 +563,12 @@ auth_debug_add(const char *fmt,...)
 	vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 	if ((r = sshbuf_put_cstring(auth_debug, buf)) != 0)
-		fatal("%s: sshbuf_put_cstring: %s", __func__, ssh_err(r));
+		fatal_fr(r, "sshbuf_put_cstring");
 }
 
 void
-auth_debug_send(void)
+auth_debug_send(struct ssh *ssh)
 {
-	struct ssh *ssh = active_state;		/* XXX */
 	char *msg;
 	int r;
 
@@ -572,8 +576,7 @@ auth_debug_send(void)
 		return;
 	while (sshbuf_len(auth_debug) != 0) {
 		if ((r = sshbuf_get_cstring(auth_debug, &msg, NULL)) != 0)
-			fatal("%s: sshbuf_get_cstring: %s",
-			    __func__, ssh_err(r));
+			fatal_fr(r, "sshbuf_get_cstring");
 		ssh_packet_send_debug(ssh, "%s", msg);
 		free(msg);
 	}
@@ -585,7 +588,7 @@ auth_debug_reset(void)
 	if (auth_debug != NULL)
 		sshbuf_reset(auth_debug);
 	else if ((auth_debug = sshbuf_new()) == NULL)
-		fatal("%s: sshbuf_new failed", __func__);
+		fatal_f("sshbuf_new failed");
 }
 
 struct passwd *
@@ -630,9 +633,9 @@ remote_hostname(struct ssh *ssh)
 	fromlen = sizeof(from);
 	memset(&from, 0, sizeof(from));
 	if (getpeername(ssh_packet_get_connection_in(ssh),
-	    (struct sockaddr *)&from, &fromlen) < 0) {
+	    (struct sockaddr *)&from, &fromlen) == -1) {
 		debug("getpeername failed: %.100s", strerror(errno));
-		return strdup(ntop);
+		return xstrdup(ntop);
 	}
 
 	debug3("Trying to reverse map address %.100s.", ntop);
@@ -640,7 +643,7 @@ remote_hostname(struct ssh *ssh)
 	if (getnameinfo((struct sockaddr *)&from, fromlen, name, sizeof(name),
 	    NULL, 0, NI_NAMEREQD) != 0) {
 		/* Host name not found.  Use ip address. */
-		return strdup(ntop);
+		return xstrdup(ntop);
 	}
 
 	/*
@@ -655,7 +658,7 @@ remote_hostname(struct ssh *ssh)
 		logit("Nasty PTR record \"%s\" is set up for %s, ignoring",
 		    name, ntop);
 		freeaddrinfo(ai);
-		return strdup(ntop);
+		return xstrdup(ntop);
 	}
 
 	/* Names are stored in lowercase. */
@@ -676,7 +679,7 @@ remote_hostname(struct ssh *ssh)
 	if (getaddrinfo(name, NULL, &hints, &aitop) != 0) {
 		logit("reverse mapping checking getaddrinfo for %.700s "
 		    "[%s] failed.", name, ntop);
-		return strdup(ntop);
+		return xstrdup(ntop);
 	}
 	/* Look for the address from the list of addresses. */
 	for (ai = aitop; ai; ai = ai->ai_next) {
@@ -691,9 +694,9 @@ remote_hostname(struct ssh *ssh)
 		/* Address not found for the host name. */
 		logit("Address %.100s maps to %.600s, but this does not "
 		    "map back to the address.", ntop, name);
-		return strdup(ntop);
+		return xstrdup(ntop);
 	}
-	return strdup(name);
+	return xstrdup(name);
 }
 
 /*
@@ -741,17 +744,17 @@ subprocess(const char *tag, struct passwd *pw, const char *command,
 	if (child != NULL)
 		*child = NULL;
 
-	debug3("%s: %s command \"%s\" running as %s (flags 0x%x)", __func__,
+	debug3_f("%s command \"%s\" running as %s (flags 0x%x)",
 	    tag, command, pw->pw_name, flags);
 
 	/* Check consistency */
 	if ((flags & SSH_SUBPROCESS_STDOUT_DISCARD) != 0 &&
 	    (flags & SSH_SUBPROCESS_STDOUT_CAPTURE) != 0) {
-		error("%s: inconsistent flags", __func__);
+		error_f("inconsistent flags");
 		return 0;
 	}
 	if (((flags & SSH_SUBPROCESS_STDOUT_CAPTURE) == 0) != (child == NULL)) {
-		error("%s: inconsistent flags/output", __func__);
+		error_f("inconsistent flags/output");
 		return 0;
 	}
 
@@ -759,12 +762,12 @@ subprocess(const char *tag, struct passwd *pw, const char *command,
 	 * If executing an explicit binary, then verify the it exists
 	 * and appears safe-ish to execute
 	 */
-	if (*av[0] != '/') {
+	if (!path_absolute(av[0])) {
 		error("%s path is not absolute", tag);
 		return 0;
 	}
 	temporarily_use_uid(pw);
-	if (stat(av[0], &st) < 0) {
+	if (stat(av[0], &st) == -1) {
 		error("Could not stat %s \"%s\": %s", tag,
 		    av[0], strerror(errno));
 		restore_uid();
@@ -776,7 +779,7 @@ subprocess(const char *tag, struct passwd *pw, const char *command,
 		return 0;
 	}
 	/* Prepare to keep the child's stdout if requested */
-	if (pipe(p) != 0) {
+	if (pipe(p) == -1) {
 		error("%s: pipe: %s", tag, strerror(errno));
 		restore_uid();
 		return 0;
@@ -801,7 +804,7 @@ subprocess(const char *tag, struct passwd *pw, const char *command,
 			child_set_env(&child_env, &envsize, "LANG", cp);
 
 		for (i = 0; i < NSIG; i++)
-			signal(i, SIG_DFL);
+			ssh_signal(i, SIG_DFL);
 
 		if ((devnull = open(_PATH_DEVNULL, O_RDWR)) == -1) {
 			error("%s: open %s: %s", tag, _PATH_DEVNULL,
@@ -826,12 +829,12 @@ subprocess(const char *tag, struct passwd *pw, const char *command,
 		closefrom(STDERR_FILENO + 1);
 
 		/* Don't use permanently_set_uid() here to avoid fatal() */
-		if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) != 0) {
+		if (setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) == -1) {
 			error("%s: setresgid %u: %s", tag, (u_int)pw->pw_gid,
 			    strerror(errno));
 			_exit(1);
 		}
-		if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) != 0) {
+		if (setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) == -1) {
 			error("%s: setresuid %u: %s", tag, (u_int)pw->pw_uid,
 			    strerror(errno));
 			_exit(1);
@@ -863,7 +866,7 @@ subprocess(const char *tag, struct passwd *pw, const char *command,
 		return 0;
 	}
 	/* Success */
-	debug3("%s: %s pid %ld", __func__, tag, (long)pid);
+	debug3_f("%s pid %ld", tag, (long)pid);
 	if (child != NULL)
 		*child = f;
 	return pid;
@@ -885,16 +888,18 @@ auth_log_authopts(const char *loc, const struct sshauthopt *opts, int do_remote)
 
 	snprintf(buf, sizeof(buf), "%d", opts->force_tun_device);
 	/* Try to keep this alphabetically sorted */
-	snprintf(msg, sizeof(msg), "key options:%s%s%s%s%s%s%s%s%s%s%s%s%s",
+	snprintf(msg, sizeof(msg), "key options:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
 	    opts->permit_agent_forwarding_flag ? " agent-forwarding" : "",
 	    opts->force_command == NULL ? "" : " command",
 	    do_env ?  " environment" : "",
 	    opts->valid_before == 0 ? "" : "expires",
+	    opts->no_require_user_presence ? " no-touch-required" : "",
 	    do_permitopen ?  " permitopen" : "",
 	    do_permitlisten ?  " permitlisten" : "",
 	    opts->permit_port_forwarding_flag ? " port-forwarding" : "",
 	    opts->cert_principals == NULL ? "" : " principals",
 	    opts->permit_pty_flag ? " pty" : "",
+	    opts->require_verify ? " uv" : "",
 	    opts->force_tun_device == -1 ? "" : " tun=",
 	    opts->force_tun_device == -1 ? "" : buf,
 	    opts->permit_user_rc ? " user-rc" : "",
@@ -946,7 +951,7 @@ auth_activate_options(struct ssh *ssh, struct sshauthopt *opts)
 	struct sshauthopt *old = auth_opts;
 	const char *emsg = NULL;
 
-	debug("%s: setting new authentication options", __func__);
+	debug_f("setting new authentication options");
 	if ((auth_opts = sshauthopt_merge(old, opts, &emsg)) == NULL) {
 		error("Inconsistent authentication options: %s", emsg);
 		return -1;
@@ -960,7 +965,7 @@ auth_restrict_session(struct ssh *ssh)
 {
 	struct sshauthopt *restricted;
 
-	debug("%s: restricting session", __func__);
+	debug_f("restricting session");
 
 	/* A blank sshauthopt defaults to permitting nothing */
 	restricted = sshauthopt_new();
@@ -968,7 +973,7 @@ auth_restrict_session(struct ssh *ssh)
 	restricted->restricted = 1;
 
 	if (auth_activate_options(ssh, restricted) != 0)
-		fatal("%s: failed to restrict session", __func__);
+		fatal_f("failed to restrict session");
 	sshauthopt_free(restricted);
 }
 
@@ -1043,8 +1048,7 @@ auth_authorise_keyopts(struct ssh *ssh, struct passwd *pw,
 		case -1:
 		default:
 			/* invalid */
-			error("%s: Certificate source-address invalid",
-			    loc);
+			error("%s: Certificate source-address invalid", loc);
 			/* FALLTHROUGH */
 		case 0:
 			logit("%s: Authentication tried for %.100s with valid "

@@ -1,7 +1,7 @@
-/*	$OpenBSD: more.c,v 1.39 2018/04/26 12:42:50 guenther Exp $	*/
+/*	$OpenBSD: more.c,v 1.41 2019/06/28 13:32:52 deraadt Exp $	*/
 
 /*
- * Copyright (c) 2003 Todd C. Miller <Todd.Miller@courtesan.com>
+ * Copyright (c) 2003 Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -1322,7 +1322,7 @@ retry:
 		 * Wait until we're in the foreground before we save the
 		 * the terminal modes.
 		 */
-		if ((tgrp = tcgetpgrp(STDOUT_FILENO)) < 0) {
+		if ((tgrp = tcgetpgrp(STDOUT_FILENO)) == -1) {
 			perror("tcgetpgrp");
 			exit(1);
 		}
@@ -1333,7 +1333,7 @@ retry:
 		if ((term = getenv("TERM")) == 0 || tgetent(buf, term) <= 0) {
 			dumb++; ul_opt = 0;
 		} else {
-			if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &win) < 0) {
+			if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &win) == -1) {
 				Lpp = tgetnum("li");
 				Mcol = tgetnum("co");
 			} else {

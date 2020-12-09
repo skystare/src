@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_mvneta.c,v 1.6 2018/08/06 10:52:30 patrick Exp $	*/
+/*	$OpenBSD: if_mvneta.c,v 1.15 2020/12/06 16:50:01 kettenis Exp $	*/
 /*	$NetBSD: if_mvneta.c,v 1.41 2015/04/15 10:15:40 hsuenaga Exp $	*/
 /*
  * Copyright (c) 2007, 2008, 2013 KIYOHARA Takashi
@@ -41,15 +41,16 @@
 #include <sys/mbuf.h>
 
 #include <machine/bus.h>
+#include <machine/cpufunc.h>
 #include <machine/fdt.h>
 
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_clock.h>
+#include <dev/ofw/ofw_misc.h>
 #include <dev/ofw/ofw_pinctrl.h>
 #include <dev/ofw/fdt.h>
 
 #include <dev/fdt/if_mvnetareg.h>
-#include <dev/fdt/mvmdiovar.h>
 
 #ifdef __armv7__
 #include <armv7/marvell/mvmbusvar.h>
@@ -127,7 +128,7 @@ struct mvneta_buf {
 
 struct mvneta_softc {
 	struct device sc_dev;
-	struct device *sc_mdio;
+	struct mii_bus *sc_mdio;
 
 	bus_space_tag_t sc_iot;
 	bus_space_handle_t sc_ioh;
@@ -159,11 +160,16 @@ struct mvneta_softc {
 		PHY_MODE_SGMII,
 		PHY_MODE_RGMII,
 		PHY_MODE_RGMII_ID,
+		PHY_MODE_1000BASEX,
+		PHY_MODE_2500BASEX,
 	}			 sc_phy_mode;
 	int			 sc_fixed_link;
 	int			 sc_inband_status;
 	int			 sc_phy;
+	int			 sc_phyloc;
 	int			 sc_link;
+	int			 sc_sfp;
+	int			 sc_node;
 };
 
 
@@ -204,6 +210,8 @@ struct mvneta_dmamem *mvneta_dmamem_alloc(struct mvneta_softc *,
 void mvneta_dmamem_free(struct mvneta_softc *, struct mvneta_dmamem *);
 void mvneta_fill_rx_ring(struct mvneta_softc *);
 
+static struct rwlock mvneta_sff_lock = RWLOCK_INITIALIZER("mvnetasff");
+
 struct cfdriver mvneta_cd = {
 	NULL, "mvneta", DV_IFNET
 };
@@ -216,14 +224,14 @@ int
 mvneta_miibus_readreg(struct device *dev, int phy, int reg)
 {
 	struct mvneta_softc *sc = (struct mvneta_softc *) dev;
-	return mvmdio_miibus_readreg(sc->sc_mdio, phy, reg);
+	return sc->sc_mdio->md_readreg(sc->sc_mdio->md_cookie, phy, reg);
 }
 
 void
 mvneta_miibus_writereg(struct device *dev, int phy, int reg, int val)
 {
 	struct mvneta_softc *sc = (struct mvneta_softc *) dev;
-	return mvmdio_miibus_writereg(sc->sc_mdio, phy, reg, val);
+	return sc->sc_mdio->md_writereg(sc->sc_mdio->md_cookie, phy, reg, val);
 }
 
 void
@@ -264,6 +272,7 @@ mvneta_miibus_statchg(struct device *self)
 void
 mvneta_inband_statchg(struct mvneta_softc *sc)
 {
+	uint64_t subtype = IFM_SUBTYPE(sc->sc_mii.mii_media_active);
 	uint32_t reg;
 
 	sc->sc_mii.mii_media_status = IFM_AVALID;
@@ -272,7 +281,11 @@ mvneta_inband_statchg(struct mvneta_softc *sc)
 	reg = MVNETA_READ(sc, MVNETA_PS0);
 	if (reg & MVNETA_PS0_LINKUP)
 		sc->sc_mii.mii_media_status |= IFM_ACTIVE;
-	if (reg & MVNETA_PS0_GMIISPEED)
+	if (sc->sc_phy_mode == PHY_MODE_2500BASEX)
+		sc->sc_mii.mii_media_active |= subtype;
+	else if (sc->sc_phy_mode == PHY_MODE_1000BASEX)
+		sc->sc_mii.mii_media_active |= subtype;
+	else if (reg & MVNETA_PS0_GMIISPEED)
 		sc->sc_mii.mii_media_active |= IFM_1000_T;
 	else if (reg & MVNETA_PS0_MIISPEED)
 		sc->sc_mii.mii_media_active |= IFM_100_TX;
@@ -301,13 +314,14 @@ mvneta_enaddr_write(struct mvneta_softc *sc)
 void
 mvneta_wininit(struct mvneta_softc *sc)
 {
-#ifdef __armv7__
 	uint32_t en;
 	int i;
 
+#ifdef __armv7__
 	if (mvmbus_dram_info == NULL)
 		panic("%s: mbus dram information not set up",
 		    sc->sc_dev.dv_xname);
+#endif
 
 	for (i = 0; i < MVNETA_NWINDOW; i++) {
 		MVNETA_WRITE(sc, MVNETA_BASEADDR(i), 0);
@@ -319,6 +333,7 @@ mvneta_wininit(struct mvneta_softc *sc)
 
 	en = MVNETA_BARE_EN_MASK;
 
+#ifdef __armv7__
 	for (i = 0; i < mvmbus_dram_info->numcs; i++) {
 		struct mbus_dram_window *win = &mvmbus_dram_info->cs[i];
 
@@ -330,9 +345,70 @@ mvneta_wininit(struct mvneta_softc *sc)
 
 		en &= ~(1 << i);
 	}
+#else
+	MVNETA_WRITE(sc, MVNETA_S(0), MVNETA_S_SIZE(0));
+	en &= ~(1 << 0);
+#endif
 
 	MVNETA_WRITE(sc, MVNETA_BARE, en);
-#endif
+}
+
+#define COMPHY_SIP_POWER_ON	0x82000001
+#define COMPHY_SIP_POWER_OFF	0x82000002
+#define COMPHY_SPEED(x)		((x) << 2)
+#define  COMPHY_SPEED_1_25G		0 /* SGMII 1G */
+#define  COMPHY_SPEED_2_5G		1
+#define  COMPHY_SPEED_3_125G		2 /* SGMII 2.5G */
+#define  COMPHY_SPEED_5G		3
+#define  COMPHY_SPEED_5_15625G		4 /* XFI 5G */
+#define  COMPHY_SPEED_6G		5
+#define  COMPHY_SPEED_10_3125G		6 /* XFI 10G */
+#define COMPHY_UNIT(x)		((x) << 8)
+#define COMPHY_MODE(x)		((x) << 12)
+#define  COMPHY_MODE_SATA		1
+#define  COMPHY_MODE_SGMII		2 /* SGMII 1G */
+#define  COMPHY_MODE_HS_SGMII		3 /* SGMII 2.5G */
+#define  COMPHY_MODE_USB3H		4
+#define  COMPHY_MODE_USB3D		5
+#define  COMPHY_MODE_PCIE		6
+#define  COMPHY_MODE_RXAUI		7
+#define  COMPHY_MODE_XFI		8
+#define  COMPHY_MODE_SFI		9
+#define  COMPHY_MODE_USB3		10
+
+void
+mvneta_comphy_init(struct mvneta_softc *sc)
+{
+	int node, phys[2], lane, unit;
+	uint32_t mode;
+
+	if (OF_getpropintarray(sc->sc_node, "phys", phys, sizeof(phys)) !=
+	    sizeof(phys))
+		return;
+	node = OF_getnodebyphandle(phys[0]);
+	if (!node)
+		return;
+
+	lane = OF_getpropint(node, "reg", 0);
+	unit = phys[1];
+
+	switch (sc->sc_phy_mode) {
+	case PHY_MODE_1000BASEX:
+	case PHY_MODE_SGMII:
+		mode = COMPHY_MODE(COMPHY_MODE_SGMII) |
+		    COMPHY_SPEED(COMPHY_SPEED_1_25G) |
+		    COMPHY_UNIT(unit);
+		break;
+	case PHY_MODE_2500BASEX:
+		mode = COMPHY_MODE(COMPHY_MODE_HS_SGMII) |
+		    COMPHY_SPEED(COMPHY_SPEED_3_125G) |
+		    COMPHY_UNIT(unit);
+		break;
+	default:
+		return;
+	}
+
+	smc_call(COMPHY_SIP_POWER_ON, lane, mode, 0);
 }
 
 int
@@ -340,7 +416,8 @@ mvneta_match(struct device *parent, void *cfdata, void *aux)
 {
 	struct fdt_attach_args *faa = aux;
 
-	return OF_is_compatible(faa->fa_node, "marvell,armada-370-neta");
+	return OF_is_compatible(faa->fa_node, "marvell,armada-370-neta") ||
+	    OF_is_compatible(faa->fa_node, "marvell,armada-3700-neta");
 }
 
 void
@@ -348,7 +425,7 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct mvneta_softc *sc = (struct mvneta_softc *) self;
 	struct fdt_attach_args *faa = aux;
-	uint32_t ctl0, ctl2, panc;
+	uint32_t ctl0, ctl2, ctl4, panc;
 	struct ifnet *ifp;
 	int i, len, node;
 	char *phy_mode;
@@ -364,6 +441,7 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 		return;
 	}
 	sc->sc_dmat = faa->fa_dmat;
+	sc->sc_node = faa->fa_node;
 
 	clock_enable(faa->fa_node, NULL);
 
@@ -385,6 +463,10 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 		sc->sc_phy_mode = PHY_MODE_RGMII_ID;
 	else if (!strncmp(phy_mode, "rgmii", strlen("rgmii")))
 		sc->sc_phy_mode = PHY_MODE_RGMII;
+	else if (!strncmp(phy_mode, "1000base-x", strlen("1000base-x")))
+		sc->sc_phy_mode = PHY_MODE_1000BASEX;
+	else if (!strncmp(phy_mode, "2500base-x", strlen("2500base-x")))
+		sc->sc_phy_mode = PHY_MODE_2500BASEX;
 	else {
 		printf("%s: cannot use phy-mode %s\n", self->dv_xname,
 		    phy_mode);
@@ -409,14 +491,14 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	if (!sc->sc_fixed_link) {
-		node = OF_getnodebyphandle(OF_getpropint(faa->fa_node,
-		    "phy", 0));
+		sc->sc_phy = OF_getpropint(faa->fa_node, "phy", 0);
+		node = OF_getnodebyphandle(sc->sc_phy);
 		if (!node) {
 			printf("%s: cannot find phy in fdt\n", self->dv_xname);
 			return;
 		}
 
-		if ((sc->sc_phy = OF_getpropint(node, "reg", -1)) == -1) {
+		if ((sc->sc_phyloc = OF_getpropint(node, "reg", -1)) == -1) {
 			printf("%s: cannot extract phy addr\n", self->dv_xname);
 			return;
 		}
@@ -443,6 +525,8 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 		} else
 			ether_fakeaddr(&sc->sc_ac.ac_if);
 	}
+
+	sc->sc_sfp = OF_getpropint(faa->fa_node, "sfp", 0);
 
 	printf("%s: Ethernet address %s\n", self->dv_xname,
 	    ether_sprintf(sc->sc_enaddr));
@@ -520,6 +604,7 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 	/* Setup phy. */
 	ctl0 = MVNETA_READ(sc, MVNETA_PMACC0);
 	ctl2 = MVNETA_READ(sc, MVNETA_PMACC2);
+	ctl4 = MVNETA_READ(sc, MVNETA_PMACC4);
 	panc = MVNETA_READ(sc, MVNETA_PANC);
 
 	/* Force link down to change in-band settings. */
@@ -527,8 +612,11 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 	panc |= MVNETA_PANC_FORCELINKFAIL;
 	MVNETA_WRITE(sc, MVNETA_PANC, panc);
 
+	mvneta_comphy_init(sc);
+
 	ctl0 &= ~MVNETA_PMACC0_PORTTYPE;
 	ctl2 &= ~(MVNETA_PMACC2_PORTMACRESET | MVNETA_PMACC2_INBANDAN);
+	ctl4 &= ~(MVNETA_PMACC4_SHORT_PREAMBLE);
 	panc &= ~(MVNETA_PANC_INBANDANEN | MVNETA_PANC_INBANDRESTARTAN |
 	    MVNETA_PANC_SETMIISPEED | MVNETA_PANC_SETGMIISPEED |
 	    MVNETA_PANC_ANSPEEDEN | MVNETA_PANC_SETFCEN |
@@ -546,6 +634,17 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 		MVNETA_WRITE(sc, MVNETA_SERDESCFG,
 		    MVNETA_SERDESCFG_SGMII_PROTO);
 		ctl2 |= MVNETA_PMACC2_PCSEN;
+		break;
+	case PHY_MODE_1000BASEX:
+		MVNETA_WRITE(sc, MVNETA_SERDESCFG,
+		    MVNETA_SERDESCFG_SGMII_PROTO);
+		ctl2 |= MVNETA_PMACC2_PCSEN;
+		break;
+	case PHY_MODE_2500BASEX:
+		MVNETA_WRITE(sc, MVNETA_SERDESCFG,
+		    MVNETA_SERDESCFG_HSGMII_PROTO);
+		ctl2 |= MVNETA_PMACC2_PCSEN;
+		ctl4 |= MVNETA_PMACC4_SHORT_PREAMBLE;
 		break;
 	default:
 		break;
@@ -578,6 +677,7 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 
 	MVNETA_WRITE(sc, MVNETA_PMACC0, ctl0);
 	MVNETA_WRITE(sc, MVNETA_PMACC2, ctl2);
+	MVNETA_WRITE(sc, MVNETA_PMACC4, ctl4);
 	MVNETA_WRITE(sc, MVNETA_PANC, panc);
 
 	/* Port reset */
@@ -609,7 +709,7 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_capabilities &= ~IFCAP_CSUM_TCPv4;
 #endif
 
-	IFQ_SET_MAXLEN(&ifp->if_snd, max(MVNETA_TX_RING_CNT - 1, IFQ_MAXLEN));
+	ifq_set_maxlen(&ifp->if_snd, max(MVNETA_TX_RING_CNT - 1, IFQ_MAXLEN));
 	strlcpy(ifp->if_xname, sc->sc_dev.dv_xname, sizeof(ifp->if_xname));
 
 	/*
@@ -623,16 +723,23 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 	ifmedia_init(&sc->sc_mii.mii_media, 0,
 	    mvneta_mediachange, mvneta_mediastatus);
 
-	if (!sc->sc_fixed_link) {
-		extern void *mvmdio_sc;
-		sc->sc_mdio = mvmdio_sc;
+	config_defer(self, mvneta_attach_deferred);
+}
 
+void
+mvneta_attach_deferred(struct device *self)
+{
+	struct mvneta_softc *sc = (struct mvneta_softc *) self;
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+
+	if (!sc->sc_fixed_link) {
+		sc->sc_mdio = mii_byphandle(sc->sc_phy);
 		if (sc->sc_mdio == NULL) {
-			config_defer(self, mvneta_attach_deferred);
+			printf("%s: mdio bus not yet attached\n", self->dv_xname);
 			return;
 		}
 
-		mii_attach(self, &sc->sc_mii, 0xffffffff, sc->sc_phy,
+		mii_attach(self, &sc->sc_mii, 0xffffffff, sc->sc_phyloc,
 		    MII_OFFSET_ANY, 0);
 		if (LIST_FIRST(&sc->sc_mii.mii_phys) == NULL) {
 			printf("%s: no PHY found!\n", self->dv_xname);
@@ -642,12 +749,22 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 		} else
 			ifmedia_set(&sc->sc_mii.mii_media, IFM_ETHER|IFM_AUTO);
 	} else {
-		ifmedia_add(&sc->sc_mii.mii_media,
-		    IFM_ETHER|IFM_MANUAL, 0, NULL);
-		ifmedia_set(&sc->sc_mii.mii_media,
-		    IFM_ETHER|IFM_MANUAL);
+		ifmedia_add(&sc->sc_mii.mii_media, IFM_ETHER|IFM_AUTO, 0, NULL);
+		ifmedia_set(&sc->sc_mii.mii_media, IFM_ETHER|IFM_AUTO);
 
 		if (sc->sc_inband_status) {
+			switch (sc->sc_phy_mode) {
+			case PHY_MODE_1000BASEX:
+				sc->sc_mii.mii_media_active =
+				    IFM_ETHER|IFM_1000_KX|IFM_FDX;
+				break;
+			case PHY_MODE_2500BASEX:
+				sc->sc_mii.mii_media_active =
+				    IFM_ETHER|IFM_2500_KX|IFM_FDX;
+				break;
+			default:
+				break;
+			}
 			mvneta_inband_statchg(sc);
 		} else {
 			sc->sc_mii.mii_media_status = IFM_AVALID|IFM_ACTIVE;
@@ -664,40 +781,6 @@ mvneta_attach(struct device *parent, struct device *self, void *aux)
 	 */
 	if_attach(ifp);
 	ether_ifattach(ifp);
-
-	return;
-}
-
-void
-mvneta_attach_deferred(struct device *self)
-{
-	struct mvneta_softc *sc = (struct mvneta_softc *) self;
-	struct ifnet *ifp = &sc->sc_ac.ac_if;
-
-	extern void *mvmdio_sc;
-	sc->sc_mdio = mvmdio_sc;
-	if (sc->sc_mdio == NULL) {
-		printf("%s: mdio bus not yet attached\n", self->dv_xname);
-		return;
-	}
-
-	mii_attach(self, &sc->sc_mii, 0xffffffff, sc->sc_phy,
-	    MII_OFFSET_ANY, 0);
-	if (LIST_FIRST(&sc->sc_mii.mii_phys) == NULL) {
-		printf("%s: no PHY found!\n", self->dv_xname);
-		ifmedia_add(&sc->sc_mii.mii_media,
-		    IFM_ETHER|IFM_MANUAL, 0, NULL);
-		ifmedia_set(&sc->sc_mii.mii_media, IFM_ETHER|IFM_MANUAL);
-	} else
-		ifmedia_set(&sc->sc_mii.mii_media, IFM_ETHER|IFM_AUTO);
-
-	/*
-	 * Call MI attach routines.
-	 */
-	if_attach(ifp);
-	ether_ifattach(ifp);
-
-	return;
 }
 
 void
@@ -743,7 +826,7 @@ mvneta_intr(void *arg)
 	if (ic & MVNETA_PRXTXTI_RBICTAPQ(0))
 		mvneta_rx_proc(sc);
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		mvneta_start(ifp);
 
 	return 1;
@@ -762,7 +845,7 @@ mvneta_start(struct ifnet *ifp)
 		return;
 	if (ifq_is_oactive(&ifp->if_snd))
 		return;
-	if (IFQ_IS_EMPTY(&ifp->if_snd))
+	if (ifq_empty(&ifp->if_snd))
 		return;
 
 	/* If Link is DOWN, can't start TX */
@@ -845,6 +928,14 @@ mvneta_ioctl(struct ifnet *ifp, u_long cmd, caddr_t addr)
 	case SIOCGIFRXR:
 		error = if_rxr_ioctl((struct if_rxrinfo *)ifr->ifr_data,
 		    NULL, MCLBYTES, &sc->sc_rx_ring);
+		break;
+	case SIOCGIFSFFPAGE:
+		error = rw_enter(&mvneta_sff_lock, RW_WRITE|RW_INTR);
+		if (error != 0)
+			break;
+
+		error = sfp_get_sffpage(sc->sc_sfp, (struct if_sffpage *)addr);
+		rw_exit(&mvneta_sff_lock);
 		break;
 	default:
 		DPRINTFN(2, ("mvneta_ioctl ETHER\n"));
@@ -1368,9 +1459,10 @@ mvneta_rx_proc(struct mvneta_softc *sc)
 		sc->sc_rx_cons = MVNETA_RX_RING_NEXT(idx);
 	}
 
-	mvneta_fill_rx_ring(sc);
+	if (ifiq_input(&ifp->if_rcv, &ml))
+		if_rxr_livelocked(&sc->sc_rx_ring);
 
-	if_input(ifp, &ml);
+	mvneta_fill_rx_ring(sc);
 }
 
 void

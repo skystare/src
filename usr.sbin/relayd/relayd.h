@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.251 2018/09/09 21:06:51 bluhm Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.262 2020/09/14 11:30:25 martijn Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -26,6 +26,7 @@
 #include <sys/queue.h>
 #include <sys/tree.h>
 #include <sys/time.h>
+#include <sys/un.h>
 
 #include <net/if.h>
 #include <net/pfvar.h>
@@ -97,7 +98,7 @@
 #define ICMP_BUF_SIZE		64
 #define ICMP_RCVBUF_SIZE	262144
 
-#define SNMP_RECONNECT_TIMEOUT	{ 3, 0 }	/* sec, usec */
+#define AGENTX_RECONNECT_TIMEOUT	{ 3, 0 }	/* sec, usec */
 
 #define PROC_PARENT_SOCK_FILENO	3
 #define PROC_MAX_INSTANCES	32
@@ -137,13 +138,19 @@ struct ctl_relaytable {
 	u_int32_t	 flags;
 };
 
-struct ctl_relayfd {
-	objid_t		 relayid;
-	int		 type;
+enum fd_type {
+	RELAY_FD_CERT	= 1,
+	RELAY_FD_CACERT	= 2,
+	RELAY_FD_CAFILE	= 3,
+	RELAY_FD_KEY	= 4,
+	RELAY_FD_OCSP	= 5
 };
-#define RELAY_FD_CERT	1
-#define RELAY_FD_CACERT	2
-#define RELAY_FD_CAFILE	3
+
+struct ctl_relayfd {
+	objid_t		 id;
+	objid_t		 relayid;
+	enum fd_type	 type;
+};
 
 struct ctl_script {
 	objid_t		 host;
@@ -193,6 +200,7 @@ enum relay_state {
 	STATE_PENDING,
 	STATE_PRECONNECT,
 	STATE_CONNECTED,
+	STATE_CLOSED,
 	STATE_DONE
 };
 
@@ -382,7 +390,7 @@ union hashkey {
 #define F_DEMOTED		0x00008000
 #define F_UDP			0x00010000
 #define F_RETURN		0x00020000
-#define F_SNMP			0x00040000
+#define F_AGENTX		0x00040000
 #define F_NEEDPF		0x00080000
 #define F_PORT			0x00100000
 #define F_TLSCLIENT		0x00200000
@@ -392,7 +400,7 @@ union hashkey {
 #define F_SCRIPT		0x02000000
 #define F_TLSINSPECT		0x04000000
 #define F_HASHKEY		0x08000000
-#define	F_SNMP_TRAPONLY		0x10000000
+#define F_AGENTX_TRAPONLY	0x10000000
 
 #define F_BITS								\
 	"\10\01DISABLE\02BACKUP\03USED\04DOWN\05ADD\06DEL\07CHANGED"	\
@@ -400,7 +408,7 @@ union hashkey {
 	"\14TLS\15NAT_LOOKUP\16DEMOTE\17LOOKUP_PATH\20DEMOTED\21UDP"	\
 	"\22RETURN\23TRAP\24NEEDPF\25PORT\26TLS_CLIENT\27NEEDRT"	\
 	"\30MATCH\31DIVERT\32SCRIPT\33TLS_INSPECT\34HASHKEY"		\
-	"\35SNMP_TRAPONLY"
+	"\35AGENTX_TRAPONLY"
 
 enum forwardmode {
 	FWD_NORMAL		= 0,
@@ -497,7 +505,8 @@ struct table_config {
 	char			 name[TABLE_NAME_SIZE];
 	size_t			 name_len;
 	char			 path[PATH_MAX];
-	char			 exbuf[64];
+	unsigned char		 exbinbuf[128];
+	char			 exbuf[256];
 	char			 digest[41]; /* length of sha1 digest * 2 */
 	u_int8_t		 digest_type;
 	enum forwardmode	 fwdmode;
@@ -510,6 +519,7 @@ struct table {
 	int			 skipped;
 	struct hostlist		 hosts;
 	struct tls_config	*tls_cfg;
+	struct ibuf		*sendbinbuf;
 	char			*sendbuf;
 };
 TAILQ_HEAD(tablelist, table);
@@ -520,8 +530,9 @@ enum table_check {
 	CHECK_TCP		= 2,
 	CHECK_HTTP_CODE		= 3,
 	CHECK_HTTP_DIGEST	= 4,
-	CHECK_SEND_EXPECT	= 5,
-	CHECK_SCRIPT		= 6
+	CHECK_BINSEND_EXPECT	= 5,
+	CHECK_SEND_EXPECT	= 6,
+	CHECK_SCRIPT		= 7
 };
 
 struct rdr_config {
@@ -550,11 +561,13 @@ TAILQ_HEAD(rdrlist, rdr);
 struct rsession {
 	objid_t				 se_id;
 	objid_t				 se_relayid;
+	struct sockaddr_storage		 se_sockname;
 	struct ctl_relay_event		 se_in;
 	struct ctl_relay_event		 se_out;
 	void				*se_priv;
 	SIPHASH_CTX			 se_siphashctx;
 	struct relay_table		*se_table;
+	struct relay_table		*se_table0;
 	struct event			 se_ev;
 	struct timeval			 se_timeout;
 	struct timeval			 se_tv_start;
@@ -601,11 +614,9 @@ enum rule_action {
 };
 
 struct rule_addr {
-	int				 addr_af;
 	struct sockaddr_storage		 addr;
 	u_int8_t			 addr_mask;
-	int				 addr_net;
-	in_port_t			 addr_port;
+	int				 addr_port;
 };
 
 #define RELAY_ADDR_EQ(_a, _b)						\
@@ -621,6 +632,10 @@ struct rule_addr {
 	((_a)->addr_mask != (_b)->addr_mask ||				\
 	sockaddr_cmp((struct sockaddr *)&(_a)->addr,			\
 	(struct sockaddr *)&(_b)->addr, (_a)->addr_mask) != 0)
+
+#define RELAY_AF_NEQ(_a, _b)						\
+	(((_a) != AF_UNSPEC) && ((_b) != AF_UNSPEC) &&			\
+	((_a) != (_b)))
 
 struct relay_rule {
 	objid_t			 rule_id;
@@ -681,15 +696,16 @@ TAILQ_HEAD(relay_rules, relay_rule);
 #define TLSFLAG_TLSV1_0				0x02
 #define TLSFLAG_TLSV1_1				0x04
 #define TLSFLAG_TLSV1_2				0x08
-#define TLSFLAG_TLSV1				0x0e
+#define TLSFLAG_TLSV1_3				0x10
+#define TLSFLAG_TLSV1				0x1e
 #define TLSFLAG_VERSION				0x1f
 #define TLSFLAG_CIPHER_SERVER_PREF		0x20
 #define TLSFLAG_CLIENT_RENEG			0x40
 #define TLSFLAG_DEFAULT				\
-	(TLSFLAG_TLSV1_2|TLSFLAG_CIPHER_SERVER_PREF)
+	(TLSFLAG_TLSV1_2|TLSFLAG_TLSV1_3|TLSFLAG_CIPHER_SERVER_PREF)
 
 #define TLSFLAG_BITS						\
-	"\06\01sslv3\02tlsv1.0\03tlsv1.1\04tlsv1.2"	\
+	"\06\01sslv3\02tlsv1.0\03tlsv1.1\04tlsv1.2\05tlsv1.3"	\
 	"\06cipher-server-preference\07client-renegotiation"
 
 #define TLSCIPHERS_DEFAULT	"HIGH:!aNULL"
@@ -702,6 +718,14 @@ struct relay_ticket_key {
 };
 #define	TLS_SESSION_LIFETIME	(2 * 3600)
 
+#define HTTPFLAG_WEBSOCKETS	0x01
+
+struct keyname {
+	TAILQ_ENTRY(keyname)	 entry;
+	char			*name;
+};
+TAILQ_HEAD(keynamelist, keyname);
+
 struct protocol {
 	objid_t			 id;
 	u_int32_t		 flags;
@@ -711,6 +735,7 @@ struct protocol {
 	u_int8_t		 tcpipttl;
 	u_int8_t		 tcpipminttl;
 	size_t			 httpheaderlen;
+	int			 httpflags;
 	u_int8_t		 tlsflags;
 	char			 tlsciphers[768];
 	char			 tlsdhparams[128];
@@ -719,6 +744,7 @@ struct protocol {
 	char			 tlscacert[PATH_MAX];
 	char			 tlscakey[PATH_MAX];
 	char			*tlscapass;
+	struct keynamelist	 tlscerts;
 	char			 name[MAX_NAME_SIZE];
 	int			 tickets;
 	enum prototype		 type;
@@ -756,6 +782,17 @@ struct ca_pkey {
 };
 TAILQ_HEAD(ca_pkeylist, ca_pkey);
 
+struct relay_cert {
+	objid_t			 cert_id;
+	objid_t			 cert_relayid;
+	int			 cert_fd;
+	int			 cert_key_fd;
+	int			 cert_ocsp_fd;
+	EVP_PKEY		*cert_pkey;
+	TAILQ_ENTRY(relay_cert)	 cert_entry;
+};
+TAILQ_HEAD(relaycertlist, relay_cert);
+
 struct relay_config {
 	objid_t			 id;
 	u_int32_t		 flags;
@@ -770,7 +807,6 @@ struct relay_config {
 	struct timeval		 timeout;
 	enum forwardmode	 fwdmode;
 	union hashkey		 hashkey;
-	off_t			 tls_key_len;
 	off_t			 tls_cakey_len;
 };
 
@@ -795,10 +831,8 @@ struct relay {
 	struct tls_config	*rl_tls_client_cfg;
 	struct tls		*rl_tls_ctx;
 
-	int			rl_tls_cert_fd;
-	int			rl_tls_ca_fd;
-	int			rl_tls_cacert_fd;
-	char			*rl_tls_key;
+	int			 rl_tls_ca_fd;
+	int			 rl_tls_cacert_fd;
 	EVP_PKEY		*rl_tls_pkey;
 	X509			*rl_tls_cacertx509;
 	char			*rl_tls_cakey;
@@ -953,7 +987,7 @@ enum imsg_type {
 	IMSG_DEMOTE,
 	IMSG_STATISTICS,
 	IMSG_SCRIPT,
-	IMSG_SNMPSOCK,
+	IMSG_AGENTXSOCK,
 	IMSG_BINDANY,
 	IMSG_RTMSG,		/* from pfe to parent */
 	IMSG_CFG_TABLE,		/* configuration from parent */
@@ -1040,7 +1074,8 @@ struct privsep_fd {
 
 struct relayd_config {
 	char			 tls_sid[SSL_MAX_SID_CTX_LENGTH];
-	char			 snmp_path[PATH_MAX];
+	char			 agentx_path[sizeof(((struct sockaddr_un *)NULL)->sun_path)];
+	char			 agentx_context[32];
 	struct timeval		 interval;
 	struct timeval		 timeout;
 	struct timeval		 statinterval;
@@ -1080,6 +1115,7 @@ struct relayd {
 	struct routerlist	*sc_rts;
 	struct netroutelist	*sc_routes;
 	struct ca_pkeylist	*sc_pkeys;
+	struct relaycertlist	*sc_certs;
 	struct sessionlist	 sc_sessions;
 	char			 sc_demote_group[IFNAMSIZ];
 	u_int16_t		 sc_id;
@@ -1087,9 +1123,7 @@ struct relayd {
 
 	struct event		 sc_statev;
 
-	int			 sc_snmp;
-	struct event		 sc_snmpto;
-	struct event		 sc_snmpev;
+	struct event		 sc_agentxev;
 
 	int			 sc_has_icmp;
 	int			 sc_has_icmp6;
@@ -1131,11 +1165,17 @@ int	 cmdline_symset(char *);
 const char *host_error(enum host_error);
 const char *host_status(enum host_status);
 const char *table_check(enum table_check);
+#ifdef DEBUG
+const char *relay_state(enum relay_state);
+#endif
 const char *print_availability(u_long, u_long);
 const char *print_host(struct sockaddr_storage *, char *, size_t);
 const char *print_time(struct timeval *, struct timeval *, char *, size_t);
 const char *printb_flags(const u_int32_t, const char *);
 void	 getmonotime(struct timeval *);
+struct ibuf	*string2binary(const char *);
+void		 print_hex(uint8_t *, off_t, size_t);
+void		 print_debug(const char *, ...);
 
 /* pfe.c */
 void	 pfe(struct privsep *, struct privsep_proc *);
@@ -1172,10 +1212,8 @@ void	 relay(struct privsep *, struct privsep_proc *);
 int	 relay_privinit(struct relay *);
 void	 relay_notify_done(struct host *, const char *);
 int	 relay_session_cmp(struct rsession *, struct rsession *);
-char	*relay_load_fd(int, off_t *);
-int	 relay_load_certfiles(struct relay *);
 void	 relay_close(struct rsession *, const char *, int);
-int	 relay_reset_event(struct ctl_relay_event *);
+int	 relay_reset_event(struct rsession *, struct ctl_relay_event *);
 void	 relay_natlook(int, short, void *);
 void	 relay_session(struct rsession *);
 int	 relay_from_table(struct rsession *);
@@ -1227,6 +1265,7 @@ const char
 	*relay_httpmethod_byid(u_int);
 const char
 	*relay_httperror_byid(u_int);
+int	 relay_http_priv_init(struct rsession *);
 int	 relay_httpdesc_init(struct ctl_relay_event *);
 ssize_t	 relay_http_time(time_t, char *, size_t);
 
@@ -1286,6 +1325,11 @@ struct relay	*relay_findbyname(struct relayd *, const char *);
 struct relay	*relay_findbyaddr(struct relayd *, struct relay_config *);
 EVP_PKEY	*pkey_find(struct relayd *, char *hash);
 struct ca_pkey	*pkey_add(struct relayd *, EVP_PKEY *, char *hash);
+struct relay_cert *cert_add(struct relayd *, objid_t);
+struct relay_cert *cert_find(struct relayd *, objid_t);
+char		*relay_load_fd(int, off_t *);
+int		 relay_load_certfiles(struct relayd *, struct relay *,
+		    const char *);
 int		 expand_string(char *, size_t, const char *, const char *);
 void		 translate_string(char *);
 void		 purge_key(char **, off_t);
@@ -1320,6 +1364,8 @@ void		 relay_log(struct rsession *, char *);
 int		 kv_log(struct rsession *, struct kv *, u_int16_t,
 		     enum direction);
 struct kv	*kv_find(struct kvtree *, struct kv *);
+struct kv	*kv_find_value(struct kvtree *, char *, const char *,
+		     const char *);
 int		 kv_cmp(struct kv *, struct kv *);
 int		 rule_add(struct protocol *, struct relay_rule *, const char
 		     *);
@@ -1347,10 +1393,10 @@ const char	*tag_id2name(u_int16_t);
 void		 tag_unref(u_int16_t);
 void		 tag_ref(u_int16_t);
 
-/* snmp.c */
-void	 snmp_init(struct relayd *, enum privsep_procid);
-void	 snmp_setsock(struct relayd *, enum privsep_procid);
-int	 snmp_getsock(struct relayd *, struct imsg *);
+/* agentx_control.c */
+void	 agentx_init(struct relayd *);
+void	 agentx_setsock(struct relayd *, enum privsep_procid);
+int	 agentx_getsock(struct imsg *);
 void	 snmp_hosttrap(struct relayd *, struct table *, struct host *);
 
 /* shuffle.c */

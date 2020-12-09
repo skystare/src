@@ -1,18 +1,11 @@
-# $OpenBSD: Makefile,v 1.2 2017/07/09 15:28:34 espie Exp $
+# $OpenBSD: Makefile,v 1.4 2020/08/03 14:45:25 patrick Exp $
 
 LIB=	LLVMBitWriter
-NOPIC=
 NOPROFILE=
 
-.include <bsd.own.mk>
-SRCS=	BitWriter.cpp \
+SRCS+=	BitWriter.cpp \
 	BitcodeWriter.cpp \
 	BitcodeWriterPass.cpp \
 	ValueEnumerator.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Bitcode/Writer
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Bitcode/Writer

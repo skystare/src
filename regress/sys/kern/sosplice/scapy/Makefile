@@ -1,44 +1,52 @@
-#	$OpenBSD: Makefile,v 1.3 2017/11/05 13:15:36 bluhm Exp $
+#	$OpenBSD: Makefile,v 1.6 2020/01/15 20:47:13 bluhm Exp $
+
+# Copyright (c) 2017-2020 Alexander Bluhm <bluhm@openbsd.org>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 # The following ports must be installed:
 #
-# python-2.7          interpreted object-oriented programming language
-# py-libdnet          python interface to libdnet
 # scapy               powerful interactive packet manipulation in python
 
 .include <bsd.own.mk>
 
 .if ! (make(clean) || make(cleandir) || make(obj))
-# Check wether all required python packages are installed.  If some
-# are missing print a warning and skip the tests, but do not fail.
-PYTHON_IMPORT !!= python2.7 -c 'from scapy.all import *' 2>&1 || true
-PF_ENABLED !!=	${SUDO} pfctl -si | grep '^Status: Enabled ' || true
-PF_ANCHOR !!=	${SUDO} pfctl -sr | grep '^anchor "regress" all$$' || true
-.endif
 
-.if ! empty(PYTHON_IMPORT)
-.BEGIN:
-	@true
+.if ! exists(/usr/local/bin/scapy)
 regress:
-	@echo '${PYTHON_IMPORT}'
-	@echo Install python and the scapy module for additional tests.
+	@echo Install scapy package to run this regress.
 	@echo SKIPPED
 .endif
 
+# PERL_REQUIRE set in ../Makefile.inc
 .if ! empty (PERL_REQUIRE)
 regress:
-	@echo "${PERL_REQUIRE}"
+	@echo perl require: "${PERL_REQUIRE}"
 	@echo install these perl packages for additional tests
 .endif
 
-.if ! empty(PF_ENABLED) && empty(PF_ANCHOR)
-.BEGIN:
-	@true
+PF_STATUS !=	${SUDO} pfctl -si | sed -n 's/^Status: \([^ ]*\) .*/\1/p'
+PF_ANCHOR !=	${SUDO} pfctl -sr | sed -n 's/^anchor "\([^"]*\)" all$$/\1/p'
+.if ! empty(PF_STATUS:MEnabled) && empty(PF_ANCHOR:Mregress)
 regress:
-	@echo This test cannot run with pf filtering packets on localhost.
+	@echo pf status: "${PF_STATUS}"
+	@echo pf anchor: "${PF_ANCHOR}"
+	@echo This regress cannot run with pf filtering packets on localhost.
 	@echo Either disable pf or add a line 'anchor "regress"' to pf.conf.
 	@echo There the test will add a stateless rule that passes all packets.
 	@echo SKIPPED
+.endif
+
 .endif
 
 # This test needs a manual setup of two machines
@@ -76,7 +84,7 @@ regress:
 .MAIN: all
 
 .if make (regress) || make (all)
-.BEGIN: addr.py
+.BEGIN:
 	@echo
 	${SUDO} true
 	ssh -t ${REMOTE_SSH} true
@@ -93,14 +101,15 @@ addr.py: Makefile
 	mv $@.tmp $@
 
 # load the pf rules into the kernel of the REMOTE and LOCAL machine
+REGRESS_SETUP +=	stamp-pfctl
 stamp-pfctl:
-.if ! empty(PF_ANCHOR)
+.if ! empty(PF_ANCHOR:Mregress)
 	echo 'pass on ${LOCAL_IF} no state' | ${SUDO} pfctl -a regress -f -
 .endif
 	@date >$@
 
 SCAPYS !=		cd ${.CURDIR} && ls scapy-*.py
-TARGETS =		${SCAPYS}
+TARGETS =
 
 # Set variables so that make runs with and without obj directory.
 # Only do that if necessary to keep visible output short.
@@ -113,14 +122,15 @@ SCAPYPATH =	${.CURDIR}/
 .endif
 
 .for s in ${SCAPYS}
-run-regress-$s: $s addr.py stamp-pfctl
+REGRESS_TARGETS +=	run-$s
+run-$s: $s addr.py
 	@echo '\n======== $@ ========'
 	time SUDO=${SUDO} PYTHON="${PYTHON}" perl ${PERLINC} ${PERLPATH}scapy.pl splice ${FAKE_NET_ADDR} ${REMOTE_ADDR} ${REMOTE_SSH} ${SCAPYPATH}$s
 .endfor
 
-.if ! empty(PF_ANCHOR)
-TARGETS +=	cleanup
-run-regress-cleanup:
+.if ! empty(PF_ANCHOR:Mregress)
+REGRESS_CLEANUP +=	cleanup
+cleanup:
 	@echo '\n======== $@ ========'
 	${SUDO} pfctl -a regress -Fr
 	rm -f stamp-pfctl

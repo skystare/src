@@ -1,4 +1,4 @@
-/*	$OpenBSD: mpls_raw.c,v 1.15 2017/02/27 19:16:56 claudio Exp $	*/
+/*	$OpenBSD: mpls_raw.c,v 1.18 2020/08/19 19:22:53 gnezdo Exp $	*/
 
 /*
  * Copyright (C) 1999, 2000 and 2001 AYAME Project, WIDE Project.
@@ -46,28 +46,21 @@
 #include <netmpls/mpls.h>
 
 int mpls_defttl = 255;
-int mpls_inkloop = MPLS_INKERNEL_LOOP_MAX;
 int mpls_push_expnull_ip = 0;
 int mpls_push_expnull_ip6 = 0;
 int mpls_mapttl_ip = 1;
 int mpls_mapttl_ip6 = 0;
 
-int *mplsctl_vars[MPLSCTL_MAXID] = MPLSCTL_VARS;
+const struct sysctl_bounded_args mplsctl_vars[] = {
+	{ MPLSCTL_DEFTTL, &mpls_defttl, 0, 255 },
+	{ MPLSCTL_MAPTTL_IP, &mpls_mapttl_ip, 0, 1 },
+	{ MPLSCTL_MAPTTL_IP6, &mpls_mapttl_ip6, 0, 1 },
+};
 
 int
 mpls_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
     size_t newlen)
 {
-	if (name[0] >= MPLSCTL_MAXID)
-		return (EOPNOTSUPP);
-
-	/* Almost all sysctl names at this level are terminal. */
-	if (namelen != 1)
-		return (ENOTDIR);
-
-	switch (name[0]) {
-	default:
-		return sysctl_int_arr(mplsctl_vars, name, namelen,
-		    oldp, oldlenp, newp, newlen);
-	}
+	return sysctl_bounded_arr(mplsctl_vars, nitems(mplsctl_vars),
+	    name, namelen, oldp, oldlenp, newp, newlen);
 }

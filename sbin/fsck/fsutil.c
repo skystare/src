@@ -1,4 +1,4 @@
-/*	$OpenBSD: fsutil.c,v 1.22 2015/09/27 05:25:00 guenther Exp $	*/
+/*	$OpenBSD: fsutil.c,v 1.24 2019/06/28 13:32:43 deraadt Exp $	*/
 /*	$NetBSD: fsutil.c,v 1.2 1996/10/03 20:06:31 christos Exp $	*/
 
 /*
@@ -52,6 +52,17 @@ static int preen = 0;
 extern char *__progname;
 
 static void vmsg(int, const char *, va_list);
+
+struct stat stslash;
+
+void
+checkroot(void)
+{
+	if (stat("/", &stslash) == -1) {
+		xperror("/");
+		printf("Can't stat root\n");
+	}
+}
 
 void
 setcdevname(const char *cd, const char *ocd, int pr)
@@ -153,7 +164,7 @@ unrawname(char *name)
 
 	if ((dp = strrchr(name, '/')) == NULL)
 		return (name);
-	if (stat(name, &stb) < 0)
+	if (stat(name, &stb) == -1)
 		return (name);
 	if (!S_ISCHR(stb.st_mode))
 		return (name);
@@ -182,27 +193,22 @@ rawname(char *name)
 char *
 blockcheck(char *origname)
 {
-	struct stat stslash, stblock, stchar;
+	struct stat stblock, stchar;
 	char *newname, *raw;
 	struct fstab *fsp;
 	int retried = 0;
 
 	hot = 0;
-	if (stat("/", &stslash) < 0) {
-		xperror("/");
-		printf("Can't stat root\n");
-		return (origname);
-	}
 	newname = origname;
 retry:
-	if (stat(newname, &stblock) < 0)
+	if (stat(newname, &stblock) == -1)
 		return (origname);
 
 	if (S_ISBLK(stblock.st_mode)) {
 		if (stslash.st_dev == stblock.st_rdev)
 			hot++;
 		raw = rawname(newname);
-		if (stat(raw, &stchar) < 0) {
+		if (stat(raw, &stchar) == -1) {
 			xperror(raw);
 			printf("Can't stat %s\n", raw);
 			return (origname);

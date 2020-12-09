@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_gif.c,v 1.116 2018/04/18 13:24:07 bluhm Exp $	*/
+/*	$OpenBSD: if_gif.c,v 1.131 2020/08/21 22:59:27 kn Exp $	*/
 /*	$KAME: if_gif.c,v 1.43 2001/02/20 08:51:07 itojun Exp $	*/
 
 /*
@@ -46,7 +46,6 @@
 #include <netinet/in.h>
 #include <netinet/in_var.h>
 #include <netinet/ip.h>
-#include <netinet/ip_ether.h>
 #include <netinet/ip_var.h>
 #include <netinet/ip_ipip.h>
 #include <netinet/ip_ecn.h>
@@ -106,6 +105,9 @@ struct gif_softc {
 	struct ifnet		sc_if;
 	uint16_t		sc_df;
 	int			sc_ttl;
+	int			sc_txhprio;
+	int			sc_rxhprio;
+	int			sc_ecn;
 };
 
 struct gif_list gif_list = TAILQ_HEAD_INITIALIZER(gif_list);
@@ -128,7 +130,7 @@ int	gif_del_tunnel(struct gif_softc *);
 int	in_gif_output(struct ifnet *, int, struct mbuf **);
 int	in6_gif_output(struct ifnet *, int, struct mbuf **);
 int	gif_input(struct gif_tunnel *, struct mbuf **, int *, int, int,
-	    uint8_t, uint8_t);
+	    uint8_t);
 
 /*
  * gif global variable definitions
@@ -153,6 +155,9 @@ gif_clone_create(struct if_clone *ifc, int unit)
 
 	sc->sc_df = htons(0);
 	sc->sc_ttl = ip_defttl;
+	sc->sc_txhprio = IF_HDRPRIO_PAYLOAD;
+	sc->sc_rxhprio = IF_HDRPRIO_PAYLOAD;
+	sc->sc_ecn = ECN_ALLOWED;
 
 	snprintf(ifp->if_xname, sizeof(ifp->if_xname),
 	    "%s%d", ifc->ifc_name, unit);
@@ -165,7 +170,6 @@ gif_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_output = gif_output;
 	ifp->if_rtrequest = p2p_rtrequest;
 	ifp->if_type   = IFT_GIF;
-	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
 	ifp->if_softc = sc;
 
 	if_attach(ifp);
@@ -255,25 +259,44 @@ gif_start(struct ifnet *ifp)
 		}
 #endif
 #ifdef MPLS
-		case AF_MPLS:
+		case AF_MPLS: {
+			uint32_t shim;
+
+			m = m_pullup(m, sizeof(shim));
+			if (m == NULL)
+				continue;
+
+			shim = *mtod(m, uint32_t *) & MPLS_EXP_MASK;
+			tos = (ntohl(shim) >> MPLS_EXP_OFFSET) << 5;
+
 			ttloff = 3;
-			tos = 0;
 
 			proto = IPPROTO_MPLS;
 			break;
+		}
 #endif
 		default:
 			unhandled_af(m->m_pkthdr.ph_family);
 		}
 
 		if (tttl == -1) {
-			m = m_pullup(m, ttloff + 1);
-			if (m == NULL)
-				continue;
+			KASSERT(m->m_len > ttloff);
 
 			ttl = *(m->m_data + ttloff);
 		} else
 			ttl = tttl;
+
+		switch (sc->sc_txhprio) {
+		case IF_HDRPRIO_PAYLOAD:
+			/* tos is already set */
+			break;
+		case IF_HDRPRIO_PACKET:
+			tos = IFQ_PRIO2TOS(m->m_pkthdr.pf.prio);
+			break;
+		default:
+			tos = IFQ_PRIO2TOS(sc->sc_txhprio);
+			break;
+		}
 
 		gif_send(sc, m, proto, ttl, tos);
 	}
@@ -281,9 +304,9 @@ gif_start(struct ifnet *ifp)
 
 int
 gif_send(struct gif_softc *sc, struct mbuf *m,
-    uint8_t proto, uint8_t ttl, uint8_t otos)
+    uint8_t proto, uint8_t ttl, uint8_t itos)
 {
-	uint8_t itos = 0;
+	uint8_t otos;
 
 	m->m_flags &= ~(M_BCAST|M_MCAST);
 	m->m_pkthdr.ph_rtableid = sc->sc_tunnel.t_rtableid;
@@ -292,7 +315,7 @@ gif_send(struct gif_softc *sc, struct mbuf *m,
 	pf_pkt_addr_changed(m);
 #endif
 
-	ip_ecn_ingress(ECN_ALLOWED, &otos, &itos);
+	ip_ecn_ingress(sc->sc_ecn, &otos, &itos);
 
 	switch (sc->sc_tunnel.t_af) {
 	case AF_INET: {
@@ -331,8 +354,8 @@ gif_send(struct gif_softc *sc, struct mbuf *m,
 			return (-1);
 
 		flow = otos << 20;
-		if (ISSET(m->m_pkthdr.ph_flowid, M_FLOWID_VALID))
-			flow |= m->m_pkthdr.ph_flowid & M_FLOWID_MASK;
+		if (ISSET(m->m_pkthdr.csum_flags, M_FLOWID))
+			flow |= m->m_pkthdr.ph_flowid;
 
 		ip6 = mtod(m, struct ip6_hdr *);
 		ip6->ip6_flow = htonl(flow);
@@ -522,6 +545,35 @@ gif_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		ifr->ifr_df = sc->sc_df ? 1 : 0;
 		break;
 
+	case SIOCSLIFPHYECN:
+		sc->sc_ecn = ifr->ifr_metric ? ECN_ALLOWED : ECN_FORBIDDEN;
+		break;
+	case SIOCGLIFPHYECN:
+		ifr->ifr_metric = (sc->sc_ecn == ECN_ALLOWED);
+		break;
+
+	case SIOCSTXHPRIO:
+		error = if_txhprio_l3_check(ifr->ifr_hdrprio);
+		if (error != 0)
+			break;
+
+		sc->sc_txhprio = ifr->ifr_hdrprio;
+		break;
+	case SIOCGTXHPRIO:
+		ifr->ifr_hdrprio = sc->sc_txhprio;
+		break;
+
+	case SIOCSRXHPRIO:
+		error = if_rxhprio_l3_check(ifr->ifr_hdrprio);
+		if (error != 0)
+			break;
+
+		sc->sc_rxhprio = ifr->ifr_hdrprio;
+		break;
+	case SIOCGRXHPRIO:
+		ifr->ifr_hdrprio = sc->sc_rxhprio;
+		break;
+
 	default:
 		error = ENOTTY;
 		break;
@@ -675,7 +727,7 @@ in_gif_input(struct mbuf **mp, int *offp, int proto, int af)
 	key.t_src4 = ip->ip_dst;
 	key.t_dst4 = ip->ip_src;
 
-	rv = gif_input(&key, mp, offp, proto, af, ip->ip_ttl, ip->ip_tos);
+	rv = gif_input(&key, mp, offp, proto, af, ip->ip_tos);
 	if (rv == -1)
 		rv = ipip_input(mp, offp, proto, af);
 
@@ -700,8 +752,7 @@ in6_gif_input(struct mbuf **mp, int *offp, int proto, int af)
 
 	flow = ntohl(ip6->ip6_flow);
 
-	rv = gif_input(&key, mp, offp, proto, af, ip6->ip6_hlim,
-	    flow >> 20);
+	rv = gif_input(&key, mp, offp, proto, af, flow >> 20);
 	if (rv == -1)
 		rv = ipip_input(mp, offp, proto, af);
 
@@ -731,14 +782,14 @@ gif_find(const struct gif_tunnel *key)
 
 int
 gif_input(struct gif_tunnel *key, struct mbuf **mp, int *offp, int proto,
-    int af, uint8_t ttl, uint8_t otos)
+    int af, uint8_t otos)
 {
 	struct mbuf *m = *mp;
 	struct gif_softc *sc;
 	struct ifnet *ifp;
 	void (*input)(struct ifnet *, struct mbuf *);
-	int ttloff;
 	uint8_t itos;
+	int rxhprio;
 
 	/* IP-in-IP header is caused by tunnel mode, so skip gif lookup */
 	if (m->m_flags & M_TUNNEL) {
@@ -756,6 +807,11 @@ gif_input(struct gif_tunnel *key, struct mbuf **mp, int *offp, int proto,
 			return (-1);
 	}
 
+	m_adj(m, *offp); /* this is ours now */
+
+	ifp = &sc->sc_if;
+	rxhprio = sc->sc_rxhprio;
+
 	switch (proto) {
 	case IPPROTO_IPV4: {
 		struct ip *ip;
@@ -767,14 +823,14 @@ gif_input(struct gif_tunnel *key, struct mbuf **mp, int *offp, int proto,
 		ip = mtod(m, struct ip *);
 
 		itos = ip->ip_tos;
-		if (ip_ecn_egress(ECN_ALLOWED, &otos, &itos) == 0)
+		if (ip_ecn_egress(sc->sc_ecn, &otos, &itos) == 0)
 			goto drop;
 
-		ip->ip_tos = itos;
+		if (itos != ip->ip_tos)
+			ip_tos_patch(ip, itos);
 
 		m->m_pkthdr.ph_family = AF_INET;
 		input = ipv4_input;
-		ttloff = offsetof(struct ip, ip_ttl);
 		break;
 	}
 #ifdef INET6
@@ -788,7 +844,7 @@ gif_input(struct gif_tunnel *key, struct mbuf **mp, int *offp, int proto,
 		ip6 = mtod(m, struct ip6_hdr *);
 
 		itos = ntohl(ip6->ip6_flow) >> 20;
-		if (!ip_ecn_egress(ECN_ALLOWED, &otos, &itos))
+		if (!ip_ecn_egress(sc->sc_ecn, &otos, &itos))
 			goto drop;
 
 		CLR(ip6->ip6_flow, htonl(0xff << 20));
@@ -796,36 +852,46 @@ gif_input(struct gif_tunnel *key, struct mbuf **mp, int *offp, int proto,
 
 		m->m_pkthdr.ph_family = AF_INET6;
 		input = ipv6_input;
-		ttloff = offsetof(struct ip6_hdr, ip6_hlim);
 		break;
 	}
 #endif /* INET6 */
 #ifdef MPLS
-	case IPPROTO_MPLS:
+	case IPPROTO_MPLS: {
+		uint32_t shim;
+		m = *mp = m_pullup(m, sizeof(shim));
+		if (m == NULL)
+			return (IPPROTO_DONE);
+
+		shim = *mtod(m, uint32_t *) & MPLS_EXP_MASK;
+		itos = (ntohl(shim) >> MPLS_EXP_OFFSET) << 5;
+	
 		m->m_pkthdr.ph_family = AF_MPLS;
 		input = mpls_input;
-		ttloff = 3;
 		break;
+	}
 #endif /* MPLS */
 	default:
 		return (-1);
 	}
 
-	m_adj(m, *offp);
-
-	if (sc->sc_ttl == -1) {
-		m = *mp = m_pullup(m, ttloff + 1);
-		if (m == NULL)
-			return (IPPROTO_DONE);
-
-		*(m->m_data + ttloff) = ttl;
-	}
-
-	ifp = &sc->sc_if;
-
 	m->m_flags &= ~(M_MCAST|M_BCAST);
 	m->m_pkthdr.ph_ifidx = ifp->if_index;
 	m->m_pkthdr.ph_rtableid = ifp->if_rdomain;
+
+	switch (rxhprio) {
+	case IF_HDRPRIO_PACKET:
+		/* nop */
+		break;
+	case IF_HDRPRIO_PAYLOAD:
+		m->m_pkthdr.pf.prio = IFQ_TOS2PRIO(itos);
+		break;
+	case IF_HDRPRIO_OUTER:
+		m->m_pkthdr.pf.prio = IFQ_TOS2PRIO(otos);
+		break;
+	default:
+		m->m_pkthdr.pf.prio = rxhprio;
+		break;
+	}
 
 #if NPF > 0
 	pf_pkt_addr_changed(m);

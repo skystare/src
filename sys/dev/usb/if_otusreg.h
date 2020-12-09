@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_otusreg.h,v 1.10 2017/04/08 02:57:25 deraadt Exp $	*/
+/*	$OpenBSD: if_otusreg.h,v 1.12 2020/11/30 16:09:33 krw Exp $	*/
 
 /*-
  * Copyright (c) 2009 Damien Bergamini <damien.bergamini@free.fr>
@@ -72,6 +72,15 @@
 #define AR_MAC_REG_OFDM_PHY_ERRORS	(AR_MAC_REG_BASE + 0xcb4)
 #define AR_MAC_REG_CCK_PHY_ERRORS	(AR_MAC_REG_BASE + 0xcb8)
 #define AR_MAC_REG_BCN_HT1		(AR_MAC_REG_BASE + 0xda0)
+#define AR_MAC_REG_DMA_TRIGGER		(AR_MAC_REG_BASE + 0xd30)
+
+/* Possible values for register AR_MAC_REG_DMA_TRIGGER. */
+#define AR_DMA_TRIGGER_TXQ0	0x001
+#define AR_DMA_TRIGGER_TXQ1	0x002
+#define AR_DMA_TRIGGER_TXQ2	0x004
+#define AR_DMA_TRIGGER_TXQ3	0x008
+#define AR_DMA_TRIGGER_TXQ4	0x010
+#define AR_DMA_TRIGGER_RXQ	0x100
 
 /* Possible values for register AR_USB_MODE_CTRL. */
 #define AR_USB_DS_ENA		(1 << 0)
@@ -914,7 +923,7 @@ struct otus_cmd_newstate {
 
 struct otus_cmd_key {
 	struct ieee80211_key	key;
-	uint16_t		associd;
+	struct ieee80211_node	*ni;
 };
 
 struct otus_softc {
@@ -985,4 +994,5 @@ struct otus_softc {
 #define sc_txtap	sc_txtapu.th
 	int				sc_txtap_len;
 #endif
+	int				sc_key_tasks;
 };

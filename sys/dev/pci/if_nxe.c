@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_nxe.c,v 1.75 2017/04/08 02:57:25 deraadt Exp $ */
+/*	$OpenBSD: if_nxe.c,v 1.77 2020/07/10 13:26:38 patrick Exp $ */
 
 /*
  * Copyright (c) 2007 David Gwynne <dlg@openbsd.org>
@@ -834,7 +834,7 @@ int			nxe_rom_read_region(struct nxe_softc *, u_int32_t,
 /* let's go! */
 
 const struct pci_matchid nxe_devices[] = {
-	{ PCI_VENDOR_NETXEN, PCI_PRODUCT_NETXEN_NXB_10GXxR },
+	{ PCI_VENDOR_NETXEN, PCI_PRODUCT_NETXEN_NXB_10GXXR },
 	{ PCI_VENDOR_NETXEN, PCI_PRODUCT_NETXEN_NXB_10GCX4 },
 	{ PCI_VENDOR_NETXEN, PCI_PRODUCT_NETXEN_NXB_4GCU },
 	{ PCI_VENDOR_NETXEN, PCI_PRODUCT_NETXEN_NXB_IMEZ },
@@ -919,7 +919,7 @@ nxe_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_watchdog = nxe_watchdog;
 	ifp->if_hardmtu = MCLBYTES - ETHER_HDR_LEN - ETHER_CRC_LEN;
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
-	IFQ_SET_MAXLEN(&ifp->if_snd, 512); /* XXX */
+	ifq_set_maxlen(&ifp->if_snd, 512); /* XXX */
 
 	ifmedia_init(&sc->sc_media, 0, nxe_media_change, nxe_media_status);
 	ifmedia_add(&sc->sc_media, IFM_ETHER|IFM_AUTO, 0, NULL);
@@ -1308,7 +1308,7 @@ nxe_start(struct ifnet *ifp)
 
 	if (!ISSET(ifp->if_flags, IFF_RUNNING) ||
 	    ifq_is_oactive(&ifp->if_snd) ||
-	    IFQ_IS_EMPTY(&ifp->if_snd))
+	    ifq_empty(&ifp->if_snd))
 		return;
 
 	if (nxe_ring_writeable(nr, sc->sc_cmd_consumer_cur) < NXE_TXD_DESCS) {

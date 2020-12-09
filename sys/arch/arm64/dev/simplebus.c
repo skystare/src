@@ -1,4 +1,4 @@
-/* $OpenBSD: simplebus.c,v 1.8 2017/06/01 21:19:07 patrick Exp $ */
+/* $OpenBSD: simplebus.c,v 1.12 2020/11/19 17:42:59 kettenis Exp $ */
 /*
  * Copyright (c) 2016 Patrick Wildt <patrick@blueri.se>
  *
@@ -33,6 +33,7 @@ void simplebus_attach(struct device *, struct device *, void *);
 void simplebus_attach_node(struct device *, int);
 int simplebus_bs_map(bus_space_tag_t, bus_addr_t, bus_size_t, int,
     bus_space_handle_t *);
+paddr_t simplebus_bs_mmap(bus_space_tag_t, bus_addr_t, off_t, int, int);
 int simplebus_dmamap_load_buffer(bus_dma_tag_t, bus_dmamap_t, void *,
     bus_size_t, struct proc *, int, paddr_t *, int *, int);
 
@@ -89,6 +90,7 @@ simplebus_attach(struct device *parent, struct device *self, void *aux)
 	memcpy(&sc->sc_bus, sc->sc_iot, sizeof(sc->sc_bus));
 	sc->sc_bus.bus_private = sc;
 	sc->sc_bus._space_map = simplebus_bs_map;
+	sc->sc_bus._space_mmap = simplebus_bs_mmap;
 
 	sc->sc_rangeslen = OF_getproplen(sc->sc_node, "ranges");
 	if (sc->sc_rangeslen > 0 &&
@@ -149,6 +151,26 @@ simplebus_submatch(struct device *self, void *match, void *aux)
 	return 0;
 }
 
+int
+simplebus_print(void *aux, const char *pnp)
+{
+	struct fdt_attach_args *fa = aux;
+	char name[32];
+
+	if (!pnp)
+		return (QUIET);
+
+	if (OF_getprop(fa->fa_node, "name", name, sizeof(name)) > 0) {
+		name[sizeof(name) - 1] = 0;
+		printf("\"%s\"", name);
+	} else
+		printf("node %u", fa->fa_node);
+
+	printf(" at %s", pnp);
+
+	return (UNCONF);
+}
+
 /*
  * Look for a driver that wants to be attached to this node.
  */
@@ -160,6 +182,7 @@ simplebus_attach_node(struct device *self, int node)
 	char			 buf[32];
 	int			 i, len, line;
 	uint32_t		*cell, *reg;
+	struct device		*child;
 
 	if (OF_getproplen(node, "compatible") <= 0)
 		return;
@@ -167,6 +190,14 @@ simplebus_attach_node(struct device *self, int node)
 	if (OF_getprop(node, "status", buf, sizeof(buf)) > 0 &&
 	    strcmp(buf, "disabled") == 0)
 		return;
+
+	/* Skip if already attached early. */
+	for (i = 0; i < nitems(sc->sc_early_nodes); i++) {
+		if (sc->sc_early_nodes[i] == node)
+			return;
+		if (sc->sc_early_nodes[i] == 0)
+			break;
+	}
 
 	memset(&fa, 0, sizeof(fa));
 	fa.fa_name = "";
@@ -221,7 +252,18 @@ simplebus_attach_node(struct device *self, int node)
 		fa.fa_dmat->_flags |= BUS_DMA_COHERENT;
 	}
 
-	config_found_sm(self, &fa, NULL, simplebus_submatch);
+	child = config_found_sm(self, &fa, sc->sc_early ? NULL :
+	    simplebus_print, simplebus_submatch);
+
+	/* Record nodes that we attach early. */
+	if (child && sc->sc_early) {
+		for (i = 0; i < nitems(sc->sc_early_nodes); i++) {
+			if (sc->sc_early_nodes[i] != 0)
+				continue;
+			sc->sc_early_nodes[i] = node;
+			break;
+		}
+	}
 
 	free(fa.fa_reg, M_DEVBUF, fa.fa_nreg * sizeof(struct fdt_reg));
 	free(fa.fa_intr, M_DEVBUF, fa.fa_nintr * sizeof(uint32_t));
@@ -281,6 +323,57 @@ simplebus_bs_map(bus_space_tag_t t, bus_addr_t bpa, bus_size_t size,
 	return ESRCH;
 }
 
+paddr_t
+simplebus_bs_mmap(bus_space_tag_t t, bus_addr_t bpa, off_t off,
+    int prot, int flags)
+{
+	struct simplebus_softc *sc = t->bus_private;
+	uint64_t addr, rfrom, rto, rsize;
+	uint32_t *range;
+	int parent, rlen, rone;
+
+	addr = bpa;
+	parent = OF_parent(sc->sc_node);
+	if (parent == 0)
+		return bus_space_mmap(sc->sc_iot, addr, off, prot, flags);
+
+	if (sc->sc_rangeslen < 0)
+		return EINVAL;
+	if (sc->sc_rangeslen == 0)
+		return bus_space_mmap(sc->sc_iot, addr, off, prot, flags);
+
+	rlen = sc->sc_rangeslen / sizeof(uint32_t);
+	rone = sc->sc_pacells + sc->sc_acells + sc->sc_scells;
+
+	/* For each range. */
+	for (range = sc->sc_ranges; rlen >= rone; rlen -= rone, range += rone) {
+		/* Extract from and size, so we can see if we fit. */
+		rfrom = range[0];
+		if (sc->sc_acells == 2)
+			rfrom = (rfrom << 32) + range[1];
+		rsize = range[sc->sc_acells + sc->sc_pacells];
+		if (sc->sc_scells == 2)
+			rsize = (rsize << 32) +
+			    range[sc->sc_acells + sc->sc_pacells + 1];
+
+		/* Try next, if we're not in the range. */
+		if (addr < rfrom || addr >= (rfrom + rsize))
+			continue;
+
+		/* All good, extract to address and translate. */
+		rto = range[sc->sc_acells];
+		if (sc->sc_pacells == 2)
+			rto = (rto << 32) + range[sc->sc_acells + 1];
+
+		addr -= rfrom;
+		addr += rto;
+
+		return bus_space_mmap(sc->sc_iot, addr, off, prot, flags);
+	}
+
+	return -1;
+}
+
 int
 simplebus_dmamap_load_buffer(bus_dma_tag_t t, bus_dmamap_t map, void *buf,
     bus_size_t buflen, struct proc *p, int flags, paddr_t *lastaddrp,
@@ -329,7 +422,7 @@ simplebus_dmamap_load_buffer(bus_dma_tag_t t, bus_dmamap_t map, void *buf,
 
 			/* All good, extract to address and translate. */
 			rto = range[0];
-			if (sc->sc_pacells == 2)
+			if (sc->sc_acells == 2)
 				rto = (rto << 32) + range[1];
 
 			map->dm_segs[seg].ds_addr -= rfrom;

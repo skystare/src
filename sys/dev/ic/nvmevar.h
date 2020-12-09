@@ -1,4 +1,4 @@
-/*	$OpenBSD: nvmevar.h,v 1.11 2017/05/29 12:58:37 jmatthew Exp $ */
+/*	$OpenBSD: nvmevar.h,v 1.20 2020/07/22 13:16:04 krw Exp $ */
 
 /*
  * Copyright (c) 2014 David Gwynne <dlg@openbsd.org>
@@ -18,6 +18,7 @@
 
 #define NVME_IO_Q	1
 #define NVME_HIB_Q	2
+#define NVME_MAXPHYS	(128 * 1024)
 
 struct nvme_dmamem {
 	bus_dmamap_t		ndm_map;
@@ -79,10 +80,9 @@ struct nvme_softc {
 	void			*sc_ih;
 
 	u_int			sc_rdy_to;
-	u_int			sc_mps_bits;
 	size_t			sc_mps;
 	size_t			sc_mdts;
-	u_int			sc_max_sgl;
+	u_int			sc_max_prpl;
 	u_int			sc_dstrd;
 
 	struct nvm_identify_controller
@@ -100,9 +100,6 @@ struct nvme_softc {
 	struct nvme_ccb_list	sc_ccb_list;
 	struct nvme_dmamem	*sc_ccb_prpls;
 	struct scsi_iopool	sc_iopool;
-
-	struct scsi_link	sc_link;
-	struct scsibus_softc	*sc_scsibus;
 };
 
 int	nvme_attach(struct nvme_softc *);

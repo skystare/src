@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.18 2018/05/09 19:40:12 anton Exp $
+#	$OpenBSD: Makefile,v 1.24 2020/10/16 01:16:55 beck Exp $
 
 SUBDIR += acme-client
 SUBDIR += arp
@@ -7,9 +7,11 @@ SUBDIR += httpd
 SUBDIR += ifstated
 SUBDIR += ldapd
 SUBDIR += mtree
+SUBDIR += ocspcheck
 SUBDIR += ospfd
-SUBDIR += rebound
+SUBDIR += ospf6d
 SUBDIR += relayd
+SUBDIR += rpki-client
 SUBDIR += snmpd
 SUBDIR += switchd
 SUBDIR += syslogd

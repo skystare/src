@@ -1,4 +1,4 @@
-/*	$OpenBSD: acpi_machdep.c,v 1.1 2018/07/01 19:30:37 kettenis Exp $	*/
+/*	$OpenBSD: acpi_machdep.c,v 1.10 2020/12/06 21:19:55 kettenis Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis
  *
@@ -29,8 +29,10 @@
 #include <dev/ofw/fdt.h>
 
 #include <dev/acpi/acpivar.h>
+#include <dev/acpi/dsdt.h>
 
 int	lid_action;
+int	pwr_action = 1;
 
 int	acpi_fdt_match(struct device *, void *, void *);
 void	acpi_fdt_attach(struct device *, struct device *, void *);
@@ -55,13 +57,14 @@ acpi_fdt_attach(struct device *parent, struct device *self, void *aux)
 	struct fdt_attach_args *faa = aux;
 	bus_dma_tag_t dmat;
 
+	sc->sc_memt = faa->fa_iot;
+	sc->sc_ci_dmat = faa->fa_dmat;
+
 	/* Create coherent DMA tag. */
-	dmat = malloc(sizeof(*sc->sc_dmat), M_DEVBUF, M_WAITOK | M_ZERO);
+	dmat = malloc(sizeof(*sc->sc_cc_dmat), M_DEVBUF, M_WAITOK | M_ZERO);
 	memcpy(dmat, faa->fa_dmat, sizeof(*dmat));
 	dmat->_flags |= BUS_DMA_COHERENT;
-	
-	sc->sc_memt = faa->fa_iot;
-	sc->sc_dmat = dmat;
+	sc->sc_cc_dmat = dmat;
 
 	acpi_attach_common(sc, faa->fa_reg[0].addr);
 }
@@ -136,7 +139,9 @@ acpi_intr_establish(int irq, int flags, int level,
     int (*func)(void *), void *arg, const char *name)
 {
 	struct interrupt_controller *ic;
+	struct arm_intr_handle *aih;
 	uint32_t interrupt[3];
+	void *cookie;
 
 	extern LIST_HEAD(, interrupt_controller) interrupt_controllers;
 	LIST_FOREACH(ic, &interrupt_controllers, ic_list) {
@@ -148,19 +153,41 @@ acpi_intr_establish(int irq, int flags, int level,
 
 	interrupt[0] = 0;
 	interrupt[1] = irq - 32;
-	interrupt[2] = 0x4;
+	if (flags & LR_EXTIRQ_MODE) { /* edge */
+		if (flags & LR_EXTIRQ_POLARITY)
+			interrupt[2] = 0x2; /* falling */
+		else
+			interrupt[2] = 0x1; /* rising */
+	} else { /* level */
+		if (flags & LR_EXTIRQ_POLARITY)
+			interrupt[2] = 0x8; /* low */
+		else
+			interrupt[2] = 0x4; /* high */
+	}
 
-	return ic->ic_establish(ic->ic_cookie, interrupt, level,
-				func, arg, (char *)name);
+	cookie = ic->ic_establish(ic->ic_cookie, interrupt, level, NULL,
+	    func, arg, (char *)name);
+	if (cookie == NULL)
+		return NULL;
+
+	aih = malloc(sizeof(*aih), M_DEVBUF, M_WAITOK);
+	aih->ih_ic = ic;
+	aih->ih_ih = cookie;
+
+	return aih;
+}
+
+void
+acpi_intr_disestablish(void *cookie)
+{
+	struct arm_intr_handle *aih = cookie;
+	struct interrupt_controller *ic = aih->ih_ic;
+
+	ic->ic_disestablish(aih->ih_ih);
 }
 
 void
 acpi_sleep_clocks(struct acpi_softc *sc, int state)
-{
-}
-
-void
-acpi_resume_clocks(struct acpi_softc *sc)
 {
 }
 
@@ -171,7 +198,7 @@ acpi_sleep_cpu(struct acpi_softc *sc, int state)
 }
 
 void
-acpi_resume_cpu(struct acpi_softc *sc)
+acpi_resume_cpu(struct acpi_softc *sc, int state)
 {
 }
 

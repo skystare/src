@@ -1,7 +1,7 @@
-/*	$OpenBSD: kern_unveil.c,v 1.14 2018/08/28 02:51:55 beck Exp $	*/
+/*	$OpenBSD: kern_unveil.c,v 1.39 2020/03/22 20:23:36 anton Exp $	*/
 
 /*
- * Copyright (c) 2017-2018 Bob Beck <beck@openbsd.org>
+ * Copyright (c) 2017-2019 Bob Beck <beck@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,7 +18,9 @@
 
 #include <sys/param.h>
 
+#include <sys/acct.h>
 #include <sys/mount.h>
+#include <sys/filedesc.h>
 #include <sys/proc.h>
 #include <sys/namei.h>
 #include <sys/pool.h>
@@ -27,6 +29,7 @@
 #include <sys/types.h>
 #include <sys/malloc.h>
 #include <sys/tree.h>
+#include <sys/lock.h>
 
 #include <sys/conf.h>
 #include <sys/syscall.h>
@@ -34,6 +37,23 @@
 #include <sys/systm.h>
 
 #include <sys/pledge.h>
+
+struct unvname {
+	char 			*un_name;
+	size_t 			un_namesize;
+	u_char			un_flags;
+	RBT_ENTRY(unvnmae)	un_rbt;
+};
+
+RBT_HEAD(unvname_rbt, unvname);
+
+struct unveil {
+	struct vnode		*uv_vp;
+	ssize_t			uv_cover;
+	struct unvname_rbt	uv_names;
+	struct rwlock		uv_lock;
+	u_char			uv_flags;
+};
 
 /* #define DEBUG_UNVEIL */
 
@@ -68,7 +88,8 @@ unveil_free_traversed_vnodes(struct nameidata *ndp)
 
 		for (i = 0; i < ndp->ni_tvpend; i++)
 			vrele(ndp->ni_tvp[i]); /* ref for being in list */
-		free(ndp->ni_tvp, M_PROC, ndp->ni_tvpsize * sizeof(struct vnode *));
+		free(ndp->ni_tvp, M_PROC, ndp->ni_tvpsize *
+		    sizeof(struct vnode *));
 		ndp->ni_tvpsize = 0;
 		ndp->ni_tvpend = 0;
 	}
@@ -91,7 +112,7 @@ unveil_save_traversed_vnode(struct nameidata *ndp, struct vnode *vp)
 void
 unvname_delete(struct unvname *name)
 {
-	free(name->un_name, M_PROC, name->un_namesize);;
+	free(name->un_name, M_PROC, name->un_namesize);
 	free(name, M_PROC, sizeof(struct unvname));
 }
 
@@ -117,18 +138,32 @@ unveil_delete_names(struct unveil *uv)
 	return ret;
 }
 
-void
-unveil_add_name(struct unveil *uv, char *name, u_char flags)
+int
+unveil_add_name_unlocked(struct unveil *uv, char *name, u_char flags)
 {
 	struct unvname *unvn;
 
-	rw_enter_write(&uv->uv_lock);
 	unvn = unvname_new(name, strlen(name) + 1, flags);
-	RBT_INSERT(unvname_rbt, &uv->uv_names, unvn);
-	rw_exit_write(&uv->uv_lock);
+	if (RBT_INSERT(unvname_rbt, &uv->uv_names, unvn) != NULL) {
+		/* Name already present. */
+		unvname_delete(unvn);
+		return 0;
+	}
 #ifdef DEBUG_UNVEIL
 	printf("added name %s underneath vnode %p\n", name, uv->uv_vp);
 #endif
+	return 1;
+}
+
+int
+unveil_add_name(struct unveil *uv, char *name, u_char flags)
+{
+	int ret;
+
+	rw_enter_write(&uv->uv_lock);
+	ret = unveil_add_name_unlocked(uv, name, flags);
+	rw_exit_write(&uv->uv_lock);
+	return ret;
 }
 
 struct unvname *
@@ -192,6 +227,7 @@ unveil_destroy(struct process *ps)
 	    sizeof(struct unveil));
 	ps->ps_uvvcount = 0;
 	ps->ps_uvpaths = NULL;
+	ps->ps_uvpcwd = NULL;
 }
 
 void
@@ -202,8 +238,8 @@ unveil_copy(struct process *parent, struct process *child)
 	if (parent->ps_uvvcount == 0)
 		return;
 
-	child->ps_uvpaths = mallocarray(UNVEIL_MAX_VNODES, sizeof(struct unveil),
-	    M_PROC, M_WAITOK|M_ZERO);
+	child->ps_uvpaths = mallocarray(UNVEIL_MAX_VNODES,
+	    sizeof(struct unveil), M_PROC, M_WAITOK|M_ZERO);
 
 	child->ps_uvncount = 0;
 	for (i = 0; parent->ps_uvpaths != NULL && i < parent->ps_uvvcount;
@@ -221,28 +257,105 @@ unveil_copy(struct process *parent, struct process *child)
 		RBT_INIT(unvname_rbt, &to->uv_names);
 		rw_enter_read(&from->uv_lock);
 		RBT_FOREACH_SAFE(unvn, unvname_rbt, &from->uv_names, next) {
-			unveil_add_name(&child->ps_uvpaths[i], unvn->un_name,
-			    unvn->un_flags);
-			child->ps_uvncount++;
+			if (unveil_add_name_unlocked(&child->ps_uvpaths[i],
+				    unvn->un_name, unvn->un_flags))
+				child->ps_uvncount++;
 		}
 		rw_exit_read(&from->uv_lock);
 		to->uv_flags = from->uv_flags;
+		to->uv_cover = from->uv_cover;
 	}
 	child->ps_uvvcount = parent->ps_uvvcount;
 	if (parent->ps_uvpcwd)
 		child->ps_uvpcwd = child->ps_uvpaths +
 		    (parent->ps_uvpcwd - parent->ps_uvpaths);
-	child->ps_uvpcwdgone = parent->ps_uvpcwdgone;
 	child->ps_uvdone = parent->ps_uvdone;
 	child->ps_uvshrink = parent->ps_uvshrink;
 }
 
-struct unveil *
-unveil_lookup(struct vnode *vp, struct proc *p)
+/*
+ * Walk up from vnode dp, until we find a matching unveil, or the root vnode
+ * returns -1 if no unveil to be found above dp.
+ */
+ssize_t
+unveil_find_cover(struct vnode *dp, struct proc *p)
 {
-	struct process *pr = p->p_p;
+	struct vnode *vp = NULL, *parent = NULL, *root;
+	ssize_t ret = -1;
+	int error;
+
+	/* use the correct root to stop at, chrooted or not.. */
+	root = p->p_fd->fd_rdir ? p->p_fd->fd_rdir : rootvnode;
+	vp = dp;
+
+	do {
+		struct componentname cn = {
+			.cn_nameiop = LOOKUP,
+			.cn_flags = ISLASTCN | ISDOTDOT | RDONLY,
+			.cn_proc = p,
+			.cn_cred = p->p_ucred,
+			.cn_pnbuf = NULL,
+			.cn_nameptr = "..",
+			.cn_namelen = 2,
+			.cn_consume = 0
+		};
+
+		/*
+		 * If we are at the root of a filesystem, and we are
+		 * still mounted somewhere, take the .. in the above
+		 * filesystem.
+		 */
+		if (vp != root && (vp->v_flag & VROOT)) {
+			if (vp->v_mount == NULL)
+				return -1;
+			vp = vp->v_mount->mnt_vnodecovered ?
+			    vp->v_mount->mnt_vnodecovered : vp;
+		}
+
+		if (vget(vp, LK_EXCLUSIVE|LK_RETRY) != 0)
+			return -1;
+		/* Get parent vnode of vp using lookup of '..' */
+		/* This returns with vp unlocked but ref'ed*/
+		error = VOP_LOOKUP(vp, &parent, &cn);
+		if (error) {
+			if (!(cn.cn_flags & PDIRUNLOCK))
+				vput(vp);
+			else {
+				/*
+				 * This corner case should not happen because
+				 * we have not set LOCKPARENT in the flags
+				 */
+				printf("vnode %p PDIRUNLOCK on error\n", vp);
+				vrele(vp);
+			}
+			break;
+		}
+
+		vrele(vp);
+		(void) unveil_lookup(parent, p->p_p, &ret);
+		vput(parent);
+
+		if (ret >= 0)
+			break;
+
+		if (vp == parent) {
+			ret = -1;
+			break;
+		}
+		vp = parent;
+		parent = NULL;
+	} while (vp != root);
+	return ret;
+}
+
+
+struct unveil *
+unveil_lookup(struct vnode *vp, struct process *pr, ssize_t *position)
+{
 	struct unveil *uv = pr->ps_uvpaths;
 	ssize_t l, r;
+	if (position != NULL)
+		*position = -1;
 
 	if (vp->v_uvcount == 0)
 		return NULL;
@@ -259,6 +372,18 @@ unveil_lookup(struct vnode *vp, struct proc *p)
 				for (j = i + 1; j < pr->ps_uvvcount; j++)
 					uv[j - 1] = uv[j];
 				pr->ps_uvvcount--;
+				for (j = 0; j < pr->ps_uvvcount; j++) {
+					if (uv[j].uv_cover == i) {
+						/*
+						 * anything covered by
+						 * this one will be nuked
+						 * on unmount as well.
+						 */
+						uv[j].uv_cover = -1;
+					}
+					else if (uv[j].uv_cover > i)
+						uv[j].uv_cover--;
+				}
 			}
 			i++;
 		}
@@ -267,26 +392,6 @@ unveil_lookup(struct vnode *vp, struct proc *p)
 
 	if (pr->ps_uvvcount == 0)
 		return NULL;
-
-	/* clear the cwd unveil when we .. past it */
-	if (pr->ps_uvpcwd && (vp == pr->ps_uvpcwd->uv_vp)) {
-#ifdef DEBUG_UNVEIL
-		printf("unveil: %s(%d): nuking cwd traversing vnode %p\n",
-		    p->p_p->ps_comm, p->p_p->ps_pid, vp);
-#endif
-		p->p_p->ps_uvpcwd = NULL;
-		p->p_p->ps_uvpcwdgone = 0;
-	}
-#ifdef DEBUG_UNVEIL
-	else {
-		if (pr->ps_uvpcwd) {
-			printf("unveil: %s(%d): did not nuke cwd because %p != %p\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid, vp, pr->ps_uvpcwd->uv_vp);
-		} else
-			printf("unveil: %s(%d): cwd is null\n",
- 			    p->p_p->ps_comm, p->p_p->ps_pid);
-	}
-#endif
 
 	l = 0;
 	r = pr->ps_uvvcount - 1;
@@ -299,6 +404,8 @@ unveil_lookup(struct vnode *vp, struct proc *p)
 		if (vp == uv[m].uv_vp) {
 			KASSERT(uv[m].uv_vp->v_uvcount > 0);
 			KASSERT(uv[m].uv_vp->v_usecount > 0);
+			if (position != NULL)
+				*position = m;
 			return &uv[m];
 		}
 		if (vp > uv[m].uv_vp)
@@ -353,22 +460,31 @@ unveil_setflags(u_char *flags, u_char nflags)
 }
 
 struct unveil *
-unveil_add_vnode(struct process *pr, struct vnode *vp)
+unveil_add_vnode(struct proc *p, struct vnode *vp)
 {
+	struct process *pr = p->p_p;
 	struct unveil *uv = NULL;
-	ssize_t i;
+	ssize_t i, j;
 
 	KASSERT(pr->ps_uvvcount < UNVEIL_MAX_VNODES);
 
 	for (i = pr->ps_uvvcount;
 	     i > 0 && pr->ps_uvpaths[i - 1].uv_vp > vp;
-	     i--)
+	     i--) {
 		pr->ps_uvpaths[i] = pr->ps_uvpaths[i - 1];
+	}
+
+	/* adjust the covers to account for our addition  */
+	for (j = 0; j < pr->ps_uvvcount; j++) {
+		if (pr->ps_uvpaths[i].uv_cover >= i)
+			pr->ps_uvpaths[i].uv_cover++;
+	}
 
 	uv = &pr->ps_uvpaths[i];
 	rw_init(&uv->uv_lock, "unveil");
 	RBT_INIT(unvname_rbt, &uv->uv_names);
 	uv->uv_vp = vp;
+
 	/*
 	 * Added vnodes are added with the UNVEIL_INSPECT flag
 	 * to allow operations such as access and stat. This lets
@@ -378,23 +494,36 @@ unveil_add_vnode(struct process *pr, struct vnode *vp)
 	 */
 	uv->uv_flags = UNVEIL_INSPECT;
 	pr->ps_uvvcount++;
+
+	/* find out what we are covered by */
+	uv->uv_cover = unveil_find_cover(vp, p);
+
+	/*
+	 * Find anyone covered by what we are covered by
+	 * and re-check what covers them (we could have
+	 * interposed a cover)
+	 */
+	for (j = 0; j < pr->ps_uvvcount; j++) {
+		if (pr->ps_uvpaths[i].uv_cover == uv->uv_cover)
+			pr->ps_uvpaths[j].uv_cover =
+			    unveil_find_cover(pr->ps_uvpaths[j].uv_vp, p);
+	}
+
 	return (uv);
 }
 
 void
 unveil_add_traversed_vnodes(struct proc *p, struct nameidata *ndp)
 {
-	struct unveil *uv;
-
 	if (ndp->ni_tvpsize) {
 		size_t i;
 
 		for (i = 0; i < ndp->ni_tvpend; i++) {
 			struct vnode *vp = ndp->ni_tvp[i];
-			if (unveil_lookup(vp, p) == NULL) {
+			if (unveil_lookup(vp, p->p_p, NULL) == NULL) {
 				vref(vp);
 				vp->v_uvcount++;
-				uv = unveil_add_vnode(p->p_p, vp);
+				unveil_add_vnode(p, vp);
 			}
 		}
 	}
@@ -437,7 +566,7 @@ unveil_add(struct proc *p, struct nameidata *ndp, const char *permissions)
 	KASSERT(vp->v_type == VDIR);
 	vref(vp);
 	vp->v_uvcount++;
-	if ((uv = unveil_lookup(vp, p)) != NULL) {
+	if ((uv = unveil_lookup(vp, pr, NULL)) != NULL) {
 		/*
 		 * We already have unveiled this directory
 		 * vnode
@@ -489,7 +618,7 @@ unveil_add(struct proc *p, struct nameidata *ndp, const char *permissions)
 		/*
 		 * New unveil involving this directory vnode.
 		 */
-		uv = unveil_add_vnode(pr, vp);
+		uv = unveil_add_vnode(p, vp);
 	}
 
 	/*
@@ -510,8 +639,8 @@ unveil_add(struct proc *p, struct nameidata *ndp, const char *permissions)
 		goto done;
 	}
 
-	unveil_add_name(uv, ndp->ni_cnd.cn_nameptr, flags);
-	pr->ps_uvncount++;
+	if (unveil_add_name(uv, ndp->ni_cnd.cn_nameptr, flags))
+		pr->ps_uvncount++;
 	ret = 0;
 
 #ifdef DEBUG_UNVEIL
@@ -525,8 +654,16 @@ unveil_add(struct proc *p, struct nameidata *ndp, const char *permissions)
  done:
 	if (ret == 0)
 		unveil_add_traversed_vnodes(p, ndp);
-	unveil_free_traversed_vnodes(ndp);
-	pool_put(&namei_pool, ndp->ni_cnd.cn_pnbuf);
+
+	pr->ps_uvpcwd = unveil_lookup(p->p_fd->fd_cdir, pr, NULL);
+	if (pr->ps_uvpcwd == NULL) {
+		ssize_t i;
+
+		i = unveil_find_cover(p->p_fd->fd_cdir, p);
+		if (i >= 0)
+			pr->ps_uvpcwd = &pr->ps_uvpaths[i];
+	}
+
 	return ret;
 }
 
@@ -548,6 +685,8 @@ unveil_flagmatch(struct nameidata *ni, u_char flags)
 #ifdef DEBUG_UNVEIL
 			printf("unveil lacks UNVEIL_READ\n");
 #endif
+			if (flags != UNVEIL_INSPECT)
+				ni->ni_unveil_eacces = 1;
 			return 0;
 		}
 	}
@@ -556,6 +695,8 @@ unveil_flagmatch(struct nameidata *ni, u_char flags)
 #ifdef DEBUG_UNVEIL
 			printf("unveil lacks UNVEIL_WRITE\n");
 #endif
+			if (flags != UNVEIL_INSPECT)
+				ni->ni_unveil_eacces = 1;
 			return 0;
 		}
 	}
@@ -564,6 +705,8 @@ unveil_flagmatch(struct nameidata *ni, u_char flags)
 #ifdef DEBUG_UNVEIL
 			printf("unveil lacks UNVEIL_EXEC\n");
 #endif
+			if (flags != UNVEIL_INSPECT)
+				ni->ni_unveil_eacces = 1;
 			return 0;
 		}
 	}
@@ -572,6 +715,8 @@ unveil_flagmatch(struct nameidata *ni, u_char flags)
 #ifdef DEBUG_UNVEIL
 			printf("unveil lacks UNVEIL_CREATE\n");
 #endif
+			if (flags != UNVEIL_INSPECT)
+				ni->ni_unveil_eacces = 1;
 			return 0;
 		}
 	}
@@ -583,28 +728,114 @@ unveil_flagmatch(struct nameidata *ni, u_char flags)
 	return 1;
 }
 
+
+struct unveil *
+unveil_covered(struct unveil *uv, struct vnode *dvp, struct process *pr) {
+	if (uv && uv->uv_vp == dvp) {
+		if (uv->uv_cover >=0) {
+			KASSERT(uv->uv_cover < pr->ps_uvvcount);
+			return &pr->ps_uvpaths[uv->uv_cover];
+		}
+		return NULL;
+	}
+	return uv;
+}
+
+
+/*
+ * Start a relative path lookup. Ensure we find whatever unveil covered
+ * where we start from, either by having a saved current working directory
+ * unveil, or by walking up and finding a cover the hard way if we are
+ * doing a non AT_FDCWD relative lookup. Caller passes a NULL dp
+ * if we are using AT_FDCWD.
+ */
+void
+unveil_start_relative(struct proc *p, struct nameidata *ni, struct vnode *dp)
+{
+	struct process *pr = p->p_p;
+	struct unveil *uv = NULL;
+
+	if (dp != NULL && pr->ps_uvpaths != NULL) {
+		ssize_t uvi;
+		/*
+		 * XXX
+		 * This is a non AT_FDCWD relative lookup starting
+		 * from a file descriptor. As such, we can't use the
+		 * saved current working directory unveil. We walk up
+		 * and find what we are covered by.
+		 */
+		uv = unveil_lookup(dp, pr, NULL);
+		if (uv == NULL) {
+			uvi = unveil_find_cover(dp, p);
+			if (uvi >= 0) {
+				KASSERT(uvi < pr->ps_uvvcount);
+				uv = &pr->ps_uvpaths[uvi];
+			}
+		}
+	} else {
+		/*
+		 * Check saved cwd unveil match.
+		 *
+		 * Since ps_uvpcwd is set on chdir (UNVEIL_READ) we
+		 * don't need to go up any further as in the above
+		 * case.
+		 */
+		uv = pr->ps_uvpcwd;
+	}
+
+	/*
+	 * If the flags don't match, we have no match from our
+	 * starting point. If we do not find a matching unveil later
+	 * on a later component of this lookup, we'll be out of luck
+	 */
+	if (uv && (unveil_flagmatch(ni, uv->uv_flags))) {
+#ifdef DEBUG_UNVEIL
+		printf("unveil: %s(%d): cwd unveil at %p matches",
+		    pr->ps_comm, pr->ps_pid, uv);
+#endif
+		ni->ni_unveil_match = uv;
+	}
+
+}
+
 /*
  * unveil checking - for component directories in a namei lookup.
  */
 void
 unveil_check_component(struct proc *p, struct nameidata *ni, struct vnode *dp)
 {
+	struct process *pr = p->p_p;
 	struct unveil *uv = NULL;
 
 	if (ni->ni_pledge != PLEDGE_UNVEIL) {
-		if ((ni->ni_cnd.cn_flags & BYPASSUNVEIL) == 0 &&
-		    ! (ni->ni_cnd.cn_flags & ISDOTDOT) &&
-		    (uv = unveil_lookup(dp, p)) != NULL) {
-			/* if directory flags match, it's a match */
-			if (unveil_flagmatch(ni, uv->uv_flags)) {
-				if (uv->uv_flags & UNVEIL_USERSET) {
-					ni->ni_unveil_match = uv;
-#ifdef DEBUG_UNVEIL
-					printf("unveil: %s(%d): component directory match"
-					    " for vnode %p\n",
-					    p->p_p->ps_comm, p->p_p->ps_pid, dp);
+		if ((ni->ni_cnd.cn_flags & BYPASSUNVEIL) == 0) {
+			if (ni->ni_cnd.cn_flags & ISDOTDOT) {
+				/*
+				 * adjust unveil match as necessary
+				 */
+				uv = unveil_covered(ni->ni_unveil_match, dp,
+				    pr);
+				/* clear the match when we DOTDOT above it */
+				if (ni->ni_unveil_match &&
+				    ni->ni_unveil_match->uv_vp == dp) {
+					ni->ni_unveil_match = NULL;
+					ni->ni_unveil_eacces = 0;
+				}
+			}
+			else
+				uv = unveil_lookup(dp, pr, NULL);
 
+			if (uv != NULL) {
+				/* if directory flags match, it's a match */
+				if (unveil_flagmatch(ni, uv->uv_flags)) {
+					if (uv->uv_flags & UNVEIL_USERSET) {
+						ni->ni_unveil_match = uv;
+#ifdef DEBUG_UNVEIL
+					printf("unveil: %s(%d): component "
+					    "directory match for vnode %p\n",
+					    pr->ps_comm, pr->ps_pid, dp);
 #endif
+					}
 				}
 			}
 		}
@@ -614,32 +845,32 @@ unveil_check_component(struct proc *p, struct nameidata *ni, struct vnode *dp)
 
 /*
  * unveil checking - only done after namei lookup has succeeded on
- * the last compoent of a namei lookup.
+ * the last component of a namei lookup.
  */
 int
 unveil_check_final(struct proc *p, struct nameidata *ni)
 {
-	struct unveil *uv;
+	struct process *pr = p->p_p;
+	struct unveil *uv = NULL;
 	struct unvname *tname = NULL;
 
-	if (ni->ni_pledge == PLEDGE_UNVEIL ||
-	    p->p_p->ps_uvpaths == NULL)
+	if (ni->ni_pledge == PLEDGE_UNVEIL || pr->ps_uvpaths == NULL)
 		return (0);
 
 	if (ni->ni_cnd.cn_flags & BYPASSUNVEIL) {
 #ifdef DEBUG_UNVEIL
 		printf("unveil: %s(%d): BYPASSUNVEIL.\n",
-		    p->p_p->ps_comm, p->p_p->ps_pid);
+		    pr->ps_comm, pr->ps_pid);
 #endif
-		CLR(ni->ni_pledge, PLEDGE_STATLIE);
 		return (0);
 	}
 	if (ni->ni_vp != NULL && ni->ni_vp->v_type == VDIR) {
-		uv = unveil_lookup(ni->ni_vp, p);
+		/* We are matching a directory terminal component */
+		uv = unveil_lookup(ni->ni_vp, pr, NULL);
 		if (uv == NULL) {
 #ifdef DEBUG_UNVEIL
 			printf("unveil: %s(%d) no match for vnode %p\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid, ni->ni_vp);
+			    pr->ps_comm, pr->ps_pid, ni->ni_vp);
 #endif
 			goto done;
 		}
@@ -647,58 +878,95 @@ unveil_check_final(struct proc *p, struct nameidata *ni)
 #ifdef DEBUG_UNVEIL
 			printf("unveil: %s(%d) flag mismatch for directory"
 			    " vnode %p\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid, ni->ni_vp);
+			    pr->ps_comm, pr->ps_pid, ni->ni_vp);
 #endif
-			return EACCES;
+			pr->ps_acflag |= AUNVEIL;
+			if (uv->uv_flags & UNVEIL_USERSET)
+				return EACCES;
+			else
+				return ENOENT;
+
 		}
-	} else {
-		uv = unveil_lookup(ni->ni_dvp, p);
-		if (uv == NULL) {
+		/* directry and flags match, update match */
+		ni->ni_unveil_match = uv;
+		goto done;
+	}
+	/* Otherwise, we are matching a non-terminal component */
+	uv = unveil_lookup(ni->ni_dvp, pr, NULL);
+	if (uv == NULL) {
 #ifdef DEBUG_UNVEIL
-			printf("unveil: %s(%d) no match for directory"
-			    " vnode %p\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid, ni->ni_dvp);
+		printf("unveil: %s(%d) no match for directory"
+		    " vnode %p\n",
+		    pr->ps_comm, pr->ps_pid, ni->ni_dvp);
 #endif
-			goto done;
-		}
-		if ((tname = unveil_namelookup(uv, ni->ni_cnd.cn_nameptr))
-		    == NULL) {
+		goto done;
+	}
+	if ((tname = unveil_namelookup(uv, ni->ni_cnd.cn_nameptr))
+	    == NULL) {
 #ifdef DEBUG_UNVEIL
-			printf("unveil: %s(%d) no match for terminal '%s' in "
-			    "directory vnode %p\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid,
+		printf("unveil: %s(%d) no match for terminal '%s' in "
+		    "directory vnode %p\n",
+		    pr->ps_comm, pr->ps_pid,
+		    ni->ni_cnd.cn_nameptr, ni->ni_dvp);
+#endif
+		/* no specific name, so check unveil directory flags */
+		if (!unveil_flagmatch(ni, uv->uv_flags)) {
+#ifdef DEBUG_UNVEIL
+			printf("unveil: %s(%d) terminal "
+			    "'%s' flags mismatch in directory "
+			    "vnode %p\n",
+			    pr->ps_comm, pr->ps_pid,
 			    ni->ni_cnd.cn_nameptr, ni->ni_dvp);
 #endif
-			uv = NULL;
+			/*
+			 * If dir has user set restrictions fail with
+			 * EACCES. Otherwise, use any covering match
+			 * that we found above this dir.
+			 */
+			if (uv->uv_flags & UNVEIL_USERSET) {
+				pr->ps_acflag |= AUNVEIL;
+				return EACCES;
+			}
 			goto done;
 		}
-		if (!unveil_flagmatch(ni, tname->un_flags)) {
-#ifdef DEBUG_UNVEIL
-			printf("unveil: %s(%d) flag mismatch for terminal '%s'\n",
-			    p->p_p->ps_comm, p->p_p->ps_pid, tname->un_name);
-#endif
-			return EACCES;
-		}
+		/* directory flags match, update match */
+		if (uv->uv_flags & UNVEIL_USERSET)
+			ni->ni_unveil_match = uv;
+		goto done;
 	}
+	if (!unveil_flagmatch(ni, tname->un_flags)) {
+		/* do flags match for matched name */
+#ifdef DEBUG_UNVEIL
+		printf("unveil: %s(%d) flag mismatch for terminal '%s'\n",
+		    pr->ps_comm, pr->ps_pid, tname->un_name);
+#endif
+		pr->ps_acflag |= AUNVEIL;
+		return EACCES;
+	}
+	/* name and flags match in this dir. update match*/
 	ni->ni_unveil_match = uv;
+
 done:
 	if (ni->ni_unveil_match) {
 #ifdef DEBUG_UNVEIL
-		printf("unveil: %s(%d): matched \"%s\" underneath/at vnode %p\n",
-		    p->p_p->ps_comm, p->p_p->ps_pid, ni->ni_cnd.cn_nameptr,
+		printf("unveil: %s(%d): matched \"%s\" underneath/at "
+		    "vnode %p\n",
+		    pr->ps_comm, pr->ps_pid, ni->ni_cnd.cn_nameptr,
 		    ni->ni_unveil_match->uv_vp);
 #endif
 		return (0);
-	} else if (p->p_p->ps_uvpcwd) {
-		ni->ni_unveil_match = p->p_p->ps_uvpcwd;
-#ifdef DEBUG_UNVEIL
-		printf("unveil: %s(%d): used cwd unveil vnode from vnode %p\n",
-		    p->p_p->ps_comm, p->p_p->ps_pid, ni->ni_unveil_match->uv_vp);
-#endif
-		return (0);
-	} else if (p->p_p->ps_uvpcwdgone) {
-		printf("Corner cases make Bob cry in a corner\n");
 	}
+	if (ni->ni_unveil_eacces) {
+#ifdef DEBUG_UNVEIL
+		printf("unveil: %s(%d): \"%s\" flag mismatch above/at "
+		    "vnode %p\n",
+		    pr->ps_comm, pr->ps_pid, ni->ni_cnd.cn_nameptr,
+		    ni->ni_unveil_match->uv_vp);
+#endif
+		pr->ps_acflag |= AUNVEIL;
+		return EACCES;
+	}
+	pr->ps_acflag |= AUNVEIL;
 	return ENOENT;
 }
 
@@ -726,7 +994,7 @@ unveil_removevnode(struct vnode *vp)
 	LIST_FOREACH(pr, &allprocess, ps_list) {
 		struct unveil * uv;
 
-		if ((uv = unveil_lookup(vp, pr->ps_mainproc)) != NULL &&
+		if ((uv = unveil_lookup(vp, pr, NULL)) != NULL &&
 		    uv->uv_vp != NULL) {
 			uv->uv_vp = NULL;
 			uv->uv_flags = 0;

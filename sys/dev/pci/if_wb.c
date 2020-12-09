@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_wb.c,v 1.69 2017/07/13 17:45:00 naddy Exp $	*/
+/*	$OpenBSD: if_wb.c,v 1.72 2020/07/10 13:26:38 patrick Exp $	*/
 
 /*
  * Copyright (c) 1997, 1998
@@ -660,7 +660,7 @@ wb_fixmedia(sc)
 	if (IFM_SUBTYPE(mii->mii_media_active) == IFM_10_T) {
 		media = mii->mii_media_active & ~IFM_10_T;
 		media |= IFM_100_TX;
-	} if (IFM_SUBTYPE(mii->mii_media_active) == IFM_100_TX) {
+	} else if (IFM_SUBTYPE(mii->mii_media_active) == IFM_100_TX) {
 		media = mii->mii_media_active & ~IFM_100_TX;
 		media |= IFM_10_T;
 	} else
@@ -784,7 +784,7 @@ wb_attach(parent, self, aux)
 	ifp->if_ioctl = wb_ioctl;
 	ifp->if_start = wb_start;
 	ifp->if_watchdog = wb_watchdog;
-	IFQ_SET_MAXLEN(&ifp->if_snd, WB_TX_LIST_CNT - 1);
+	ifq_set_maxlen(&ifp->if_snd, WB_TX_LIST_CNT - 1);
 
 	bcopy(sc->sc_dev.dv_xname, ifp->if_xname, IFNAMSIZ);
 
@@ -1150,7 +1150,7 @@ int wb_intr(arg)
 	/* Re-enable interrupts. */
 	CSR_WRITE_4(sc, WB_IMR, WB_INTRS);
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd)) {
+	if (!ifq_empty(&ifp->if_snd)) {
 		wb_start(ifp);
 	}
 
@@ -1289,7 +1289,7 @@ void wb_start(ifp)
 	start_tx = sc->wb_cdata.wb_tx_free;
 
 	while(sc->wb_cdata.wb_tx_free->wb_mbuf == NULL) {
-		IFQ_DEQUEUE(&ifp->if_snd, m_head);
+		m_head = ifq_dequeue(&ifp->if_snd);
 		if (m_head == NULL)
 			break;
 
@@ -1569,7 +1569,7 @@ void wb_watchdog(ifp)
 #endif
 	wb_init(sc);
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		wb_start(ifp);
 
 	return;

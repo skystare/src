@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_var.h,v 1.133 2018/06/11 07:40:26 bluhm Exp $	*/
+/*	$OpenBSD: tcp_var.h,v 1.135 2020/08/18 05:21:21 gnezdo Exp $	*/
 /*	$NetBSD: tcp_var.h,v 1.17 1996/02/13 23:44:24 christos Exp $	*/
 
 /*
@@ -433,6 +433,7 @@ struct	tcpstat {
 	u_int64_t tcps_sack_rexmit_bytes;	/* SACK rexmit bytes */
 	u_int64_t tcps_sack_rcv_opts;		/* SACK options received */
 	u_int64_t tcps_sack_snd_opts;		/* SACK options sent */
+	u_int64_t tcps_sack_drop_opts;		/* SACK options dropped */
 };
 
 /*
@@ -493,35 +494,6 @@ struct	tcpstat {
 	{ "synuselimit", 	CTLTYPE_INT }, \
 	{ "rootonly", CTLTYPE_STRUCT }, \
 	{ "synhashsize", 	CTLTYPE_INT }, \
-}
-
-#define	TCPCTL_VARS { \
-	NULL, \
-	&tcp_do_rfc1323, \
-	&tcptv_keep_init, \
-	&tcp_keepidle, \
-	&tcp_keepintvl, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	&tcp_mssdflt, \
-	&tcp_rst_ppslim, \
-	&tcp_ack_on_push, \
-	NULL, \
-	&tcp_syn_cache_limit, \
-	&tcp_syn_bucket_limit, \
-	&tcp_do_rfc3390, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL \
 }
 
 struct tcp_ident_mapping {
@@ -632,6 +604,7 @@ enum tcpstat_counters {
 	tcps_sack_rexmit_bytes,
 	tcps_sack_rcv_opts,
 	tcps_sack_snd_opts,
+	tcps_sack_drop_opts,
 	tcps_ncounters,
 };
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: pci_machdep.h,v 1.3 2018/08/19 08:23:47 kettenis Exp $ */
+/*	$OpenBSD: pci_machdep.h,v 1.7 2020/07/14 15:42:19 patrick Exp $ */
 
 /*
  * Copyright (c) 2003-2004 Opsycon AB  (www.opsycon.se / www.opsycon.com)
@@ -28,7 +28,19 @@
 
 typedef struct arm64_pci_chipset *pci_chipset_tag_t;
 typedef u_long pcitag_t;
-typedef u_long pci_intr_handle_t;
+
+/* Supported interrupt types. */
+#define PCI_NONE		0
+#define PCI_INTX		1
+#define PCI_MSI			2
+#define PCI_MSIX		3
+
+typedef struct {
+	pci_chipset_tag_t	ih_pc;
+	pcitag_t		ih_tag;
+	int			ih_intrpin;
+	int			ih_type;
+} pci_intr_handle_t;
 
 struct pci_attach_args;
 
@@ -57,7 +69,8 @@ struct arm64_pci_chipset {
 			    int, pci_intr_handle_t *);
 	const char	*(*pc_intr_string)(void *, pci_intr_handle_t);
 	void		*(*pc_intr_establish)(void *, pci_intr_handle_t,
-			    int, int (*)(void *), void *, char *);
+			    int, struct cpu_info *, int (*)(void *), void *,
+			    char *);
 	void		(*pc_intr_disestablish)(void *, void *);
 };
 
@@ -87,7 +100,11 @@ struct arm64_pci_chipset {
 #define	pci_intr_string(c, ih)						\
     (*(c)->pc_intr_string)((c)->pc_intr_v, (ih))
 #define	pci_intr_establish(c, ih, l, h, a, nm)				\
-    (*(c)->pc_intr_establish)((c)->pc_intr_v, (ih), (l), (h), (a), (nm))
+    (*(c)->pc_intr_establish)((c)->pc_intr_v, (ih), (l), NULL, (h), (a),\
+	(nm))
+#define	pci_intr_establish_cpu(c, ih, l, ci, h, a, nm)			\
+    (*(c)->pc_intr_establish)((c)->pc_intr_v, (ih), (l), (ci), (h), (a),\
+	(nm))
 #define	pci_intr_disestablish(c, iv)					\
     (*(c)->pc_intr_disestablish)((c)->pc_intr_v, (iv))
 #define	pci_probe_device_hook(c, a)	(0)
@@ -97,5 +114,18 @@ struct arm64_pci_chipset {
 
 #define	pci_dev_postattach(a, b)
 
-void	 pci_mcfg_init(bus_space_tag_t, bus_addr_t, int, int, int);
+void	pci_mcfg_init(bus_space_tag_t, bus_addr_t, int, int, int);
 pci_chipset_tag_t pci_lookup_segment(int);
+
+void	pci_msi_enable(pci_chipset_tag_t, pcitag_t, bus_addr_t, uint32_t);
+void	pci_msix_enable(pci_chipset_tag_t, pcitag_t, bus_space_tag_t,
+	    int, bus_addr_t, uint32_t);
+int	_pci_intr_map_msi(struct pci_attach_args *, pci_intr_handle_t *);
+int	_pci_intr_map_msix(struct pci_attach_args *, int, pci_intr_handle_t *);
+
+#define __HAVE_PCI_MSIX
+
+int	pci_msix_table_map(pci_chipset_tag_t, pcitag_t,
+	    bus_space_tag_t, bus_space_handle_t *);
+void	pci_msix_table_unmap(pci_chipset_tag_t, pcitag_t,
+	    bus_space_tag_t, bus_space_handle_t);

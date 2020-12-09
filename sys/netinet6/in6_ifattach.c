@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_ifattach.c,v 1.110 2018/08/26 22:30:00 mpi Exp $	*/
+/*	$OpenBSD: in6_ifattach.c,v 1.117 2020/06/21 11:32:34 dlg Exp $	*/
 /*	$KAME: in6_ifattach.c,v 1.124 2001/07/18 08:32:51 jinmei Exp $	*/
 
 /*
@@ -58,7 +58,6 @@
 
 void	in6_get_rand_ifid(struct ifnet *, struct in6_addr *);
 int	in6_get_hw_ifid(struct ifnet *, struct in6_addr *);
-int	in6_get_soii_ifid(struct ifnet *, struct in6_addr *);
 void	in6_get_ifid(struct ifnet *, struct in6_addr *);
 int	in6_ifattach_loopback(struct ifnet *);
 
@@ -72,24 +71,6 @@ int	in6_ifattach_loopback(struct ifnet *);
 
 #define IFID_LOCAL(in6)		(!EUI64_LOCAL(in6))
 #define IFID_UNIVERSAL(in6)	(!EUI64_UNIVERSAL(in6))
-
-void
-in6_soiiupdate(struct ifnet *ifp)
-{
-	struct ifaddr *ifa;
-
-	NET_ASSERT_LOCKED();
-
-	/*
-	 * Update the link-local address.
-	 */
-	ifa = &in6ifa_ifpforlinklocal(ifp, 0)->ia_ifa;
-	if (ifa) {
-		in6_purgeaddr(ifa);
-		dohooks(ifp->if_addrhooks, 0);
-		in6_ifattach(ifp);
-	}
-}
 
 /*
  * Generate a random interface identifier.
@@ -211,61 +192,6 @@ in6_get_hw_ifid(struct ifnet *ifp, struct in6_addr *in6)
 }
 
 /*
- * Generate a Semantically Opaque Interface Identifier according to RFC 7217
- *
- * in6 - upper 64bits are preserved
- */
-int
-in6_get_soii_ifid(struct ifnet *ifp0, struct in6_addr *in6)
-{
-	struct ifnet *ifp;
-	SHA2_CTX ctx;
-	u_int8_t digest[SHA512_DIGEST_LENGTH];
-	struct in6_addr prefix;
-	struct sockaddr_dl *sdl;
-	int dad_counter = 0; /* XXX not used */
-	char *addr;
-
-	if (ifp0->if_xflags & IFXF_INET6_NOSOII)
-		return -1;
-
-	sdl = ifp0->if_sadl;
-
-	if (sdl == NULL || sdl->sdl_alen == 0) {
-		/*
-		 * try to get it from some other hardware interface like
-		 * in in6_get_ifid()
-		 */
-		TAILQ_FOREACH(ifp, &ifnet, if_list) {
-			if (ifp == ifp0)
-				continue;
-			sdl = ifp->if_sadl;
-			if (sdl != NULL && sdl->sdl_alen != 0)
-				break;
-		}
-	}
-
-	if (sdl == NULL || sdl->sdl_alen == 0)
-		return -1;
-
-	memset(&prefix, 0, sizeof(prefix));
-	prefix.s6_addr16[0] = htons(0xfe80);
-	addr = LLADDR(sdl);
-
-	SHA512Init(&ctx);
-
-	SHA512Update(&ctx, &prefix, sizeof(prefix));
-	SHA512Update(&ctx, addr, sdl->sdl_alen);
-	SHA512Update(&ctx, &dad_counter, sizeof(dad_counter));
-	SHA512Update(&ctx, ip6_soiikey, sizeof(ip6_soiikey));
-	SHA512Final(digest, &ctx);
-
-	memcpy(&in6->s6_addr[8], digest + (sizeof(digest) - 8), 8);
-
-	return 0;
-}
-
-/*
  * Get interface identifier for the specified interface.  If it is not
  * available on ifp0, borrow interface identifier from other information
  * sources.
@@ -275,14 +201,7 @@ in6_get_ifid(struct ifnet *ifp0, struct in6_addr *in6)
 {
 	struct ifnet *ifp;
 
-	/* first, try to generate a Semantically Opaque Interface Identifier */
-	if (in6_get_soii_ifid(ifp0, in6) == 0) {
-		nd6log((LOG_DEBUG, "%s: got Semantically Opaque Interface "
-		    "Identifier\n", ifp0->if_xname));
-		goto success;
-	}
-
-	/* next, try to get it from the interface itself */
+	/* first, try to get it from the interface itself */
 	if (in6_get_hw_ifid(ifp0, in6) == 0) {
 		nd6log((LOG_DEBUG, "%s: got interface identifier from itself\n",
 		    ifp0->if_xname));
@@ -326,7 +245,7 @@ in6_ifattach_linklocal(struct ifnet *ifp, struct in6_addr *ifid)
 	 * configure link-local address.
 	 */
 	bzero(&ifra, sizeof(ifra));
-	strncpy(ifra.ifra_name, ifp->if_xname, sizeof(ifra.ifra_name));
+	strlcpy(ifra.ifra_name, ifp->if_xname, sizeof(ifra.ifra_name));
 	ifra.ifra_addr.sin6_family = AF_INET6;
 	ifra.ifra_addr.sin6_len = sizeof(struct sockaddr_in6);
 	ifra.ifra_addr.sin6_addr.s6_addr16[0] = htons(0xfe80);
@@ -370,20 +289,21 @@ in6_ifattach_linklocal(struct ifnet *ifp, struct in6_addr *ifid)
 		nd6_dad_start(&ia6->ia_ifa);
 
 	if (ifp->if_flags & IFF_LOOPBACK) {
-		dohooks(ifp->if_addrhooks, 0);
+		if_addrhooks_run(ifp);
 		return (0); /* No need to install a connected route. */
 	}
 
-	flags = RTF_CONNECTED;
+	flags = RTF_CONNECTED | RTF_MPATH;
 	if ((ifp->if_flags & IFF_POINTOPOINT) == 0)
 		flags |= RTF_CLONING;
 
-	error = rt_ifa_add(&ia6->ia_ifa, flags, ia6->ia_ifa.ifa_addr);
+	error = rt_ifa_add(&ia6->ia_ifa, flags, ia6->ia_ifa.ifa_addr,
+	    ifp->if_rdomain);
 	if (error) {
 		in6_purgeaddr(&ia6->ia_ifa);
 		return (error);
 	}
-	dohooks(ifp->if_addrhooks, 0);
+	if_addrhooks_run(ifp);
 
 	return (0);
 }
@@ -400,7 +320,7 @@ in6_ifattach_loopback(struct ifnet *ifp)
 		return (0);
 
 	bzero(&ifra, sizeof(ifra));
-	strncpy(ifra.ifra_name, ifp->if_xname, sizeof(ifra.ifra_name));
+	strlcpy(ifra.ifra_name, ifp->if_xname, sizeof(ifra.ifra_name));
 	ifra.ifra_prefixmask.sin6_len = sizeof(struct sockaddr_in6);
 	ifra.ifra_prefixmask.sin6_family = AF_INET6;
 	ifra.ifra_prefixmask.sin6_addr = in6mask128;
@@ -426,57 +346,6 @@ in6_ifattach_loopback(struct ifnet *ifp)
 	 * NULL to the 3rd arg.
 	 */
 	return (in6_update_ifa(ifp, &ifra, NULL));
-}
-
-/*
- * compute NI group address, based on the current hostname setting.
- * see draft-ietf-ipngwg-icmp-name-lookup-* (04 and later).
- *
- * when ifp == NULL, the caller is responsible for filling scopeid.
- */
-int
-in6_nigroup(struct ifnet *ifp, const char *name, int namelen,
-    struct sockaddr_in6 *sa6)
-{
-	const char *p;
-	u_int8_t *q;
-	SHA2_CTX ctx;
-	u_int8_t digest[SHA512_DIGEST_LENGTH];
-	u_int8_t l;
-	u_int8_t n[64];	/* a single label must not exceed 63 chars */
-
-	if (!namelen || !name)
-		return -1;
-
-	p = name;
-	while (p && *p && *p != '.' && p - name < namelen)
-		p++;
-	if (p - name > sizeof(n) - 1)
-		return -1;	/* label too long */
-	l = p - name;
-	strncpy((char *)n, name, l);
-	n[(int)l] = '\0';
-	for (q = n; *q; q++) {
-		if ('A' <= *q && *q <= 'Z')
-			*q = *q - 'A' + 'a';
-	}
-
-	/* generate 8 bytes of pseudo-random value. */
-	SHA512Init(&ctx);
-	SHA512Update(&ctx, &l, sizeof(l));
-	SHA512Update(&ctx, n, l);
-	SHA512Final(digest, &ctx);
-
-	bzero(sa6, sizeof(*sa6));
-	sa6->sin6_family = AF_INET6;
-	sa6->sin6_len = sizeof(*sa6);
-	sa6->sin6_addr.s6_addr16[0] = htons(0xff02);
-	sa6->sin6_addr.s6_addr16[1] = htons(ifp->if_index);
-	sa6->sin6_addr.s6_addr8[11] = 2;
-	memcpy(&sa6->sin6_addr.s6_addr32[3], digest,
-	    sizeof(sa6->sin6_addr.s6_addr32[3]));
-
-	return 0;
 }
 
 /*
@@ -520,6 +389,13 @@ in6_ifattach(struct ifnet *ifp)
 			return (error);
 	}
 
+	/* Interfaces that rely on strong a priori cryptographic binding of
+	 * IP addresses are incompatible with automatically assigned llv6. */
+	switch (ifp->if_type) {
+	case IFT_WIREGUARD:
+		return (0);
+	}
+
 	/* Assign a link-local address, if there's none. */
 	if (in6ifa_ifpforlinklocal(ifp, 0) == NULL) {
 		if (in6_ifattach_linklocal(ifp, NULL) != 0) {
@@ -550,7 +426,7 @@ in6_ifdetach(struct ifnet *ifp)
 		if (ifa->ifa_addr->sa_family != AF_INET6)
 			continue;
 		in6_purgeaddr(ifa);
-		dohooks(ifp->if_addrhooks, 0);
+		if_addrhooks_run(ifp);
 	}
 
 	/*

@@ -1,4 +1,4 @@
-/* $OpenBSD: cpu.h,v 1.59 2018/04/09 04:11:04 deraadt Exp $ */
+/* $OpenBSD: cpu.h,v 1.63 2020/06/05 14:25:05 naddy Exp $ */
 /* $NetBSD: cpu.h,v 1.45 2000/08/21 02:03:12 thorpej Exp $ */
 
 /*-
@@ -101,6 +101,7 @@ typedef union alpha_t_float {
 #include <sys/cdefs.h>
 #include <sys/device.h>
 #include <sys/sched.h>
+#include <sys/srp.h>
 
 struct pcb;
 struct proc;
@@ -287,6 +288,12 @@ do {									\
  */
 #define	cpu_number()		alpha_pal_whami()
 
+static inline unsigned int
+cpu_rnd_messybits(void)
+{
+	return alpha_rpcc();
+}
+
 /*
  * Arguments to hardclock and gatherstats encapsulate the previous
  * machine state in an opaque clockframe.  On the Alpha, we use
@@ -422,6 +429,18 @@ void alpha_enable_fp(struct proc *, int);
 #ifdef MULTIPROCESSOR
 #include <sys/mplock.h>
 #endif
+
+static inline u_long
+intr_disable(void)
+{
+	return (u_long)splhigh();
+}
+
+static inline void
+intr_restore(u_long s)
+{
+	splx((int)s);
+}
 
 #endif /* _KERNEL */
 #endif /* _MACHINE_CPU_H_ */

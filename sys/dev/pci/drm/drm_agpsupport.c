@@ -1,4 +1,4 @@
-/* $OpenBSD: drm_agpsupport.c,v 1.26 2014/03/13 13:35:21 kettenis Exp $ */
+/* $OpenBSD: drm_agpsupport.c,v 1.28 2020/06/08 04:47:58 jsg Exp $ */
 /*-
  * Copyright 1999 Precision Insight, Inc., Cedar Park, Texas.
  * Copyright 2000 VA Linux Systems, Inc., Sunnyvale, California.
@@ -33,9 +33,21 @@
  * Support code for tying the kernel AGP support to DRM drivers.
  */
 
-#include "drmP.h"
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/slab.h>
 
-#if __OS_HAS_AGP
+#include <asm/agp.h>
+
+#include <drm/drm_agpsupport.h>
+#include <drm/drm_device.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_file.h>
+#include <drm/drm_print.h>
+
+#include "drm_legacy.h"
+
+#if IS_ENABLED(CONFIG_AGP)
 
 int
 drm_agp_info(struct drm_device * dev, struct drm_agp_info *info)
@@ -126,7 +138,7 @@ drm_agp_init(void)
 	DRM_DEBUG("agp_available = %d\n", agp_available);
 
 	if (agp_available) {
-		head = drm_calloc(1, sizeof(*head));
+		head = mallocarray(1, sizeof(*head), M_DRM, M_NOWAIT | M_ZERO);
 		if (head == NULL)
 			return (NULL);
 		head->agpdev = agpdev;
@@ -138,4 +150,4 @@ drm_agp_init(void)
 	return (head);
 }
 
-#endif /* __OS_HAS_AGP */
+#endif /* IS_ENABLED(CONFIG_AGP) */

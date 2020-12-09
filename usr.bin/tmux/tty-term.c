@@ -1,4 +1,4 @@
-/* $OpenBSD: tty-term.c,v 1.59 2018/05/07 13:39:09 nicm Exp $ */
+/* $OpenBSD: tty-term.c,v 1.85 2020/10/13 07:29:24 nicm Exp $ */
 
 /*
  * Copyright (c) 2008 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -27,7 +27,6 @@
 
 #include "tmux.h"
 
-static void	 tty_term_override(struct tty_term *, const char *);
 static char	*tty_term_strip(const char *);
 
 struct tty_terms tty_terms = LIST_HEAD_INITIALIZER(tty_terms);
@@ -55,6 +54,7 @@ struct tty_term_code_entry {
 
 static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_ACSC] = { TTYCODE_STRING, "acsc" },
+	[TTYC_AM] = { TTYCODE_FLAG, "am" },
 	[TTYC_AX] = { TTYCODE_FLAG, "AX" },
 	[TTYC_BCE] = { TTYCODE_FLAG, "bce" },
 	[TTYC_BEL] = { TTYCODE_STRING, "bel" },
@@ -62,6 +62,8 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_BOLD] = { TTYCODE_STRING, "bold" },
 	[TTYC_CIVIS] = { TTYCODE_STRING, "civis" },
 	[TTYC_CLEAR] = { TTYCODE_STRING, "clear" },
+	[TTYC_CLMG] = { TTYCODE_STRING, "Clmg" },
+	[TTYC_CMG] = { TTYCODE_STRING, "Cmg" },
 	[TTYC_CNORM] = { TTYCODE_STRING, "cnorm" },
 	[TTYC_COLORS] = { TTYCODE_NUMBER, "colors" },
 	[TTYC_CR] = { TTYCODE_STRING, "Cr" },
@@ -82,12 +84,20 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_DIM] = { TTYCODE_STRING, "dim" },
 	[TTYC_DL1] = { TTYCODE_STRING, "dl1" },
 	[TTYC_DL] = { TTYCODE_STRING, "dl" },
+	[TTYC_DSEKS] = { TTYCODE_STRING, "Dseks" },
+	[TTYC_DSFCS] = { TTYCODE_STRING, "Dsfcs" },
+	[TTYC_DSBP] = { TTYCODE_STRING, "Dsbp" },
+	[TTYC_DSMG] = { TTYCODE_STRING, "Dsmg" },
 	[TTYC_E3] = { TTYCODE_STRING, "E3" },
 	[TTYC_ECH] = { TTYCODE_STRING, "ech" },
 	[TTYC_ED] = { TTYCODE_STRING, "ed" },
 	[TTYC_EL1] = { TTYCODE_STRING, "el1" },
 	[TTYC_EL] = { TTYCODE_STRING, "el" },
 	[TTYC_ENACS] = { TTYCODE_STRING, "enacs" },
+	[TTYC_ENBP] = { TTYCODE_STRING, "Enbp" },
+	[TTYC_ENEKS] = { TTYCODE_STRING, "Eneks" },
+	[TTYC_ENFCS] = { TTYCODE_STRING, "Enfcs" },
+	[TTYC_ENMG] = { TTYCODE_STRING, "Enmg" },
 	[TTYC_FSL] = { TTYCODE_STRING, "fsl" },
 	[TTYC_HOME] = { TTYCODE_STRING, "home" },
 	[TTYC_HPA] = { TTYCODE_STRING, "hpa" },
@@ -235,33 +245,39 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_KUP6] = { TTYCODE_STRING, "kUP6" },
 	[TTYC_KUP7] = { TTYCODE_STRING, "kUP7" },
 	[TTYC_MS] = { TTYCODE_STRING, "Ms" },
+	[TTYC_OL] = { TTYCODE_STRING, "ol" },
 	[TTYC_OP] = { TTYCODE_STRING, "op" },
 	[TTYC_REV] = { TTYCODE_STRING, "rev" },
 	[TTYC_RGB] = { TTYCODE_FLAG, "RGB" },
+	[TTYC_RIN] = { TTYCODE_STRING, "rin" },
 	[TTYC_RI] = { TTYCODE_STRING, "ri" },
 	[TTYC_RMACS] = { TTYCODE_STRING, "rmacs" },
 	[TTYC_RMCUP] = { TTYCODE_STRING, "rmcup" },
 	[TTYC_RMKX] = { TTYCODE_STRING, "rmkx" },
 	[TTYC_SETAB] = { TTYCODE_STRING, "setab" },
 	[TTYC_SETAF] = { TTYCODE_STRING, "setaf" },
+	[TTYC_SETAL] = { TTYCODE_STRING, "setal" },
 	[TTYC_SETRGBB] = { TTYCODE_STRING, "setrgbb" },
 	[TTYC_SETRGBF] = { TTYCODE_STRING, "setrgbf" },
+	[TTYC_SETULC] = { TTYCODE_STRING, "Setulc" },
 	[TTYC_SE] = { TTYCODE_STRING, "Se" },
 	[TTYC_SGR0] = { TTYCODE_STRING, "sgr0" },
 	[TTYC_SITM] = { TTYCODE_STRING, "sitm" },
 	[TTYC_SMACS] = { TTYCODE_STRING, "smacs" },
 	[TTYC_SMCUP] = { TTYCODE_STRING, "smcup" },
 	[TTYC_SMKX] = { TTYCODE_STRING, "smkx" },
+	[TTYC_SMOL] = { TTYCODE_STRING, "Smol" },
 	[TTYC_SMSO] = { TTYCODE_STRING, "smso" },
+	[TTYC_SMULX] = { TTYCODE_STRING, "Smulx" },
 	[TTYC_SMUL] = { TTYCODE_STRING, "smul" },
 	[TTYC_SMXX] =  { TTYCODE_STRING, "smxx" },
 	[TTYC_SS] = { TTYCODE_STRING, "Ss" },
+	[TTYC_SYNC] = { TTYCODE_STRING, "Sync" },
 	[TTYC_TC] = { TTYCODE_FLAG, "Tc" },
 	[TTYC_TSL] = { TTYCODE_STRING, "tsl" },
 	[TTYC_U8] = { TTYCODE_NUMBER, "U8" },
 	[TTYC_VPA] = { TTYCODE_STRING, "vpa" },
-	[TTYC_XENL] = { TTYCODE_FLAG, "xenl" },
-	[TTYC_XT] = { TTYCODE_FLAG, "XT" },
+	[TTYC_XT] = { TTYCODE_FLAG, "XT" }
 };
 
 u_int
@@ -274,7 +290,7 @@ static char *
 tty_term_strip(const char *s)
 {
 	const char     *ptr;
-	static char	buf[BUFSIZ];
+	static char	buf[8192];
 	size_t		len;
 
 	/* Ignore strings with no padding. */
@@ -288,6 +304,8 @@ tty_term_strip(const char *s)
 				ptr++;
 			if (*ptr == '>')
 				ptr++;
+			if (*ptr == '\0')
+				break;
 		}
 
 		buf[len++] = *ptr;
@@ -299,25 +317,49 @@ tty_term_strip(const char *s)
 	return (xstrdup(buf));
 }
 
-static void
-tty_term_override(struct tty_term *term, const char *override)
+static char *
+tty_term_override_next(const char *s, size_t *offset)
+{
+	static char	value[8192];
+	size_t		n = 0, at = *offset;
+
+	if (s[at] == '\0')
+		return (NULL);
+
+	while (s[at] != '\0') {
+		if (s[at] == ':') {
+			if (s[at + 1] == ':') {
+				value[n++] = ':';
+				at += 2;
+			} else
+				break;
+		} else {
+			value[n++] = s[at];
+			at++;
+		}
+		if (n == (sizeof value) - 1)
+			return (NULL);
+	}
+	if (s[at] != '\0')
+		*offset = at + 1;
+	else
+		*offset = at;
+	value[n] = '\0';
+	return (value);
+}
+
+void
+tty_term_apply(struct tty_term *term, const char *capabilities, int quiet)
 {
 	const struct tty_term_code_entry	*ent;
 	struct tty_code				*code;
-	char					*next, *s, *copy, *cp, *value;
-	const char				*errstr;
+	size_t                                   offset = 0;
+	char					*cp, *value, *s;
+	const char				*errstr, *name = term->name;
 	u_int					 i;
 	int					 n, remove;
 
-	copy = next = xstrdup(override);
-
-	s = strsep(&next, ":");
-	if (s == NULL || next == NULL || fnmatch(s, term->name, 0) != 0) {
-		free(copy);
-		return;
-	}
-
-	while ((s = strsep(&next, ":")) != NULL) {
+	while ((s = tty_term_override_next(capabilities, &offset)) != NULL) {
 		if (*s == '\0')
 			continue;
 		value = NULL;
@@ -336,10 +378,14 @@ tty_term_override(struct tty_term *term, const char *override)
 		} else
 			value = xstrdup("");
 
-		if (remove)
-			log_debug("%s override: %s@", term->name, s);
-		else
-			log_debug("%s override: %s=%s", term->name, s, value);
+		if (!quiet) {
+			if (remove)
+				log_debug("%s override: %s@", name, s);
+			else if (*value == '\0')
+				log_debug("%s override: %s", name, s);
+			else
+				log_debug("%s override: %s=%s", name, s, value);
+		}
 
 		for (i = 0; i < tty_term_ncodes(); i++) {
 			ent = &tty_term_codes[i];
@@ -376,32 +422,52 @@ tty_term_override(struct tty_term *term, const char *override)
 
 		free(value);
 	}
-	free(s);
+}
+
+void
+tty_term_apply_overrides(struct tty_term *term)
+{
+	struct options_entry		*o;
+	struct options_array_item	*a;
+	union options_value		*ov;
+	const char			*s;
+	size_t				 offset;
+	char				*first;
+
+	o = options_get_only(global_options, "terminal-overrides");
+	a = options_array_first(o);
+	while (a != NULL) {
+		ov = options_array_item_value(a);
+		s = ov->string;
+
+		offset = 0;
+		first = tty_term_override_next(s, &offset);
+		if (first != NULL && fnmatch(first, term->name, 0) == 0)
+			tty_term_apply(term, s + offset, 0);
+		a = options_array_next(a);
+	}
 }
 
 struct tty_term *
-tty_term_find(char *name, int fd, char **cause)
+tty_term_create(struct tty *tty, char *name, int *feat, int fd, char **cause)
 {
 	struct tty_term				*term;
 	const struct tty_term_code_entry	*ent;
 	struct tty_code				*code;
 	struct options_entry			*o;
-	u_int					 size, i;
+	struct options_array_item		*a;
+	union options_value			*ov;
+	u_int					 i;
 	int		 			 n, error;
 	const char				*s, *acs;
+	size_t					 offset;
+	char					*first;
 
-	LIST_FOREACH(term, &tty_terms, entry) {
-		if (strcmp(term->name, name) == 0) {
-			term->references++;
-			return (term);
-		}
-	}
-	log_debug("new term: %s", name);
+	log_debug("adding term %s", name);
 
-	term = xmalloc(sizeof *term);
+	term = xcalloc(1, sizeof *term);
+	term->tty = tty;
 	term->name = xstrdup(name);
-	term->references = 1;
-	term->flags = 0;
 	term->codes = xcalloc(tty_term_ncodes(), sizeof *term->codes);
 	LIST_INSERT_HEAD(&tty_terms, term, entry);
 
@@ -459,18 +525,25 @@ tty_term_find(char *name, int fd, char **cause)
 		}
 	}
 
-	/* Apply terminal overrides. */
-	o = options_get_only(global_options, "terminal-overrides");
-	if (options_array_size(o, &size) != -1) {
-		for (i = 0; i < size; i++) {
-			s = options_array_get(o, i);
-			if (s != NULL)
-				tty_term_override(term, s);
-		}
+	/* Apply terminal features. */
+	o = options_get_only(global_options, "terminal-features");
+	a = options_array_first(o);
+	while (a != NULL) {
+		ov = options_array_item_value(a);
+		s = ov->string;
+
+		offset = 0;
+		first = tty_term_override_next(s, &offset);
+		if (first != NULL && fnmatch(first, term->name, 0) == 0)
+			tty_add_features(feat, s + offset, ":");
+		a = options_array_next(a);
 	}
 
 	/* Delete curses data. */
 	del_curterm(cur_term);
+
+	/* Apply overrides so any capabilities used for features are changed. */
+	tty_term_apply_overrides(term);
 
 	/* These are always required. */
 	if (!tty_term_has(term, TTYC_CLEAR)) {
@@ -482,29 +555,54 @@ tty_term_find(char *name, int fd, char **cause)
 		goto error;
 	}
 
-	/* These can be emulated so one of the two is required. */
-	if (!tty_term_has(term, TTYC_CUD1) && !tty_term_has(term, TTYC_CUD)) {
-		xasprintf(cause, "terminal does not support cud1 or cud");
-		goto error;
+	/*
+	 * If TERM has XT or clear starts with CSI then it is safe to assume
+	 * the terminal is derived from the VT100. This controls whether device
+	 * attributes requests are sent to get more information.
+	 *
+	 * This is a bit of a hack but there aren't that many alternatives.
+	 * Worst case tmux will just fall back to using whatever terminfo(5)
+	 * says without trying to correct anything that is missing.
+	 *
+	 * Also add few features that VT100-like terminals should either
+	 * support or safely ignore.
+	 */
+	s = tty_term_string(term, TTYC_CLEAR);
+	if (tty_term_flag(term, TTYC_XT) || strncmp(s, "\033[", 2) == 0) {
+		term->flags |= TERM_VT100LIKE;
+		tty_add_features(feat, "bpaste,focus,title", ",");
 	}
 
-	/* Figure out if we have 256 colours (or more). */
-	if (tty_term_number(term, TTYC_COLORS) >= 256 ||
-	    tty_term_has(term, TTYC_RGB))
-		term->flags |= TERM_256COLOURS;
+	/* Add RGB feature if terminal has RGB colours. */
+	if ((tty_term_flag(term, TTYC_TC) || tty_term_has(term, TTYC_RGB)) &&
+	    (!tty_term_has(term, TTYC_SETRGBF) ||
+	    !tty_term_has(term, TTYC_SETRGBB)))
+		tty_add_features(feat, "RGB", ",");
+	if (tty_term_has(term, TTYC_SETRGBF) &&
+	    tty_term_has(term, TTYC_SETRGBB))
+		term->flags |= TERM_RGBCOLOURS;
+
+	/* Apply the features and overrides again. */
+	tty_apply_features(term, *feat);
+	tty_term_apply_overrides(term);
 
 	/*
-	 * Terminals without xenl (eat newline glitch) wrap at at $COLUMNS - 1
+	 * Terminals without am (auto right margin) wrap at at $COLUMNS - 1
 	 * rather than $COLUMNS (the cursor can never be beyond $COLUMNS - 1).
 	 *
-	 * This is irritating, most notably because it is impossible to write
-	 * to the very bottom-right of the screen without scrolling.
+	 * Terminals without xenl (eat newline glitch) ignore a newline beyond
+	 * the right edge of the terminal, but tmux doesn't care about this -
+	 * it always uses absolute only moves the cursor with a newline when
+	 * also sending a linefeed.
+	 *
+	 * This is irritating, most notably because it is painful to write to
+	 * the very bottom-right of the screen without scrolling.
 	 *
 	 * Flag the terminal here and apply some workarounds in other places to
 	 * do the best possible.
 	 */
-	if (!tty_term_flag(term, TTYC_XENL))
-		term->flags |= TERM_EARLYWRAP;
+	if (!tty_term_flag(term, TTYC_AM))
+		term->flags |= TERM_NOAM;
 
 	/* Generate ACS table. If none is present, use nearest ASCII. */
 	memset(term->acs, 0, sizeof term->acs);
@@ -515,34 +613,7 @@ tty_term_find(char *name, int fd, char **cause)
 	for (; acs[0] != '\0' && acs[1] != '\0'; acs += 2)
 		term->acs[(u_char) acs[0]][0] = acs[1];
 
-	/* On terminals with xterm titles (XT), fill in tsl and fsl. */
-	if (tty_term_flag(term, TTYC_XT) &&
-	    !tty_term_has(term, TTYC_TSL) &&
-	    !tty_term_has(term, TTYC_FSL)) {
-		code = &term->codes[TTYC_TSL];
-		code->value.string = xstrdup("\033]0;");
-		code->type = TTYCODE_STRING;
-		code = &term->codes[TTYC_FSL];
-		code->value.string = xstrdup("\007");
-		code->type = TTYCODE_STRING;
-	}
-
-	/*
-	 * On terminals with RGB colour (Tc or RGB), fill in setrgbf and
-	 * setrgbb if they are missing.
-	 */
-	if ((tty_term_flag(term, TTYC_TC) || tty_term_flag(term, TTYC_RGB)) &&
-	    !tty_term_has(term, TTYC_SETRGBF) &&
-	    !tty_term_has(term, TTYC_SETRGBB)) {
-		code = &term->codes[TTYC_SETRGBF];
-		code->value.string = xstrdup("\033[38;2;%p1%d;%p2%d;%p3%dm");
-		code->type = TTYCODE_STRING;
-		code = &term->codes[TTYC_SETRGBB];
-		code->value.string = xstrdup("\033[48;2;%p1%d;%p2%d;%p3%dm");
-		code->type = TTYCODE_STRING;
-	}
-
-	/* Log it. */
+	/* Log the capabilities. */
 	for (i = 0; i < tty_term_ncodes(); i++)
 		log_debug("%s%s", name, tty_term_describe(term, i));
 
@@ -558,10 +629,7 @@ tty_term_free(struct tty_term *term)
 {
 	u_int	i;
 
-	if (--term->references != 0)
-		return;
-
-	LIST_REMOVE(term, entry);
+	log_debug("removing term %s", term->name);
 
 	for (i = 0; i < tty_term_ncodes(); i++) {
 		if (term->codes[i].type == TTYCODE_STRING)
@@ -569,6 +637,7 @@ tty_term_free(struct tty_term *term)
 	}
 	free(term->codes);
 
+	LIST_REMOVE(term, entry);
 	free(term->name);
 	free(term);
 }
@@ -602,7 +671,8 @@ tty_term_string2(struct tty_term *term, enum tty_code_code code, int a, int b)
 }
 
 const char *
-tty_term_string3(struct tty_term *term, enum tty_code_code code, int a, int b, int c)
+tty_term_string3(struct tty_term *term, enum tty_code_code code, int a, int b,
+    int c)
 {
 	return (tparm((char *) tty_term_string(term, code), a, b, c));
 }
@@ -653,7 +723,7 @@ tty_term_describe(struct tty_term *term, enum tty_code_code code)
 		break;
 	case TTYCODE_STRING:
 		strnvis(out, term->codes[code].value.string, sizeof out,
-		    VIS_OCTAL|VIS_TAB|VIS_NL);
+		    VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
 		xsnprintf(s, sizeof s, "%4u: %s: (string) %s",
 		    code, tty_term_codes[code].name,
 		    out);

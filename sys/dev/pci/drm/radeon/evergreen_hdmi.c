@@ -24,9 +24,9 @@
  * Authors: Christian König
  *          Rafał Miłecki
  */
-#include <dev/pci/drm/linux_hdmi.h>
-#include <dev/pci/drm/drmP.h>
-#include <dev/pci/drm/radeon_drm.h>
+#include <linux/hdmi.h>
+
+#include <drm/radeon_drm.h>
 #include "radeon.h"
 #include "radeon_asic.h"
 #include "radeon_audio.h"
@@ -206,7 +206,7 @@ void evergreen_hdmi_write_sad_regs(struct drm_encoder *encoder,
  * build a AVI Info Frame
  */
 void evergreen_set_avi_packet(struct radeon_device *rdev, u32 offset,
-    unsigned char *buffer, size_t size)
+			      unsigned char *buffer, size_t size)
 {
 	uint8_t *frame = buffer + 3;
 
@@ -318,9 +318,7 @@ void dce4_hdmi_set_color_depth(struct drm_encoder *encoder, u32 offset, int bpc)
 {
 	struct drm_device *dev = encoder->dev;
 	struct radeon_device *rdev = dev->dev_private;
-#ifdef DRMDEBUG
 	struct drm_connector *connector = radeon_get_connector_for_encoder(encoder);
-#endif
 	uint32_t val;
 
 	val = RREG32(HDMI_CONTROL + offset);

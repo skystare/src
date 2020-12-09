@@ -1,4 +1,4 @@
-/*	$OpenBSD: conf.c,v 1.5 2017/01/23 12:34:06 kettenis Exp $	*/
+/*	$OpenBSD: conf.c,v 1.16 2020/10/07 13:37:32 jan Exp $	*/
 
 /*
  * Copyright (c) 1994, 1995 Charles M. Hannum.  All rights reserved.
@@ -46,6 +46,7 @@ bdev_decl(wd);
 #include "uk.h"
 #include "vnd.h"
 #include "rd.h"
+#include "apm.h"
 
 struct bdevsw	bdevsw[] =
 {
@@ -71,19 +72,6 @@ struct bdevsw	bdevsw[] =
 };
 int	nblkdev = nitems(bdevsw);
 
-/* open, close, read, write, ioctl, tty, mmap */
-#define cdev_pc_init(c,n) { \
-	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
-	dev_init(c,n,write), dev_init(c,n,ioctl), dev_init(c,n,stop), \
-	dev_init(c,n,tty), ttselect, dev_init(c,n,mmap), D_TTY }
-
-/* open, close, read, ioctl */
-#define cdev_joy_init(c,n) { \
-	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
-	(dev_type_write((*))) enodev, dev_init(c,n,ioctl), \
-	(dev_type_stop((*))) enodev, 0, seltrue, \
-	(dev_type_mmap((*))) enodev }
-
 /* open, close, ioctl, select -- XXX should be a generic device */
 #define cdev_ocis_init(c,n) { \
         dev_init(c,n,open), dev_init(c,n,close), (dev_type_read((*))) enodev, \
@@ -96,7 +84,7 @@ int	nblkdev = nitems(bdevsw);
 	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
 	(dev_type_write((*))) enodev, (dev_type_ioctl((*))) enodev, \
 	(dev_type_stop((*))) enodev, 0, seltrue, \
-	(dev_type_mmap((*))) enodev, 0 }
+	(dev_type_mmap((*))) enodev, 0, 0, seltrue_kqfilter }
 
 
 #define	mmread	mmrw
@@ -118,8 +106,10 @@ cdev_decl(spkr);
 #include "midi.h"
 #include "bktr.h"
 #include "ksyms.h"
+#include "kstat.h"
 #include "usb.h"
 #include "uhid.h"
+#include "fido.h"
 #include "ugen.h"
 #include "ulpt.h"
 #include "ucom.h"
@@ -137,6 +127,7 @@ cdev_decl(drm);
 cdev_decl(pci);
 #endif
 
+#include "dt.h"
 #include "pf.h"
 #include "hotplug.h"
 #include "vscsi.h"
@@ -144,6 +135,7 @@ cdev_decl(pci);
 #include "fuse.h"
 #include "openprom.h"
 #include "gpio.h"
+#include "ipmi.h"
 #include "switch.h"
 
 struct cdevsw	cdevsw[] =
@@ -179,7 +171,7 @@ struct cdevsw	cdevsw[] =
 	cdev_notdef(),			/* 27 */
 	cdev_notdef(),			/* 28 was LKM */
 	cdev_notdef(),			/* 29 */
-	cdev_notdef(),			/* 30 */
+	cdev_dt_init(NDT,dt),		/* 30: dynamic tracer */
 	cdev_notdef(),			/* 31 */
 	cdev_notdef(),			/* 32 */
 	cdev_notdef(),			/* 33 */
@@ -200,7 +192,7 @@ struct cdevsw	cdevsw[] =
 	cdev_notdef(),			/* 48 */
 	cdev_bktr_init(NBKTR,bktr),     /* 49: Bt848 video capture device */
 	cdev_ksyms_init(NKSYMS,ksyms),	/* 50: Kernel symbols device */
-	cdev_notdef(),			/* 51 */
+	cdev_kstat_init(NKSTAT,kstat),	/* 51: kernel statistics */
 	cdev_midi_init(NMIDI,midi),	/* 52: MIDI I/O */
 	cdev_notdef(),			/* 53 was: sequencer I/O */
 	cdev_notdef(),			/* 54 was: RAIDframe disk driver */
@@ -236,10 +228,10 @@ struct cdevsw	cdevsw[] =
 	cdev_notdef(),			/* 77: was USB scanners */
 	cdev_notdef(),			/* 78: was: system call tracing */
 	cdev_bio_init(NBIO,bio),	/* 79: ioctl tunnel */
-	cdev_notdef(),			/* 80: gpr? XXX */
+	cdev_notdef(),			/* 80 */
 	cdev_ptm_init(NPTY,ptm),	/* 81: pseudo-tty ptm device */
 	cdev_hotplug_init(NHOTPLUG,hotplug), /* 82: devices hot plugging */
-	cdev_notdef(),			/* 83 */
+	cdev_acpiapm_init(NAPM,acpiapm),	/* 83: apm */
 	cdev_notdef(),			/* 84 */
 	cdev_notdef(),			/* 85 */
 	cdev_notdef(),			/* 86 */
@@ -249,11 +241,13 @@ struct cdevsw	cdevsw[] =
 	cdev_disk_init(1,diskmap),	/* 90: disk mapper */
 	cdev_pppx_init(NPPPX,pppx),     /* 91: pppx */
 	cdev_fuse_init(NFUSE,fuse),	/* 92: fuse */
-	cdev_notdef(),			/* 93 */
+	cdev_tun_init(NTUN,tap),	/* 93: Ethernet network tunnel */
 	cdev_notdef(),			/* 94 */
 	cdev_notdef(),			/* 95 */
-	cdev_notdef(),			/* 96 */
+	cdev_ipmi_init(NIPMI,ipmi),	/* 96: ipmi */
 	cdev_switch_init(NSWITCH,switch), /* 97: switch(4) control interface */
+	cdev_fido_init(NFIDO,fido),	/* 98: FIDO/U2F security key */
+	cdev_pppx_init(NPPPX,pppac),	/* 99: PPP Access Concentrator */
 };
 int	nchrdev = nitems(cdevsw);
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mpath.c,v 1.41 2015/08/23 01:55:39 tedu Exp $ */
+/*	$OpenBSD: mpath.c,v 1.54 2020/09/22 19:32:53 krw Exp $ */
 
 /*
  * Copyright (c) 2009 David Gwynne <dlg@openbsd.org>
@@ -66,7 +66,6 @@ struct mpath_dev {
 
 struct mpath_softc {
 	struct device		sc_dev;
-	struct scsi_link	sc_link;
 	struct scsibus_softc	*sc_scsibus;
 	struct mpath_dev	*sc_devs[MPATH_BUSWIDTH];
 };
@@ -98,9 +97,7 @@ void		mpath_failover_start(void *);
 void		mpath_failover_check(struct mpath_dev *);
 
 struct scsi_adapter mpath_switch = {
-	mpath_cmd,
-	scsi_minphys,
-	mpath_probe
+	mpath_cmd, NULL, mpath_probe, NULL, NULL
 };
 
 void		mpath_xs_stuffup(struct scsi_xfer *);
@@ -121,15 +118,15 @@ mpath_attach(struct device *parent, struct device *self, void *aux)
 
 	printf("\n");
 
-	sc->sc_link.adapter = &mpath_switch;
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.adapter_target = MPATH_BUSWIDTH;
-	sc->sc_link.adapter_buswidth = MPATH_BUSWIDTH;
-	sc->sc_link.luns = 1;
-	sc->sc_link.openings = 1024; /* XXX magical */
-
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
+	saa.saa_adapter = &mpath_switch;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter_target = SDEV_NO_ADAPTER_TARGET;
+	saa.saa_adapter_buswidth = MPATH_BUSWIDTH;
+	saa.saa_luns = 1;
+	saa.saa_openings = 1024; /* XXX magical */
+	saa.saa_pool = NULL;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 
 	sc->sc_scsibus = (struct scsibus_softc *)config_found(&sc->sc_dev,
 	    &saa, scsiprint);
@@ -145,7 +142,7 @@ mpath_xs_stuffup(struct scsi_xfer *xs)
 int
 mpath_probe(struct scsi_link *link)
 {
-	struct mpath_softc *sc = link->adapter_softc;
+	struct mpath_softc *sc = link->bus->sb_adapter_softc;
 	struct mpath_dev *d = sc->sc_devs[link->target];
 
 	if (link->lun != 0 || d == NULL)
@@ -165,7 +162,7 @@ mpath_next_path(struct mpath_dev *d)
 #ifdef DIAGNOSTIC
 	if (d == NULL)
 		panic("%s: d is NULL", __func__);
-#endif
+#endif /* DIAGNOSTIC */
 
 	p = d->d_next_path;
 	if (p != NULL) {
@@ -182,15 +179,15 @@ void
 mpath_cmd(struct scsi_xfer *xs)
 {
 	struct scsi_link *link = xs->sc_link;
-	struct mpath_softc *sc = link->adapter_softc;
+	struct mpath_softc *sc = link->bus->sb_adapter_softc;
 	struct mpath_dev *d = sc->sc_devs[link->target];
 	struct mpath_path *p;
 	struct scsi_xfer *mxs;
 
 #ifdef DIAGNOSTIC
 	if (d == NULL)
-		panic("mpath_cmd issued against nonexistant device");
-#endif
+		panic("mpath_cmd issued against nonexistent device");
+#endif /* DIAGNOSTIC */
 
 	if (ISSET(xs->flags, SCSI_POLL)) {
 		mtx_enter(&d->d_mtx);
@@ -207,7 +204,7 @@ mpath_cmd(struct scsi_xfer *xs)
 			return;
 		}
 
-		memcpy(mxs->cmd, xs->cmd, xs->cmdlen);
+		memcpy(&mxs->cmd, &xs->cmd, xs->cmdlen);
 		mxs->cmdlen = xs->cmdlen;
 		mxs->data = xs->data;
 		mxs->datalen = xs->datalen;
@@ -259,7 +256,7 @@ mpath_start(struct mpath_path *p, struct scsi_xfer *mxs)
 	if (xs == NULL)
 		goto fail;
 
-	memcpy(mxs->cmd, xs->cmd, xs->cmdlen);
+	memcpy(&mxs->cmd, &xs->cmd, xs->cmdlen);
 	mxs->cmdlen = xs->cmdlen;
 	mxs->data = xs->data;
 	mxs->datalen = xs->datalen;
@@ -286,7 +283,7 @@ mpath_done(struct scsi_xfer *mxs)
 {
 	struct scsi_xfer *xs = mxs->cookie;
 	struct scsi_link *link = xs->sc_link;
-	struct mpath_softc *sc = link->adapter_softc;
+	struct mpath_softc *sc = link->bus->sb_adapter_softc;
 	struct mpath_dev *d = sc->sc_devs[link->target];
 	struct mpath_path *p;
 
@@ -320,7 +317,7 @@ mpath_done(struct scsi_xfer *mxs)
 #ifdef DIAGNOSTIC
 		default:
 			panic("unexpected return from checksense");
-#endif
+#endif /* DIAGNOSTIC */
 		}
 		break;
 	}
@@ -397,21 +394,23 @@ mpath_path_status(struct mpath_path *p, int status)
 void
 mpath_minphys(struct buf *bp, struct scsi_link *link)
 {
-	struct mpath_softc *sc = link->adapter_softc;
+	struct mpath_softc *sc = link->bus->sb_adapter_softc;
 	struct mpath_dev *d = sc->sc_devs[link->target];
 	struct mpath_group *g;
 	struct mpath_path *p;
 
 #ifdef DIAGNOSTIC
 	if (d == NULL)
-		panic("mpath_minphys against nonexistant device");
-#endif
+		panic("mpath_minphys against nonexistent device");
+#endif /* DIAGNOSTIC */
 
 	mtx_enter(&d->d_mtx);
 	TAILQ_FOREACH(g, &d->d_groups, g_entry) {
 		TAILQ_FOREACH(p, &g->g_paths, p_entry) {
 			/* XXX crossing layers with mutex held */
-			p->p_link->adapter->scsi_minphys(bp, p->p_link);
+			if (p->p_link->bus->sb_adapter->dev_minphys != NULL)
+				p->p_link->bus->sb_adapter->dev_minphys(bp,
+				    p->p_link);
 		}
 	}
 	mtx_leave(&d->d_mtx);
@@ -429,7 +428,7 @@ mpath_path_probe(struct scsi_link *link)
 	if (ISSET(link->flags, SDEV_UMASS))
 		return (EINVAL);
 
-	if (mpath == link->adapter_softc)
+	if (mpath == link->bus->sb_adapter_softc)
 		return (ENXIO);
 
 	return (0);
@@ -450,7 +449,7 @@ mpath_path_attach(struct mpath_path *p, u_int g_id, const struct mpath_ops *ops)
 		panic("mpath_path_attach: NULL link");
 	if (p->p_group != NULL)
 		panic("mpath_path_attach: group is not NULL");
-#endif
+#endif /* DIAGNOSTIC */
 
 	for (target = 0; target < MPATH_BUSWIDTH; target++) {
 		if ((d = sc->sc_devs[target]) == NULL)
@@ -548,8 +547,8 @@ mpath_path_detach(struct mpath_path *p)
 
 #ifdef DIAGNOSTIC
 	if (g == NULL)
-		panic("mpath: detaching a path from a nonexistant bus");
-#endif
+		panic("mpath: detaching a path from a nonexistent bus");
+#endif /* DIAGNOSTIC */
 	d = g->g_dev;
 	p->p_group = NULL;
 

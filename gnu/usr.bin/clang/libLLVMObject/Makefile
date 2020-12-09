@@ -1,20 +1,19 @@
-# $OpenBSD: Makefile,v 1.5 2017/10/04 20:57:09 patrick Exp $
+# $OpenBSD: Makefile,v 1.8 2020/08/03 14:45:26 patrick Exp $
 
 LIB=	LLVMObject
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/Object
 
-.include <bsd.own.mk>
-SRCS=	Archive.cpp \
+SRCS+=	Archive.cpp \
 	ArchiveWriter.cpp \
 	Binary.cpp \
 	COFFObjectFile.cpp \
 	Decompressor.cpp \
 	ELF.cpp \
 	ELFObjectFile.cpp \
-	Error.cpp \
+	ObjectError.cpp \
+	ObjectMinidump.cpp \
 	IRObjectFile.cpp \
 	IRSymtab.cpp \
 	MachOObjectFile.cpp \
@@ -23,14 +22,22 @@ SRCS=	Archive.cpp \
 	Object.cpp \
 	ObjectFile.cpp \
 	RecordStreamer.cpp \
+	RelocationResolver.cpp \
 	SymbolicFile.cpp \
 	SymbolSize.cpp \
+	TapiFile.cpp \
+	TapiUniversal.cpp \
 	WasmObjectFile.cpp \
-	WindowsResource.cpp
+	WindowsMachineFlag.cpp \
+	WindowsResource.cpp \
+	XCOFFObjectFile.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Object
+ObjectError.cpp:
+	ln -s ${LLVM_SRCS}/lib/Object/Error.cpp $@
 
-install:
-	@# Nothing here so far ...
+ObjectMinidump.cpp:
+	ln -s ${LLVM_SRCS}/lib/Object/Minidump.cpp $@
 
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Object
+
+CLEANFILES+= ObjectError.cpp ObjectMinidump.cpp

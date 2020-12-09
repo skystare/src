@@ -1,4 +1,4 @@
-/* $OpenBSD: acpiec.c,v 1.59 2018/07/01 19:40:49 mlarkin Exp $ */
+/* $OpenBSD: acpiec.c,v 1.62 2020/08/26 03:29:06 visa Exp $ */
 /*
  * Copyright (c) 2006 Can Erkin Acar <canacar@openbsd.org>
  *
@@ -76,8 +76,6 @@ void		acpiec_unlock(struct acpiec_softc *);
 #define		EC_CMD_QR	0x84	/* Query */
 
 int	acpiec_reg(struct acpiec_softc *);
-
-extern char	*hw_vendor, *hw_prod;
 
 struct cfattach acpiec_ca = {
 	sizeof(struct acpiec_softc), acpiec_match, acpiec_attach
@@ -322,7 +320,7 @@ acpiec_attach(struct device *parent, struct device *self, void *aux)
 
 #ifndef SMALL_KERNEL
 	acpi_set_gpehandler(sc->sc_acpi, sc->sc_gpe, acpiec_gpehandler,
-	    sc, 1);
+	    sc, GPE_EDGE);
 #endif
 
 	if (aml_evalname(sc->sc_acpi, sc->sc_devnode, "_GLK", 0, NULL, &res))
@@ -374,7 +372,7 @@ acpiec_gpehandler(struct acpi_softc *acpi_sc, int gpe, void *arg)
 	} while (sc->sc_gotsci);
 
 	/* Unmask the GPE which was blocked at interrupt time */
-	s = spltty();
+	s = splbio();
 	mask = (1L << (gpe & 7));
 	en = acpi_read_pmreg(acpi_sc, ACPIREG_GPE_EN, gpe>>3);
 	acpi_write_pmreg(acpi_sc, ACPIREG_GPE_EN, gpe>>3, en | mask);

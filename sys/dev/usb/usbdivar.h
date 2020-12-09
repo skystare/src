@@ -1,4 +1,4 @@
-/*	$OpenBSD: usbdivar.h,v 1.75 2018/05/01 18:14:46 landry Exp $ */
+/*	$OpenBSD: usbdivar.h,v 1.81 2020/03/21 12:08:31 patrick Exp $ */
 /*	$NetBSD: usbdivar.h,v 1.70 2002/07/11 21:14:36 augustss Exp $	*/
 /*	$FreeBSD: src/sys/dev/usb/usbdivar.h,v 1.11 1999/11/17 22:33:51 n_hibma Exp $	*/
 
@@ -47,6 +47,7 @@ struct usb_dma_block;
 struct usb_dma {
 	struct usb_dma_block	*block;
 	u_int			 offs;
+#define USB_DMA_COHERENT		(1 << 0)
 };
 
 struct usbd_xfer;
@@ -158,6 +159,7 @@ struct usbd_device {
 	const struct usbd_quirks     *quirks;  /* device quirks, always set */
 	struct usbd_hub	       *hub;           /* only if this is a hub */
 	struct device         **subdevs;       /* sub-devices, 0 terminated */
+	int			nsubdev;       /* size of the `subdevs' array */
 	int			ndevs;	       /* # of subdevs */
 
 	char                   *serial;        /* serial number, can be NULL */
@@ -173,7 +175,8 @@ struct usbd_interface {
 	struct usbd_endpoint   *endpoints;
 	void		       *priv;
 	LIST_HEAD(, usbd_pipe)	pipes;
-	u_int8_t		claimed;
+	uint8_t			claimed;
+	uint8_t			nendpt;
 };
 
 struct usbd_pipe {

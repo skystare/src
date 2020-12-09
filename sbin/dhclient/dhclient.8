@@ -1,4 +1,4 @@
-.\" $OpenBSD: dhclient.8,v 1.37 2018/05/19 22:10:22 krw Exp $
+.\" $OpenBSD: dhclient.8,v 1.45 2020/12/06 17:40:43 krw Exp $
 .\"
 .\" Copyright (c) 1997 The Internet Software Consortium.
 .\" All rights reserved.
@@ -35,7 +35,7 @@
 .\" Enterprises.  To learn more about the Internet Software Consortium,
 .\" see ``http://www.isc.org/isc''.  To learn more about Vixie
 .\" Enterprises, see ``http://www.vix.com''.
-.Dd $Mdocdate: May 19 2018 $
+.Dd $Mdocdate: December 6 2020 $
 .Dt DHCLIENT 8
 .Os
 .Sh NAME
@@ -46,40 +46,34 @@
 .Op Fl dnrv
 .Op Fl c Ar file
 .Op Fl i Ar options
-.Op Fl L Ar file
-.Op Fl l Ar file
 .Ar interface
 .Sh DESCRIPTION
-The Dynamic Host Configuration Protocol (DHCP) allows hosts on a TCP/IP network
-to configure one or more network interfaces based on information collected from
-a DHCP server.
-DHCP is often used, for example, by cable modem and DSL network
-providers to automate network configuration for their customers.
-.Pp
+.Nm
+uses the Dynamic Host Configuration Protocol (DHCP), or its
+predecessor BOOTP, to configure a network interface.
 Information typically provided via DHCP includes
-address and subnet mask for the interface,
-default route,
+IPv4 address and subnet mask, default route,
 and domain name server.
 .Pp
-To have
-.Ox
-configure an interface using DHCP
-(or its predecessor, BOOTP)
-the
 .Nm
-utility is used.
+can be run on the command line, or at boot time by specifying
+.Sq dhcp
+in the appropriate
+.Xr hostname.if 5
+file.
+.Pp
 .Nm
-is run on the command line with the name of the
-.Ar interface
-to be configured.
+sets the
+.Sy AUTOCONF4
+flag on
+.Ar interface .
+If the flag is later cleared by
+.Xr ifconfig 8
 .Nm
-can also be run at boot time from
-.Xr hostname.if 5 ,
-in which case
-.Xr netstart 8
-reads the hostname files and runs
-.Nm
-for each interface that is to be configured via DHCP.
+will continue to obtain leases normally but it will not apply any
+changes to the interface or the host until
+.Xr ifconfig 8
+restores the flag.
 .Pp
 The options are as follows:
 .Bl -tag -width Ds
@@ -87,6 +81,9 @@ The options are as follows:
 Specify an alternate location to
 .Pa /etc/dhclient.conf
 for the configuration file.
+If
+.Ar file
+is the empty string then no configuration file is read.
 .It Fl d
 Do not daemonize.
 If this option is specified,
@@ -101,25 +98,6 @@ This list will override any ignore statements in
 .Ar options
 must be a comma separated list of valid option names.
 Invalid option names will cause the entire list to be discarded.
-.It Fl L Ar file
-Specify a
-.Ar file
-to write the option data to.
-This causes
-.Nm
-to write two pseudo-leases,
-.Dq offered
-and
-.Dq effective ,
-to the specified file.
-.Dq offered
-will be the lease offered by the DHCP server;
-.Dq effective
-will be the modified lease bound to the interface.
-.It Fl l Ar file
-Specify an alternate location to
-.Pa /var/db/dhclient.leases . Ns Aq Ar IFNAME
-for the leases file.
 .It Fl n
 Configtest mode.
 Only check the configuration file for validity.
@@ -129,10 +107,7 @@ Release the current lease back to the server it came from.
 exits after removing the active lease from
 .Pa /var/db/dhclient.leases . Ns Aq Ar IFNAME ,
 deleting the address the lease caused to be added to the interface,
-truncating any option file specified by
-.Fl L
-and sending a DHCPRELEASE packet to
-the server that supplied the lease.
+and sending a DHCPRELEASE packet to the server that supplied the lease.
 .Pp
 If there is no
 .Nm
@@ -142,7 +117,8 @@ has no active lease configured, no action is performed.
 .It Fl v
 Causes
 .Nm
-to log more information.
+to show more information about interactions with the DHCP server and what
+network configuration changes are attempted after accepting a lease.
 .Fl v
 is implied if either
 .Fl d
@@ -197,10 +173,11 @@ Once the interface is configured,
 constructs a
 .Xr resolv.conf 5
 file.
-It does this only when one or both of the options
-.Cm domain-name
-and
-.Cm domain-name-servers
+It does this only if any of the options
+.Cm domain-name ,
+.Cm domain-name-servers ,
+or
+.Cm domain-search
 are present
 (note that these options may be offered by the DHCP server but suppressed by
 .Xr dhclient.conf 5 ) .
@@ -260,16 +237,6 @@ In that case, it may be advantageous to
 arrange with the network administrator for an entry on the BOOTP
 database, so that the host can boot quickly on that network rather
 than cycling through the list of old leases.
-.Sh SIGNALS
-.Bl -tag -width "HUP"
-.It Dv HUP
-On receiving
-.Dv HUP
-.Nm
-will restart itself, reading
-.Xr dhclient.conf 5
-and obtaining a new lease.
-.El
 .Sh FILES
 .Bl -tag -width "/var/db/dhclient.leases.<IFNAME>XXX" -compact
 .It Pa /etc/dhclient.conf
@@ -284,7 +251,8 @@ database of acquired leases
 .Xr dhclient.leases 5 ,
 .Xr hostname.if 5 ,
 .Xr dhcpd 8 ,
-.Xr dhcrelay 8
+.Xr dhcrelay 8 ,
+.Xr ifconfig 8
 .Sh STANDARDS
 .Rs
 .%A R. Droms

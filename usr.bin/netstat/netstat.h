@@ -1,4 +1,4 @@
-/*	$OpenBSD: netstat.h,v 1.72 2018/08/13 14:36:54 mpi Exp $	*/
+/*	$OpenBSD: netstat.h,v 1.75 2020/06/12 06:22:32 remi Exp $	*/
 /*	$NetBSD: netstat.h,v 1.6 1996/05/07 02:55:05 thorpej Exp $	*/
 
 /*
@@ -57,6 +57,7 @@ int	pflag;		/* show given protocol */
 int	Pflag;		/* show given PCB */
 int	qflag;		/* only display non-zero values for output */
 int	rflag;		/* show routing tables (or routing stats) */
+int	Rflag;		/* show rdomain and rtable summary */
 int	sflag;		/* show protocol statistics */
 int	tflag;		/* show i/f watchdog timers */
 int	vflag;		/* be verbose */
@@ -113,6 +114,8 @@ void	pr_rthdr(int, int);
 void	pr_encaphdr(void);
 void	pr_family(int);
 
+void	rdomainpr(void);
+
 void	ip6_stats(char *);
 void	icmp6_stats(char *);
 void	pim6_stats(char *);
@@ -138,9 +141,13 @@ char	*routename4(in_addr_t);
 char	*netname(struct sockaddr *, struct sockaddr *);
 char	*netname4(in_addr_t, in_addr_t);
 char	*mpls_op(u_int32_t);
-void	routepr(u_long, u_long, u_long, u_long, u_int);
+void	routepr(u_long, u_long, u_long, u_int);
 
 void	nsprotopr(u_long, char *);
+
+#define	IF_SHOW_FAIL	0
+#define	IF_SHOW_ERRS	1
+#define	IF_SHOW_DROP	2
 
 void	intpr(int, int);
 

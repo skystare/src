@@ -1,4 +1,4 @@
-/*	$OpenBSD: route.h,v 1.172 2018/07/12 16:07:35 florian Exp $	*/
+/*	$OpenBSD: route.h,v 1.183 2020/10/29 21:15:27 denis Exp $	*/
 /*	$NetBSD: route.h,v 1.9 1996/02/13 22:00:49 christos Exp $	*/
 
 /*
@@ -93,12 +93,8 @@ struct rt_metrics {
  */
 
 struct rtentry {
-#if !defined(_KERNEL) && !defined(ART)
-	struct	radix_node rt_nodes[2];	/* tree glue, and other values */
-#else
 	struct sockaddr	*rt_dest;	/* destination */
 	SRPL_ENTRY(rtentry) rt_next;	/* Next multipath entry to our dst. */
-#endif
 	struct sockaddr	*rt_gateway;	/* value */
 	struct ifaddr	*rt_ifa;	/* the answer: interface addr to use */
 	caddr_t		 rt_llinfo;	/* pointer to link level info cache or
@@ -115,9 +111,7 @@ struct rtentry {
 	unsigned int	 rt_ifidx;	/* the answer: interface to use */
 	unsigned int	 rt_flags;	/* up/down?, host/net */
 	int		 rt_refcnt;	/* # held references */
-#if defined(_KERNEL) || defined(ART)
 	int		 rt_plen;	/* prefix length */
-#endif
 	uint16_t	 rt_labelid;	/* route label ID */
 	uint8_t		 rt_priority;	/* routing priority to use */
 };
@@ -171,6 +165,8 @@ struct rtentry {
 #define RTP_PROPOSAL_STATIC	57
 #define RTP_PROPOSAL_DHCLIENT	58
 #define RTP_PROPOSAL_SLAAC	59
+#define RTP_PROPOSAL_UMB	60
+#define RTP_PROPOSAL_SOLICIT	61	/* request reply of all RTM_PROPOSAL */
 #define RTP_MAX		63	/* maximum priority */
 #define RTP_ANY		64	/* any of the above */
 #define RTP_MASK	0x7f
@@ -241,6 +237,8 @@ struct rt_msghdr {
 #define RTM_BFD		0x12	/* bidirectional forwarding detection */
 #define RTM_PROPOSAL	0x13	/* proposal for netconfigd */
 #define RTM_CHGADDRATTR	0x14	/* address attribute change */
+#define RTM_80211INFO	0x15	/* 80211 iface change */
+#define RTM_SOURCE	0x16	/* set source address */
 
 #define RTV_MTU		0x1	/* init or lock _mtu */
 #define RTV_HOPCOUNT	0x2	/* init or lock _hopcount */
@@ -300,6 +298,8 @@ struct rt_msghdr {
 #define ROUTE_PRIOFILTER 3	/* only pass updates with a priority higher or
 				   equal (actual value lower) to the specified
 				   priority. */
+#define ROUTE_FLAGFILTER 4	/* do not pass updates for routes with flags
+				   in this bitmask. */
 
 #define ROUTE_FILTER(m)	(1 << (m))
 #define RTABLE_ANY	0xffffffff
@@ -319,6 +319,16 @@ struct sockaddr_rtdns {
 	sa_family_t	sr_family;		/* address family */
 	char		sr_dns[RTDNS_LEN];
 };
+
+#ifdef _KERNEL
+
+static inline struct sockaddr *
+srtdnstosa(struct sockaddr_rtdns *sdns)
+{
+	return ((struct sockaddr *)(sdns));
+}
+
+#endif
 
 #define	RTSTATIC_LEN	128
 
@@ -417,18 +427,21 @@ struct mbuf;
 struct socket;
 struct ifnet;
 struct sockaddr_in6;
+struct if_ieee80211_data;
 struct bfd_config;
 
 void	 route_init(void);
 void	 rtm_ifchg(struct ifnet *);
 void	 rtm_ifannounce(struct ifnet *, int);
 void	 rtm_bfd(struct bfd_config *);
+void	 rtm_80211info(struct ifnet *, struct if_ieee80211_data *);
 void	 rt_maskedcopy(struct sockaddr *,
 	    struct sockaddr *, struct sockaddr *);
 struct sockaddr *rt_plen2mask(struct rtentry *, struct sockaddr_in6 *);
 void	 rtm_send(struct rtentry *, int, int, unsigned int);
 void	 rtm_addr(int, struct ifaddr *);
 void	 rtm_miss(int, struct rt_addrinfo *, int, uint8_t, u_int, int, u_int);
+void	 rtm_proposal(struct ifnet *, struct rt_addrinfo *, int, uint8_t);
 int	 rt_setgate(struct rtentry *, struct sockaddr *, u_int);
 struct rtentry *rt_getll(struct rtentry *);
 
@@ -452,8 +465,8 @@ struct	 rtentry *rtalloc(struct sockaddr *, int, unsigned int);
 void	 rtref(struct rtentry *);
 void	 rtfree(struct rtentry *);
 
-int	 rt_ifa_add(struct ifaddr *, int, struct sockaddr *);
-int	 rt_ifa_del(struct ifaddr *, int, struct sockaddr *);
+int	 rt_ifa_add(struct ifaddr *, int, struct sockaddr *, unsigned int);
+int	 rt_ifa_del(struct ifaddr *, int, struct sockaddr *, unsigned int);
 void	 rt_ifa_purge(struct ifaddr *);
 int	 rt_ifa_addlocal(struct ifaddr *);
 int	 rt_ifa_dellocal(struct ifaddr *);
@@ -462,7 +475,7 @@ int	 rtrequest(int, struct rt_addrinfo *, u_int8_t, struct rtentry **,
 	     u_int);
 int	 rtrequest_delete(struct rt_addrinfo *, u_int8_t, struct ifnet *,
 	     struct rtentry **, u_int);
-void	 rt_if_track(struct ifnet *);
+int	 rt_if_track(struct ifnet *);
 int	 rt_if_linkstate_change(struct rtentry *, void *, u_int);
 int	 rtdeletemsg(struct rtentry *, struct ifnet *, u_int);
 #endif /* _KERNEL */

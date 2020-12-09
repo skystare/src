@@ -1,4 +1,4 @@
-.\" $OpenBSD: ral.4,v 1.112 2018/07/15 10:44:49 phessler Exp $
+.\" $OpenBSD: ral.4,v 1.116 2020/05/16 18:28:23 jmc Exp $
 .\"
 .\" Copyright (c) 2005-2010 Damien Bergamini <damien.bergamini@free.fr>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: July 15 2018 $
+.Dd $Mdocdate: May 16 2020 $
 .Dt RAL 4
 .Os
 .Sh NAME
@@ -65,7 +65,10 @@ The RT3090 chipset is the first generation of single-chip 802.11n adapters
 from Ralink.
 .Pp
 The RT3900E chipset is a single-chip 802.11n adapter from Ralink.
-The MAC/Baseband Processor can be an RT5390 or RT5392.
+The MAC/Baseband Processor can be an RT3290, RT5390 or RT5392.
+The RT3290 is a combo 802.11n and Bluetooth chip.
+It operates in the 2GHz spectrum and supports one transmit path and on one
+receiver path (1T1R).
 The RT5390 chip operates in the 2GHz spectrum and supports one transmit path
 and one receiver path (1T1R).
 The RT5392 chip operates in the 2GHz spectrum and supports up to two transmit
@@ -105,12 +108,18 @@ The
 .Nm
 driver can be configured to use
 Wired Equivalent Privacy (WEP) or
-Wi-Fi Protected Access (WPA-PSK and WPA2-PSK).
-WPA is the current encryption standard for wireless networks.
-It is strongly recommended that WEP
-not be used as the sole mechanism
-to secure wireless communication,
-due to serious weaknesses in it.
+Wi-Fi Protected Access (WPA1 and WPA2).
+WPA2 is the current encryption standard for wireless networks.
+It is strongly recommended that neither WEP nor WPA1
+are used as the sole mechanism to secure wireless communication,
+due to serious weaknesses.
+WPA1 is disabled by default and may be enabled using the option
+.Qq Cm wpaprotos Ar wpa1,wpa2 .
+For standard WPA networks which use pre-shared keys (PSK),
+keys are configured using the
+.Qq Cm wpakey
+option.
+WPA-Enterprise networks require use of the wpa_supplicant package.
 .Pp
 The
 .Nm
@@ -123,6 +132,10 @@ hardware for the WEP40, WEP104, TKIP(+MIC) and CCMP ciphers.
 .Pp
 The transmit speed is user-selectable or can be adapted automatically by the
 driver depending on the number of hardware transmission retries.
+.Pp
+In Host AP mode,
+devices with the RT2700, RT2800, RT3090, and RT3900E chipsets
+are compatible with clients using powersave.
 .Pp
 The
 .Nm
@@ -139,6 +152,7 @@ files to be loaded when an interface is brought up:
 .It /etc/firmware/ral-rt2561s
 .It /etc/firmware/ral-rt2661
 .It /etc/firmware/ral-rt2860
+.It /etc/firmware/ral-rt3290
 .El
 .Pp
 The RT2500 chipset does not require a firmware file to operate.
@@ -343,7 +357,7 @@ before those features can be supported.
 On the RT2500, RT2501 and RT2600 chipsets, host AP mode doesn't
 support power saving.
 Clients attempting to use power saving mode may experience significant
-packet loss (disabling power saving on the client will fix this).
+packet loss.
 .Pp
 Some PCI
 .Nm

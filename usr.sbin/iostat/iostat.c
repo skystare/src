@@ -1,4 +1,4 @@
-/*	$OpenBSD: iostat.c,v 1.41 2018/09/05 09:35:49 yasuoka Exp $	*/
+/*	$OpenBSD: iostat.c,v 1.43 2020/08/21 01:10:07 kn Exp $	*/
 /*	$NetBSD: iostat.c,v 1.10 1996/10/25 18:21:58 scottr Exp $	*/
 
 /*
@@ -161,6 +161,12 @@ main(int argc, char *argv[])
 		todo |= SHOW_CPU | SHOW_TTY | SHOW_STATS_1;
 
 	dkinit(0);
+
+	if (unveil("/", "") == -1)
+		err(1, "unveil");
+	if (unveil(NULL, NULL) == -1)
+		err(1, "unveil");
+
 	dkreadstats();
 	selectdrives(argv);
 
@@ -218,15 +224,12 @@ header(void)
 	if (ISSET(todo, SHOW_STATS_1))
 		for (i = 0; i < dk_ndrive; i++)
 			if (cur.dk_select[i]) {
-				if (ISSET(todo, SHOW_TOTALS))
-					printf(" %18.18s ", cur.dk_name[i]);
-				else
-					printf(" %16.16s ", cur.dk_name[i]);
+				printf(" %18.18s ", cur.dk_name[i]);
 			}
 	if (ISSET(todo, SHOW_STATS_2))
 		for (i = 0; i < dk_ndrive; i++)
 			if (cur.dk_select[i])
-				printf(" %16.16s ", cur.dk_name[i]);
+				printf(" %17.17s ", cur.dk_name[i]);
 
 	if (ISSET(todo, SHOW_CPU))
 		printf("               cpu");
@@ -246,12 +249,12 @@ header(void)
 				if (ISSET(todo, SHOW_TOTALS))
 					printf("  KB/t   xfr     MB ");
 				else
-					printf("  KB/t  t/s  MB/s ");
+					printf("  KB/t  t/s    MB/s ");
 			}
 	if (ISSET(todo, SHOW_STATS_2))
 		for (i = 0; i < dk_ndrive; i++)
 			if (cur.dk_select[i])
-				printf("     KB  xfr time ");
+				printf("      KB  xfr time ");
 
 	if (ISSET(todo, SHOW_CPU))
 		printf(" us ni sy sp in id");
@@ -296,7 +299,7 @@ disk_stats(double etime)
 		if (ISSET(todo, SHOW_TOTALS))
 			printf(" %6.2f ", mbps / etime);
 		else
-			printf(" %5.2f ", mbps / etime);
+			printf(" %7.2f ", mbps / etime);
 	}
 }
 
@@ -311,7 +314,7 @@ disk_stats2(double etime)
 			continue;
 
 		/* average kbytes per second. */
-		printf(" %6.0f",
+		printf(" %7.0f",
 		    (cur.dk_rbytes[dn] + cur.dk_wbytes[dn]) / (1024.0) / etime);
 
 		/* average transfers per second. */

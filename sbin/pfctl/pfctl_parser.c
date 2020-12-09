@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfctl_parser.c,v 1.337 2018/09/13 06:03:27 kn Exp $ */
+/*	$OpenBSD: pfctl_parser.c,v 1.343 2020/05/15 00:56:03 cheloha Exp $ */
 
 /*
  * Copyright (c) 2001 Daniel Hartmeier
@@ -62,10 +62,9 @@
 #include "pfctl_parser.h"
 #include "pfctl.h"
 
-void		 copy_satopfaddr(struct pf_addr *, struct sockaddr *);
 void		 print_op (u_int8_t, const char *, const char *);
 void		 print_port (u_int8_t, u_int16_t, u_int16_t, const char *, int);
-void		 print_ugid (u_int8_t, unsigned, unsigned, const char *, unsigned);
+void		 print_ugid (u_int8_t, id_t, id_t, const char *);
 void		 print_flags (u_int8_t);
 void		 print_fromto(struct pf_rule_addr *, pf_osfp_t,
 		    struct pf_rule_addr *, u_int8_t, u_int8_t, int);
@@ -216,8 +215,10 @@ copy_satopfaddr(struct pf_addr *pfa, struct sockaddr *sa)
 {
 	if (sa->sa_family == AF_INET6)
 		pfa->v6 = ((struct sockaddr_in6 *)sa)->sin6_addr;
-	else
+	else if (sa->sa_family == AF_INET)
 		pfa->v4 = ((struct sockaddr_in *)sa)->sin_addr;
+	else
+		warnx("unhandled af %d", sa->sa_family);
 }
 
 const struct icmptypeent *
@@ -397,14 +398,14 @@ print_port(u_int8_t op, u_int16_t p1, u_int16_t p2, const char *proto, int opts)
 }
 
 void
-print_ugid(u_int8_t op, unsigned u1, unsigned u2, const char *t, unsigned umax)
+print_ugid(u_int8_t op, id_t i1, id_t i2, const char *t)
 {
 	char	a1[11], a2[11];
 
-	snprintf(a1, sizeof(a1), "%u", u1);
-	snprintf(a2, sizeof(a2), "%u", u2);
+	snprintf(a1, sizeof(a1), "%u", i1);
+	snprintf(a2, sizeof(a2), "%u", i2);
 	printf(" %s", t);
-	if (u1 == umax && (op == PF_OP_EQ || op == PF_OP_NE))
+	if (i1 == -1 && (op == PF_OP_EQ || op == PF_OP_NE))
 		print_op(op, "unknown", a2);
 	else
 		print_op(op, a1, a2);
@@ -534,7 +535,7 @@ print_status(struct pf_status *s, struct pfctl_watermarks *synflwats, int opts)
 	char			buf[PF_MD5_DIGEST_LENGTH * 2 + 1];
 	static const char	hex[] = "0123456789abcdef";
 
-	if (!clock_gettime(CLOCK_UPTIME, &uptime))
+	if (!clock_gettime(CLOCK_BOOTTIME, &uptime))
 		runtime = uptime.tv_sec - s->since;
 	running = s->running ? "Enabled" : "Disabled";
 
@@ -836,11 +837,9 @@ print_rule(struct pf_rule *r, const char *anchor_call, int opts)
 		printf(" %sreceived-on %s", r->rcvifnot ? "!" : "",
 		    r->rcv_ifname);
 	if (r->uid.op)
-		print_ugid(r->uid.op, r->uid.uid[0], r->uid.uid[1], "user",
-		    UID_MAX);
+		print_ugid(r->uid.op, r->uid.uid[0], r->uid.uid[1], "user");
 	if (r->gid.op)
-		print_ugid(r->gid.op, r->gid.gid[0], r->gid.gid[1], "group",
-		    GID_MAX);
+		print_ugid(r->gid.op, r->gid.gid[0], r->gid.gid[1], "group");
 	if (r->flags || r->flagset) {
 		printf(" flags ");
 		print_flags(r->flags);
@@ -1349,7 +1348,7 @@ ifa_load(void)
 	struct ifaddrs		*ifap, *ifa;
 	struct node_host	*n = NULL, *h = NULL;
 
-	if (getifaddrs(&ifap) < 0)
+	if (getifaddrs(&ifap) == -1)
 		err(1, "getifaddrs");
 
 	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
@@ -1383,11 +1382,16 @@ ifa_load(void)
 			    ifa->ifa_addr)->sdl_index;
 		else {
 			copy_satopfaddr(&n->addr.v.a.addr, ifa->ifa_addr);
+			ifa->ifa_netmask->sa_family = ifa->ifa_addr->sa_family;
 			copy_satopfaddr(&n->addr.v.a.mask, ifa->ifa_netmask);
-			if (ifa->ifa_broadaddr != NULL)
+			if (ifa->ifa_broadaddr != NULL) {
+				ifa->ifa_broadaddr->sa_family = ifa->ifa_addr->sa_family;
 				copy_satopfaddr(&n->bcast, ifa->ifa_broadaddr);
-			if (ifa->ifa_dstaddr != NULL)
+			}
+			if (ifa->ifa_dstaddr != NULL) {
+				ifa->ifa_dstaddr->sa_family = ifa->ifa_addr->sa_family;
 				copy_satopfaddr(&n->peer, ifa->ifa_dstaddr);
+			}
 			if (n->af == AF_INET6)
 				n->ifindex = ((struct sockaddr_in6 *)
 				    ifa->ifa_addr)->sin6_scope_id;
@@ -1621,7 +1625,7 @@ host(const char *s, int opts)
 		if_name++;
 	}
 
-	if ((p = strrchr(ps, '/')) != NULL) {
+	if ((p = strchr(ps, '/')) != NULL) {
 		mask = strtonum(p+1, 0, 128, &errstr);
 		if (errstr) {
 			fprintf(stderr, "netmask is %s: %s\n", errstr, p);

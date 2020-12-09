@@ -1,4 +1,4 @@
-/*	$OpenBSD: pucdata.c,v 1.109 2018/05/02 19:11:01 phessler Exp $	*/
+/*	$OpenBSD: pucdata.c,v 1.113 2020/10/07 11:20:41 jsg Exp $	*/
 /*	$NetBSD: pucdata.c,v 1.6 1999/07/03 05:55:23 cgd Exp $	*/
 
 /*
@@ -98,6 +98,62 @@ const struct puc_device_description puc_devs[] = {
 	},
 	{	/* 100 Series LP KT */
 	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_100SERIES_LP_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 200 Series KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_200SERIES_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 300 Series KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_300SERIES_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 300 Series U KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_300SERIES_U_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 400 Series KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_400SERIES_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 400 Series LP KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_400SERIES_LP_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 400 Series V KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_400SERIES_V_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 495 Series LP KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_495SERIES_LP_KT, 0x0000, 0x0000 },
+	    {	0xffff, 0xffff,					0x0000, 0x0000 },
+	    {
+		{ PUC_PORT_COM, 0x10, 0x0000 },
+	    },
+	},
+	{	/* 500 Series LP KT */
+	    {	PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_500SERIES_LP_KT, 0x0000, 0x0000 },
 	    {	0xffff, 0xffff,					0x0000, 0x0000 },
 	    {
 		{ PUC_PORT_COM, 0x10, 0x0000 },
@@ -850,7 +906,7 @@ const struct puc_device_description puc_devs[] = {
 	 * is the lpt part of VScom 110H, 210H, 410H
 	 */
 	{   /* "VScom PCI-x10H", */
-	    {	PCI_VENDOR_OXFORD, PCI_PRODUCT_OXFORD_VSCOM_PCIx10H,	0, 0 },
+	    {	PCI_VENDOR_OXFORD, PCI_PRODUCT_OXFORD_VSCOM_PCIX10H,	0, 0 },
 	    {	0xffff, 0xffff,						0, 0 },
 	    {
 		{ PUC_PORT_LPT, 0x10, 0x0000 },
@@ -2062,10 +2118,10 @@ const struct puc_device_description puc_devs[] = {
 	    {   PCI_VENDOR_EXAR, PCI_PRODUCT_EXAR_XR17V354,	0, 0 },
 	    {   0xffff, 0xffff,					0, 0 },
 	    {
-		{ PUC_PORT_COM_MUL8, 0x10, 0x0000 },
-		{ PUC_PORT_COM_MUL8, 0x10, 0x0400 },
-		{ PUC_PORT_COM_MUL8, 0x10, 0x0800 },
-		{ PUC_PORT_COM_MUL8, 0x10, 0x0C00 },
+		{ PUC_PORT_COM_XR17V35X, 0x10, 0x0000 },
+		{ PUC_PORT_COM_XR17V35X, 0x10, 0x0400 },
+		{ PUC_PORT_COM_XR17V35X, 0x10, 0x0800 },
+		{ PUC_PORT_COM_XR17V35X, 0x10, 0x0C00 },
 	    },
 	},
 

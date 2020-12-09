@@ -272,7 +272,7 @@ region_alloc(region_type *region, size_t size)
 		region->total_allocated += size;
 		++region->large_objects;
 
-		return result + sizeof(struct large_elem);
+		return (char *)result + sizeof(struct large_elem);
 	}
 
 	if (region->recycle_bin && region->recycle_bin[aligned_size]) {
@@ -469,7 +469,7 @@ region_recycle(region_type *region, void *block, size_t size)
 		region->total_allocated -= size;
 		--region->large_objects;
 
-		l = (struct large_elem*)(block-sizeof(struct large_elem));
+		l = (struct large_elem*)((char*)block-sizeof(struct large_elem));
 		if(l->prev)
 			l->prev->next = l->next;
 		else	region->large_list = l->next;
@@ -491,7 +491,7 @@ region_dump_stats(region_type *region, FILE *out)
 		(unsigned long) region->chunk_count,
 		(unsigned long) region->cleanup_count,
 		(unsigned long) region->recycle_size);
-	if(1 && region->recycle_bin) {
+	if(region->recycle_bin) {
 		/* print details of the recycle bin */
 		size_t i;
 		for(i=0; i<region->large_object_size; i++) {
@@ -541,7 +541,7 @@ region_log_stats(region_type *region)
 	len = strlen(str);
 	str+=len;
 	strl-=len;
-	if(1 && region->recycle_bin) {
+	if(region->recycle_bin) {
 		/* print details of the recycle bin */
 		size_t i;
 		for(i=0; i<region->large_object_size; i++) {

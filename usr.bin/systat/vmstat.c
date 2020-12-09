@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmstat.c,v 1.86 2018/06/22 14:22:06 krw Exp $	*/
+/*	$OpenBSD: vmstat.c,v 1.91 2019/06/28 13:35:04 deraadt Exp $	*/
 /*	$NetBSD: vmstat.c,v 1.5 1996/05/10 23:16:40 thorpej Exp $	*/
 
 /*-
@@ -60,13 +60,15 @@
 #define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 static struct Info {
-	long	time[CPUSTATES];
+	struct	cpustats cpustats;
 	struct	uvmexp uvmexp;
 	struct	vmtotal Total;
 	struct	nchstats nchstats;
 	long	nchcount;
 	uint64_t *intrcnt;
 } s, s1, s2, s3, z;
+
+static int ncpu;
 
 extern struct _disk	cur;
 
@@ -95,7 +97,6 @@ int select_vm(void);
 int vm_keyboard_callback(int);
 
 static	time_t t;
-static	double etime;
 static	float hertz;
 static	int nintr;
 static	long *intrloc;
@@ -172,11 +173,17 @@ initvmstat(void)
 	if (!dkinit(1))
 		return(0);
 
+	mib[0] = CTL_HW;
+	mib[1] = HW_NCPU;
+	size = sizeof(ncpu);
+	if (sysctl(mib, 2, &ncpu, &size, NULL, 0) == -1)
+		return (-1);
+
 	mib[0] = CTL_KERN;
 	mib[1] = KERN_INTRCNT;
 	mib[2] = KERN_INTRCNT_NUM;
 	size = sizeof(nintr);
-	if (sysctl(mib, 3, &nintr, &size, NULL, 0) < 0)
+	if (sysctl(mib, 3, &nintr, &size, NULL, 0) == -1)
 		return (-1);
 
 	intrloc = calloc(nintr, sizeof(long));
@@ -192,7 +199,7 @@ initvmstat(void)
 		mib[2] = KERN_INTRCNT_NAME;
 		mib[3] = i;
 		size = sizeof(name);
-		if (sysctl(mib, 4, name, &size, NULL, 0) < 0)
+		if (sysctl(mib, 4, name, &size, NULL, 0) == -1)
 			return (-1);
 
 		intrname[i] = strdup(name);
@@ -328,6 +335,7 @@ showkre(void)
 	u_int64_t inttotal, intcnt;
 	int i, l, c;
 	static int failcnt = 0, first_run = 0;
+	double etime;
 
 	if (state == TIME) {
 		if (!first_run) {
@@ -337,8 +345,8 @@ showkre(void)
 	}
 	etime = 0;
 	for (i = 0; i < CPUSTATES; i++) {
-		X(time);
-		etime += s.time[i];
+		X(cpustats.cs_time);
+		etime += s.cpustats.cs_time[i];
 	}
 	if (etime < 5.0) {	/* < 5 ticks - ignore this trash */
 		if (failcnt++ >= MAXFAIL) {
@@ -497,11 +505,11 @@ cputime(int indx)
 	int i;
 
 	tm = 0;
-	for (i = 0; i < CPUSTATES; i++)
-		tm += s.time[i];
+	for (i = 0; i < nitems(s.cpustats.cs_time); i++)
+		tm += s.cpustats.cs_time[i];
 	if (tm == 0.0)
 		tm = 1.0;
-	return (s.time[indx] * 100.0 / tm);
+	return (s.cpustats.cs_time[indx] * 100.0 / tm);
 }
 
 void
@@ -592,11 +600,12 @@ putfloat(double f, int l, int c, int w, int d, int nz)
 static void
 getinfo(struct Info *si)
 {
-	static int cp_time_mib[] = { CTL_KERN, KERN_CPTIME };
+	static int cpustats_mib[3] = { CTL_KERN, KERN_CPUSTATS, 0 };
 	static int nchstats_mib[2] = { CTL_KERN, KERN_NCHSTATS };
 	static int uvmexp_mib[2] = { CTL_VM, VM_UVMEXP };
 	static int vmtotal_mib[2] = { CTL_VM, VM_METER };
-	int mib[4], i;
+	struct cpustats cs;
+	int mib[4], i, j;
 	size_t size;
 
 	dkreadstats();
@@ -607,31 +616,39 @@ getinfo(struct Info *si)
 		mib[2] = KERN_INTRCNT_CNT;
 		mib[3] = i;
 		size = sizeof(si->intrcnt[i]);
-		if (sysctl(mib, 4, &si->intrcnt[i], &size, NULL, 0) < 0) {
+		if (sysctl(mib, 4, &si->intrcnt[i], &size, NULL, 0) == -1) {
 			si->intrcnt[i] = 0;
 		}
 	}
 
-	size = sizeof(si->time);
-	if (sysctl(cp_time_mib, 2, &si->time, &size, NULL, 0) < 0) {
-		error("Can't get KERN_CPTIME: %s\n", strerror(errno));
-		memset(&si->time, 0, sizeof(si->time));
+	memset(&si->cpustats.cs_time, 0, sizeof(si->cpustats.cs_time));
+	for (i = 0; i < ncpu; i++) {
+		cpustats_mib[2] = i;
+		size = sizeof(cs);
+		if (sysctl(cpustats_mib, 3, &cs, &size, NULL, 0) == -1) {
+			error("Can't get KERN_CPUSTATS: %s\n", strerror(errno));
+			memset(&si->cpustats, 0, sizeof(si->cpustats));
+		}
+		if ((cs.cs_flags & CPUSTATS_ONLINE) == 0)
+			continue;	/* omit totals for offline CPUs */
+		for (j = 0; j < nitems(cs.cs_time); j++)
+			si->cpustats.cs_time[j] += cs.cs_time[j];
 	}
 
 	size = sizeof(si->nchstats);
-	if (sysctl(nchstats_mib, 2, &si->nchstats, &size, NULL, 0) < 0) {
+	if (sysctl(nchstats_mib, 2, &si->nchstats, &size, NULL, 0) == -1) {
 		error("Can't get KERN_NCHSTATS: %s\n", strerror(errno));
 		memset(&si->nchstats, 0, sizeof(si->nchstats));
 	}
 
 	size = sizeof(si->uvmexp);
-	if (sysctl(uvmexp_mib, 2, &si->uvmexp, &size, NULL, 0) < 0) {
+	if (sysctl(uvmexp_mib, 2, &si->uvmexp, &size, NULL, 0) == -1) {
 		error("Can't get VM_UVMEXP: %s\n", strerror(errno));
 		memset(&si->uvmexp, 0, sizeof(si->uvmexp));
 	}
 
 	size = sizeof(si->Total);
-	if (sysctl(vmtotal_mib, 2, &si->Total, &size, NULL, 0) < 0) {
+	if (sysctl(vmtotal_mib, 2, &si->Total, &size, NULL, 0) == -1) {
 		error("Can't get VM_METER: %s\n", strerror(errno));
 		memset(&si->Total, 0, sizeof(si->Total));
 	}
@@ -659,7 +676,9 @@ copyinfo(struct Info *from, struct Info *to)
 static void
 dinfo(int dn, int c)
 {
-	double words, atime;
+	double words, atime, etime;
+
+	etime = naptime;
 
 	c += DISKCOL;
 

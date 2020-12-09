@@ -4,16 +4,13 @@ NNAAMMEE
      ssttrriinngg--ddoottTT - interpolating the device name
 
 DDEESSCCRRIIPPTTIIOONN
-     initial text
-
      BEGINTEST
 
-     We are using the ascii device.
+     We are using the ascii device.  It can also be written as the ascii
+     device.
 
-     The device name can be overridden.
-
+     The device name can be overridden.  Both escape forms work for the name.
      ENDTEST
+     end of file
 
-     final text
-
-OpenBSD                         August 16, 2018                        OpenBSD
+OpenBSD                        October 24, 2020                        OpenBSD

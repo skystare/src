@@ -1,4 +1,4 @@
-/*	$OpenBSD: sh_machdep.c,v 1.48 2018/07/10 04:19:59 guenther Exp $	*/
+/*	$OpenBSD: sh_machdep.c,v 1.52 2020/11/08 20:37:23 mpi Exp $	*/
 /*	$NetBSD: sh3_machdep.c,v 1.59 2006/03/04 01:13:36 uwe Exp $	*/
 
 /*
@@ -244,8 +244,7 @@ sh_startup(void)
 	vaddr_t minaddr, maxaddr;
 
 	printf("%s", version);
-	if (*cpu_model != '\0')
-		printf("%s\n", cpu_model);
+
 #ifdef DEBUG
 	printf("general exception handler:\t%d byte\n",
 	    sh_vector_generic_end - sh_vector_generic);
@@ -447,7 +446,7 @@ struct sigframe {
 /*
  * Send an interrupt to process.
  */
-void
+int
 sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 {
 	struct proc *p = curproc;
@@ -486,14 +485,8 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 	frame.sf_uc.sc_mask = mask;
 
 	frame.sf_uc.sc_cookie = (long)&fp->sf_uc ^ p->p_p->ps_sigcookie;
-	if (copyout(&frame, fp, sizeof(frame)) != 0) {
-		/*
-		 * Process has trashed its stack; give it an illegal
-		 * instruction to halt it in its tracks.
-		 */
-		sigexit(p, SIGILL);
-		/* NOTREACHED */
-	}
+	if (copyout(&frame, fp, sizeof(frame)) != 0)
+		return 1;
 
 	tf->tf_r4 = sig;		/* "signum" argument for handler */
 	tf->tf_r5 = (int)sip;		/* "sip" argument for handler */
@@ -501,6 +494,8 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
  	tf->tf_spc = (int)catcher;
 	tf->tf_r15 = (int)fp;
 	tf->tf_pr = (int)p->p_p->ps_sigcode;
+
+	return 0;
 }
 
 /*

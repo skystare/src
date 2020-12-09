@@ -1,4 +1,4 @@
-/*	$OpenBSD: print-domain.c,v 1.25 2018/07/06 05:47:22 dlg Exp $	*/
+/*	$OpenBSD: print-domain.c,v 1.27 2020/01/24 22:46:36 procter Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997
@@ -353,7 +353,7 @@ ns_qprint(const u_char *cp, const u_char *bp, int is_mdns)
 	if (is_mdns && (i & C_QU))
 		printf(" (QU)");
 
-	fputs("? ", stdout);
+	printf("? ");
 	cp = ns_nprint(np, bp);
 	return(cp ? cp + 4 : NULL);
 }
@@ -488,7 +488,6 @@ ns_rprint(const u_char *cp, const u_char *bp, int is_mdns)
 			EXTRACT_16BITS(cp), EXTRACT_16BITS(cp + 2));
 		break;
 
-#ifdef INET6
 	case T_AAAA:
 		if (!TTEST2(*cp, sizeof(struct in6_addr)))
 			return(NULL);
@@ -521,7 +520,6 @@ ns_rprint(const u_char *cp, const u_char *bp, int is_mdns)
 		}
 		break;
 	    }
-#endif /*INET6*/
 
 	case T_OPT:
 		printf(" UDPsize=%u", class);
@@ -606,7 +604,7 @@ ns_print(const u_char *bp, u_int length, int is_mdns)
 			if (qdcount < EXTRACT_16BITS(&np->qdcount) - 1)
 				putchar(',');
 			if (vflag > 1) {
-				fputs(" q:", stdout);
+				printf(" q:");
 				if ((cp = ns_qprint(cp, bp, is_mdns)) == NULL)
 					goto trunc;
 			} else {
@@ -630,7 +628,7 @@ ns_print(const u_char *bp, u_int length, int is_mdns)
 		/* Print NS and AR sections on -vv */
 		if (vflag > 1) {
 			if (cp < snapend && nscount--) {
-				fputs(" ns:", stdout);
+				printf(" ns:");
 				if ((cp = ns_rprint(cp, bp, is_mdns)) == NULL)
 					goto trunc;
 				while (cp < snapend && nscount--) {
@@ -642,7 +640,7 @@ ns_print(const u_char *bp, u_int length, int is_mdns)
 			if (nscount > 0)
 				goto trunc;
 			if (cp < snapend && arcount--) {
-				fputs(" ar:", stdout);
+				printf(" ar:");
 				if ((cp = ns_rprint(cp, bp, is_mdns)) == NULL)
 					goto trunc;
 				while (cp < snapend && arcount--) {
@@ -714,7 +712,7 @@ ns_print(const u_char *bp, u_int length, int is_mdns)
 			if (ancount > 0)
 				goto trunc;
 			if (cp < snapend && nscount--) {
-				fputs(" ns:", stdout);
+				printf(" ns:");
 				if ((cp = ns_rprint(cp, bp, is_mdns)) == NULL)
 					goto trunc;
 				while (nscount-- && cp < snapend) {
@@ -726,7 +724,7 @@ ns_print(const u_char *bp, u_int length, int is_mdns)
 			if (nscount > 0)
 				goto trunc;
 			if (cp < snapend && arcount--) {
-				fputs(" ar:", stdout);
+				printf(" ar:");
 				if ((cp = ns_rprint(cp, bp, is_mdns)) == NULL)
 					goto trunc;
 				while (cp < snapend && arcount--) {

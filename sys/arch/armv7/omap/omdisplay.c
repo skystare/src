@@ -1,4 +1,4 @@
-/* $OpenBSD: omdisplay.c,v 1.5 2014/07/12 18:44:41 tedu Exp $ */
+/* $OpenBSD: omdisplay.c,v 1.8 2020/05/25 09:55:48 jsg Exp $ */
 /*
  * Copyright (c) 2007 Dale Rahn <drahn@openbsd.org>
  *
@@ -443,7 +443,7 @@ void omdisplay_initialize(struct omdisplay_softc *sc,
 void omdisplay_setup_rasops(struct omdisplay_softc *sc,
     struct rasops_info *rinfo);
 int omdisplay_alloc_screen(void *v, const struct wsscreen_descr *_type,
-    void **cookiep, int *curxp, int *curyp, long *attrp);
+    void **cookiep, int *curxp, int *curyp, uint32_t *attrp);
 int omdisplay_new_screen(struct omdisplay_softc *sc,
     struct omdisplay_screen *scr, int depth);
 paddr_t omdisplay_mmap(void *v, off_t offset, int prot);
@@ -618,7 +618,7 @@ omdisplay_ioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 	case WSDISPLAYIO_LINEBYTES:
 		if (scr != NULL)
 			*(u_int *)data = scr->rinfo.ri_stride;
-		else 
+		else
 			*(u_int *)data = 0;
 		break;
 
@@ -652,7 +652,7 @@ omdisplay_burner(void *v, u_int on, u_int flags)
 
 int
 omdisplay_show_screen(void *v, void *cookie, int waitok,
-    void (*cb)(void *, int, int), void *cbarg)  
+    void (*cb)(void *, int, int), void *cbarg)
 {
 	struct omdisplay_softc *sc = v;
 	struct rasops_info *ri = cookie;
@@ -661,7 +661,7 @@ omdisplay_show_screen(void *v, void *cookie, int waitok,
 	old = sc->sc_active;
 	if (old == scr)
 		return 0;
-  
+
 	if (old != NULL)
 		; /* Stop old screen */
 
@@ -826,7 +826,7 @@ omdisplay_set_backlight(int on)
 		omdisplay_set_brightness(omdisplay_get_brightness());
 	}
 }
-   
+
 void
 omdisplay_blank(int blank)
 {
@@ -1023,8 +1023,8 @@ omdisplay_initialize(struct omdisplay_softc *sc,
 	    scr->segs[0].ds_addr);
 
 	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_BA0, 0);
-	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_BA1, 0); 
-	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_SIZE, 0); 
+	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_BA1, 0);
+	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_SIZE, 0);
 	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_ATTRIBUTES, 0);
 	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID1_FIFO_THRESHOLD,
 	    0xc00040); /* XXX */
@@ -1092,7 +1092,7 @@ omdisplay_initialize(struct omdisplay_softc *sc,
 	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID2_CONV_COEF1, 0);
 	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID2_CONV_COEF2, 0);
 	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID2_CONV_COEF3, 0);
-	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID2_CONV_COEF4, 0); 
+	bus_space_write_4(sc->sc_iot, sc->sc_dcioh, DISPC_VID2_CONV_COEF4, 0);
 
 	omdisplay_start(sc);
 }
@@ -1142,7 +1142,7 @@ omdisplay_setup_rasops(struct omdisplay_softc *sc, struct rasops_info *rinfo)
 
 int
 omdisplay_alloc_screen(void *v, const struct wsscreen_descr *_type,
-    void **cookiep, int *curxp, int *curyp, long *attrp)
+    void **cookiep, int *curxp, int *curyp, uint32_t *attrp)
 {
 	struct omdisplay_softc *sc = v;
 	struct omdisplay_screen *scr;
@@ -1170,7 +1170,7 @@ omdisplay_alloc_screen(void *v, const struct wsscreen_descr *_type,
 	omdisplay_setup_rasops(sc, ri);
 
 	/* assumes 16 bpp */
-	ri->ri_ops.alloc_attr(ri, 0, 0, 0, attrp);
+	ri->ri_ops.pack_attr(ri, 0, 0, 0, attrp);
 
 	*cookiep = ri;
 	*curxp = 0;
@@ -1264,7 +1264,7 @@ omdisplay_new_screen(struct omdisplay_softc *sc,
 	    sizeof (splash) > scr->buf_size ? scr->buf_size : sizeof (splash));
 
 	/* map memory for DMA */
-	if (bus_dmamap_create(dma_tag, 1024 * 1024 * 2, 1, 
+	if (bus_dmamap_create(dma_tag, 1024 * 1024 * 2, 1,
 	    1024 * 1024 * 2, 0,  busdma_flag, &scr->dma))
 		goto bad;
 	error = bus_dmamap_load(dma_tag, scr->dma,

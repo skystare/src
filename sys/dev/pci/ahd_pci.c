@@ -1,4 +1,4 @@
-/*	$OpenBSD: ahd_pci.c,v 1.24 2014/07/12 18:48:51 tedu Exp $	*/
+/*	$OpenBSD: ahd_pci.c,v 1.26 2020/07/24 12:43:31 krw Exp $	*/
 
 /*
  * Copyright (c) 2004 Milos Urbanek, Kenneth R. Westerback & Marco Peereboom
@@ -75,8 +75,7 @@
 
 #include <dev/pci/pcivar.h>
 
-__inline uint64_t ahd_compose_id(u_int, u_int, u_int, u_int);
-__inline uint64_t
+static inline uint64_t
 ahd_compose_id(u_int device, u_int vendor, u_int subdevice, u_int subvendor)
 {
 	uint64_t id;
@@ -428,7 +427,7 @@ ahd_pci_attach(struct device *parent, struct device *self, void *aux)
 		}
 
 #ifdef AHD_DEBUG
-		printf("%s: doing memory mapping tag0 0x%x, tag1 0x%x, shs0 "
+		printf("%s: doing memory mapping tag0 %p, tag1 %p, shs0 "
 		    "0x%lx, shs1 0x%lx\n", ahd_name(ahd), ahd->tags[0],
 		    ahd->tags[1], ahd->bshs[0], ahd->bshs[1]);
 #endif
@@ -446,7 +445,7 @@ ahd_pci_attach(struct device *parent, struct device *self, void *aux)
 		    NULL, 0) == 0);
 
 #ifdef AHD_DEBUG
-		printf("%s: doing io mapping tag0 0x%x, tag1 0x%x, shs0 0x%lx, "
+		printf("%s: doing io mapping tag0 %p, tag1 %p, shs0 0x%lx, "
 		    "shs1 0x%lx\n", ahd_name(ahd), ahd->tags[0], ahd->tags[1],
 		    ahd->bshs[0], ahd->bshs[1]);
 #endif

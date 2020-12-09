@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_nep.c,v 1.30 2017/04/11 14:43:49 dhill Exp $	*/
+/*	$OpenBSD: if_nep.c,v 1.33 2020/07/10 13:26:38 patrick Exp $	*/
 /*
  * Copyright (c) 2014, 2015 Mark Kettenis
  *
@@ -1049,7 +1049,8 @@ nep_rx_proc(struct nep_softc *sc)
 	bus_dmamap_sync(sc->sc_dmat, NEP_DMA_MAP(sc->sc_rcring), 0,
 	    NEP_DMA_LEN(sc->sc_rcring), BUS_DMASYNC_PREREAD);
 
-	if_input(ifp, &ml);
+	if (ifiq_input(&ifp->if_rcv, &ml))
+		if_rxr_livelocked(&sc->sc_rx_ring);
 
 	nep_fill_rx_ring(sc);
 
@@ -1803,7 +1804,7 @@ nep_encap(struct nep_softc *sc, struct mbuf **m0, int *idx)
 		m->m_pkthdr.len += padlen;
 	}
 
-	if (M_LEADINGSPACE(m) < 16)
+	if (m_leadingspace(m) < 16)
 		pad = 0;
 	else
 		pad = mtod(m, u_long) % 16;
@@ -1875,7 +1876,7 @@ nep_start(struct ifnet *ifp)
 		return;
 	if (ifq_is_oactive(&ifp->if_snd))
 		return;
-	if (IFQ_IS_EMPTY(&ifp->if_snd))
+	if (ifq_empty(&ifp->if_snd))
 		return;
 
 	idx = sc->sc_tx_prod;

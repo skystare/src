@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.65 2018/03/17 18:52:42 schwarze Exp $
+# $OpenBSD: Makefile,v 1.69 2020/09/21 08:53:56 schwarze Exp $
 
 .include <bsd.own.mk>
 
@@ -8,6 +8,7 @@ MAN =	BIO_f_ssl.3 \
 	PEM_read_SSL_SESSION.3 \
 	SSL_CIPHER_get_name.3 \
 	SSL_COMP_add_compression_method.3 \
+	SSL_CTX_add1_chain_cert.3 \
 	SSL_CTX_add_extra_chain_cert.3 \
 	SSL_CTX_add_session.3 \
 	SSL_CTX_ctrl.3 \
@@ -101,7 +102,9 @@ MAN =	BIO_f_ssl.3 \
 	SSL_renegotiate.3 \
 	SSL_rstate_string.3 \
 	SSL_session_reused.3 \
+	SSL_set1_host.3 \
 	SSL_set1_param.3 \
+	SSL_set_SSL_CTX.3 \
 	SSL_set_bio.3 \
 	SSL_set_connect_state.3 \
 	SSL_set_fd.3 \
@@ -116,6 +119,9 @@ MAN =	BIO_f_ssl.3 \
 	SSL_write.3 \
 	d2i_SSL_SESSION.3 \
 	ssl.3
+
+# To be enabled after the release of OpenBSD 6.8:
+#	SSL_read_early_data.3 \
 
 all clean cleandir depend includes obj tags:
 

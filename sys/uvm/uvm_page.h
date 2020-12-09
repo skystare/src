@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_page.h,v 1.63 2016/11/07 00:26:33 guenther Exp $	*/
+/*	$OpenBSD: uvm_page.h,v 1.65 2020/09/22 14:31:08 mpi Exp $	*/
 /*	$NetBSD: uvm_page.h,v 1.19 2000/12/28 08:24:55 chs Exp $	*/
 
 /* 
@@ -227,6 +227,7 @@ void		uvm_pageactivate(struct vm_page *);
 vaddr_t		uvm_pageboot_alloc(vsize_t);
 void		uvm_pagecopy(struct vm_page *, struct vm_page *);
 void		uvm_pagedeactivate(struct vm_page *);
+void		uvm_pageclean(struct vm_page *);
 void		uvm_pagefree(struct vm_page *);
 void		uvm_page_unbusy(struct vm_page **, int);
 struct vm_page	*uvm_pagelookup(struct uvm_object *, voff_t);
@@ -248,7 +249,7 @@ psize_t		uvm_pagecount(struct uvm_constraint_range*);
 /*
  * vm_physseg_find: find vm_physseg structure that belongs to a PA
  */
-static __inline int
+static inline int
 vm_physseg_find(paddr_t pframe, int *offp)
 {
 	/* 'contig' case */
@@ -264,7 +265,7 @@ vm_physseg_find(paddr_t pframe, int *offp)
  * PHYS_TO_VM_PAGE: find vm_page for a PA.   used by MI code to get vm_pages
  * back from an I/O mapping (ugh!).   used in some MD code as well.
  */
-static __inline struct vm_page *
+static inline struct vm_page *
 PHYS_TO_VM_PAGE(paddr_t pa)
 {
 	paddr_t pf = atop(pa);

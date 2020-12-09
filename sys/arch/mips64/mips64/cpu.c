@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.69 2017/09/02 15:56:29 visa Exp $ */
+/*	$OpenBSD: cpu.c,v 1.77 2020/07/22 08:04:41 fcambus Exp $ */
 
 /*
  * Copyright (c) 1997-2004 Opsycon AB (www.opsycon.se)
@@ -32,7 +32,6 @@
 #include <sys/atomic.h>
 #include <sys/device.h>
 #include <sys/malloc.h>
-#include <dev/rndvar.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -56,6 +55,7 @@ extern void cpu_idle_cycle_wait(void);
 void (*cpu_idle_cycle_func)(void) = cpu_idle_cycle_nop;
 
 vaddr_t	cache_valias_mask;
+int	cpu_has_synced_cp0_count;
 int	cpu_has_userlocal;
 
 struct cfattach cpu_ca = {
@@ -121,7 +121,7 @@ cpuattach(struct device *parent, struct device *dev, void *aux)
 	 * instead.
 	 * XXX The MP boot sequence needs to be reworked to avoid this.
 	 */
-	if (!ISSET(ci->ci_flags, CPUF_PRIMARY)) {
+	if (!CPU_IS_PRIMARY(ci)) {
 		ci->ci_l1inst = cpu_info_primary.ci_l1inst;
 		ci->ci_l1data = cpu_info_primary.ci_l1data;
 		ci->ci_l2 = cpu_info_primary.ci_l2;
@@ -231,11 +231,26 @@ cpuattach(struct device *parent, struct device *dev, void *aux)
 			printf("CN61xx CPU");
 		fptype = MIPS_SOFT;
 		break;
+	case MIPS_CN63XX:
+		printf("CN62xx/CN63xx CPU");
+		fptype = MIPS_SOFT;
+		break;
+	case MIPS_CN66XX:
+		printf("CN66xx CPU");
+		fptype = MIPS_SOFT;
+		break;
+	case MIPS_CN68XX:
+		printf("CN68xx CPU");
+		fptype = MIPS_SOFT;
+		break;
 	case MIPS_CN71XX:
 		printf("CN70xx/CN71xx CPU");
 		break;
 	case MIPS_CN73XX:
 		printf("CN72xx/CN73xx CPU");
+		break;
+	case MIPS_CN78XX:
+		printf("CN76xx/CN77xx/CN78xx CPU");
 		break;
 	default:
 		printf("Unknown CPU type (0x%x)", ch->type);
@@ -327,6 +342,9 @@ cpuattach(struct device *parent, struct device *dev, void *aux)
 		break;
 	case MIPS_CN73XX:
 		printf("CN72xx/CN73xx FPU");
+		break;
+	case MIPS_CN78XX:
+		printf("CN76xx/CN77xx/CN78xx FPU");
 		break;
 	default:
 		printf("Unknown FPU type (0x%x)", fptype);
@@ -454,6 +472,23 @@ save_fpu(void)
 		MipsSaveCurFPState16(p);
 }
 
+void
+need_resched(struct cpu_info *ci)
+{
+	ci->ci_want_resched = 1;
+
+	if (ci->ci_curproc != NULL) {
+		/*
+		 * Ensure that preceding stores are visible to other CPUs
+		 * before setting the AST flag.
+		 */
+		membar_producer();
+
+		aston(ci->ci_curproc);
+		cpu_unidle(ci);
+	}
+}
+
 #ifdef MULTIPROCESSOR
 struct cpu_info *
 get_cpu_info(int cpuno)
@@ -479,7 +514,7 @@ cpu_boot_secondary_processors(void)
 	CPU_INFO_FOREACH(cii, ci) {
 		if ((ci->ci_flags & CPUF_PRESENT) == 0)
 			continue;
-		if (ci->ci_flags & CPUF_PRIMARY)
+		if (CPU_IS_PRIMARY(ci))
 			continue;
 
 		ci->ci_randseed = (arc4random() & 0x7fffffff) + 1;

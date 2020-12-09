@@ -1,4 +1,4 @@
-/*	$OpenBSD: rad.h,v 1.15 2018/08/03 13:14:46 florian Exp $	*/
+/*	$OpenBSD: rad.h,v 1.19 2020/12/01 17:31:37 florian Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -18,19 +18,23 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#define CONF_FILE		"/etc/rad.conf"
+#define	CONF_FILE		"/etc/rad.conf"
 #define	RAD_SOCKET		"/var/run/rad.sock"
-#define RAD_USER		"_rad"
+#define	RAD_USER		"_rad"
 
-#define OPT_VERBOSE	0x00000001
-#define OPT_VERBOSE2	0x00000002
-#define OPT_NOACTION	0x00000004
+#define	OPT_VERBOSE	0x00000001
+#define	OPT_VERBOSE2	0x00000002
+#define	OPT_NOACTION	0x00000004
 
+#define	MAX_RTR_ADV_INTERVAL	600
+#define	MIN_RTR_ADV_INTERVAL	200
+#define	ADV_DEFAULT_LIFETIME	3 * MAX_RTR_ADV_INTERVAL
+#define	ADV_PREFERRED_LIFETIME	604800	/* 7 days */
+#define ADV_VALID_LIFETIME	2592000	/* 30 days */
+#define	MAX_SEARCH		1025	/* MAXDNAME in arpa/nameser.h */
+#define	DEFAULT_RDNS_LIFETIME	600 * 1.5
 
-#define	MAX_RTR_ADV_INTERVAL		600
-#define	MIN_RTR_ADV_INTERVAL		200
-#define	MAX_SEARCH 1025 /* same as MAXDNAME in arpa/nameser.h */
-#define	DEFAULT_RDNS_LIFETIME		600 * 1.5
+#define	IMSG_DATA_SIZE(imsg)	((imsg).hdr.len - IMSG_HEADER_SIZE)
 
 enum {
 	PROC_MAIN,
@@ -63,15 +67,14 @@ enum imsg_type {
 	IMSG_RECONF_RA_DNSSL,
 	IMSG_RECONF_END,
 	IMSG_ICMP6SOCK,
+	IMSG_OPEN_ICMP6SOCK,
 	IMSG_ROUTESOCK,
 	IMSG_CONTROLFD,
 	IMSG_STARTUP,
-	IMSG_STARTUP_DONE,
 	IMSG_RA_RS,
 	IMSG_SEND_RA,
 	IMSG_UPDATE_IF,
 	IMSG_REMOVE_IF,
-	IMSG_SHUTDOWN,
 	IMSG_SOCKET_IPC
 };
 
@@ -142,9 +145,7 @@ struct imsg_send_ra {
 extern uint32_t	 cmd_opts;
 
 /* rad.c */
-void	main_imsg_compose_frontend(int, pid_t, void *, uint16_t);
-void	main_imsg_compose_frontend_fd(int, pid_t, int);
-
+int	main_imsg_compose_frontend(int, int, void *, uint16_t);
 void	main_imsg_compose_engine(int, pid_t, void *, uint16_t);
 void	merge_config(struct rad_conf *, struct rad_conf *);
 void	imsg_event_add(struct imsgev *);

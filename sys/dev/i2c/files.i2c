@@ -1,4 +1,4 @@
-# $OpenBSD: files.i2c,v 1.61 2018/07/09 18:48:52 patrick Exp $
+# $OpenBSD: files.i2c,v 1.67 2020/09/30 22:23:41 patrick Exp $
 #	$NetBSD: files.i2c,v 1.3 2003/10/20 16:24:10 briggs Exp $
 
 define	i2c {[addr = -1], [size = -1]}
@@ -69,6 +69,11 @@ device	admtt
 attach	admtt at i2c
 file	dev/i2c/adm1031.c			admtt
 
+# PCA9548
+device	pcamux: i2cbus
+attach	pcamux at i2c
+file	dev/i2c/pca9548.c			pcamux
+
 # PCA9554
 device	pcagpio
 attach	pcagpio at i2c
@@ -83,6 +88,11 @@ file	dev/i2c/ds1307.c			maxrtc
 device	maxds
 attach	maxds at i2c
 file	dev/i2c/ds1631.c			maxds
+
+# Maxim DS3231
+device	dsxrtc
+attach	dsxrtc at i2c
+file	dev/i2c/ds3231.c			dsxrtc
 
 # Apple FCU
 device	fcu
@@ -224,3 +234,22 @@ file dev/i2c/bmc150.c				bgw
 device	islrtc
 attach	islrtc at i2c
 file dev/i2c/isl1208.c				islrtc
+
+# Abracon ABx8xx Real Time Clock
+device	abcrtc
+attach	abcrtc at i2c
+file dev/i2c/abx80x.c				abcrtc
+
+# IPMI SMBus System Interface (SSIF)
+attach	ipmi at i2c with ipmi_i2c
+file dev/i2c/ipmi_i2c.c				ipmi_i2c
+
+# Microchip MCP794xx Real Time Clock
+device	mcprtc
+attach	mcprtc at i2c
+file dev/i2c/mcp794xx.c				mcprtc
+
+# STMicroelectronics M41T8x RTC
+device	mfokrtc
+attach	mfokrtc at i2c
+file	dev/i2c/m41t8x.c			mfokrtc

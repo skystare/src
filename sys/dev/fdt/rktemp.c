@@ -1,4 +1,4 @@
-/*	$OpenBSD: rktemp.c,v 1.3 2018/02/26 22:37:10 kettenis Exp $	*/
+/*	$OpenBSD: rktemp.c,v 1.6 2020/09/08 01:29:58 jmatthew Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -28,6 +28,7 @@
 #include <dev/ofw/ofw_clock.h>
 #include <dev/ofw/ofw_misc.h>
 #include <dev/ofw/ofw_pinctrl.h>
+#include <dev/ofw/ofw_thermal.h>
 #include <dev/ofw/fdt.h>
 
 /* Registers */
@@ -152,6 +153,7 @@ struct rktemp_entry rk3328_temps[] = {
 	{ 125000, 675 },
 };
 
+const char *rk3308_names[] = { "CPU", "GPU" };
 const char *rk3328_names[] = { "CPU" };
 
 /* RK3399 conversion table. */
@@ -205,6 +207,8 @@ struct rktemp_softc {
 	struct ksensor		sc_sensors[3];
 	int			sc_nsensors;
 	struct ksensordev	sc_sensordev;
+
+	struct thermal_sensor	sc_ts;
 };
 
 int	rktemp_match(struct device *, void *, void *);
@@ -222,6 +226,7 @@ int32_t rktemp_calc_code(struct rktemp_softc *, int32_t);
 int32_t rktemp_calc_temp(struct rktemp_softc *, int32_t);
 int	rktemp_valid(struct rktemp_softc *, int32_t);
 void	rktemp_refresh_sensors(void *);
+int32_t	rktemp_get_temperature(void *, uint32_t *);
 
 int
 rktemp_match(struct device *parent, void *match, void *aux)
@@ -229,6 +234,7 @@ rktemp_match(struct device *parent, void *match, void *aux)
 	struct fdt_attach_args *faa = aux;
 
 	return (OF_is_compatible(faa->fa_node, "rockchip,rk3288-tsadc") ||
+	    OF_is_compatible(faa->fa_node, "rockchip,rk3308-tsadc") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3328-tsadc") ||
 	    OF_is_compatible(faa->fa_node, "rockchip,rk3399-tsadc"));
 }
@@ -263,6 +269,11 @@ rktemp_attach(struct device *parent, struct device *self, void *aux)
 		sc->sc_ntemps = nitems(rk3288_temps);
 		sc->sc_nsensors = 3;
 		names = rk3288_names;
+	} else if (OF_is_compatible(node, "rockchip,rk3308-tsadc")) {
+		sc->sc_temps = rk3328_temps;
+		sc->sc_ntemps = nitems(rk3328_temps);
+		sc->sc_nsensors = 2;
+		names = rk3308_names;
 	} else if (OF_is_compatible(node, "rockchip,rk3328-tsadc")) {
 		sc->sc_temps = rk3328_temps;
 		sc->sc_ntemps = nitems(rk3328_temps);
@@ -277,6 +288,7 @@ rktemp_attach(struct device *parent, struct device *self, void *aux)
 
 	pinctrl_byname(node, "init");
 
+	clock_set_assigned(node);
 	clock_enable(node, "tsadc");
 	clock_enable(node, "apb_pclk");
 
@@ -331,6 +343,11 @@ rktemp_attach(struct device *parent, struct device *self, void *aux)
 	}
 	sensordev_install(&sc->sc_sensordev);
 	sensor_task_register(sc, rktemp_refresh_sensors, 5);
+
+	sc->sc_ts.ts_node = node;
+	sc->sc_ts.ts_cookie = sc;
+	sc->sc_ts.ts_get_temperature = rktemp_get_temperature;
+	thermal_sensor_register(&sc->sc_ts);
 }
 
 int32_t
@@ -433,4 +450,21 @@ rktemp_refresh_sensors(void *arg)
 		else
 			sc->sc_sensors[i].flags |= SENSOR_FINVALID;
 	}
+}
+
+int32_t
+rktemp_get_temperature(void *cookie, uint32_t *cells)
+{
+	struct rktemp_softc *sc = cookie;
+	uint32_t idx = cells[0];
+	int32_t code;
+
+	if (idx >= sc->sc_nsensors)
+		return THERMAL_SENSOR_MAX;
+
+	code = HREAD4(sc, TSADC_DATA0 + idx * 4);
+	if (rktemp_valid(sc, code))
+		return rktemp_calc_temp(sc, code);
+	else
+		return THERMAL_SENSOR_MAX;
 }

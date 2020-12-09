@@ -1,4 +1,4 @@
-/*	$OpenBSD: mainbus.c,v 1.44 2018/07/13 08:30:34 sf Exp $	*/
+/*	$OpenBSD: mainbus.c,v 1.50 2020/05/14 13:07:11 kettenis Exp $	*/
 /*	$NetBSD: mainbus.c,v 1.1 2003/04/26 18:39:29 fvdl Exp $	*/
 
 /*
@@ -72,6 +72,8 @@
 #if NEFIFB > 0
 #include <machine/efifbvar.h>
 #endif
+
+void	replacemds(void);
 
 int	mainbus_match(struct device *, void *, void *);
 void	mainbus_attach(struct device *, struct device *, void *);
@@ -171,6 +173,10 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 		pvbus_identify();
 #endif
 
+#if NEFIFB > 0
+	efifb_cnremap();
+#endif
+
 #if NBIOS > 0
 	{
 		mba.mba_bios.ba_name = "bios";
@@ -201,6 +207,9 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 		config_found(self, &caa, mainbus_print);
 	}
 
+	/* All CPUs are attached, handle MDS */
+	replacemds();
+
 #if NACPI > 0
 	if (!acpi_hasprocfvs)
 #endif
@@ -222,6 +231,13 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 #endif
 
 #if NPCI > 0
+#if NACPI > 0
+	if (acpi_haspci) {
+		extern void acpipci_attach_busses(struct device *);
+
+		acpipci_attach_busses(self);
+	} else
+#endif
 	{
 		pci_init_extents();
 
@@ -236,9 +252,6 @@ mainbus_attach(struct device *parent, struct device *self, void *aux)
 		mba.mba_pba.pba_domain = pci_ndomains++;
 		mba.mba_pba.pba_bus = 0;
 		config_found(self, &mba.mba_pba, mainbus_print);
-#if NACPI > 0
-		acpi_pciroots_attach(self, &mba.mba_pba, mainbus_print);
-#endif
 	}
 #endif
 
@@ -269,8 +282,8 @@ mainbus_efifb_reattach(void)
 {
 	union mainbus_attach_args mba;
 	struct device *self = device_mainbus();
+
 	if (bios_efiinfo != NULL || efifb_cb_found()) {
-		efifb_cnreattach();
 		mba.mba_eaa.eaa_name = "efifb";
 		config_found(self, &mba, mainbus_print);
 	}

@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-#	$OpenBSD: updatedb.sh,v 1.13 2015/08/14 03:02:07 rzalamena Exp $
+#	$OpenBSD: updatedb.sh,v 1.17 2019/09/10 18:20:07 millert Exp $
 #
 # Copyright (c) September 1995 Wolfram Schneider <wosch@FreeBSD.org>. Berlin.
 # All rights reserved.
@@ -28,7 +28,6 @@
 #
 # updatedb - update locate database for local mounted filesystems
 #
-# $Id: updatedb.sh,v 1.13 2015/08/14 03:02:07 rzalamena Exp $
 
 LOCATE_CONFIG="/etc/locate.rc"
 if [ -f "$LOCATE_CONFIG" -a -r "$LOCATE_CONFIG" ]; then
@@ -70,6 +69,14 @@ while test $# != 0; do
 	esac
 	shift
 done
+
+if [ "${FCODES}" != "-" ]; then
+	FCODESDIR=$( dirname "${FCODES}" )
+	if [ ! -w "${FCODESDIR}" ]; then
+		echo "$0: no permission to create $FCODES"
+		exit 1
+	fi
+fi
 
 case X"$SEARCHPATHS" in 
 	X) echo "$0: empty variable SEARCHPATHS"; exit 1;; esac

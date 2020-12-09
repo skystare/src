@@ -1,4 +1,4 @@
-/* $OpenBSD: pfkeyv2.h,v 1.80 2018/08/28 15:15:02 mpi Exp $ */
+/* $OpenBSD: pfkeyv2.h,v 1.85 2020/11/05 19:28:27 phessler Exp $ */
 /*
  *	@(#)COPYRIGHT	1.1 (NRL) January 1998
  *
@@ -212,6 +212,13 @@ struct sadb_x_tag {
 	u_int32_t sadb_x_tag_taglen;
 };
 
+struct sadb_x_rdomain {
+	uint16_t  sadb_x_rdomain_len;
+	uint16_t  sadb_x_rdomain_exttype;
+	uint16_t  sadb_x_rdomain_dom1;
+	uint16_t  sadb_x_rdomain_dom2;
+};
+
 struct sadb_x_tap {
 	uint16_t  sadb_x_tap_len;
 	uint16_t  sadb_x_tap_exttype;
@@ -221,6 +228,7 @@ struct sadb_x_tap {
 struct sadb_x_counter {
 	uint16_t  sadb_x_counter_len;
 	uint16_t  sadb_x_counter_exttype;
+	uint32_t  sadb_x_counter_pad;
 	uint64_t  sadb_x_counter_ipackets;	/* Input IPsec packets */
 	uint64_t  sadb_x_counter_opackets;	/* Output IPsec packets */
 	uint64_t  sadb_x_counter_ibytes;	/* Input bytes */
@@ -276,7 +284,8 @@ struct sadb_x_counter {
 #define SADB_X_EXT_TAP                34
 #define SADB_X_EXT_SATYPE2            35
 #define SADB_X_EXT_COUNTER            36
-#define SADB_EXT_MAX                  36
+#define SADB_X_EXT_RDOMAIN            37
+#define SADB_EXT_MAX                  37
 
 /* Fix pfkeyv2.c struct pfkeyv2_socket if SATYPE_MAX > 31 */
 #define SADB_SATYPE_UNSPEC		 0
@@ -342,7 +351,8 @@ struct sadb_x_counter {
 #define SADB_IDENTTYPE_PREFIX       1
 #define SADB_IDENTTYPE_FQDN         2
 #define SADB_IDENTTYPE_USERFQDN     3
-#define SADB_IDENTTYPE_MAX          3
+#define SADB_IDENTTYPE_ASN1_DN      4
+#define SADB_IDENTTYPE_MAX          4
 
 #define SADB_KEY_FLAGS_MAX 0
 
@@ -386,8 +396,8 @@ int pfkeyv2_expire(struct tdb *, u_int16_t);
 int pfkeyv2_acquire(struct ipsec_policy *, union sockaddr_union *,
     union sockaddr_union *, u_int32_t *, struct sockaddr_encap *);
 
-int pfkeyv2_get(struct tdb *, void **, void **, int *);
-int pfkeyv2_policy(struct ipsec_acquire *, void **, void **);
+int pfkeyv2_get(struct tdb *, void **, void **, int *, int *);
+int pfkeyv2_policy(struct ipsec_acquire *, void **, void **, int *);
 int pfkeyv2_send(struct socket *, void *, int);
 int pfkeyv2_sendmessage(void **, int, struct socket *, u_int8_t, int, u_int);
 int pfkeyv2_dump_policy(struct ipsec_policy *, void **, void **, int *);
@@ -408,6 +418,7 @@ void export_flow(void **, u_int8_t, struct sockaddr_encap *,
 void export_key(void **, struct tdb *, int);
 void export_udpencap(void **, struct tdb *);
 void export_tag(void **, struct tdb *);
+void export_rdomain(void **, struct tdb *);
 void export_tap(void **, struct tdb *);
 void export_satype(void **, struct tdb *);
 void export_counter(void **, struct tdb *);
@@ -423,6 +434,7 @@ void import_flow(struct sockaddr_encap *, struct sockaddr_encap *,
     struct sadb_address *, struct sadb_protocol *, struct sadb_protocol *);
 void import_udpencap(struct tdb *, struct sadb_x_udpencap *);
 void import_tag(struct tdb *, struct sadb_x_tag *);
+void import_rdomain(struct tdb *, struct sadb_x_rdomain *);
 void import_tap(struct tdb *, struct sadb_x_tap *);
 #endif /* _KERNEL */
 

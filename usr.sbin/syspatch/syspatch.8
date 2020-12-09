@@ -1,4 +1,4 @@
-.\"	$OpenBSD: syspatch.8,v 1.19 2017/08/22 13:32:50 ajacoutot Exp $
+.\"	$OpenBSD: syspatch.8,v 1.22 2020/12/07 21:19:28 ajacoutot Exp $
 .\"
 .\" Copyright (c) 2016 Antoine Jacoutot <ajacoutot@openbsd.org>
 .\"
@@ -14,7 +14,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: August 22 2017 $
+.Dd $Mdocdate: December 7 2020 $
 .Dt SYSPATCH 8
 .Os
 .Sh NAME
@@ -36,6 +36,7 @@ will apply
 missing patches, creating a rollback tarball containing the files it is about
 to replace, then extracting and installing all files contained in the syspatch
 tarball.
+If any sets are missing, patches are skipped accordingly.
 Patches are cumulative and as such it is not possible to install only a subset
 of them.
 .Pp
@@ -61,6 +62,10 @@ Directories containing the rollback tarball and original signed
 .Xr diff 1
 of installed patches.
 .El
+.Sh EXIT STATUS
+.Ex -std syspatch
+In particular, 2 indicates that applying patches was requested but no
+additional patch was installed.
 .Sh SEE ALSO
 .Xr signify 1 ,
 .Xr installurl 5 ,

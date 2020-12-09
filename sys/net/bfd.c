@@ -1,4 +1,4 @@
-/*	$OpenBSD: bfd.c,v 1.72 2018/07/30 12:22:14 mpi Exp $	*/
+/*	$OpenBSD: bfd.c,v 1.77 2019/06/02 13:22:36 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2016-2018 Peter Hessler <phessler@openbsd.org>
@@ -90,8 +90,8 @@ struct bfd_auth_header {
 #define BFD_VERSION		1	/* RFC 5880 Page 6 */
 #define BFD_VER(x)		(((x) & 0xe0) >> 5)
 #define BFD_DIAG(x)		((x) & 0x1f)
-#define BFD_STATE(x)		(((x) & 0xf0) >> 6)
-#define BFD_FLAGS(x)		((x) & 0x0f)
+#define BFD_STATE(x)		(((x) & 0xc0) >> 6)
+#define BFD_FLAGS(x)		((x) & 0x3f)
 #define BFD_HDRLEN		24	/* RFC 5880 Page 37 */
 #define BFD_AUTH_SIMPLE_LEN	16 + 3	/* RFC 5880 Page 10 */
 #define BFD_AUTH_MD5_LEN	24	/* RFC 5880 Page 11 */
@@ -195,7 +195,7 @@ bfdset(struct rtentry *rt)
 	bfd->bc_rt = rt;
 	rtref(bfd->bc_rt);	/* we depend on this route not going away */
 
-	microtime(bfd->bc_time);
+	getmicrotime(bfd->bc_time);
 	bfd_reset(bfd);
 	bfd->bc_neighbor->bn_ldiscr = arc4random();
 
@@ -243,8 +243,7 @@ bfd_clear_task(void *arg)
 	TAILQ_REMOVE(&bfd_queue, bfd, bc_entry);
 
 	/* inform our neighbor */
-	if (rtisvalid(bfd->bc_rt))
-		bfd_senddown(bfd);
+	bfd_senddown(bfd);
 
 	rt->rt_flags &= ~RTF_BFD;
 	if (bfd->bc_so) {
@@ -453,7 +452,7 @@ bfd_listener(struct bfd_config *bfd, unsigned int port)
 	*ip = MAXTTL;
 	s = solock(so);
 	error = sosetopt(so, IPPROTO_IP, IP_MINTTL, mopt);
-	sounlock(s);
+	sounlock(so, s);
 	m_freem(mopt);
 	if (error) {
 		printf("%s: sosetopt error %d\n",
@@ -480,7 +479,7 @@ bfd_listener(struct bfd_config *bfd, unsigned int port)
 
 	s = solock(so);
 	error = sobind(so, m, p);
-	sounlock(s);
+	sounlock(so, s);
 	if (error) {
 		printf("%s: sobind error %d\n",
 		    __func__, error);
@@ -533,7 +532,7 @@ bfd_sender(struct bfd_config *bfd, unsigned int port)
 	*ip = IP_PORTRANGE_HIGH;
 	s = solock(so);
 	error = sosetopt(so, IPPROTO_IP, IP_PORTRANGE, mopt);
-	sounlock(s);
+	sounlock(so, s);
 	m_freem(mopt);
 	if (error) {
 		printf("%s: sosetopt error %d\n",
@@ -547,7 +546,7 @@ bfd_sender(struct bfd_config *bfd, unsigned int port)
 	*ip = MAXTTL;
 	s = solock(so);
 	error = sosetopt(so, IPPROTO_IP, IP_TTL, mopt);
-	sounlock(s);
+	sounlock(so, s);
 	m_freem(mopt);
 	if (error) {
 		printf("%s: sosetopt error %d\n",
@@ -561,7 +560,7 @@ bfd_sender(struct bfd_config *bfd, unsigned int port)
 	*ip = IPTOS_PREC_INTERNETCONTROL;
 	s = solock(so);
 	error = sosetopt(so, IPPROTO_IP, IP_TOS, mopt);
-	sounlock(s);
+	sounlock(so, s);
 	m_freem(mopt);
 	if (error) {
 		printf("%s: sosetopt error %d\n",
@@ -588,7 +587,7 @@ bfd_sender(struct bfd_config *bfd, unsigned int port)
 
 	s = solock(so);
 	error = sobind(so, m, p);
-	sounlock(s);
+	sounlock(so, s);
 	if (error) {
 		printf("%s: sobind error %d\n",
 		    __func__, error);
@@ -928,7 +927,7 @@ bfd_set_state(struct bfd_config *bfd, unsigned int state)
 		bfd->bc_laststate = bfd->bc_state;
 	/* FALLTHROUGH */
 	case BFD_STATE_DOWN:
-		if (bfd->bc_laststate == BFD_STATE_UP) {
+		if (bfd->bc_state == BFD_STATE_UP) {
 			bfd->bc_laststate = bfd->bc_state;
 			bfd_set_uptime(bfd);
 		}
@@ -956,7 +955,7 @@ bfd_set_uptime(struct bfd_config *bfd)
 {
 	struct timeval tv;
 
-	microtime(&tv);
+	getmicrotime(&tv);
 	bfd->bc_lastuptime = tv.tv_sec - bfd->bc_time->tv_sec;
 	memcpy(bfd->bc_time, &tv, sizeof(tv));
 }
@@ -1004,13 +1003,6 @@ bfd_send_control(void *x)
 int
 bfd_send(struct bfd_config *bfd, struct mbuf *m)
 {
-	struct rtentry *rt = bfd->bc_rt;
-
-	if (!rtisvalid(rt)) {
-		m_freem(m);
-		return (EHOSTDOWN);
-	}
-
 	return(sosend(bfd->bc_sosend, NULL, NULL, m, NULL, MSG_DONTWAIT));
 }
 

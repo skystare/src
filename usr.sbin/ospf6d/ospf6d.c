@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospf6d.c,v 1.39 2018/09/01 19:21:10 remi Exp $ */
+/*	$OpenBSD: ospf6d.c,v 1.48 2020/09/16 20:50:10 remi Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -211,7 +211,7 @@ main(int argc, char *argv[])
 	log_setverbose(ospfd_conf->opts & OSPFD_OPT_VERBOSE);
 
 	if ((control_check(ospfd_conf->csock)) == -1)
-		fatalx("control socket check failed");
+		fatalx("ospf6d already running");
 
 	if (!debug)
 		daemon(1, 0);
@@ -274,8 +274,15 @@ main(int argc, char *argv[])
 		fatalx("control socket setup failed");
 	main_imsg_compose_ospfe_fd(IMSG_CONTROLFD, 0, control_fd);
 
+	/* no filesystem visibility */
+	if (unveil("/", "") == -1)
+		fatal("unveil");
+	if (unveil(NULL, NULL) == -1)
+		fatal("unveil");
+
 	if (kr_init(!(ospfd_conf->flags & OSPFD_FLAG_NO_FIB_UPDATE),
-	    ospfd_conf->rdomain) == -1)
+	    ospfd_conf->rdomain, ospfd_conf->redist_label_or_prefix,
+	    ospfd_conf->fib_priority) == -1)
 		fatalx("kr_init failed");
 
 	event_dispatch();
@@ -297,7 +304,7 @@ ospfd_shutdown(void)
 	msgbuf_clear(&iev_rde->ibuf.w);
 	close(iev_rde->ibuf.fd);
 
-	control_cleanup(ospfd_conf->csock);
+	control_cleanup();
 	kr_shutdown();
 	carp_demote_shutdown();
 
@@ -529,7 +536,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 		switch (r->type & ~REDIST_NO) {
 		case REDIST_LABEL:
 			if (kr->rtlabel == r->label) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -544,7 +552,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (kr->flags & F_DYNAMIC)
 				continue;
 			if (kr->flags & F_STATIC) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -554,7 +563,8 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			if (kr->flags & F_DYNAMIC)
 				continue;
 			if (kr->flags & F_CONNECTED) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -566,7 +576,7 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			    r->prefixlen == 0) {
 				if (is_default) {
 					*metric = depend_ok ? r->metric :
-					    MAX_METRIC;
+					    r->metric | MAX_METRIC;
 					return (r->type & REDIST_NO ? 0 : 1);
 				} else
 					return (0);
@@ -576,13 +586,15 @@ ospf_redistribute(struct kroute *kr, u_int32_t *metric)
 			inet6applymask(&inb, &r->addr, r->prefixlen);
 			if (IN6_ARE_ADDR_EQUAL(&ina, &inb) &&
 			    kr->prefixlen >= r->prefixlen) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
 		case REDIST_DEFAULT:
 			if (is_default) {
-				*metric = depend_ok ? r->metric : MAX_METRIC;
+				*metric = depend_ok ? r->metric :
+				    r->metric | MAX_METRIC;
 				return (r->type & REDIST_NO ? 0 : 1);
 			}
 			break;
@@ -602,6 +614,8 @@ ospf_reload(void)
 	if ((xconf = parse_config(conffile, ospfd_conf->opts)) == NULL)
 		return (-1);
 
+	/* XXX bail out if router-id changed */
+
 	/* send config to childs */
 	if (ospf_sendboth(IMSG_RECONF_CONF, xconf, sizeof(*xconf)) == -1)
 		return (-1);
@@ -619,7 +633,7 @@ ospf_reload(void)
 
 	merge_config(ospfd_conf, xconf);
 	/* update redistribute lists */
-	kr_reload();
+	kr_reload(ospfd_conf->redist_label_or_prefix);
 	return (0);
 #else
 	return (-1);
@@ -642,12 +656,16 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 	struct area		*a, *xa, *na;
 	struct iface		*iface;
 	struct redistribute	*r;
+	int			 rchange = 0;
 
 	/* change of rtr_id needs a restart */
 	conf->flags = xconf->flags;
 	conf->spf_delay = xconf->spf_delay;
 	conf->spf_hold_time = xconf->spf_hold_time;
-	conf->redistribute = xconf->redistribute;
+	if (SIMPLEQ_EMPTY(&conf->redist_list) !=
+	    SIMPLEQ_EMPTY(&xconf->redist_list))
+		rchange = 1;
+	conf->redist_label_or_prefix = xconf->redist_label_or_prefix;
 
 	if (ospfd_process == PROC_MAIN) {
 		/* main process does neither use areas nor interfaces */
@@ -655,10 +673,16 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 			SIMPLEQ_REMOVE_HEAD(&conf->redist_list, entry);
 			free(r);
 		}
-		while ((r = SIMPLEQ_FIRST(&xconf->redist_list)) != NULL) {
-			SIMPLEQ_REMOVE_HEAD(&xconf->redist_list, entry);
-			SIMPLEQ_INSERT_TAIL(&conf->redist_list, r, entry);
+		SIMPLEQ_CONCAT(&conf->redist_list, &xconf->redist_list);
+
+		/* adjust FIB priority if changed */
+		if (conf->fib_priority != xconf->fib_priority) {
+			kr_fib_decouple();
+			kr_fib_update_prio(xconf->fib_priority);
+			conf->fib_priority = xconf->fib_priority;
+			kr_fib_couple();
 		}
+
 		goto done;
 	}
 
@@ -715,7 +739,7 @@ merge_config(struct ospfd_conf *conf, struct ospfd_conf *xconf)
 			}
 			if (a->dirty) {
 				a->dirty = 0;
-				orig_rtr_lsa(LIST_FIRST(&a->iface_list));
+				orig_rtr_lsa(LIST_FIRST(&a->iface_list)->area);
 			}
 		}
 	}
@@ -780,6 +804,8 @@ merge_interfaces(struct area *a, struct area *xa)
 			dirty = 1;
 		i->metric = xi->metric;
 		i->priority = xi->priority;
+		if (i->self)
+			i->self->priority = i->priority;
 		i->flags = xi->flags; /* needed? */
 		i->type = xi->type; /* needed? */
 		i->if_type = xi->if_type; /* needed? */

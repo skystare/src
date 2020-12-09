@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6_pcb.c,v 1.106 2018/09/11 21:04:03 bluhm Exp $	*/
+/*	$OpenBSD: in6_pcb.c,v 1.110 2019/11/29 16:41:01 nayden Exp $	*/
 
 /*
  * Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
@@ -305,7 +305,7 @@ in6_pcbconnect(struct inpcb *inp, struct mbuf *nam)
  * Get the local address/port, and put it in a sockaddr_in6.
  * This services the getsockname(2) call.
  */
-int
+void
 in6_setsockaddr(struct inpcb *inp, struct mbuf *nam)
 {
 	struct sockaddr_in6 *sin6;
@@ -320,15 +320,13 @@ in6_setsockaddr(struct inpcb *inp, struct mbuf *nam)
 	sin6->sin6_addr = inp->inp_laddr6;
 	/* KAME hack: recover scopeid */
 	in6_recoverscope(sin6, &inp->inp_laddr6);
-
-	return 0;
 }
 
 /*
  * Get the foreign address/port, and put it in a sockaddr_in6.
  * This services the getpeername(2) call.
  */
-int
+void
 in6_setpeeraddr(struct inpcb *inp, struct mbuf *nam)
 {
 	struct sockaddr_in6 *sin6;
@@ -343,8 +341,6 @@ in6_setpeeraddr(struct inpcb *inp, struct mbuf *nam)
 	sin6->sin6_addr = inp->inp_faddr6;
 	/* KAME hack: recover scopeid */
 	in6_recoverscope(sin6, &inp->inp_faddr6);
-
-	return 0;
 }
 
 /*
@@ -380,8 +376,8 @@ in6_pcbnotify(struct inpcbtable *table, struct sockaddr_in6 *dst,
 		return (0);
 	if (IN6_IS_ADDR_V4MAPPED(&dst->sin6_addr)) {
 #ifdef DIAGNOSTIC
-		printf("Huh?  Thought in6_pcbnotify() never got "
-		       "called with mapped!\n");
+		printf("%s: Huh?  Thought we never got "
+		       "called with mapped!\n", __func__);
 #endif
 		return (0);
 	}
@@ -474,7 +470,7 @@ in6_pcbnotify(struct inpcbtable *table, struct sockaddr_in6 *dst,
 		else if (!IN6_ARE_ADDR_EQUAL(&inp->inp_faddr6,
 					     &dst->sin6_addr) ||
 			 rtable_l2(inp->inp_rtableid) != rdomain ||
-			 inp->inp_socket == 0 ||
+			 inp->inp_socket == NULL ||
 			 (lport && inp->inp_lport != lport) ||
 			 (!IN6_IS_ADDR_UNSPECIFIED(&sa6_src.sin6_addr) &&
 			  !IN6_ARE_ADDR_EQUAL(&inp->inp_laddr6,

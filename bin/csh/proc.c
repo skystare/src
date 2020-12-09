@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.32 2018/09/08 01:28:39 miko Exp $	*/
+/*	$OpenBSD: proc.c,v 1.34 2020/08/30 22:23:47 mortimer Exp $	*/
 /*	$NetBSD: proc.c,v 1.9 1995/04/29 23:21:33 mycroft Exp $	*/
 
 /*-
@@ -45,6 +45,17 @@
 #include "extern.h"
 
 #define BIGINDEX	9	/* largest desirable job index */
+
+struct process proclist;        /* list head of all processes */
+bool    pnoprocesses;           /* pchild found nothing to wait for */
+
+struct process *pholdjob;       /* one level stack of current jobs */
+
+struct process *pcurrjob;       /* current job */
+struct process *pcurrent;       /* current job in table */
+struct process *pprevious;      /* previous job in table */
+
+int    pmaxindex;               /* current maximum job index */
 
 static struct rusage zru;
 
@@ -1042,7 +1053,7 @@ pkill(Char **v, int signum)
 		pstart(pp, 0);
 		goto cont;
 	    }
-	    if (kill(-pp->p_jobid, signum) < 0) {
+	    if (kill(-pp->p_jobid, signum) == -1) {
 		(void) fprintf(csherr, "%s: %s\n", vis_str(cp),
 			       strerror(errno));
 		err1++;
@@ -1062,7 +1073,7 @@ pkill(Char **v, int signum)
 		err1++;
 		goto cont;
 	    }
-	    if (kill((pid_t) pid, signum) < 0) {
+	    if (kill((pid_t) pid, signum) == -1) {
 		(void) fprintf(csherr, "%d: %s\n", pid, strerror(errno));
 		err1++;
 		goto cont;
@@ -1258,7 +1269,7 @@ pfork(struct command *t, int wanttty)
     sigemptyset(&sigset);
     sigaddset(&sigset, SIGCHLD);
     sigprocmask(SIG_BLOCK, &sigset, &osigset);
-    while ((pid = fork()) < 0)
+    while ((pid = fork()) == -1)
 	if (setintr == 0)
 	    (void) sleep(FORKSLEEP);
 	else {

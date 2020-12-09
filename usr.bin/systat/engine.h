@@ -1,4 +1,4 @@
-/* $Id: engine.h,v 1.9 2018/02/08 07:00:33 martijn Exp $	 */
+/* $OpenBSD: engine.h,v 1.12 2020/01/12 20:51:08 martijn Exp $	 */
 /*
  * Copyright (c) 2001, 2007 Can Erkin Acar <canacar@openbsd.org>
  *
@@ -53,7 +53,7 @@
 
 
 typedef struct {
-	char *title;
+	const char *title;
 	int norm_width;
 	int max_width;
 	int increment;
@@ -148,6 +148,7 @@ void foreach_view(void (*callback)(field_view *));
 extern int sortdir;
 extern useconds_t udelay;
 extern int dispstart;
+extern int humanreadable;
 extern int interactive;
 extern int averageonly;
 extern int maxprint;

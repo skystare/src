@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.69 2017/12/11 00:15:50 kettenis Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.71 2020/07/31 11:19:12 kettenis Exp $	*/
 /*	$NetBSD: cpu.c,v 1.13 2001/05/26 21:27:15 chs Exp $ */
 
 /*
@@ -57,7 +57,6 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
-#include <dev/rndvar.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -418,10 +417,8 @@ cpu_init(struct cpu_info *ci)
 	int err;
 #endif
 
-	if (CPU_ISSUN4U || CPU_ISSUN4US) {
-		tick_enable();
+	if (CPU_ISSUN4U || CPU_ISSUN4US)
 		return;
-	}
 
 #ifdef SUN4V
 #define MONDO_QUEUE_SIZE	32

@@ -1,4 +1,4 @@
-/* $OpenBSD: pms.c,v 1.87 2018/05/13 14:48:19 bru Exp $ */
+/* $OpenBSD: pms.c,v 1.95 2020/10/23 22:06:27 bru Exp $ */
 /* $NetBSD: psm.c,v 1.11 2000/06/05 22:20:57 sommerfeld Exp $ */
 
 /*-
@@ -142,7 +142,9 @@ struct elantech_softc {
 
 	int max_x, max_y;
 	int old_x, old_y;
+	int initial_pkt;
 };
+#define ELANTECH_IS_CLICKPAD(sc) (((sc)->elantech->fw_version & 0x1000) != 0)
 
 struct pms_softc {		/* driver status information */
 	struct device sc_dev;
@@ -303,7 +305,7 @@ void	pms_proc_elantech_v3(struct pms_softc *);
 void	pms_proc_elantech_v4(struct pms_softc *);
 
 int	synaptics_knock(struct pms_softc *);
-int	synaptics_set_mode(struct pms_softc *, int);
+int	synaptics_set_mode(struct pms_softc *, int, int);
 int	synaptics_query(struct pms_softc *, int, int *);
 int	synaptics_get_hwinfo(struct pms_softc *);
 void	synaptics_sec_proc(struct pms_softc *);
@@ -921,6 +923,19 @@ pms_sec_ioctl(void *v, u_long cmd, caddr_t data, int flag, struct proc *p)
 	return (0);
 }
 
+#ifdef DIAGNOSTIC
+static inline void
+pms_print_packet(struct pms_softc *sc)
+{
+	int i, state, size;
+
+	state = sc->inputstate;
+	size = sc->protocol->packetsize;
+	for (i = 0; i < size; i++)
+		printf(i == state ? " %02x |" : " %02x", sc->packet[i]);
+}
+#endif
+
 void
 pmsinput(void *vsc, int data)
 {
@@ -936,8 +951,10 @@ pmsinput(void *vsc, int data)
 	if (sc->protocol->sync(sc, data)) {
 #ifdef DIAGNOSTIC
 		printf("%s: not in sync yet, discard input "
-		    "(state = %d, data = %#x)\n",
-		    DEVNAME(sc), sc->inputstate, data);
+		    "(state = %d,",
+		    DEVNAME(sc), sc->inputstate);
+		pms_print_packet(sc);
+		printf(")\n");
 #endif
 
 		sc->inputstate = 0;
@@ -954,15 +971,22 @@ pmsinput(void *vsc, int data)
 }
 
 int
-synaptics_set_mode(struct pms_softc *sc, int mode)
+synaptics_set_mode(struct pms_softc *sc, int mode, int rate)
 {
 	struct synaptics_softc *syn = sc->synaptics;
 
 	if (pms_spec_cmd(sc, mode) ||
-	    pms_set_rate(sc, SYNAPTICS_CMD_SET_MODE))
+	    pms_set_rate(sc, rate == 0 ? SYNAPTICS_CMD_SET_MODE : rate))
 		return (-1);
 
-	syn->mode = mode;
+	/*
+	 * Make sure that the set mode command has finished.
+	 * Otherwise enabling the device before that will make it fail.
+	 */
+	delay(10000);
+
+	if (rate == 0)
+		syn->mode = mode;
 
 	return (0);
 }
@@ -1164,27 +1188,34 @@ pms_enable_synaptics(struct pms_softc *sc)
 		    nitems(synaptics_params)))
 			goto err;
 
-		printf("%s: Synaptics %s, firmware %d.%d, 0x%x 0x%x\n",
+		printf("%s: Synaptics %s, firmware %d.%d, "
+		    "0x%x 0x%x 0x%x 0x%x 0x%x\n",
 		    DEVNAME(sc),
 		    (syn->ext_capabilities & SYNAPTICS_EXT_CAP_CLICKPAD ?
 			"clickpad" : "touchpad"),
 		    SYNAPTICS_ID_MAJOR(syn->identify),
 		    SYNAPTICS_ID_MINOR(syn->identify),
-		    syn->model, syn->ext_model);
+		    syn->model, syn->ext_model, syn->modes,
+		    syn->capabilities, syn->ext_capabilities);
 	}
 
+	/*
+	 * Enable absolute mode, plain W-mode and "advanced gesture mode"
+	 * (AGM), if possible.  AGM, which seems to be a prerequisite for the
+	 * extended W-mode, might not always be necessary here, but at least
+	 * some older Synaptics models do not report finger counts without it.
+	 */
 	mode = SYNAPTICS_ABSOLUTE_MODE | SYNAPTICS_HIGH_RATE;
-	if (SYNAPTICS_ID_MAJOR(syn->identify) >= 4)
-		mode |= SYNAPTICS_DISABLE_GESTURE;
 	if (syn->capabilities & SYNAPTICS_CAP_EXTENDED)
 		mode |= SYNAPTICS_W_MODE;
-	if (synaptics_set_mode(sc, mode))
+	else if (SYNAPTICS_ID_MAJOR(syn->identify) >= 4)
+		mode |= SYNAPTICS_DISABLE_GESTURE;
+	if (synaptics_set_mode(sc, mode, 0))
 		goto err;
 
-	/* enable advanced gesture mode if supported */
-	if ((syn->ext_capabilities & SYNAPTICS_EXT_CAP_ADV_GESTURE) &&
-	    (pms_spec_cmd(sc, SYNAPTICS_QUE_MODEL) ||
-	     pms_set_rate(sc, SYNAPTICS_CMD_SET_ADV_GESTURE_MODE)))
+	if (SYNAPTICS_SUPPORTS_AGM(syn->ext_capabilities) &&
+	    synaptics_set_mode(sc, SYNAPTICS_QUE_MODEL,
+	        SYNAPTICS_CMD_SET_ADV_GESTURE_MODE))
 		goto err;
 
 	return (1);
@@ -1272,17 +1303,17 @@ pms_proc_synaptics(struct pms_softc *sc)
 	}
 
 
-	if ((syn->capabilities & SYNAPTICS_CAP_PASSTHROUGH) && w == 3) {
-		synaptics_sec_proc(sc);
+	if (w == 3) {
+		if (syn->capabilities & SYNAPTICS_CAP_PASSTHROUGH)
+			synaptics_sec_proc(sc);
 		return;
 	}
 
 	if ((sc->sc_dev_enable & PMS_DEV_PRIMARY) == 0)
 		return;
 
-	/* XXX ignore advanced gesture packet, not yet supported */
-	if ((syn->ext_capabilities & SYNAPTICS_EXT_CAP_ADV_GESTURE) && w == 2)
-		return;
+	if (w == 2)
+		return;	/* EW-mode packets are not expected here. */
 
 	x = ((sc->packet[3] & 0x10) << 8) | ((sc->packet[1] & 0x0f) << 8) |
 	    sc->packet[4];
@@ -1357,7 +1388,7 @@ pms_disable_synaptics(struct pms_softc *sc)
 
 	if (syn->capabilities & SYNAPTICS_CAP_SLEEP)
 		synaptics_set_mode(sc, SYNAPTICS_SLEEP_MODE |
-		    SYNAPTICS_DISABLE_GESTURE);
+		    SYNAPTICS_DISABLE_GESTURE, 0);
 }
 
 int
@@ -1939,13 +1970,14 @@ elantech_get_hwinfo_v4(struct pms_softc *sc)
 	if (synaptics_query(sc, ELANTECH_QUE_FW_VER, &fw_version))
 		return (-1);
 
-	if ((fw_version & 0x0f0000) >> 16 != 6
-	    && (fw_version & 0x0f0000) >> 16 != 8
-	    && (fw_version & 0x0f0000) >> 16 != 15)
+	if ((fw_version & 0x0f0000) >> 16 < 6)
 		return (-1);
 
 	elantech->fw_version = fw_version;
 	elantech->flags |= ELANTECH_F_REPORTS_PRESSURE;
+
+	if ((fw_version & 0x4000) == 0x4000)
+		elantech->flags |= ELANTECH_F_CRC_ENABLED;
 
 	if (elantech_set_absolute_mode_v4(sc))
 		return (-1);
@@ -1969,7 +2001,8 @@ elantech_get_hwinfo_v4(struct pms_softc *sc)
 		elantech->flags |= ELANTECH_F_TRACKPOINT;
 
 	hw->type = WSMOUSE_TYPE_ELANTECH;
-	hw->hw_type = WSMOUSEHW_CLICKPAD;
+	hw->hw_type = (ELANTECH_IS_CLICKPAD(sc)
+	    ? WSMOUSEHW_CLICKPAD : WSMOUSEHW_TOUCHPAD);
 	hw->mt_slots = ELANTECH_MAX_FINGERS;
 
 	elantech->width = hw->x_max / (capabilities[1] - 1);
@@ -2173,8 +2206,9 @@ pms_enable_elantech_v4(struct pms_softc *sc)
 			goto err;
 		}
 
-		printf("%s: Elantech Clickpad, version %d, firmware 0x%x\n",
-		    DEVNAME(sc), 4, sc->elantech->fw_version);
+		printf("%s: Elantech %s, version 4, firmware 0x%x\n",
+		    DEVNAME(sc), (ELANTECH_IS_CLICKPAD(sc) ?  "Clickpad"
+		    : "Touchpad"), sc->elantech->fw_version);
 
 		if (sc->elantech->flags & ELANTECH_F_TRACKPOINT) {
 			a.accessops = &pms_sec_accessops;
@@ -2259,7 +2293,12 @@ pms_sync_elantech_v1(struct pms_softc *sc, int data)
 	}
 
 	if (data < 0 || data >= nitems(elantech->parity) ||
-	    elantech->parity[data] != p)
+	/*
+	 * FW 0x20022 sends inverted parity bits on cold boot, returning
+	 * to normal after suspend & resume, so the parity check is
+	 * disabled for this one.
+	 */
+	    (elantech->fw_version != 0x20022 && elantech->parity[data] != p))
 		return (-1);
 
 	return (0);
@@ -2344,28 +2383,33 @@ pms_sync_elantech_v3(struct pms_softc *sc, int data)
 
 /* Extract the type bits from packet[3]. */
 static inline int
-elantech_packet_type(u_char b)
+elantech_packet_type(struct elantech_softc *elantech, u_char b)
 {
-	return ((b & 4) ? (b & 0xcf) : (b & 0x1f));
+	/*
+	 * This looks dubious, but in the "crc-enabled" format bit 2 may
+	 * be set even in MOTION packets.
+	 */
+	if ((elantech->flags & ELANTECH_F_TRACKPOINT) && ((b & 0x0f) == 0x06))
+		return (ELANTECH_PKT_TRACKPOINT);
+	else
+		return (b & 0x03);
 }
 
 int
 pms_sync_elantech_v4(struct pms_softc *sc, int data)
 {
-	if (sc->inputstate == 0) {
-		if ((data & 0x0c) == 0x04)
-			return (0);
-		if ((sc->elantech->flags & ELANTECH_F_TRACKPOINT)
-		    && (data & 0xc8) == 0)
-			return (0);
-		return (-1);
-	}
+	if (sc->inputstate == 0)
+		return ((data & 0x08) == 0 ? 0 : -1);
+
 	if (sc->inputstate == 3) {
-		switch (elantech_packet_type(data)) {
+		switch (elantech_packet_type(sc->elantech, data)) {
 		case ELANTECH_V4_PKT_STATUS:
 		case ELANTECH_V4_PKT_HEAD:
 		case ELANTECH_V4_PKT_MOTION:
-			return ((sc->packet[0] & 4) ? 0 : -1);
+			if (sc->elantech->flags & ELANTECH_F_CRC_ENABLED)
+				return ((data & 0x08) == 0 ? 0 : -1);
+			else
+				return ((data & 0x1c) == 0x10 ? 0 : -1);
 		case ELANTECH_PKT_TRACKPOINT:
 			return ((sc->packet[0] & 0xc8) == 0
 			    && sc->packet[1] == ((data & 0x10) << 3)
@@ -2400,15 +2444,29 @@ pms_proc_elantech_v1(struct pms_softc *sc)
 	else
 		w = (sc->packet[0] & 0xc0) >> 6;
 
+	/*
+	 * Firmwares 0x20022 and 0x20600 have a bug, position data in the
+	 * first two reports for single-touch contacts may be corrupt.
+	 */
+	if (elantech->fw_version == 0x20022 ||
+	    elantech->fw_version == 0x20600) {
+		if (w == 1) {
+			if (elantech->initial_pkt < 2) {
+				elantech->initial_pkt++;
+				return;
+			}
+		} else if (elantech->initial_pkt) {
+			elantech->initial_pkt = 0;
+		}
+	}
+
 	/* Hardware version 1 doesn't report pressure. */
 	if (w) {
 		x = ((sc->packet[1] & 0x0c) << 6) | sc->packet[2];
 		y = ((sc->packet[1] & 0x03) << 8) | sc->packet[3];
 		z = SYNAPTICS_PRESSURE;
 	} else {
-		x = elantech->old_x;
-		y = elantech->old_y;
-		z = 0;
+		x = y = z = 0;
 	}
 
 	WSMOUSE_TOUCH(sc->sc_wsmousedev, buttons, x, y, z, w);
@@ -2445,9 +2503,7 @@ pms_proc_elantech_v2(struct pms_softc *sc)
 		y = (((sc->packet[0] & 0x20) << 3) | sc->packet[2]) << 2;
 		z = SYNAPTICS_PRESSURE;
 	} else {
-		x = elantech->old_x;
-		y = elantech->old_y;
-		z = 0;
+		x = y = z = 0;
 	}
 
 	WSMOUSE_TOUCH(sc->sc_wsmousedev, buttons, x, y, z, w);
@@ -2515,7 +2571,7 @@ pms_proc_elantech_v4(struct pms_softc *sc)
 	int id, weight, n, x, y, z;
 	u_int buttons, slots;
 
-	switch (elantech_packet_type(sc->packet[3])) {
+	switch (elantech_packet_type(elantech, sc->packet[3])) {
 	case ELANTECH_V4_PKT_STATUS:
 		slots = elantech->mt_slots;
 		elantech->mt_slots = sc->packet[1] & 0x1f;

@@ -1,4 +1,4 @@
-/* $OpenBSD: imxuart.c,v 1.4 2018/08/06 10:52:30 patrick Exp $ */
+/* $OpenBSD: imxuart.c,v 1.8 2019/07/19 00:17:15 cheloha Exp $ */
 /*
  * Copyright (c) 2005 Dale Rahn <drahn@motorola.com>
  *
@@ -182,6 +182,7 @@ imxuart_attach(struct device *parent, struct device *self, void *aux)
 				break;
 		cn_tab->cn_dev = makedev(maj, sc->sc_dev.dv_unit);
 
+		SET(sc->sc_hwflags, COM_HW_CONSOLE);
 		printf(": console");
 	}
 
@@ -224,11 +225,21 @@ imxuart_intr(void *arg)
 	p = sc->sc_ibufp;
 
 	while(ISSET(bus_space_read_2(iot, ioh, IMXUART_USR2), IMXUART_SR2_RDR)) {
-		c = bus_space_read_1(iot, ioh, IMXUART_URXD);
+		c = bus_space_read_2(iot, ioh, IMXUART_URXD);
+		if (ISSET(c, IMXUART_RX_BRK)) {
+#ifdef DDB
+			if (ISSET(sc->sc_hwflags, COM_HW_CONSOLE)) {
+				if (db_console)
+					db_enter();
+				continue;
+			}
+#endif
+			c &= ~0xff;
+		}
 		if (p >= sc->sc_ibufend) {
 			sc->sc_floods++;
 			if (sc->sc_errors++ == 0)
-				timeout_add(&sc->sc_diag_tmo, 60 * hz);
+				timeout_add_sec(&sc->sc_diag_tmo, 60);
 		} else {
 			*p++ = c;
 			if (p == sc->sc_ibufhigh &&
@@ -290,7 +301,7 @@ imxuart_param(struct tty *tp, struct termios *t)
 		while (ISSET(tp->t_state, TS_BUSY)) {
 			++sc->sc_halt;
 			error = ttysleep(tp, &tp->t_outq,
-			    TTOPRI | PCATCH, "imxuartprm", 0);
+			    TTOPRI | PCATCH, "imxuartprm");
 			--sc->sc_halt;
 			if (error) {
 				imxuart_start(tp);
@@ -457,7 +468,7 @@ imxuart_softint(void *arg)
 		if (ISSET(c, IMXUART_RX_OVERRUN)) {
 			sc->sc_overflows++;
 			if (sc->sc_errors++ == 0)
-				timeout_add(&sc->sc_diag_tmo, 60 * hz);
+				timeout_add_sec(&sc->sc_diag_tmo, 60);
 		}
 		/* This is ugly, but fast. */
 
@@ -587,7 +598,7 @@ imxuartopen(dev_t dev, int flag, int mode, struct proc *p)
 				!ISSET(tp->t_state, TS_CARR_ON))) {
 				SET(tp->t_state, TS_WOPEN);
 				error = ttysleep(tp, &tp->t_rawq,
-				    TTIPRI | PCATCH, ttopen, 0);
+				    TTIPRI | PCATCH, ttopen);
 				/*
 				 * If TS_WOPEN has been reset, that means the
 				 * cua device has been closed.  We don't want
@@ -629,7 +640,7 @@ imxuartclose(dev_t dev, int flag, int mode, struct proc *p)
 		/* tty device is waiting for carrier; drop dtr then re-raise */
 		CLR(sc->sc_ucr3, IMXUART_CR3_DSR);
 		bus_space_write_2(iot, ioh, IMXUART_UCR3, sc->sc_ucr3);
-		timeout_add(&sc->sc_dtr_tmo, hz * 2);
+		timeout_add_sec(&sc->sc_dtr_tmo, 2);
 	} else {
 		/* no one else waiting; turn off the uart */
 		imxuart_pwroff(sc);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: locore.S,v 1.17 2018/02/18 14:50:08 visa Exp $ */
+/*	$OpenBSD: locore.S,v 1.21 2020/07/11 15:18:08 visa Exp $ */
 
 /*
  * Copyright (c) 2001-2004 Opsycon AB  (www.opsycon.se / www.opsycon.com)
@@ -37,6 +37,7 @@
 #include <octeon/dev/cn30xxcorereg.h>
 
 #include "assym.h"
+#include "octboot.h"
 
 #define RNG_CONTROL_ADDR	0x9001180040000000
 #define RNG_CONTROL_ENABLE	0x3
@@ -88,6 +89,17 @@ locore_start:
 	nop
 	j	hw_cpu_spinup_trampoline
 	nop
+#elif NOCTBOOT > 0
+	LA	t0, octeon_boot_ready
+1:	lw	t1, (t0)
+	beq	t1, zero, 1b
+	nop
+
+	LA	t0, octeon_boot_entry
+	ld	t0, (t0)			# get entry point
+	cache	1, 0(zero)			# flush and invalidate dcache
+	jr	t0
+	cache	0, 0(zero)			# invalidate icache
 #else
 	/* Halt extra cores on single-processor kernel. */
 1:	wait
@@ -123,9 +135,20 @@ locore_start:
 	sd	v0, -8(t0)			# store to randomdata
 
 	/*
+	 * Clear the compiled BSS segment in OpenBSD code.
+	 * U-Boot is supposed to have done this, though.
+	 */
+	LA	t0, edata
+	LA	t1, end
+1:
+	daddu	t0, t0, 8
+	blt	t0, t1, 1b
+	sd	zero, -8(t0)
+
+	/*
 	 * Initialize stack and call machine startup.
 	 */
-	LA	t0, start - FRAMESZ(CF_SZ)
+	LA	t0, initstack_end - FRAMESZ(CF_SZ)
 	PTR_S	ra, CF_RA_OFFS(t0)		# save uboot return address
 	PTR_S	sp, 0(t0)			# and stack
 	move	sp, t0
@@ -147,6 +170,38 @@ locore_start:
 	nop
 	.end	locore_start
 
+/*
+ * void octeon_sync_tc(vaddr_t reg, uint64_t mul, uint64_t frac)
+ */
+LEAF(octeon_sync_tc, 0)
+	/*
+	 * The measurement is done several times in a loop.
+	 * The initial iterations warm up the icache and train the branch
+	 * predictor to reduce jitter.
+	 * The final iteration performs the actual synchronization.
+	 */
+	li	t0, 5				# set number of iterations
+	di	t3				# disable all interrupts
+	MTC0_SR_IE_HAZARD
+1:
+	ld	t1, (a0)			# load data clock counter
+	dmultu	t1, a1				# multiply with mul
+	mflo	t1				# fetch result
+	beqz	a2, 2f				# skip if frac == 2^64
+	subu	t0, 1
+	dmultu	t1, a2				# multiply with frac
+	mfhi	t1				# fetch result divided by 2^64
+2:
+	mtc0	t1, COP_0_COUNT			# set core clock counter
+	MTC0_HAZARD
+	bnez	t0, 1b
+	nop
+	mtc0	t3, COP_0_STATUS_REG		# restore status register
+	MTC0_SR_IE_HAZARD
+	jr	ra
+	nop
+END(octeon_sync_tc)
+
 #if defined(MULTIPROCESSOR)
 LEAF(hw_cpu_spinup_trampoline, 0)
 	LA	t0, cpu_spinup_a0
@@ -157,3 +212,12 @@ LEAF(hw_cpu_spinup_trampoline, 0)
 	nop
 END(hw_cpu_spinup_trampoline)
 #endif /* MULTIPROCESSOR */
+
+/*
+ * Bootstrap stack for mips_init()
+ */
+	.bss
+	.align	3
+initstack:
+	.space	4096
+initstack_end:

@@ -1,4 +1,4 @@
-/*	$OpenBSD: aacvar.h,v 1.13 2016/04/01 04:16:27 jsg Exp $	*/
+/*	$OpenBSD: aacvar.h,v 1.15 2020/07/22 13:16:04 krw Exp $	*/
 
 /*-
  * Copyright (c) 2000 Michael Smith
@@ -315,7 +315,6 @@ struct aac_softc
 {
 	struct device aac_dev;
 	void   *aac_ih;
-	struct	scsi_link aac_link;	/* Virtual SCSI bus for cache devs */
 
 	bus_space_tag_t aac_memt;
 	bus_space_handle_t aac_memh;
@@ -429,11 +428,6 @@ int	aac_attach(struct aac_softc *);
 int	aac_intr(void *);
 
 /* These all require correctly aligned buffers */
-static __inline__ void aac_enc16(u_int8_t *, u_int16_t);
-static __inline__ void aac_enc32(u_int8_t *, u_int32_t);
-static __inline__ u_int16_t aac_dec16(u_int8_t *);
-static __inline__ u_int32_t aac_dec32(u_int8_t *);
-
 static __inline__ void
 aac_enc16(addr, value)
 	u_int8_t *addr;

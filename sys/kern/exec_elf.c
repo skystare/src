@@ -1,4 +1,4 @@
-/*	$OpenBSD: exec_elf.c,v 1.146 2018/08/05 14:23:57 beck Exp $	*/
+/*	$OpenBSD: exec_elf.c,v 1.156 2020/12/07 16:55:28 mpi Exp $	*/
 
 /*
  * Copyright (c) 1996 Per Fogelstrom
@@ -85,6 +85,7 @@
 #include <sys/signalvar.h>
 #include <sys/stat.h>
 #include <sys/pledge.h>
+#include <sys/smr.h>
 
 #include <sys/mman.h>
 
@@ -103,8 +104,8 @@ int	coredump_elf(struct proc *, void *);
 void	*elf_copyargs(struct exec_package *, struct ps_strings *, void *,
 	    void *);
 int	exec_elf_fixup(struct proc *, struct exec_package *);
-int	elf_os_pt_note(struct proc *, struct exec_package *, Elf_Ehdr *,
-	    char *, size_t, size_t);
+int	elf_os_pt_note_name(Elf_Note *);
+int	elf_os_pt_note(struct proc *, struct exec_package *, Elf_Ehdr *, int *);
 
 extern char sigcode[], esigcode[], sigcoderet[];
 #ifdef SYSCALL_DEBUG
@@ -124,7 +125,7 @@ extern char *syscallnames[];
 /*
  * How many entries are in the AuxInfo array we pass to the process?
  */
-#define ELF_AUX_ENTRIES	8
+#define ELF_AUX_ENTRIES	9
 
 /*
  * This is the OpenBSD ELF emul
@@ -149,6 +150,20 @@ struct emul emul_elf = {
 	esigcode,
 	sigcoderet
 };
+
+#define ELF_NOTE_NAME_OPENBSD	0x01
+#define ELF_NOTE_NAME_GO	0x02
+
+struct elf_note_name {
+	char *name;
+	int id;
+} elf_note_names[] = {
+	{ "OpenBSD",	ELF_NOTE_NAME_OPENBSD },
+	{ "Go",		ELF_NOTE_NAME_GO }
+};
+
+#define	ELFROUNDSIZE	sizeof(Elf_Word)
+#define	elfround(x)	roundup((x), ELFROUNDSIZE)
 
 /*
  * Copy arguments onto the stack in the normal way, but add some
@@ -456,7 +471,7 @@ elf_load_file(struct proc *p, char *path, struct exec_package *epp,
 				addr = ph[i].p_vaddr - base_ph->p_vaddr;
 			}
 			elf_load_psection(&epp->ep_vmcmds, nd.ni_vp,
-			    &ph[i], &addr, &size, &prot, flags);
+			    &ph[i], &addr, &size, &prot, flags | VMCMD_SYSCALL);
 			/* If entry is within this section it must be text */
 			if (eh.e_entry >= ph[i].p_vaddr &&
 			    eh.e_entry < (ph[i].p_vaddr + size)) {
@@ -515,7 +530,7 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 	Elf_Ehdr *eh = epp->ep_hdr;
 	Elf_Phdr *ph, *pp, *base_ph = NULL;
 	Elf_Addr phdr = 0, exe_base = 0;
-	int error, i, has_phdr = 0;
+	int error, i, has_phdr = 0, names = 0;
 	char *interp = NULL;
 	u_long phsize;
 	size_t randomizequota = ELF_RANDOMIZE_LIMIT;
@@ -596,10 +611,10 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 	 * Verify this is an OpenBSD executable.  If it's marked that way
 	 * via a PT_NOTE then also check for a PT_OPENBSD_WXNEEDED segment.
 	 */
-	if (eh->e_ident[EI_OSABI] != ELFOSABI_OPENBSD && (error =
-	    elf_os_pt_note(p, epp, epp->ep_hdr, "OpenBSD", 8, 4)) != 0) {
+	if ((error = elf_os_pt_note(p, epp, epp->ep_hdr, &names)) != 0)
 		goto bad;
-	}
+	if (eh->e_ident[EI_OSABI] == ELFOSABI_OPENBSD)
+		names |= ELF_NOTE_NAME_OPENBSD;
 
 	/*
 	 * Load all the necessary sections
@@ -621,6 +636,16 @@ exec_elf_makecmds(struct proc *p, struct exec_package *epp)
 				}
 			} else
 				addr = ELF_NO_ADDR;
+
+			/* Permit system calls in specific main-programs */
+			if (names & ELF_NOTE_NAME_GO) {
+				/* go main-binaries; we await a libc future */
+				flags |= VMCMD_SYSCALL;
+			} else if (interp == NULL) {
+				/* statics. Also block the ld.so syscall-grant */
+				flags |= VMCMD_SYSCALL;
+				p->p_vmspace->vm_map.flags |= VM_MAP_SYSCALL_ONCE;
+			}
 
 			/*
 			 * Calculates size of text and data segments
@@ -836,6 +861,10 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 		a->au_v = ap->arg_entry;
 		a++;
 
+		a->au_id = AUX_openbsd_timekeep;
+		a->au_v = p->p_p->ps_timekeep;
+		a++;
+
 		a->au_id = AUX_null;
 		a->au_v = 0;
 		a++;
@@ -849,14 +878,35 @@ exec_elf_fixup(struct proc *p, struct exec_package *epp)
 }
 
 int
-elf_os_pt_note(struct proc *p, struct exec_package *epp, Elf_Ehdr *eh,
-    char *os_name, size_t name_size, size_t desc_size)
+elf_os_pt_note_name(Elf_Note *np)
 {
-	char pathbuf[MAXPATHLEN];
+	int i, j;
+
+	for (i = 0; i < nitems(elf_note_names); i++) {
+		size_t namlen = strlen(elf_note_names[i].name);
+		if (np->namesz < namlen)
+			continue;
+		/* verify name padding (after the NUL) is NUL */
+		for (j = namlen + 1; j < elfround(np->namesz); j++)
+			if (((char *)(np + 1))[j] != '\0')
+				continue;		
+		/* verify desc padding is NUL */
+		for (j = np->descsz; j < elfround(np->descsz); j++)
+			if (((char *)(np + 1))[j] != '\0')
+				continue;		
+		if (strcmp((char *)(np + 1), elf_note_names[i].name) == 0)
+			return elf_note_names[i].id;
+	}
+	return (0);
+}
+
+int
+elf_os_pt_note(struct proc *p, struct exec_package *epp, Elf_Ehdr *eh, int *namesp)
+{
 	Elf_Phdr *hph, *ph;
 	Elf_Note *np = NULL;
-	size_t phsize;
-	int error;
+	size_t phsize, offset, pfilesz = 0, total;
+	int error, names = 0;
 
 	hph = mallocarray(eh->e_phnum, sizeof(Elf_Phdr), M_TEMP, M_WAITOK);
 	phsize = eh->e_phnum * sizeof(Elf_Phdr);
@@ -866,63 +916,43 @@ elf_os_pt_note(struct proc *p, struct exec_package *epp, Elf_Ehdr *eh,
 
 	for (ph = hph;  ph < &hph[eh->e_phnum]; ph++) {
 		if (ph->p_type == PT_OPENBSD_WXNEEDED) {
-			int wxallowed = (epp->ep_vp->v_mount &&
-			    (epp->ep_vp->v_mount->mnt_flag & MNT_WXALLOWED));
-			
-			if (!wxallowed) {
-				error = copyinstr(epp->ep_name, &pathbuf,
-				    sizeof(pathbuf), NULL);
-				log(LOG_NOTICE,
-				    "%s(%d): W^X binary outside wxallowed mountpoint\n",
-				    error ? "" : pathbuf, p->p_p->ps_pid);
-				error = EACCES;
-				goto out1;
-			}
 			epp->ep_flags |= EXEC_WXNEEDED;
-			break;
+			continue;
 		}
-	}
 
-	for (ph = hph;  ph < &hph[eh->e_phnum]; ph++) {
-		if (ph->p_type != PT_NOTE ||
-		    ph->p_filesz > 1024 ||
-		    ph->p_filesz < sizeof(Elf_Note) + name_size)
+		if (ph->p_type != PT_NOTE || ph->p_filesz > 1024)
 			continue;
 
-		np = malloc(ph->p_filesz, M_TEMP, M_WAITOK);
+		if (np && ph->p_filesz != pfilesz) {
+			free(np, M_TEMP, pfilesz);
+			np = NULL;
+		}
+		if (!np)
+			np = malloc(ph->p_filesz, M_TEMP, M_WAITOK);
+		pfilesz = ph->p_filesz;
 		if ((error = elf_read_from(p, epp->ep_vp, ph->p_offset,
 		    np, ph->p_filesz)) != 0)
 			goto out2;
 
-#if 0
-		if (np->type != ELF_NOTE_TYPE_OSVERSION) {
-			free(np, M_TEMP, ph->p_filesz);
-			np = NULL;
-			continue;
+		for (offset = 0; offset < ph->p_filesz; offset += total) {
+			Elf_Note *np2 = (Elf_Note *)((char *)np + offset);
+
+			if (offset + sizeof(Elf_Note) > ph->p_filesz)
+				break;
+			total = sizeof(Elf_Note) + elfround(np2->namesz) +
+			    elfround(np2->descsz);
+			if (offset + total > ph->p_filesz)
+				break;
+			names |= elf_os_pt_note_name(np2);
 		}
-#endif
-
-		/* Check the name and description sizes. */
-		if (np->namesz != name_size ||
-		    np->descsz != desc_size)
-			goto out3;
-
-		if (memcmp((np + 1), os_name, name_size))
-			goto out3;
-
-		/* XXX: We could check for the specific emulation here */
-		/* All checks succeeded. */
-		error = 0;
-		goto out2;
 	}
 
-out3:
-	error = ENOEXEC;
 out2:
-	free(np, M_TEMP, ph->p_filesz);
+	free(np, M_TEMP, pfilesz);
 out1:
 	free(hph, M_TEMP, phsize);
-	return error;
+	*namesp = names;
+	return ((names & ELF_NOTE_NAME_OPENBSD) ? 0 : ENOEXEC);
 }
 
 /*
@@ -956,9 +986,6 @@ int	coredump_notes_elf(struct proc *, void *, size_t *);
 int	coredump_note_elf(struct proc *, void *, size_t *);
 int	coredump_writenote_elf(struct proc *, void *, Elf_Note *,
 	    const char *, void *);
-
-#define	ELFROUNDSIZE	4	/* XXX Should it be sizeof(Elf_Word)? */
-#define	elfround(x)	roundup((x), ELFROUNDSIZE)
 
 int
 coredump_elf(struct proc *p, void *cookie)
@@ -1035,6 +1062,36 @@ out:
 }
 
 
+/*
+ * Normally we lay out core files like this:
+ *	[ELF Header] [Program headers] [Notes] [data for PT_LOAD segments]
+ *
+ * However, if there's >= 65535 segments then it overflows the field
+ * in the ELF header, so the standard specifies putting a magic
+ * number there and saving the real count in the .sh_info field of
+ * the first *section* header...which requires generating a section
+ * header.  To avoid confusing tools, we include an .shstrtab section
+ * as well so all the indexes look valid.  So in this case we lay
+ * out the core file like this:
+ *	[ELF Header] [Section Headers] [.shstrtab] [Program headers] \
+ *	[Notes] [data for PT_LOAD segments]
+ *
+ * The 'shstrtab' structure below is data for the second of the two
+ * section headers, plus the .shstrtab itself, in one const buffer.
+ */
+static const struct {
+    Elf_Shdr	shdr;
+    char	shstrtab[sizeof(ELF_SHSTRTAB) + 1];
+} shstrtab = {
+    .shdr = {
+	.sh_name = 1,			/* offset in .shstrtab below */
+	.sh_type = SHT_STRTAB,
+	.sh_offset = sizeof(Elf_Ehdr) + 2*sizeof(Elf_Shdr),
+	.sh_size = sizeof(ELF_SHSTRTAB) + 1,
+	.sh_addralign = 1,
+    },
+    .shstrtab = "\0" ELF_SHSTRTAB,
+};
 
 int
 coredump_setup_elf(int segment_count, void *cookie)
@@ -1066,15 +1123,26 @@ coredump_setup_elf(int segment_count, void *cookie)
 	ehdr.e_machine = ELF_TARG_MACH;
 	ehdr.e_version = EV_CURRENT;
 	ehdr.e_entry = 0;
-	ehdr.e_phoff = sizeof(ehdr);
-	ehdr.e_shoff = 0;
 	ehdr.e_flags = 0;
 	ehdr.e_ehsize = sizeof(ehdr);
 	ehdr.e_phentsize = sizeof(Elf_Phdr);
-	ehdr.e_phnum = ws->npsections;
-	ehdr.e_shentsize = 0;
-	ehdr.e_shnum = 0;
-	ehdr.e_shstrndx = 0;
+
+	if (ws->npsections < PN_XNUM) {
+		ehdr.e_phoff = sizeof(ehdr);
+		ehdr.e_shoff = 0;
+		ehdr.e_phnum = ws->npsections;
+		ehdr.e_shentsize = 0;
+		ehdr.e_shnum = 0;
+		ehdr.e_shstrndx = 0;
+	} else {
+		/* too many segments, use extension setup */
+		ehdr.e_shoff = sizeof(ehdr);
+		ehdr.e_phnum = PN_XNUM;
+		ehdr.e_shentsize = sizeof(Elf_Shdr);
+		ehdr.e_shnum = 2;
+		ehdr.e_shstrndx = 1;
+		ehdr.e_phoff = shstrtab.shdr.sh_offset + shstrtab.shdr.sh_size;
+	}
 
 	/* Write out the ELF header. */
 	error = coredump_write(ws->iocookie, UIO_SYSSPACE, &ehdr, sizeof(ehdr));
@@ -1082,14 +1150,32 @@ coredump_setup_elf(int segment_count, void *cookie)
 		return error;
 
 	/*
+	 * If an section header is needed to store extension info, write
+	 * it out after the ELF header and before the program header.
+	 */
+	if (ehdr.e_shnum != 0) {
+		Elf_Shdr shdr = { .sh_info = ws->npsections };
+		error = coredump_write(ws->iocookie, UIO_SYSSPACE, &shdr,
+		    sizeof shdr);
+		if (error)
+			return error;
+		error = coredump_write(ws->iocookie, UIO_SYSSPACE, &shstrtab,
+		    sizeof(shstrtab.shdr) + sizeof(shstrtab.shstrtab));
+		if (error)
+			return error;
+	}
+
+	/*
 	 * Allocate the segment header array and setup to collect
 	 * the section sizes and offsets
 	 */
 	ws->psections = mallocarray(ws->npsections, sizeof(Elf_Phdr),
-	    M_TEMP, M_WAITOK|M_ZERO);
+	    M_TEMP, M_WAITOK|M_CANFAIL|M_ZERO);
+	if (ws->psections == NULL)
+		return ENOMEM;
 	ws->psectionslen = ws->npsections * sizeof(Elf_Phdr);
 
-	ws->notestart = sizeof(ehdr) + ws->psectionslen;
+	ws->notestart = ehdr.e_phoff + ws->psectionslen;
 	ws->secstart = ws->notestart + ws->notesize;
 	ws->secoff = ws->secstart;
 
@@ -1165,7 +1251,7 @@ coredump_notes_elf(struct proc *p, void *iocookie, size_t *sizep)
 		cpi.cpi_signo = p->p_sisig;
 		cpi.cpi_sigcode = p->p_sicode;
 
-		cpi.cpi_sigpend = p->p_siglist;
+		cpi.cpi_sigpend = p->p_siglist | pr->ps_siglist;
 		cpi.cpi_sigmask = p->p_sigmask;
 		cpi.cpi_sigignore = pr->ps_sigacts->ps_sigignore;
 		cpi.cpi_sigcatch = pr->ps_sigacts->ps_sigcatch;
@@ -1275,7 +1361,7 @@ coredump_notes_elf(struct proc *p, void *iocookie, size_t *sizep)
 	 * threads in the process have been stopped and the list can't
 	 * change.
 	 */
-	TAILQ_FOREACH(q, &pr->ps_threads, p_thr_link) {
+	SMR_TAILQ_FOREACH_LOCKED(q, &pr->ps_threads, p_thr_link) {
 		if (q == p)		/* we've taken care of this thread */
 			continue;
 		error = coredump_note_elf(q, iocookie, &notesize);

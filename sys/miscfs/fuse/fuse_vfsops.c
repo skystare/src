@@ -1,4 +1,4 @@
-/* $OpenBSD: fuse_vfsops.c,v 1.42 2018/07/17 13:12:08 helg Exp $ */
+/* $OpenBSD: fuse_vfsops.c,v 1.44 2020/11/17 03:23:10 gnezdo Exp $ */
 /*
  * Copyright (c) 2012-2013 Sylvestre Gallon <ccna.syl@gmail.com>
  *
@@ -51,19 +51,19 @@ int	fusefs_checkexp(struct mount *, struct mbuf *, int *,
 	    struct ucred **);
 
 const struct vfsops fusefs_vfsops = {
-	fusefs_mount,
-	fusefs_start,
-	fusefs_unmount,
-	fusefs_root,
-	fusefs_quotactl,
-	fusefs_statfs,
-	fusefs_sync,
-	fusefs_vget,
-	fusefs_fhtovp,
-	fusefs_vptofh,
-	fusefs_init,
-	fusefs_sysctl,
-	fusefs_checkexp
+	.vfs_mount	= fusefs_mount,
+	.vfs_start	= fusefs_start,
+	.vfs_unmount	= fusefs_unmount,
+	.vfs_root	= fusefs_root,
+	.vfs_quotactl	= fusefs_quotactl,
+	.vfs_statfs	= fusefs_statfs,
+	.vfs_sync	= fusefs_sync,
+	.vfs_vget	= fusefs_vget,
+	.vfs_fhtovp	= fusefs_fhtovp,
+	.vfs_vptofh	= fusefs_vptofh,
+	.vfs_init	= fusefs_init,
+	.vfs_sysctl	= fusefs_sysctl,
+	.vfs_checkexp	= fusefs_checkexp,
 };
 
 struct pool fusefs_fbuf_pool;
@@ -353,30 +353,21 @@ fusefs_init(struct vfsconf *vfc)
 	return (0);
 }
 
+extern int stat_fbufs_in, stat_fbufs_wait, stat_opened_fusedev;
+
+const struct sysctl_bounded_args fusefs_vars[] = {
+	{ FUSEFS_OPENDEVS, &stat_opened_fusedev, 1, 0 },
+	{ FUSEFS_INFBUFS, &stat_fbufs_in, 1, 0 },
+	{ FUSEFS_WAITFBUFS, &stat_fbufs_wait, 1, 0 },
+	{ FUSEFS_POOL_NBPAGES, &fusefs_fbuf_pool.pr_npages, 1, 0 },
+};
+
 int
 fusefs_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
     void *newp, size_t newlen, struct proc *p)
 {
-	extern int stat_fbufs_in, stat_fbufs_wait, stat_opened_fusedev;
-
-	/* all sysctl names at this level are terminal */
-	if (namelen != 1)
-		return (ENOTDIR);		/* overloaded */
-
-	switch (name[0]) {
-	case FUSEFS_OPENDEVS:
-		return (sysctl_rdint(oldp, oldlenp, newp,
-		    stat_opened_fusedev));
-	case FUSEFS_INFBUFS:
-		return (sysctl_rdint(oldp, oldlenp, newp, stat_fbufs_in));
-	case FUSEFS_WAITFBUFS:
-		return (sysctl_rdint(oldp, oldlenp, newp, stat_fbufs_wait));
-	case FUSEFS_POOL_NBPAGES:
-		return (sysctl_rdint(oldp, oldlenp, newp,
-		    fusefs_fbuf_pool.pr_npages));
-	default:
-		return (EOPNOTSUPP);
-	}
+	return sysctl_bounded_arr(fusefs_vars, nitems(fusefs_vars), name,
+	    namelen, oldp, oldlenp, newp, newlen);
 }
 
 int

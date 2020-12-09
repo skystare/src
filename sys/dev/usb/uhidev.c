@@ -1,4 +1,4 @@
-/*	$OpenBSD: uhidev.c,v 1.76 2018/08/25 18:32:05 jcs Exp $	*/
+/*	$OpenBSD: uhidev.c,v 1.83 2020/08/31 12:26:49 patrick Exp $	*/
 /*	$NetBSD: uhidev.c,v 1.14 2003/03/11 16:44:00 augustss Exp $	*/
 
 /*
@@ -97,6 +97,7 @@ int uhidev_detach(struct device *, int);
 int uhidev_activate(struct device *, int);
 
 void uhidev_get_report_async_cb(struct usbd_xfer *, void *, usbd_status);
+void uhidev_set_report_async_cb(struct usbd_xfer *, void *, usbd_status);
 
 struct cfdriver uhidev_cd = {
 	NULL, "uhidev", DV_DULL
@@ -150,8 +151,6 @@ uhidev_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_ifaceno = uaa->ifaceno;
 	id = usbd_get_interface_descriptor(sc->sc_iface);
 
-	usbd_set_idle(sc->sc_udev, sc->sc_ifaceno, 0, 0);
-
 	sc->sc_iep_addr = sc->sc_oep_addr = -1;
 	for (i = 0; i < id->bNumEndpoints; i++) {
 		ed = usbd_interface2endpoint_descriptor(sc->sc_iface, i);
@@ -167,14 +166,14 @@ uhidev_attach(struct device *parent, struct device *self, void *aux)
 		    ed->bLength, ed->bDescriptorType,
 		    ed->bEndpointAddress & UE_ADDR,
 		    UE_GET_DIR(ed->bEndpointAddress)==UE_DIR_IN? "in" : "out",
-		    ed->bmAttributes & UE_XFERTYPE,
+		    UE_GET_XFERTYPE(ed->bmAttributes),
 		    UGETW(ed->wMaxPacketSize), ed->bInterval));
 
 		if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN &&
-		    (ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT) {
+		    UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT) {
 			sc->sc_iep_addr = ed->bEndpointAddress;
 		} else if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_OUT &&
-		    (ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT) {
+		    UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT) {
 			sc->sc_oep_addr = ed->bEndpointAddress;
 		} else {
 			printf("%s: unexpected endpoint\n", DEVNAME(sc));
@@ -393,13 +392,11 @@ uhidev_detach(struct device *self, int flags)
 	DPRINTF(("uhidev_detach: sc=%p flags=%d\n", sc, flags));
 
 	if (sc->sc_opipe != NULL) {
-		usbd_abort_pipe(sc->sc_opipe);
 		usbd_close_pipe(sc->sc_opipe);
 		sc->sc_opipe = NULL;
 	}
 
 	if (sc->sc_ipipe != NULL) {
-		usbd_abort_pipe(sc->sc_ipipe);
 		usbd_close_pipe(sc->sc_ipipe);
 		sc->sc_ipipe = NULL;
 	}
@@ -539,13 +536,13 @@ uhidev_open(struct uhidev *scd)
 
 		err = usbd_open_pipe(sc->sc_iface, sc->sc_oep_addr,
 		    0, &sc->sc_opipe);
-
 		if (err != USBD_NORMAL_COMPLETION) {
 			DPRINTF(("uhidev_open: usbd_open_pipe failed, "
 			    "error=%d\n", err));
 			error = EIO;
 			goto out2;
 		}
+
 		DPRINTF(("uhidev_open: sc->sc_opipe=%p\n", sc->sc_opipe));
 
 		sc->sc_oxfer = usbd_alloc_xfer(sc->sc_udev);
@@ -605,6 +602,17 @@ uhidev_close(struct uhidev *scd)
 		return;
 	DPRINTF(("uhidev_close: close pipe\n"));
 
+	/* Disable interrupts. */
+	if (sc->sc_opipe != NULL) {
+		usbd_close_pipe(sc->sc_opipe);
+		sc->sc_opipe = NULL;
+	}
+
+	if (sc->sc_ipipe != NULL) {
+		usbd_close_pipe(sc->sc_ipipe);
+		sc->sc_ipipe = NULL;
+	}
+
 	if (sc->sc_oxfer != NULL) {
 		usbd_free_xfer(sc->sc_oxfer);
 		sc->sc_oxfer = NULL;
@@ -618,19 +626,6 @@ uhidev_close(struct uhidev *scd)
 	if (sc->sc_ixfer != NULL) {
 		usbd_free_xfer(sc->sc_ixfer);
 		sc->sc_ixfer = NULL;
-	}
-
-	/* Disable interrupts. */
-	if (sc->sc_opipe != NULL) {
-		usbd_abort_pipe(sc->sc_opipe);
-		usbd_close_pipe(sc->sc_opipe);
-		sc->sc_opipe = NULL;
-	}
-
-	if (sc->sc_ipipe != NULL) {
-		usbd_abort_pipe(sc->sc_ipipe);
-		usbd_close_pipe(sc->sc_ipipe);
-		sc->sc_ipipe = NULL;
 	}
 
 	if (sc->sc_ibuf != NULL) {
@@ -670,19 +665,38 @@ uhidev_set_report(struct uhidev_softc *sc, int type, int id, void *data,
 		memcpy(buf + 1, data, len - 1);
 	}
 
-	req.bmRequestType = UT_WRITE_CLASS_INTERFACE;
-	req.bRequest = UR_SET_REPORT;
-	USETW2(req.wValue, type, id);
-	USETW(req.wIndex, sc->sc_ifaceno);
-	USETW(req.wLength, len);
+	if (sc->sc_opipe != NULL) {
+		usbd_setup_xfer(sc->sc_owxfer, sc->sc_opipe, 0, buf, len,
+		    USBD_SYNCHRONOUS | USBD_CATCH, 0, NULL);
+		if (usbd_transfer(sc->sc_owxfer)) {
+			usbd_clear_endpoint_stall(sc->sc_opipe);
+			actlen = -1;
+		}
+	} else {
+		req.bmRequestType = UT_WRITE_CLASS_INTERFACE;
+		req.bRequest = UR_SET_REPORT;
+		USETW2(req.wValue, type, id);
+		USETW(req.wIndex, sc->sc_ifaceno);
+		USETW(req.wLength, len);
 
-	if (usbd_do_request(sc->sc_udev, &req, buf))
-		actlen = -1;
+		if (usbd_do_request(sc->sc_udev, &req, buf))
+			actlen = -1;
+	}
 
 	if (id > 0)
 		free(buf, M_TEMP, len);
 
 	return (actlen);
+}
+
+void
+uhidev_set_report_async_cb(struct usbd_xfer *xfer, void *priv, usbd_status err)
+{
+	struct uhidev_softc *sc = priv;
+
+	if (err == USBD_STALLED)
+		usbd_clear_endpoint_stall_async(sc->sc_opipe);
+	usbd_free_xfer(xfer);
 }
 
 int
@@ -715,14 +729,23 @@ uhidev_set_report_async(struct uhidev_softc *sc, int type, int id, void *data,
 		memcpy(buf, data, len);
 	}
 
-	req.bmRequestType = UT_WRITE_CLASS_INTERFACE;
-	req.bRequest = UR_SET_REPORT;
-	USETW2(req.wValue, type, id);
-	USETW(req.wIndex, sc->sc_ifaceno);
-	USETW(req.wLength, len);
-
-	if (usbd_request_async(xfer, &req, NULL, NULL))
-		actlen = -1;
+	if (sc->sc_opipe != NULL) {
+		usbd_setup_xfer(xfer, sc->sc_opipe, sc, buf, len,
+		    USBD_NO_COPY, USBD_DEFAULT_TIMEOUT,
+		    uhidev_set_report_async_cb);
+		if (usbd_transfer(xfer)) {
+			usbd_clear_endpoint_stall_async(sc->sc_opipe);
+			actlen = -1;
+		}
+	} else {
+		req.bmRequestType = UT_WRITE_CLASS_INTERFACE;
+		req.bRequest = UR_SET_REPORT;
+		USETW2(req.wValue, type, id);
+		USETW(req.wIndex, sc->sc_ifaceno);
+		USETW(req.wLength, len);
+		if (usbd_request_async(xfer, &req, NULL, NULL))
+			actlen = -1;
+	}
 
 	return (actlen);
 }

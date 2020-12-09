@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_amap.h,v 1.30 2017/02/05 01:11:50 guenther Exp $	*/
+/*	$OpenBSD: uvm_amap.h,v 1.32 2020/11/13 11:11:49 mpi Exp $	*/
 /*	$NetBSD: uvm_amap.h,v 1.14 2001/02/18 21:19:08 chs Exp $	*/
 
 /*
@@ -146,6 +146,7 @@ struct vm_amap {
 		struct {
 			struct vm_amap_chunk **amn_buckets;
 			TAILQ_HEAD(, vm_amap_chunk) amn_chunks;
+			int amn_nbuckets; /* # of buckets */
 			int amn_ncused;	/* # of chunkers currently in use */
 			int amn_hashshift; /* shift count to hash slot to bucket */
 		} ami_normal;
@@ -159,6 +160,7 @@ struct vm_amap {
 
 #define am_buckets	am_impl.ami_normal.amn_buckets
 #define am_chunks	am_impl.ami_normal.amn_chunks
+#define am_nbuckets	am_impl.ami_normal.amn_nbuckets
 #define am_ncused	am_impl.ami_normal.amn_ncused
 #define am_hashshift	am_impl.ami_normal.amn_hashshift
 
@@ -258,23 +260,6 @@ struct vm_amap {
 
 #define amap_flags(AMAP)	((AMAP)->am_flags)
 #define amap_refs(AMAP)		((AMAP)->am_ref)
-
-/*
- * if we enable PPREF, then we have a couple of extra functions that
- * we need to prototype here...
- */
-
-#ifdef UVM_AMAP_PPREF
-
-#define PPREF_NONE ((int *) -1)	/* not using ppref */
-
-					/* adjust references */
-void		amap_pp_adjref(struct vm_amap *, int, vsize_t, int);
-					/* establish ppref */
-void		amap_pp_establish(struct vm_amap *);
-					/* wipe part of an amap */
-void		amap_wiperange(struct vm_amap *, int, int);
-#endif	/* UVM_AMAP_PPREF */
 
 #endif /* _KERNEL */
 

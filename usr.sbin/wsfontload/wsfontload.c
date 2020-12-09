@@ -1,4 +1,4 @@
-/* $OpenBSD: wsfontload.c,v 1.20 2017/08/23 09:15:33 fcambus Exp $ */
+/* $OpenBSD: wsfontload.c,v 1.23 2020/08/05 13:56:06 fcambus Exp $ */
 /* $NetBSD: wsfontload.c,v 1.2 2000/01/05 18:46:43 ad Exp $ */
 
 /*
@@ -76,6 +76,7 @@ main(int argc, char *argv[])
 {
 	char *wsdev, *infile, *p;
 	struct wsdisplay_font f;
+	struct wsdisplay_screentype screens;
 	int c, res, wsfd, ffd, type, list, i;
 	int defwidth, defheight;
 	struct stat stat;
@@ -136,12 +137,13 @@ main(int argc, char *argv[])
 		usage();
 
 	wsfd = open(wsdev, O_RDWR, 0);
-	if (wsfd < 0)
+	if (wsfd == -1)
 		err(2, "open %s", wsdev);
 
 	if (list) {
 		i = 0;
-		p = " # Name                             Encoding  W  H";
+		p = " # Name                             Encoding" \
+		    "  W  H    Chars";
 		do {
 			f.index = i;
 			res = ioctl(wsfd, WSDISPLAYIO_LSFONT, &f);
@@ -151,10 +153,11 @@ main(int argc, char *argv[])
 						puts(p);
 						p = NULL;
 					}
-					printf("%2d %-32s %8s %2d %2d\n",
+					printf("%2d %-32s %8s %2d %2d %8d\n",
 					    f.index, f.name,
 					    encodings[f.encoding].name,
-					    f.fontwidth, f.fontheight);
+					    f.fontwidth, f.fontheight,
+					    f.numchars);
 				}
 			}
 			i++;
@@ -167,7 +170,7 @@ main(int argc, char *argv[])
 	if (argc > 0) {
 		infile = argv[0];
 		ffd = open(infile, O_RDONLY, 0);
-		if (ffd < 0)
+		if (ffd == -1)
 			err(4, "open %s", infile);
 		if (!*f.name)
 			strlcpy(f.name, infile, WSFONT_NAME_SIZE);
@@ -176,23 +179,16 @@ main(int argc, char *argv[])
 		ffd = STDIN_FILENO;
 	}
 
-	res = ioctl(wsfd, WSDISPLAYIO_GTYPE, &type);
-	if (res != 0)
-		type = WSDISPLAY_TYPE_UNKNOWN;
-
-	switch (type) {
-	/* text-mode VGA */
-	case WSDISPLAY_TYPE_ISAVGA:
-	case WSDISPLAY_TYPE_PCIVGA:
+	memset(&screens, 0, sizeof(screens));
+	res = ioctl(wsfd, WSDISPLAYIO_GETSCREENTYPE, &screens);
+	if (res == 0) {
+		/* raster frame buffers */
+		defwidth = screens.fontwidth;
+		defheight = screens.fontheight;
+	} else {
+		/* text-mode VGA */
 		defwidth = 8;
 		defheight = 16;
-		break;
-	/* raster frame buffers */
-	default:
-		/* XXX ought to be computed from the frame buffer resolution */
-		defwidth = 12;
-		defheight = 22;
-		break;
 	}
 
 	f.index = -1;
@@ -229,7 +225,7 @@ main(int argc, char *argv[])
 	if (!buf)
 		errx(1, "malloc");
 	res = read(ffd, buf, len);
-	if (res < 0)
+	if (res == -1)
 		err(4, "read %s", infile);
 	if (res != len)
 		errx(4, "short read on %s", infile);
@@ -237,7 +233,7 @@ main(int argc, char *argv[])
 	f.data = buf;
 
 	res = ioctl(wsfd, WSDISPLAYIO_LDFONT, &f);
-	if (res < 0)
+	if (res == -1)
 		err(3, "WSDISPLAYIO_LDFONT");
 
 	return (0);

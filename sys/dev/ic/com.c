@@ -1,4 +1,4 @@
-/*	$OpenBSD: com.c,v 1.169 2018/05/14 19:25:54 kettenis Exp $	*/
+/*	$OpenBSD: com.c,v 1.173 2020/08/14 18:14:11 jcs Exp $	*/
 /*	$NetBSD: com.c,v 1.82.4.1 1996/06/02 09:08:00 mrg Exp $	*/
 
 /*
@@ -186,14 +186,14 @@ com_detach(struct device *self, int flags)
 	mn |= 0x80;
 	vdevgone(maj, mn, mn, VCHR);
 
+	timeout_del(&sc->sc_dtr_tmo);
+	timeout_del(&sc->sc_diag_tmo);
+	softintr_disestablish(sc->sc_si);
+
 	/* Detach and free the tty. */
 	if (sc->sc_tty) {
 		ttyfree(sc->sc_tty);
 	}
-
-	timeout_del(&sc->sc_dtr_tmo);
-	timeout_del(&sc->sc_diag_tmo);
-	softintr_disestablish(sc->sc_si);
 
 	return (0);
 }
@@ -306,6 +306,9 @@ comopen(dev_t dev, int flag, int mode, struct proc *p)
 			case COM_UART_TI16750:
 				com_write_reg(sc, com_ier, 0);
 				break;
+			case COM_UART_XR17V35X:
+				com_write_reg(sc, UART_EXAR_SLEEP, 0);
+				break;
 			}
 		}
 
@@ -395,7 +398,7 @@ comopen(dev_t dev, int flag, int mode, struct proc *p)
 			    (!ISSET(tp->t_cflag, CLOCAL) &&
 				!ISSET(tp->t_state, TS_CARR_ON))) {
 				SET(tp->t_state, TS_WOPEN);
-				error = ttysleep(tp, &tp->t_rawq, TTIPRI | PCATCH, ttopen, 0);
+				error = ttysleep(tp, &tp->t_rawq, TTIPRI | PCATCH, ttopen);
 				/*
 				 * If TS_WOPEN has been reset, that means the cua device
 				 * has been closed.  We don't want to fail in that case,
@@ -498,6 +501,9 @@ compwroff(struct com_softc *sc)
 		case COM_UART_TI16750:
 			com_write_reg(sc, com_ier, IER_SLEEP);
 			break;
+		case COM_UART_XR17V35X:
+			com_write_reg(sc, UART_EXAR_SLEEP, 0xff);
+			break;
 		}
 	}
 }
@@ -532,6 +538,9 @@ com_resume(struct com_softc *sc)
 			break;
 		case COM_UART_TI16750:
 			com_write_reg(sc, com_ier, 0);
+			break;
+		case COM_UART_XR17V35X:
+			com_write_reg(sc, UART_EXAR_SLEEP, 0);
 			break;
 		}
 	}
@@ -821,7 +830,7 @@ comparam(struct tty *tp, struct termios *t)
 
 				++sc->sc_halt;
 				error = ttysleep(tp, &tp->t_outq,
-				    TTOPRI | PCATCH, "comprm", 0);
+				    TTOPRI | PCATCH, "comprm");
 				--sc->sc_halt;
 				if (error) {
 					comstart(tp);
@@ -919,7 +928,7 @@ comstart(struct tty *tp)
 	}
 
 	if (ISSET(sc->sc_hwflags, COM_HW_FIFO)) {
-		u_char buffer[128];	/* largest fifo */
+		u_char buffer[256];	/* largest fifo */
 		int i, n;
 
 		n = q_to_b(&tp->t_outq, buffer,
@@ -1466,6 +1475,11 @@ com_attach_subr(struct com_softc *sc)
 		break;
 #endif
 #endif
+	case COM_UART_XR17V35X:
+		printf(": xr17v35x, 256 byte fifo\n");
+		SET(sc->sc_hwflags, COM_HW_FIFO);
+		sc->sc_fifolen = 256;
+		break;
 	default:
 		panic("comattach: bad fifo type");
 	}
@@ -1473,7 +1487,8 @@ com_attach_subr(struct com_softc *sc)
 #ifdef COM_CONSOLE
 	if (!ISSET(sc->sc_hwflags, COM_HW_CONSOLE))
 #endif
-		com_fifo_probe(sc);
+		if (sc->sc_fifolen < 256)
+			com_fifo_probe(sc);
 
 	if (sc->sc_fifolen == 0) {
 		CLR(sc->sc_hwflags, COM_HW_FIFO);
@@ -1498,8 +1513,8 @@ com_attach_subr(struct com_softc *sc)
 			if (cdevsw[maj].d_open == comopen)
 				break;
 
-		if (maj < nchrdev && cn_tab->cn_dev == NODEV)
-			cn_tab->cn_dev = makedev(maj, sc->sc_dev.dv_unit);
+		KASSERT(maj < nchrdev);
+		cn_tab->cn_dev = makedev(maj, sc->sc_dev.dv_unit);
 
 		printf("%s: console\n", sc->sc_dev.dv_xname);
 	}

@@ -1,4 +1,4 @@
-/*	$OpenBSD: main.c,v 1.92 2018/05/18 13:25:20 benno Exp $	*/
+/*	$OpenBSD: main.c,v 1.98 2019/06/28 13:34:59 deraadt Exp $	*/
 
 /*
  * startup, main loop, environments and error handling
@@ -35,6 +35,7 @@ uid_t	ksheuid;
 int	exstat;
 int	subst_exstat;
 const char *safe_prompt;
+int	disable_subst;
 
 Area	aperm;
 
@@ -81,7 +82,7 @@ static const char initsubs[] = "${PS2=> } ${PS3=#? } ${PS4=+ }";
 
 static const char *initcoms [] = {
 	"typeset", "-r", "KSH_VERSION", NULL,
-	"typeset", "-x", "SHELL", "PATH", "HOME", NULL,
+	"typeset", "-x", "SHELL", "PATH", "HOME", "PWD", "OLDPWD", NULL,
 	"typeset", "-ir", "PPID", NULL,
 	"typeset", "-i", "OPTIND=1", NULL,
 	"eval", "typeset -i RANDOM MAILCHECK=\"${MAILCHECK-600}\" SECONDS=\"${SECONDS-0}\" TMOUT=\"${TMOUT-0}\"", NULL,
@@ -145,10 +146,18 @@ main(int argc, char *argv[])
 
 	kshname = argv[0];
 
-	if (pledge("stdio rpath wpath cpath fattr flock getpw proc exec tty",
-	    NULL) == -1) {
-		perror("pledge");
-		exit(1);
+	if (issetugid()) { /* could later drop privileges */
+		if (pledge("stdio rpath wpath cpath fattr flock getpw proc "
+		    "exec tty id", NULL) == -1) {
+			perror("pledge");
+			exit(1);
+		}
+	} else {
+		if (pledge("stdio rpath wpath cpath fattr flock getpw proc "
+		    "exec tty", NULL) == -1) {
+			perror("pledge");
+			exit(1);
+		}
 	}
 
 	ainit(&aperm);		/* initialize permanent Area */
@@ -271,7 +280,7 @@ main(int argc, char *argv[])
 
 		/* Try to use existing $PWD if it is valid */
 		if (pwd[0] != '/' ||
-		    stat(pwd, &s_pwd) < 0 || stat(".", &s_dot) < 0 ||
+		    stat(pwd, &s_pwd) == -1 || stat(".", &s_dot) == -1 ||
 		    s_pwd.st_dev != s_dot.st_dev ||
 		    s_pwd.st_ino != s_dot.st_ino)
 			pwdx = NULL;
@@ -549,6 +558,7 @@ shell(Source *volatile s, volatile int toplevel)
 		case LERROR:
 		case LSHELL:
 			if (interactive) {
+				c_fc_reset();
 				if (i == LINTR)
 					shellf("\n");
 				/* Reset any eof that was read as part of a

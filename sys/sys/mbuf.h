@@ -1,4 +1,4 @@
-/*	$OpenBSD: mbuf.h,v 1.238 2018/09/10 16:14:08 bluhm Exp $	*/
+/*	$OpenBSD: mbuf.h,v 1.250 2020/08/08 19:53:02 florian Exp $	*/
 /*	$NetBSD: mbuf.h,v 1.19 1996/02/09 18:25:14 christos Exp $	*/
 
 /*
@@ -119,8 +119,8 @@ struct pkthdr_pf {
 
 #ifdef _KERNEL
 #define MPF_BITS \
-    ("\20\1GENERATED\3TRANSLATE_LOCALHOST\4DIVERTED\5DIVERTED_PACKET" \
-    "\6REROUTE\7REFRAGMENTED\10PROCESSED")
+    ("\20\1GENERATED\2SYNCOOKIE_RECREATED\3TRANSLATE_LOCALHOST\4DIVERTED" \
+    "\5DIVERTED_PACKET\6REROUTE\7REFRAGMENTED\10PROCESSED")
 #endif
 
 /* record/packet header in first mbuf of chain; valid if M_PKTHDR set */
@@ -190,7 +190,6 @@ struct mbuf {
 /* mbuf pkthdr flags, also in m_flags */
 #define M_VLANTAG	0x0020	/* ether_vtag is valid */
 #define M_LOOP		0x0040	/* packet has been sent from local machine */
-#define M_ACAST		0x0080	/* received as IPv6 anycast */
 #define M_BCAST		0x0100	/* sent/received as link-level broadcast */
 #define M_MCAST		0x0200	/* sent/received as link-level multicast */
 #define M_CONF		0x0400  /* payload was encrypted (ESP-transport) */
@@ -203,14 +202,13 @@ struct mbuf {
 #ifdef _KERNEL
 #define M_BITS \
     ("\20\1M_EXT\2M_PKTHDR\3M_EOR\4M_EXTWR\5M_PROTO1\6M_VLANTAG\7M_LOOP" \
-    "\10M_ACAST\11M_BCAST\12M_MCAST\13M_CONF\14M_AUTH\15M_TUNNEL" \
+    "\11M_BCAST\12M_MCAST\13M_CONF\14M_AUTH\15M_TUNNEL" \
     "\16M_ZEROIZE\17M_COMP\20M_LINK0")
 #endif
 
 /* flags copied when copying m_pkthdr */
 #define	M_COPYFLAGS	(M_PKTHDR|M_EOR|M_PROTO1|M_BCAST|M_MCAST|M_CONF|M_COMP|\
-			 M_AUTH|M_LOOP|M_TUNNEL|M_LINK0|M_VLANTAG|M_ACAST|\
-			 M_ZEROIZE)
+			 M_AUTH|M_LOOP|M_TUNNEL|M_LINK0|M_VLANTAG|M_ZEROIZE)
 
 /* Checksumming flags */
 #define	M_IPV4_CSUM_OUT		0x0001	/* IPv4 checksum needed */
@@ -226,13 +224,15 @@ struct mbuf {
 #define	M_ICMP_CSUM_IN_OK	0x0400	/* ICMP/ICMPv6 checksum verified */
 #define	M_ICMP_CSUM_IN_BAD	0x0800	/* ICMP/ICMPv6 checksum bad */
 #define	M_IPV6_DF_OUT		0x1000	/* don't fragment outgoing IPv6 */
+#define	M_TIMESTAMP		0x2000	/* ph_timestamp is set */
+#define	M_FLOWID		0x4000	/* ph_flowid is set */
 
 #ifdef _KERNEL
 #define MCS_BITS \
     ("\20\1IPV4_CSUM_OUT\2TCP_CSUM_OUT\3UDP_CSUM_OUT\4IPV4_CSUM_IN_OK" \
     "\5IPV4_CSUM_IN_BAD\6TCP_CSUM_IN_OK\7TCP_CSUM_IN_BAD\10UDP_CSUM_IN_OK" \
     "\11UDP_CSUM_IN_BAD\12ICMP_CSUM_OUT\13ICMP_CSUM_IN_OK\14ICMP_CSUM_IN_BAD" \
-    "\15IPV6_NODF_OUT")
+    "\15IPV6_NODF_OUT" "\16TIMESTAMP" "\17FLOWID")
 #endif
 
 /* mbuf types */
@@ -245,10 +245,6 @@ struct mbuf {
 #define	MT_CONTROL	6	/* extra-data protocol message */
 #define	MT_OOBDATA	7	/* expedited data  */
 #define	MT_NTYPES	8
-
-/* flowid field */
-#define M_FLOWID_VALID	0x8000	/* is the flowid set */
-#define M_FLOWID_MASK	0x7fff	/* flow id to map to path */
 
 /* flags to m_get/MGET */
 #include <sys/malloc.h>
@@ -345,19 +341,6 @@ u_int mextfree_register(void (*)(caddr_t, u_int, void *));
 } while (/* CONSTCOND */ 0)
 
 /*
- * Set the m_data pointer of a newly-allocated mbuf (m_get/MGET) to place
- * an object of the specified size at the end of the mbuf, longword aligned.
- */
-#define	M_ALIGN(m, len) \
-	(m)->m_data += (MLEN - (len)) &~ (sizeof(long) - 1)
-/*
- * As above, for mbufs allocated with m_gethdr/MGETHDR
- * or initialized by M_MOVE_PKTHDR.
- */
-#define	MH_ALIGN(m, len) \
-	(m)->m_data += (MHLEN - (len)) &~ (sizeof(long) - 1)
-
-/*
  * Determine if an mbuf's data area is read-only. This is true for
  * non-cluster external storage and for clusters that are being
  * referenced by more than one mbuf.
@@ -365,18 +348,6 @@ u_int mextfree_register(void (*)(caddr_t, u_int, void *));
 #define	M_READONLY(m)							\
 	(((m)->m_flags & M_EXT) != 0 &&					\
 	  (((m)->m_flags & M_EXTWR) == 0 || MCLISREFERENCED(m)))
-
-/*
- * Compute the amount of space available
- * before the current start of data in an mbuf.
- */
-#define	M_LEADINGSPACE(m) m_leadingspace(m)
-
-/*
- * Compute the amount of space available
- * after the end of data in an mbuf.
- */
-#define	M_TRAILINGSPACE(m) m_trailingspace(m)
 
 /*
  * Arrange to prepend space of size plen to mbuf m.
@@ -426,7 +397,7 @@ struct mbuf_queue {
 #ifdef	_KERNEL
 struct pool;
 
-extern	int nmbclust;			/* limit on the # of clusters */
+extern	long nmbclust;			/* limit on the # of clusters */
 extern	int mblowat;			/* mbuf low water mark */
 extern	int mcllowat;			/* mbuf cluster low water mark */
 extern	int max_linkhdr;		/* largest link-level header */
@@ -435,6 +406,7 @@ extern	int max_hdr;			/* largest link+protocol header */
 
 void	mbinit(void);
 void	mbcpuinit(void);
+int	nmbclust_update(long);
 struct	mbuf *m_copym(struct mbuf *, int, int, int);
 struct	mbuf *m_free(struct mbuf *);
 struct	mbuf *m_get(int, int);
@@ -453,6 +425,7 @@ struct	mbuf *m_makespace(struct mbuf *, int, int, int *);
 struct  mbuf *m_getptr(struct mbuf *, int, int *);
 int	m_leadingspace(struct mbuf *);
 int	m_trailingspace(struct mbuf *);
+void	m_align(struct mbuf *, int);
 struct mbuf *m_clget(struct mbuf *, int, u_int);
 void	m_extref(struct mbuf *, struct mbuf *);
 void	m_pool_init(struct pool *, u_int, u_int, const char *);
@@ -469,6 +442,8 @@ int	m_apply(struct mbuf *, int, int,
 	    int (*)(caddr_t, caddr_t, unsigned int), caddr_t);
 struct mbuf *m_dup_pkt(struct mbuf *, unsigned int, int);
 int	m_dup_pkthdr(struct mbuf *, struct mbuf *, int);
+
+void	m_microtime(const struct mbuf *, struct timeval *);
 
 static inline struct mbuf *
 m_freemp(struct mbuf **mp)
@@ -494,7 +469,7 @@ struct m_tag *m_tag_next(struct mbuf *, struct m_tag *);
 /* Packet tag types */
 #define PACKET_TAG_IPSEC_IN_DONE	0x0001  /* IPsec applied, in */
 #define PACKET_TAG_IPSEC_OUT_DONE	0x0002  /* IPsec applied, out */
-#define PACKET_TAG_GIF			0x0040  /* GIF processing done */
+#define PACKET_TAG_WIREGUARD		0x0040  /* WireGuard data */
 #define PACKET_TAG_GRE			0x0080  /* GRE processing done */
 #define PACKET_TAG_DLT			0x0100 /* data link layer type */
 #define PACKET_TAG_PF_DIVERT		0x0200 /* pf(4) diverted packet */
@@ -505,7 +480,7 @@ struct m_tag *m_tag_next(struct mbuf *, struct m_tag *);
 
 #define MTAG_BITS \
     ("\20\1IPSEC_IN_DONE\2IPSEC_OUT_DONE\3IPSEC_IN_CRYPTO_DONE" \
-    "\4IPSEC_OUT_CRYPTO_NEEDED\5IPSEC_PENDING_TDB\6BRIDGE\7GIF\10GRE\11DLT" \
+    "\4IPSEC_OUT_CRYPTO_NEEDED\5IPSEC_PENDING_TDB\6BRIDGE\7WG\10GRE\11DLT" \
     "\12PF_DIVERT\14PF_REASSEMBLED\15SRCROUTE\16TUNNEL\17CARP_BAL_IP")
 
 /*
@@ -514,7 +489,7 @@ struct m_tag *m_tag_next(struct mbuf *, struct m_tag *);
  * length for an existing packet tag type or when adding a new one that
  * has payload larger than the value below.
  */
-#define PACKET_TAG_MAXSIZE		60
+#define PACKET_TAG_MAXSIZE		80
 
 /* Detect mbufs looping in the kernel when spliced too often. */
 #define M_MAXLOOP	128
@@ -531,6 +506,7 @@ struct mbuf *		ml_dequeue(struct mbuf_list *);
 void			ml_enlist(struct mbuf_list *, struct mbuf_list *);
 struct mbuf *		ml_dechain(struct mbuf_list *);
 unsigned int		ml_purge(struct mbuf_list *);
+unsigned int		ml_hdatalen(struct mbuf_list *);
 
 #define	ml_len(_ml)		((_ml)->ml_len)
 #define	ml_empty(_ml)		((_ml)->ml_len == 0)
@@ -551,12 +527,14 @@ unsigned int		ml_purge(struct mbuf_list *);
     { MUTEX_INITIALIZER(_ipl), MBUF_LIST_INITIALIZER(), (_maxlen), 0 }
 
 void			mq_init(struct mbuf_queue *, u_int, int);
+int			mq_push(struct mbuf_queue *, struct mbuf *);
 int			mq_enqueue(struct mbuf_queue *, struct mbuf *);
 struct mbuf *		mq_dequeue(struct mbuf_queue *);
 int			mq_enlist(struct mbuf_queue *, struct mbuf_list *);
 void			mq_delist(struct mbuf_queue *, struct mbuf_list *);
 struct mbuf *		mq_dechain(struct mbuf_queue *);
 unsigned int		mq_purge(struct mbuf_queue *);
+unsigned int		mq_hdatalen(struct mbuf_queue *);
 
 #define	mq_len(_mq)		ml_len(&(_mq)->mq_list)
 #define	mq_empty(_mq)		ml_empty(&(_mq)->mq_list)

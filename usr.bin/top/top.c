@@ -1,4 +1,4 @@
-/*	$OpenBSD: top.c,v 1.91 2018/09/13 15:23:32 millert Exp $	*/
+/*	$OpenBSD: top.c,v 1.106 2020/08/26 16:21:28 kn Exp $	*/
 
 /*
  *  Top users/processes display for Unix
@@ -29,6 +29,7 @@
  */
 
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <curses.h>
 #include <err.h>
 #include <errno.h>
@@ -36,16 +37,17 @@
 #include <signal.h>
 #include <string.h>
 #include <poll.h>
+#include <pwd.h>
 #include <stdlib.h>
 #include <limits.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 /* includes specific to top */
 #include "display.h"		/* interface to display package */
 #include "screen.h"		/* interface to screen package */
 #include "top.h"
 #include "top.local.h"
-#include "boolean.h"
 #include "machine.h"
 #include "utils.h"
 
@@ -67,27 +69,35 @@ static void	reset_display(void);
 int		rundisplay(void);
 
 static int	max_topn;	/* maximum displayable processes */
+static int	skip;		/* how many processes to skip (scroll) */
+
+extern int ncpu;
+extern int ncpuonline;
 
 extern int	(*proc_compares[])(const void *, const void *);
 int order_index;
+int rev_order;
 
 int displays = 0;	/* indicates unspecified */
-char do_unames = Yes;
+int do_unames = true;
 struct process_select ps;
-char interactive = Maybe;
+int interactive = -1;	/* indicates undefined */
 double delay = Default_DELAY;
 char *order_name = NULL;
 int topn = Default_TOPN;
-int no_command = Yes;
-int old_system = No;
-int old_threads = No;
-int show_args = No;
-pid_t hlpid = -1;
+int no_command = true;
+int old_system = false;
+int old_threads = false;
+int show_args = false;
+pid_t hlpid = (pid_t)-1;
 int combine_cpus = 0;
 
 #if Default_TOPN == Infinity
-char topn_specified = No;
+int topn_specified = false;
 #endif
+
+struct system_info system_info;
+struct statics  statics;
 
 /*
  * these defines enumerate the "strchr"s of the commands in
@@ -118,6 +128,13 @@ char topn_specified = No;
 #define CMD_add		21
 #define CMD_hl		22
 #define CMD_cpus	23
+#define CMD_down	24
+#define CMD_up		25
+#define CMD_pagedown	26
+#define CMD_pageup	27
+#define CMD_grep2	28
+#define CMD_rtableid	29
+#define CMD_rtable	30
 
 static void
 usage(void)
@@ -125,9 +142,98 @@ usage(void)
 	extern char *__progname;
 
 	fprintf(stderr,
-	    "usage: %s [-1bCHIinqSu] [-d count] [-g string] [-o field] "
-	    "[-p pid] [-s time]\n\t[-U [-]user] [number]\n",
+	    "usage: %s [-1bCHIinqStu] [-d count] [-g string] [-o [-]field] "
+	    "[-p pid] [-s time]\n\t[-T [-]rtable] [-U [-]user] [number]\n",
 	    __progname);
+}
+
+static int
+getorder(char *field)
+{
+	int i, r = field[0] == '-';
+
+	i = string_index(r ? field + 1 : field, statics.order_names);
+	if (i != -1)
+		rev_order = r;
+
+	return i;
+}
+
+static int
+filteruser(char buf[])
+{
+	const char *errstr;
+	char *bufp = buf;
+	uid_t *uidp;
+	uid_t uid;
+
+	if (bufp[0] == '-') {
+		bufp++;
+		uidp = &ps.huid;
+		ps.uid = (pid_t)-1;
+	} else {
+		uidp = &ps.uid;
+		ps.huid = (pid_t)-1;
+	}
+
+	if (uid_from_user(bufp, uidp) == 0)
+		return 0;
+
+	uid = strtonum(bufp, 0, UID_MAX, &errstr);
+	if (errstr == NULL && user_from_uid(uid, 1) != NULL) {
+		*uidp = uid;
+		return 0;
+	}
+
+	return -1;
+}
+
+static int
+filterpid(char buf[], int hl)
+{
+	const char *errstr;
+	int pid;
+
+	pid = strtonum(buf, 0, INT_MAX, &errstr);
+	if (errstr != NULL || !find_pid(pid))
+		return -1;
+
+	if (hl)
+		hlpid = (pid_t)pid;
+	else {
+		if (!ps.system)
+			old_system = false;
+		ps.pid = (pid_t)pid;
+		ps.system = true;
+	}
+
+	return 0;
+}
+
+static int
+filterrtable(char buf[])
+{
+	const char *errstr;
+	char *bufp = buf;
+	uint32_t *rtableidp;
+	uint32_t rtableid;
+
+	if (bufp[0] == '-') {
+		bufp++;
+		rtableidp = &ps.hrtableid;
+		ps.rtableid = -1;
+	} else {
+		rtableidp = &ps.rtableid;
+		ps.hrtableid = -1;
+	}
+
+	rtableid = strtonum(bufp, 0, RT_TABLEID_MAX, &errstr);
+	if (errstr == NULL) {
+		*rtableidp = rtableid;
+		return 0;
+	}
+
+	return -1;
 }
 
 static void
@@ -136,45 +242,29 @@ parseargs(int ac, char **av)
 	char *endp;
 	int i;
 
-	while ((i = getopt(ac, av, "1SHICbinqus:d:p:U:o:g:")) != -1) {
+	while ((i = getopt(ac, av, "1SHICbinqus:d:p:U:o:g:T:t")) != -1) {
 		switch (i) {
 		case '1':
 			combine_cpus = 1;
 			break;
 		case 'C':
-			show_args = Yes;
+			show_args = true;
 			break;
 		case 'u':	/* toggle uid/username display */
 			do_unames = !do_unames;
 			break;
 
 		case 'U':	/* display only username's processes */
-			if (optarg[0] == '-') {
-				if ((ps.huid = userid(optarg+1)) == (uid_t)-1)
-					new_message(MT_delayed, "%s: unknown user",
-					    optarg);
-				else
-					ps.uid = (uid_t)-1;
-			} else if ((ps.uid = userid(optarg)) == (uid_t)-1)
+			if (filteruser(optarg) == -1)
 				new_message(MT_delayed, "%s: unknown user",
 				    optarg);
-			else
-				ps.huid = (uid_t)-1;
 			break;
 
-		case 'p': {	/* display only process id */
-			const char *errstr;
-
-			i = strtonum(optarg, 0, INT_MAX, &errstr);
-			if (errstr != NULL || !find_pid(i))
+		case 'p':	/* display only process id */
+			if (filterpid(optarg, false) == -1)
 				new_message(MT_delayed, "%s: unknown pid",
 				    optarg);
-			else {
-				ps.pid = (pid_t)i;
-				ps.system = Yes;
-			}
 			break;
-		}
 
 		case 'S':	/* show system processes */
 			ps.system = !ps.system;
@@ -182,8 +272,8 @@ parseargs(int ac, char **av)
 			break;
 
 		case 'H':	/* show threads */
-			ps.threads = Yes;
-			old_threads = Yes;
+			ps.threads = true;
+			old_threads = true;
 			break;
 
 		case 'I':	/* show idle processes */
@@ -191,19 +281,19 @@ parseargs(int ac, char **av)
 			break;
 
 		case 'i':	/* go interactive regardless */
-			interactive = Yes;
+			interactive = true;
 			break;
 
 		case 'n':	/* batch, or non-interactive */
 		case 'b':
-			interactive = No;
+			interactive = false;
 			break;
 
 		case 'd':	/* number of displays to show */
 			if ((i = atoiwi(optarg)) != Invalid && i != 0) {
 				displays = i;
 				if (displays == 1)
-					interactive = No;
+					interactive = false;
 				break;
 			}
 			new_message(MT_delayed,
@@ -244,13 +334,23 @@ parseargs(int ac, char **av)
 				err(1, NULL);
 			break;
 
+		case 'T':
+			if (filterrtable(optarg) == -1)
+				new_message(MT_delayed,
+				    "%s: invalid routing table", optarg);
+			break;
+
+		case 't':
+			ps.rtable = true;
+			break;
+
 		default:
 			usage();
 			exit(1);
 		}
 	}
 
-	i = getncpu();
+	i = getncpuonline();
 	if (i == -1)
 		err(1, NULL);
 
@@ -267,24 +367,23 @@ parseargs(int ac, char **av)
 		}
 #if Default_TOPN == Infinity
 		else
-			topn_specified = Yes;
+			topn_specified = true;
 #endif
 	}
 }
 
-struct system_info system_info;
-struct statics  statics;
-
 int
 main(int argc, char *argv[])
 {
-	char *uname_field = "USERNAME", *header_text, *env_top;
-	const char *(*get_userid)(uid_t) = username;
+	char *header_text, *env_top;
+	char *uname_field = "USERNAME", *thread_field = "     TID";
+	char *wait_field = "WAIT   ", *rtable_field = " RTABLE";
+	const char *(*get_userid)(uid_t, int) = user_from_uid;
 	char **preset_argv = NULL, **av = argv;
-	int preset_argc = 0, ac = argc, active_procs, i;
+	int preset_argc = 0, ac = argc, active_procs, i, ncpuonline_now;
 	sigset_t mask, oldmask;
 	time_t curr_time;
-	caddr_t processes;
+	struct handle *processes;
 
 	/* set the buffer for stdout */
 #ifdef DEBUG
@@ -294,11 +393,14 @@ main(int argc, char *argv[])
 #endif
 
 	/* initialize some selection options */
-	ps.idle = Yes;
-	ps.system = No;
+	ps.idle = true;
+	ps.system = false;
 	ps.uid = (uid_t)-1;
 	ps.huid = (uid_t)-1;
 	ps.pid = (pid_t)-1;
+	ps.rtable = false;
+	ps.rtableid = -1;
+	ps.hrtableid = -1;
 	ps.command = NULL;
 
 	/* get preset options from the environment */
@@ -342,20 +444,9 @@ main(int argc, char *argv[])
 
 	/* determine sorting order index, if necessary */
 	if (order_name != NULL) {
-		if ((order_index = string_index(order_name,
-		    statics.order_names)) == -1) {
-			char **pp, msg[512];
-
-			snprintf(msg, sizeof(msg),
-			    "'%s' is not a recognized sorting order",
-			    order_name);
-			strlcat(msg, ". Valid are:", sizeof(msg));
-			pp = statics.order_names;
-			while (*pp != NULL) {
-				strlcat(msg, " ", sizeof(msg));
-				strlcat(msg, *pp++, sizeof(msg));
-			}
-			new_message(MT_delayed, msg);
+		if ((order_index = getorder(order_name)) == -1) {
+			new_message(MT_delayed,
+			    " %s: unrecognized sorting order", order_name);
 			order_index = 0;
 		}
 	}
@@ -394,7 +485,7 @@ main(int argc, char *argv[])
 	display_header(topn > 0);
 
 	/* determine interactive state */
-	if (interactive == Maybe)
+	if (interactive == -1)
 		interactive = smart_terminal;
 
 	/* if # of displays not specified, fill it in */
@@ -449,6 +540,21 @@ restart:
 		/* get the current stats */
 		get_system_info(&system_info);
 
+		/*
+		 * don't display stats for offline CPUs: resize if we're
+		 * interactive and CPUs have toggled on or offline
+		 */
+		if (interactive && !combine_cpus) {
+			for (i = ncpuonline_now = 0; i < ncpu; i++)
+				if (system_info.cpuonline[i])
+					ncpuonline_now++;
+			if (ncpuonline_now != ncpuonline) {
+				max_topn = display_resize();
+				reset_display();
+				continue;
+			}
+		}
+
 		/* get the current set of processes */
 		processes = get_process_info(&system_info, &ps,
 		    proc_compares[order_index]);
@@ -466,7 +572,7 @@ restart:
 		    ps.threads);
 
 		/* display the cpu state percentage breakdown */
-		i_cpustates(system_info.cpustates);
+		i_cpustates(system_info.cpustates, system_info.cpuonline);
 
 		/* display memory stats */
 		i_memory(system_info.memory);
@@ -475,7 +581,9 @@ restart:
 		i_message();
 
 		/* get the string to use for the process area header */
-		header_text = format_header(uname_field, ps.threads);
+		header_text = format_header(
+		    ps.threads ? thread_field : uname_field,
+		    ps.rtable ? rtable_field : wait_field);
 
 		/* update the header area */
 		i_header(header_text);
@@ -501,13 +609,22 @@ restart:
 				active_procs = topn;
 			if (active_procs > max_topn)
 				active_procs = max_topn;
+			/* determine how many process to skip, if asked to */
+			/*
+			 * this number is tweaked by user, but gets shrinked
+			 * when number of active processes lowers too much
+			 */
+			if (skip + active_procs > system_info.p_active)
+				skip = system_info.p_active - active_procs;
+			skip_processes(processes, skip);
 			/* now show the top "n" processes. */
 			for (i = 0; i < active_procs; i++) {
 				pid_t pid;
 				char * s;
 
-				s = format_next_process(processes, get_userid,
-				    &pid, ps.threads);
+				s = format_next_process(processes,
+				    ps.threads ? NULL : get_userid, ps.rtable,
+				    &pid);
 				i_process(i, s, pid == hlpid);
 			}
 		}
@@ -524,7 +641,7 @@ restart:
 		/* only do the rest if we have more displays to show */
 		if (displays) {
 			/* switch out for new display on smart terminals */
-			no_command = Yes;
+			no_command = true;
 			if (!interactive) {
 				/* set up alarm */
 				(void) signal(SIGALRM, onalrm);
@@ -562,14 +679,13 @@ rundisplay(void)
 	char ch, *iptr;
 	int change, i;
 	struct pollfd pfd[1];
-	uid_t uid, huid;
-	static char command_chars[] = "\f qh?en#sdkriIuSopCHg+P1";
+	static char command_chars[] = "\f qh?en#sdkriIuSopCHg+P109)(/Tt";
 
 	/*
 	 * assume valid command unless told
 	 * otherwise
 	 */
-	no_command = No;
+	no_command = false;
 
 	/*
 	 * set up arguments for select with
@@ -638,7 +754,7 @@ rundisplay(void)
 			/* illegal command */
 			new_message(MT_standout, " Command not understood");
 			putr();
-			no_command = Yes;
+			no_command = true;
 			fflush(stdout);
 			return (0);
 		}
@@ -678,7 +794,7 @@ rundisplay(void)
 				new_message(MT_standout,
 				    " Currently no errors to report.");
 				putr();
-				no_command = Yes;
+				no_command = true;
 			} else {
 				clear();
 				show_errors();
@@ -705,16 +821,16 @@ rundisplay(void)
 					if ((i > topn || i == Infinity)
 					    && topn == 0) {
 						/* redraw the header */
-						display_header(Yes);
+						display_header(true);
 					} else if (i == 0)
-						display_header(No);
+						display_header(false);
 					topn = i;
 				} else {
 					new_message(MT_standout,
 					    "Processes should be a "
 					    "non-negative number");
 					putr();
-					no_command = Yes;
+					no_command = true;
 				}
 			} else
 				clear_message();
@@ -733,7 +849,7 @@ rundisplay(void)
 					new_message(MT_standout,
 					    "Delay should be a non-negative number");
 					putr();
-					no_command = Yes;
+					no_command = true;
 				}
 
 			} else
@@ -755,7 +871,7 @@ rundisplay(void)
 					new_message(MT_standout,
 					    "Displays should be a non-negative number");
 					putr();
-					no_command = Yes;
+					no_command = true;
 				}
 			} else
 				clear_message();
@@ -767,7 +883,7 @@ rundisplay(void)
 				if ((errmsg = kill_procs(tempbuf)) != NULL) {
 					new_message(MT_standout, "%s", errmsg);
 					putr();
-					no_command = Yes;
+					no_command = true;
 				}
 			} else
 				clear_message();
@@ -779,7 +895,7 @@ rundisplay(void)
 				if ((errmsg = renice_procs(tempbuf)) != NULL) {
 					new_message(MT_standout, "%s", errmsg);
 					putr();
-					no_command = Yes;
+					no_command = true;
 				}
 			} else
 				clear_message();
@@ -802,22 +918,12 @@ rundisplay(void)
 				    tempbuf[1] == '\0') {
 					ps.uid = (uid_t)-1;
 					ps.huid = (uid_t)-1;
-				} else if (tempbuf[0] == '-') {
-					if ((huid = userid(tempbuf+1)) == (uid_t)-1) {
-						new_message(MT_standout,
-						    " %s: unknown user", tempbuf+1);
-						no_command = Yes;
-					} else {
-						ps.huid = huid;
-						ps.uid = (uid_t)-1;
-					}
-				} else if ((uid = userid(tempbuf)) == (uid_t)-1) {
-						new_message(MT_standout,
-						    " %s: unknown user", tempbuf);
-						no_command = Yes;
-				} else {
-					ps.uid = uid;
-					ps.huid = (uid_t)-1;
+				} else if (filteruser(tempbuf) == -1) {
+					new_message(MT_standout,
+					    " %s: unknown user",
+					    tempbuf[0] == '-' ? tempbuf + 1 : 
+					    tempbuf);
+					no_command = true;
 				}
 				putr();
 			} else
@@ -836,12 +942,12 @@ rundisplay(void)
 			new_message(MT_standout,
 			    "Order to sort: ");
 			if (readline(tempbuf, sizeof(tempbuf)) > 0) {
-				if ((i = string_index(tempbuf,
-				    statics.order_names)) == -1) {
+				if ((i = getorder(tempbuf)) == -1) {
 					new_message(MT_standout,
 					    " %s: unrecognized sorting order",
+					    tempbuf[0] == '-' ? tempbuf + 1 :
 					    tempbuf);
-					no_command = Yes;
+					no_command = true;
 				} else
 					order_index = i;
 				putr();
@@ -856,23 +962,10 @@ rundisplay(void)
 				    tempbuf[1] == '\0') {
 					ps.pid = (pid_t)-1;
 					ps.system = old_system;
-				} else {
-					unsigned long long num;
-					const char *errstr;
-
-					num = strtonum(tempbuf, 0, INT_MAX,
-					    &errstr);
-					if (errstr != NULL || !find_pid(num)) {
-						new_message(MT_standout,
-						    " %s: unknown pid",
-						    tempbuf);
-						no_command = Yes;
-					} else {
-						if (ps.system == No)
-							old_system = No;
-						ps.pid = (pid_t)num;
-						ps.system = Yes;
-					}
+				} else if (filterpid(tempbuf, 0) == -1) {
+					new_message(MT_standout,
+					    " %s: unknown pid", tempbuf);
+					no_command = true;
 				}
 				putr();
 			} else
@@ -880,7 +973,7 @@ rundisplay(void)
 			break;
 
 		case CMD_command:
-			show_args = (show_args == No) ? Yes : No;
+			show_args = !show_args;
 			break;
 
 		case CMD_threads:
@@ -892,6 +985,7 @@ rundisplay(void)
 			break;
 
 		case CMD_grep:
+		case CMD_grep2:
 			new_message(MT_standout,
 			    "Grep command name: ");
 			if (readline(tempbuf, sizeof(tempbuf)) > 0) {
@@ -899,10 +993,8 @@ rundisplay(void)
 				if (tempbuf[0] == '+' &&
 				    tempbuf[1] == '\0')
 					ps.command = NULL;
-				else
-					if ((ps.command = strdup(tempbuf)) ==
-					    NULL)
-						err(1, NULL);
+				else if ((ps.command = strdup(tempbuf)) == NULL)
+					err(1, NULL);
 				putr();
 			} else
 				clear_message();
@@ -913,20 +1005,11 @@ rundisplay(void)
 			if (readline(tempbuf, sizeof(tempbuf)) > 0) {
 				if (tempbuf[0] == '+' &&
 				    tempbuf[1] == '\0') {
-					hlpid = -1;
-				} else {
-					unsigned long long num;
-					const char *errstr;
-
-					num = strtonum(tempbuf, 0, INT_MAX,
-					    &errstr);
-					if (errstr != NULL || !find_pid(num)) {
-						new_message(MT_standout,
-						    " %s: unknown pid",
-						    tempbuf);
-						no_command = Yes;
-					} else
-						hlpid = (pid_t)num;
+					hlpid = (pid_t)-1;
+				} else if (filterpid(tempbuf, true) == -1) {
+					new_message(MT_standout,
+					    " %s: unknown pid", tempbuf);
+					no_command = true;
 				}
 				putr();
 			} else
@@ -937,14 +1020,55 @@ rundisplay(void)
 			ps.uid = (uid_t)-1;	/* uid */
 			ps.huid = (uid_t)-1;
 			ps.pid = (pid_t)-1;	/* pid */
+			ps.rtableid = -1;	/* rtableid */
+			ps.hrtableid = -1;
 			ps.system = old_system;
 			ps.command = NULL;	/* grep */
-			hlpid = -1;
+			hlpid = (pid_t)-1;
 			break;
 		case CMD_cpus:
 			combine_cpus = !combine_cpus;
 			max_topn = display_resize();
 			reset_display();
+			break;
+		case CMD_down:
+			skip++;
+			break;
+		case CMD_up:
+			if (skip > 0)
+				skip--;
+			break;
+		case CMD_pagedown:
+			skip += max_topn / 2;
+			break;
+		case CMD_pageup:
+			skip -= max_topn / 2;
+			if (skip < 0)
+				skip = 0;
+			break;
+		case CMD_rtableid:
+			new_message(MT_standout,
+			    "Routing table: ");
+			if (readline(tempbuf, sizeof(tempbuf)) > 0) {
+				if (tempbuf[0] == '+' && tempbuf[1] == '\0') {
+					ps.rtableid = -1;
+					ps.hrtableid = -1;
+				} else if (filterrtable(tempbuf) == -1) {
+					new_message(MT_standout,
+					    " %s: invalid routing table",
+					    tempbuf[0] == '-' ? tempbuf + 1 :
+					    tempbuf);
+					no_command = true;
+				}
+				putr();
+			} else
+				clear_message();
+			break;
+		case CMD_rtable:
+			ps.rtable = !ps.rtable;
+			new_message(MT_standout | MT_delayed,
+			    " %sisplaying routing tables.",
+			    ps.rtable ? "D" : "Not d");
 			break;
 		default:
 			new_message(MT_standout, " BAD CASE IN SWITCH!");

@@ -1,4 +1,4 @@
-/*	$OpenBSD: pwd_mkdb.c,v 1.53 2015/11/05 15:10:11 semarie Exp $	*/
+/*	$OpenBSD: pwd_mkdb.c,v 1.57 2019/10/17 21:54:29 millert Exp $	*/
 
 /*-
  * Copyright (c) 1991, 1993, 1994
@@ -188,8 +188,9 @@ main(int argc, char **argv)
 	/* Tweak openinfo values for large passwd files. */
 	if (st.st_size > (off_t)100*1024)
 		openinfo.cachesize = MINIMUM(st.st_size * 20, (off_t)12*1024*1024);
-	if (st.st_size / 128 > openinfo.nelem)
-		openinfo.nelem = st.st_size / 128;
+	/* Estimate number of elements based on a 128-byte average entry. */
+	if (st.st_size / 128 * 3 > openinfo.nelem)
+		openinfo.nelem = st.st_size / 128 * 3;
 
 	/* If only updating a single record, stash the old uid */
 	if (username) {
@@ -209,7 +210,7 @@ main(int argc, char **argv)
 				;
 			memcpy(&olduid, p, sizeof(olduid));
 		} else
-			olduid = UID_MAX;
+			olduid = -1;
 		(dp->close)(dp);
 	}
 
@@ -226,7 +227,7 @@ main(int argc, char **argv)
 	}
 	if (!edp)
 		fatal("%s", buf);
-	if (fchown(edp->fd(edp), (uid_t)-1, shadow) != 0)
+	if (fchown(edp->fd(edp), -1, shadow) != 0)
 		warn("%s: unable to set group to %s", _PATH_SMP_DB,
 		    SHADOW_GROUP);
 	else if (fchmod(edp->fd(edp), PERM_SECURE|S_IRGRP) != 0)
@@ -264,7 +265,7 @@ main(int argc, char **argv)
 	if (makeold) {
 		(void)snprintf(buf, sizeof(buf), "%s.orig", pname);
 		if ((tfd = open(buf,
-		    O_WRONLY|O_CREAT|O_EXCL, PERM_INSECURE)) < 0)
+		    O_WRONLY|O_CREAT|O_EXCL, PERM_INSECURE)) == -1)
 			fatal("%s", buf);
 		if ((oldfp = fdopen(tfd, "w")) == NULL)
 			fatal("%s", buf);
@@ -385,16 +386,16 @@ cp(char *from, char *to, mode_t mode)
 	static char buf[MAXBSIZE];
 	int from_fd, rcount, to_fd, wcount;
 
-	if ((from_fd = open(from, O_RDONLY, 0)) < 0)
+	if ((from_fd = open(from, O_RDONLY, 0)) == -1)
 		fatal("%s", from);
-	if ((to_fd = open(to, O_WRONLY|O_CREAT|O_EXCL, mode)) < 0)
+	if ((to_fd = open(to, O_WRONLY|O_CREAT|O_EXCL, mode)) == -1)
 		fatal("%s", to);
 	while ((rcount = read(from_fd, buf, MAXBSIZE)) > 0) {
 		wcount = write(to_fd, buf, rcount);
 		if (rcount != wcount || wcount == -1)
 			fatal("%s to %s", from, to);
 	}
-	if (rcount < 0)
+	if (rcount == -1)
 		fatal("%s to %s", from, to);
 	close(to_fd);
 	close(from_fd);
@@ -501,7 +502,7 @@ write_old_entry(FILE *to, const struct passwd *pw)
 	else
 		snprintf(gidstr, sizeof(gidstr), "%u", (u_int)pw->pw_gid);
 
-	if (pw->pw_uid == (uid_t)-1)
+	if (pw->pw_uid == -1)
 		strlcpy(uidstr, "-1", sizeof(uidstr));
 	else
 		snprintf(uidstr, sizeof(uidstr), "%u", (u_int)pw->pw_uid);
@@ -555,7 +556,7 @@ db_store(FILE *fp, FILE *oldfp, DB *edp, DB *dp, struct passwd *pw,
 				continue;
 			found = 1;
 			/* If the uid changed, remove the old record by uid. */
-			if (olduid != UID_MAX && olduid != pw->pw_uid) {
+			if (olduid != -1 && olduid != pw->pw_uid) {
 				tbuf[0] = _PW_KEYBYUID;
 				memcpy(tbuf + 1, &olduid, sizeof(olduid));
 				key.size = sizeof(olduid) + 1;
@@ -631,7 +632,7 @@ db_store(FILE *fp, FILE *oldfp, DB *edp, DB *dp, struct passwd *pw,
 	}
 	if (firsttime) {
 		firsttime = 0;
-		if (username && !found && olduid != UID_MAX)
+		if (username && !found && olduid != -1)
 			fatalx("can't find user in master.passwd");
 	}
 }

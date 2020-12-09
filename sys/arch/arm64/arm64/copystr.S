@@ -1,4 +1,4 @@
-/* $OpenBSD: copystr.S,v 1.4 2018/08/12 17:15:10 mortimer Exp $ */
+/* $OpenBSD: copystr.S,v 1.7 2020/10/20 23:21:41 patrick Exp $ */
 /*
  * Copyright (c) 2015 Dale Rahn <drahn@dalerahn.com>
  * Copyright (c) 2014 Patrick Wildt <patrick@blueri.se>
@@ -18,7 +18,6 @@
 
 #include "assym.h"
 #include <machine/asm.h>
-#include <sys/errno.h>
 #include <sys/errno.h>
 
 	.text
@@ -43,6 +42,7 @@ ENTRY(copystr)
 	str	x7, [x6, #(PCB_ONFAULT)]	// set handler
 
 	mov	x8, xzr
+	cbz	x2, 2f
 
 1:	ldrb	w4, [x0], 1
 	strb	w4, [x1], #1
@@ -51,6 +51,7 @@ ENTRY(copystr)
 	cbz	w4, .Lcopystrsuccess
 	cbnz	x2, 1b
 
+2:
 	mov	x0, #ENAMETOOLONG
 	b	.Lcopystrcleanup
 
@@ -62,9 +63,9 @@ ENTRY(copystr)
 	mov	x0, xzr
 
 .Lcopystrcleanup:
-	cbz	x3, 2f
+	cbz	x3, 3f
 	str	x8, [x3]
-2:
+3:
 	str	x5, [x6, #(PCB_ONFAULT)]
 	RETGUARD_CHECK(copystr, x15)
 	ret
@@ -86,8 +87,11 @@ ENTRY(copyinstr)
 	str	x7, [x6, #(PCB_ONFAULT)]	// set handler
 
 	mov	x8, xzr
+	cbz	x2, 2f
 
-1:	ldtrb	w4, [x0]
+1:	tst	x0, #(1ULL << 63)
+	b.ne	.Lcopystrfault
+	ldtrb	w4, [x0]
 	strb	w4, [x1], #1
 	add	x0, x0, #1
 	sub	x2, x2, #1
@@ -95,6 +99,7 @@ ENTRY(copyinstr)
 	cbz	w4, .Lcopystrsuccess
 	cbnz	x2, 1b
 
+2:
 	mov	x0, #ENAMETOOLONG
 	b	.Lcopystrcleanup
 
@@ -115,8 +120,11 @@ ENTRY(copyoutstr)
 	str	x7, [x6, #(PCB_ONFAULT)]	// set handler
 
 	mov	x8, xzr
+	cbz	x2, 2f
 
-1:	ldrb	w4, [x0], 1
+1:	tst	x1, #(1ULL << 63)
+	b.ne	.Lcopystrfault
+	ldrb	w4, [x0], 1
 	sttrb	w4, [x1]
 	add	x1, x1, #1
 	sub	x2, x2, #1
@@ -124,5 +132,6 @@ ENTRY(copyoutstr)
 	cbz	w4, .Lcopystrsuccess
 	cbnz	x2, 1b
 
+2:
 	mov	x0, #ENAMETOOLONG
 	b	.Lcopystrcleanup

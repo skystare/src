@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_urndis.c,v 1.67 2017/07/19 16:31:56 mikeb Exp $ */
+/*	$OpenBSD: if_urndis.c,v 1.72 2020/07/31 10:49:33 mglocker Exp $ */
 
 /*
  * Copyright (c) 2010 Jonathan Armani <armani@openbsd.org>
@@ -804,6 +804,7 @@ urndis_encap(struct urndis_softc *sc, struct mbuf *m, int idx)
 	/* Transmit */
 	err = usbd_transfer(c->sc_xfer);
 	if (err != USBD_IN_PROGRESS) {
+		c->sc_mbuf = NULL;
 		urndis_stop(sc);
 		return(EIO);
 	}
@@ -826,7 +827,7 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 	ifp = GET_IFP(sc);
 	offset = 0;
 
-	while (len > 0) {
+	while (len > 1) {
 		msg = (struct rndis_packet_msg *)((char*)c->sc_buf + offset);
 		m = c->sc_mbuf;
 
@@ -839,7 +840,7 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 			    DEVNAME(sc),
 			    len,
 			    sizeof(*msg));
-			return;
+			break;
 		}
 
 		DPRINTF(("%s: urndis_decap len %u data(off:%u len:%u) "
@@ -859,14 +860,14 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 			    DEVNAME(sc),
 			    letoh32(msg->rm_type),
 			    REMOTE_NDIS_PACKET_MSG);
-			return;
+			break;
 		}
 		if (letoh32(msg->rm_len) < sizeof(*msg)) {
 			printf("%s: urndis_decap invalid msg len %u < %zu\n",
 			    DEVNAME(sc),
 			    letoh32(msg->rm_len),
 			    sizeof(*msg));
-			return;
+			break;
 		}
 		if (letoh32(msg->rm_len) > len) {
 			printf("%s: urndis_decap invalid msg len %u > buffer "
@@ -874,7 +875,7 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 			    DEVNAME(sc),
 			    letoh32(msg->rm_len),
 			    len);
-			return;
+			break;
 		}
 
 		if (letoh32(msg->rm_dataoffset) +
@@ -889,7 +890,7 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 			    letoh32(msg->rm_dataoffset) +
 			    letoh32(msg->rm_datalen) + RNDIS_HEADER_OFFSET,
 			    letoh32(msg->rm_len));
-			return;
+			break;
 		}
 
 		if (letoh32(msg->rm_datalen) < sizeof(struct ether_header)) {
@@ -899,7 +900,7 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 			    DEVNAME(sc),
 			    letoh32(msg->rm_datalen),
 			    sizeof(struct ether_header)));
-			return;
+			break;
 		}
 
 		memcpy(mtod(m, char*),
@@ -916,6 +917,8 @@ urndis_decap(struct urndis_softc *sc, struct urndis_chain *c, u_int32_t len)
 		offset += letoh32(msg->rm_len);
 		len -= letoh32(msg->rm_len);
 	}
+	if (ml_empty(&ml))
+		return;
 
 	s = splnet();
 	if_input(ifp, &ml);
@@ -1010,7 +1013,7 @@ urndis_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 	int			 s, error = 0;
 
 	if (usbd_is_dying(sc->sc_udev))
-		return (EIO);
+		return ENXIO;
 
 	s = splnet();
 
@@ -1137,7 +1140,6 @@ urndis_stop(struct urndis_softc *sc)
 	ifq_clr_oactive(&ifp->if_snd);
 
 	if (sc->sc_bulkin_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_bulkin_pipe);
 		err = usbd_close_pipe(sc->sc_bulkin_pipe);
 		if (err)
 			printf("%s: close rx pipe failed: %s\n",
@@ -1146,7 +1148,6 @@ urndis_stop(struct urndis_softc *sc)
 	}
 
 	if (sc->sc_bulkout_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_bulkout_pipe);
 		err = usbd_close_pipe(sc->sc_bulkout_pipe);
 		if (err)
 			printf("%s: close tx pipe failed: %s\n",
@@ -1188,16 +1189,15 @@ urndis_start(struct ifnet *ifp)
 	if (usbd_is_dying(sc->sc_udev) || ifq_is_oactive(&ifp->if_snd))
 		return;
 
-	m_head = ifq_deq_begin(&ifp->if_snd);
+	m_head = ifq_dequeue(&ifp->if_snd);
 	if (m_head == NULL)
 		return;
 
 	if (urndis_encap(sc, m_head, 0)) {
-		ifq_deq_rollback(&ifp->if_snd, m_head);
+		m_freem(m_head);
 		ifq_set_oactive(&ifp->if_snd);
 		return;
 	}
-	ifq_deq_commit(&ifp->if_snd, m_head);
 
 	/*
 	 * If there's a BPF listener, bounce a copy of this frame
@@ -1310,7 +1310,7 @@ urndis_txeof(struct usbd_xfer *xfer,
 	if (err)
 		ifp->if_oerrors++;
 
-	if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+	if (ifq_empty(&ifp->if_snd) == 0)
 		urndis_start(ifp);
 
 	splx(s);

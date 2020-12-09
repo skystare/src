@@ -1,4 +1,4 @@
-/* $OpenBSD: ipifuncs.c,v 1.19 2018/06/13 14:38:42 visa Exp $ */
+/* $OpenBSD: ipifuncs.c,v 1.22 2020/08/10 15:22:53 visa Exp $ */
 /* $NetBSD: ipifuncs.c,v 1.40 2008/04/28 20:23:10 martin Exp $ */
 
 /*-
@@ -32,10 +32,11 @@
  */
 
 #include <sys/param.h>
-#include <sys/device.h>
 #include <sys/systm.h>
-#include <sys/proc.h>
 #include <sys/atomic.h>
+#include <sys/device.h>
+#include <sys/evcount.h>
+#include <sys/proc.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -53,7 +54,7 @@ unsigned int ipi_irq = 0;
 unsigned int ipi_mailbox[MAXCPUS];
 
 /* Variables needed for SMP rendezvous. */
-struct mutex smp_ipi_mtx;
+struct mutex smp_rv_mtx;
 volatile unsigned long smp_rv_map;
 void (*volatile smp_rv_action_func)(void *arg);
 void * volatile smp_rv_func_arg;
@@ -81,7 +82,7 @@ mips64_ipi_init(void)
 	int error;
 
 	if (!cpuid) {
-		mtx_init(&smp_ipi_mtx, IPL_IPI);
+		mtx_init(&smp_rv_mtx, IPL_HIGH);
 		evcount_attach(&ipi_count, "ipi", &ipi_irq);
 	}
 
@@ -121,11 +122,8 @@ mips64_ipi_intr(void *arg)
 	return 1;
 }
 
-/*
- * Send an interprocessor interrupt.
- */
-void
-mips64_send_ipi(unsigned int cpuid, unsigned int ipimask)
+static void
+do_send_ipi(unsigned int cpuid, unsigned int ipimask)
 {
 #ifdef DEBUG
 	if (cpuid >= CPU_MAXID || get_cpu_info(cpuid) == NULL)
@@ -140,6 +138,21 @@ mips64_send_ipi(unsigned int cpuid, unsigned int ipimask)
 }
 
 /*
+ * Send an interprocessor interrupt.
+ */
+void
+mips64_send_ipi(unsigned int cpuid, unsigned int ipimask)
+{
+	/*
+	 * Ensure that preceding stores are visible to other CPUs
+	 * before sending the IPI.
+	 */
+	membar_producer();
+
+	do_send_ipi(cpuid, ipimask);
+}
+
+/*
  * Send an IPI to all in the list but ourselves.
  */
 void
@@ -150,11 +163,17 @@ mips64_multicast_ipi(unsigned int cpumask, unsigned int ipimask)
 
 	cpumask &= ~(1 << cpu_number());
 
+	/*
+	 * Ensure that preceding stores are visible to other CPUs
+	 * before sending the IPI.
+	 */
+	membar_producer();
+
 	CPU_INFO_FOREACH(cii, ci) {
 		if (!(cpumask & (1UL << ci->ci_cpuid)) || 
 		    !cpuset_isset(&cpus_running, ci))
 			continue;
-		mips64_send_ipi(ci->ci_cpuid, ipimask);
+		do_send_ipi(ci->ci_cpuid, ipimask);
 	}
 }
 
@@ -207,8 +226,7 @@ smp_rendezvous_cpus(unsigned long map,
 		return;
 	}
 
-	/* obtain rendezvous lock */
-        mtx_enter(&smp_ipi_mtx);
+	mtx_enter(&smp_rv_mtx);
 
 	/* set static function pointers */
 	smp_rv_map = map;
@@ -216,9 +234,6 @@ smp_rendezvous_cpus(unsigned long map,
 	smp_rv_func_arg = arg;
 	smp_rv_waiters[0] = 0;
 	smp_rv_waiters[1] = 0;
-
-	/* Ensure the parameters are visible to other CPUs. */
-	membar_producer();
 
 	/* signal other processors, which will enter the IPI with interrupts off */
 	mips64_multicast_ipi(map, MIPS64_IPI_RENDEZVOUS);
@@ -232,8 +247,7 @@ smp_rendezvous_cpus(unsigned long map,
 
 	smp_rv_action_func = NULL;
 
-	/* release lock */
-	mtx_leave(&smp_ipi_mtx);
+	mtx_leave(&smp_rv_mtx);
 }
 
 void

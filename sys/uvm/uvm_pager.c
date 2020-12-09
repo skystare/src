@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_pager.c,v 1.71 2014/12/17 19:42:15 tedu Exp $	*/
+/*	$OpenBSD: uvm_pager.c,v 1.73 2020/10/21 09:08:14 mpi Exp $	*/
 /*	$NetBSD: uvm_pager.c,v 1.36 2000/11/27 18:26:41 chs Exp $	*/
 
 /*
@@ -43,7 +43,7 @@
 
 struct pool *uvm_aiobuf_pool;
 
-struct uvm_pagerops *uvmpagerops[] = {
+const struct uvm_pagerops *uvmpagerops[] = {
 	&aobj_pager,
 	&uvm_deviceops,
 	&uvm_vnodeops,
@@ -166,7 +166,7 @@ pager_seg_restart:
 
 pager_seg_fail:
 	if ((flags & UVMPAGER_MAPIN_WAITOK) != 0) {
-		msleep(&psegs, &uvm_pseg_lck, PVM, "pagerseg", 0);
+		msleep_nsec(&psegs, &uvm_pseg_lck, PVM, "pagerseg", INFSLP);
 		goto pager_seg_restart;
 	}
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: inode.h,v 1.50 2016/06/19 11:54:34 natano Exp $	*/
+/*	$OpenBSD: inode.h,v 1.53 2020/06/24 22:03:45 cheloha Exp $	*/
 /*	$NetBSD: inode.h,v 1.8 1995/06/15 23:22:50 cgd Exp $	*/
 
 /*
@@ -85,7 +85,7 @@ struct inode {
 	struct   cluster_info i_ci;
 	struct	 dquot *i_dquot[MAXQUOTAS]; /* Dquot structures. */
 	u_quad_t i_modrev;	/* Revision level for NFS lease. */
-	struct	 lockf *i_lockf;/* Head of byte-level lock list. */
+	struct	 lockf_state *i_lockf; /* Byte-level lock state. */
 	struct   rrwlock i_lock;/* Inode lock */
 
 	/*
@@ -320,11 +320,11 @@ struct indir {
 	if ((ip)->i_flag & (IN_ACCESS | IN_CHANGE | IN_UPDATE)) {	\
 		(ip)->i_flag |= IN_MODIFIED;				\
 		if ((ip)->i_flag & IN_ACCESS)				\
-			(ip)->i_e2fs_atime = time_second;		\
+			(ip)->i_e2fs_atime = gettime();			\
 		if ((ip)->i_flag & IN_UPDATE)				\
-			(ip)->i_e2fs_mtime = time_second;		\
+			(ip)->i_e2fs_mtime = gettime();			\
 		if ((ip)->i_flag & IN_CHANGE) {				\
-			(ip)->i_e2fs_ctime = time_second;		\
+			(ip)->i_e2fs_ctime = gettime();			\
 			(ip)->i_modrev++;				\
 		}							\
 		(ip)->i_flag &= ~(IN_ACCESS | IN_CHANGE | IN_UPDATE);	\
@@ -344,6 +344,6 @@ struct ufid {
 	u_int16_t ufid_len;	/* Length of structure. */
 	u_int16_t ufid_pad;	/* Force 32-bit alignment. */
 	ufsino_t  ufid_ino;	/* File number (ino). */
-	int32_t	  ufid_gen;	/* Generation number. */
+	u_int32_t ufid_gen;	/* Generation number. */
 };
 #endif /* _KERNEL */

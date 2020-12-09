@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.36 2018/06/22 13:20:08 rob Exp $	*/
+/*	$OpenBSD: util.c,v 1.40 2020/08/15 11:31:17 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2010-2013 Reyk Floeter <reyk@openbsd.org>
@@ -459,14 +459,14 @@ print_map(unsigned int type, struct iked_constmap *map)
 }
 
 void
-lc_string(char *str)
+lc_idtype(char *str)
 {
-	for (; *str != '\0'; str++)
+	for (; *str != '\0' && *str != '/'; str++)
 		*str = tolower((unsigned char)*str);
 }
 
 void
-print_hex(uint8_t *buf, off_t offset, size_t length)
+print_hex(const uint8_t *buf, off_t offset, size_t length)
 {
 	unsigned int	 i;
 
@@ -486,7 +486,7 @@ print_hex(uint8_t *buf, off_t offset, size_t length)
 }
 
 void
-print_hexval(uint8_t *buf, off_t offset, size_t length)
+print_hexval(const uint8_t *buf, off_t offset, size_t length)
 {
 	unsigned int	 i;
 
@@ -553,7 +553,8 @@ uint8_t
 mask2prefixlen6(struct sockaddr *sa)
 {
 	struct sockaddr_in6	*sa_in6 = (struct sockaddr_in6 *)sa;
-	uint8_t			 l = 0, *ap, *ep;
+	uint8_t			*ap, *ep;
+	unsigned int		 l = 0;
 
 	/*
 	 * sin6_len is the size of the sockaddr so substract the offset of
@@ -569,32 +570,35 @@ mask2prefixlen6(struct sockaddr *sa)
 			break;
 		case 0xfe:
 			l += 7;
-			return (l);
+			goto done;
 		case 0xfc:
 			l += 6;
-			return (l);
+			goto done;
 		case 0xf8:
 			l += 5;
-			return (l);
+			goto done;
 		case 0xf0:
 			l += 4;
-			return (l);
+			goto done;
 		case 0xe0:
 			l += 3;
-			return (l);
+			goto done;
 		case 0xc0:
 			l += 2;
-			return (l);
+			goto done;
 		case 0x80:
 			l += 1;
-			return (l);
+			goto done;
 		case 0x00:
-			return (l);
+			goto done;
 		default:
-			return (0);
+			fatalx("non contiguous inet6 netmask");
 		}
 	}
 
+done:
+	if (l > sizeof(struct in6_addr) * 8)
+		fatalx("%s: prefixlen %d out of bound", __func__, l);
 	return (l);
 }
 
@@ -706,7 +710,7 @@ expand_string(char *label, size_t len, const char *srch, const char *repl)
 		log_debug("%s: calloc", __func__);
 		return (-1);
 	}
-	p = q = label;
+	p = label;
 	while ((q = strstr(p, srch)) != NULL) {
 		*q = '\0';
 		if ((strlcat(tmp, p, len) >= len) ||

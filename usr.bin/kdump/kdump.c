@@ -1,4 +1,4 @@
-/*	$OpenBSD: kdump.c,v 1.134 2018/08/11 11:01:37 mestre Exp $	*/
+/*	$OpenBSD: kdump.c,v 1.143 2020/04/05 08:32:14 mpi Exp $	*/
 
 /*-
  * Copyright (c) 1988, 1993
@@ -74,7 +74,14 @@
 #include "kdump_subr.h"
 #include "extern.h"
 
-int timestamp, decimal, iohex, fancy = 1, maxdata = INT_MAX;
+enum {
+	TIMESTAMP_NONE,
+	TIMESTAMP_ABSOLUTE,
+	TIMESTAMP_RELATIVE,
+	TIMESTAMP_ELAPSED
+} timestamp = TIMESTAMP_NONE;
+
+int decimal, iohex, fancy = 1, maxdata = INT_MAX;
 int needtid, tail, basecol;
 char *tracefile = DEF_TRACEFILE;
 struct ktr_header ktr_header;
@@ -186,10 +193,16 @@ main(int argc, char *argv[])
 				errx(1, "-p %s: %s", optarg, errstr);
 			break;
 		case 'R':	/* relative timestamp */
-			timestamp = timestamp == 1 ? 3 : 2;
+			if (timestamp == TIMESTAMP_ABSOLUTE)
+				timestamp = TIMESTAMP_ELAPSED;
+			else
+				timestamp = TIMESTAMP_RELATIVE;
 			break;
 		case 'T':
-			timestamp = timestamp == 2 ? 3 : 1;
+			if (timestamp == TIMESTAMP_RELATIVE)
+				timestamp = TIMESTAMP_ELAPSED;
+			else
+				timestamp = TIMESTAMP_ABSOLUTE;
 			break;
 		case 't':
 			trpoints = getpoints(optarg, DEF_POINTS);
@@ -208,7 +221,10 @@ main(int argc, char *argv[])
 	if (argc > optind)
 		usage();
 
-	if (unveil(tracefile, "r") == -1)
+	if (strcmp(tracefile, "-") != 0)
+		if (unveil(tracefile, "r") == -1)
+			err(1, "unveil");
+	if (unveil(_PATH_PROTOCOLS, "r") == -1)
 		err(1, "unveil");
 	if (pledge("stdio rpath getpw", NULL) == -1)
 		err(1, "pledge");
@@ -216,8 +232,9 @@ main(int argc, char *argv[])
 	m = malloc(size = 1025);
 	if (m == NULL)
 		err(1, NULL);
-	if (!freopen(tracefile, "r", stdin))
-		err(1, "%s", tracefile);
+	if (strcmp(tracefile, "-") != 0)
+		if (!freopen(tracefile, "r", stdin))
+			err(1, "%s", tracefile);
 
 	if (fread_tail(&ktr_header, sizeof(struct ktr_header), 1) == 0 ||
 	    ktr_header.ktr_type != htobe32(KTR_START))
@@ -350,12 +367,12 @@ dumpheader(struct ktr_header *kth)
 	if (needtid)
 		basecol += printf("/%-7ld", (long)kth->ktr_tid);
 	basecol += printf(" %-8.*s ", MAXCOMLEN, kth->ktr_comm);
-	if (timestamp) {
-		if (timestamp == 3) {
+	if (timestamp != TIMESTAMP_NONE) {
+		if (timestamp == TIMESTAMP_ELAPSED) {
 			if (prevtime.tv_sec == 0)
 				prevtime = kth->ktr_time;
 			timespecsub(&kth->ktr_time, &prevtime, &temp);
-		} else if (timestamp == 2) {
+		} else if (timestamp == TIMESTAMP_RELATIVE) {
 			timespecsub(&kth->ktr_time, &prevtime, &temp);
 			prevtime = kth->ktr_time;
 		} else
@@ -730,7 +747,6 @@ static const formatter scargs[][8] = {
     [SYS_utimes]	= { Ppath, Pptr },
     [SYS_futimes]	= { Pfd, Pptr },
     [SYS_kbind]		= { Pptr, Psize, Phexlonglong },
-    [SYS_mincore]	= { Pptr, Pbigsize, Pptr },
     [SYS_getgroups]	= { Pcount, Pptr },
     [SYS_setgroups]	= { Pcount, Pptr },
     [SYS_setpgid]	= { Ppid_t, Ppid_t },
@@ -1358,7 +1374,7 @@ ktrexec(const char *ptr, size_t len)
 static void
 ktrpledge(struct ktr_pledge *pledge, size_t len)
 {
-	char *name = "";
+	const char *name = "";
 	int i;
 
 	if (len < sizeof(struct ktr_pledge))
@@ -1388,9 +1404,8 @@ usage(void)
 
 	extern char *__progname;
 	fprintf(stderr, "usage: %s "
-	    "[-dHlnRTXx] [-f file] [-m maxdata] [-p pid]\n"
-	    "%*s[-t [cinpstuxX+]]\n",
-	    __progname, (int)(sizeof("usage: ") + strlen(__progname)), "");
+	    "[-dHlnRTXx] [-f file] [-m maxdata] [-p pid] [-t trstr]\n",
+	    __progname);
 	exit(1);
 }
 

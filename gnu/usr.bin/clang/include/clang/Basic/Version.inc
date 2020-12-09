@@ -1,9 +1,9 @@
-/*	$OpenBSD: Version.inc,v 1.6 2018/04/06 14:44:04 patrick Exp $ */
+/*	$OpenBSD: Version.inc,v 1.11 2020/08/09 15:56:39 patrick Exp $ */
 
-#define	CLANG_VERSION			6.0.0
-#define	CLANG_VERSION_STRING		"6.0.0"
-#define	CLANG_VERSION_MAJOR		6
+#define	CLANG_VERSION			10.0.1
+#define	CLANG_VERSION_STRING		"10.0.1"
+#define	CLANG_VERSION_MAJOR		10
 #define	CLANG_VERSION_MINOR		0
-#define	CLANG_VERSION_PATCHLEVEL	0
+#define	CLANG_VERSION_PATCHLEVEL	1
 
 #define	CLANG_VENDOR		"OpenBSD "

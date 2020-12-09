@@ -1,4 +1,4 @@
-/*	$OpenBSD: an.c,v 1.73 2018/02/19 08:59:52 mpi Exp $	*/
+/*	$OpenBSD: an.c,v 1.77 2020/12/08 04:37:27 cheloha Exp $	*/
 /*	$NetBSD: an.c,v 1.34 2005/06/20 02:49:18 atatat Exp $	*/
 /*
  * Copyright (c) 1997, 1998, 1999
@@ -562,7 +562,7 @@ an_intr(void *arg)
 
 		if (ifq_is_oactive(&ifp->if_snd) == 0 &&
 		    sc->sc_ic.ic_state == IEEE80211_S_RUN &&
-		    !IFQ_IS_EMPTY(&ifp->if_snd))
+		    !ifq_empty(&ifp->if_snd))
 			an_start(ifp);
 	}
 
@@ -681,10 +681,10 @@ an_wait(struct an_softc *sc)
 	int i;
 
 	CSR_WRITE_2(sc, AN_COMMAND, AN_CMD_NOOP2);
-	for (i = 0; i < 3*hz; i++) {
+	for (i = 0; i < 3000; i += 100) {
 		if (CSR_READ_2(sc, AN_EVENT_STAT) & AN_EV_CMD)
 			break;
-		(void)tsleep(sc, PWAIT, "anatch", 1);
+		tsleep_nsec(sc, PWAIT, "anatch", MSEC_TO_NSEC(100));
 	}
 	CSR_WRITE_2(sc, AN_EVENT_ACK, AN_EV_CMD);
 }
@@ -902,6 +902,8 @@ an_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 		error = 0;
 		break;
 	case SIOCS80211NWKEY:
+		if ((error = suser(curproc)) != 0)
+			break;
 		error = an_set_nwkey(sc, (struct ieee80211_nwkey *)data);
 			break;
 	case SIOCG80211NWKEY:
@@ -1515,9 +1517,8 @@ an_set_nwkey_wep(struct an_softc *sc, struct ieee80211_nwkey *nwkey)
 int
 an_get_nwkey(struct an_softc *sc, struct ieee80211_nwkey *nwkey)
 {
-	int i, error;
+	int i;
 
-	error = 0;
 	if (sc->sc_config.an_authtype & AN_AUTHTYPE_LEAP)
 		nwkey->i_wepon = IEEE80211_NWKEY_EAP;
 	else if (sc->sc_config.an_authtype & AN_AUTHTYPE_PRIVACY_IN_USE)
@@ -1533,21 +1534,10 @@ an_get_nwkey(struct an_softc *sc, struct ieee80211_nwkey *nwkey)
 	for (i = 0; i < IEEE80211_WEP_NKID; i++) {
 		if (nwkey->i_key[i].i_keydat == NULL)
 			continue;
-		/* do not show any keys to non-root user */
-		if ((error = suser(curproc)) != 0)
-			break;
-		nwkey->i_key[i].i_keylen = sc->sc_wepkeys[i].an_wep_keylen;
-		if (nwkey->i_key[i].i_keylen < 0) {
-			if (sc->sc_perskeylen[i] == 0)
-				nwkey->i_key[i].i_keylen = 0;
-			continue;
-		}
-		if ((error = copyout(sc->sc_wepkeys[i].an_wep_key,
-		    nwkey->i_key[i].i_keydat,
-		    sc->sc_wepkeys[i].an_wep_keylen)) != 0)
-			break;
+		/* do not show any keys to userland */
+		return EPERM;
 	}
-	return error;
+	return 0;
 }
 
 int

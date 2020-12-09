@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.55 2018/06/20 16:43:05 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.61 2020/09/21 09:42:07 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -18,6 +18,8 @@
 
 #include <sys/types.h>
 #include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/tree.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -135,9 +137,7 @@ config_getreset(struct httpd *env, struct imsg *imsg)
 int
 config_getcfg(struct httpd *env, struct imsg *imsg)
 {
-	struct privsep		*ps = env->sc_ps;
 	struct ctl_flags	 cf;
-	unsigned int		 what;
 
 	if (IMSG_DATA_SIZE(imsg) != sizeof(cf))
 		return (0); /* ignore */
@@ -147,8 +147,6 @@ config_getcfg(struct httpd *env, struct imsg *imsg)
 	env->sc_opts = cf.cf_opts;
 	env->sc_flags = cf.cf_flags;
 	memcpy(env->sc_tls_sid, cf.cf_tls_sid, sizeof(env->sc_tls_sid));
-
-	what = ps->ps_what[privsep_process];
 
 	if (privsep_process != PROC_PARENT)
 		proc_compose(env->sc_ps, PROC_PARENT,
@@ -231,6 +229,9 @@ config_setserver(struct httpd *env, struct server *srv)
 				    __func__, srv->srv_conf.name);
 				return (-1);
 			}
+
+			/* Configure FCGI parmeters if necessary. */
+			config_setserver_fcgiparams(env, srv);
 		}
 	}
 
@@ -290,6 +291,104 @@ config_settls(struct httpd *env, struct server *srv, enum tls_config_type type,
 		data += tls.tls_chunk_len;
 		len -= tls.tls_chunk_len;
 	}
+
+	return (0);
+}
+
+int
+config_getserver_fcgiparams(struct httpd *env, struct imsg *imsg)
+{
+	struct server		*srv;
+	struct server_config	*srv_conf, *iconf;
+	struct fastcgi_param	*fp;
+	uint32_t		 id;
+	size_t			 c, nc, len;
+	uint8_t			*p = imsg->data;
+
+	len = sizeof(nc) + sizeof(id);
+	if (IMSG_DATA_SIZE(imsg) < len) {
+		log_debug("%s: invalid message length", __func__);
+		return (-1);
+	}
+
+	memcpy(&nc, p, sizeof(nc));	/* number of params */
+	p += sizeof(nc);
+
+	memcpy(&id, p, sizeof(id));	/* server conf id */
+	srv_conf = serverconfig_byid(id);
+	p += sizeof(id);
+
+	len += nc*sizeof(*fp);
+	if (IMSG_DATA_SIZE(imsg) < len) {
+		log_debug("%s: invalid message length", __func__);
+		return (-1);
+	}
+
+	/* Find associated server config */
+	TAILQ_FOREACH(srv, env->sc_servers, srv_entry) {
+		if (srv->srv_conf.id == id) {
+			srv_conf = &srv->srv_conf;
+			break;
+		}
+		TAILQ_FOREACH(iconf, &srv->srv_hosts, entry) {
+			if (iconf->id == id) {
+				srv_conf = iconf;
+				break;
+			}
+		}
+	}
+
+	/* Fetch FCGI parameters */
+	for (c = 0; c < nc; c++) {
+		if ((fp = calloc(1, sizeof(*fp))) == NULL)
+			fatalx("fcgiparams out of memory");
+		memcpy(fp, p, sizeof(*fp));
+		TAILQ_INSERT_HEAD(&srv_conf->fcgiparams, fp, entry);
+
+		p += sizeof(*fp);
+	}
+
+	return (0);
+}
+
+int
+config_setserver_fcgiparams(struct httpd *env, struct server *srv)
+{
+	struct privsep		*ps = env->sc_ps;
+	struct server_config	*srv_conf = &srv->srv_conf;
+	struct fastcgi_param	 *fp;
+	struct iovec		 *iov;
+	size_t			 c = 0, nc = 0;
+
+	DPRINTF("%s: sending fcgiparam for \"%s[%u]\" to %s fd %d", __func__,
+	    srv_conf->name, srv_conf->id, ps->ps_title[PROC_SERVER],
+	    srv->srv_s);
+
+	if (TAILQ_EMPTY(&srv_conf->fcgiparams))	/* nothing to do */
+		return (0);
+
+	TAILQ_FOREACH(fp, &srv_conf->fcgiparams, entry) {
+		nc++;
+	}
+	if ((iov = calloc(nc + 2, sizeof(*iov))) == NULL)
+		return (-1);
+
+	iov[c].iov_base = &nc;			/* number of params */
+	iov[c++].iov_len = sizeof(nc);
+	iov[c].iov_base = &srv_conf->id;	/* server config id */
+	iov[c++].iov_len = sizeof(srv_conf->id);
+
+	TAILQ_FOREACH(fp, &srv_conf->fcgiparams, entry) {	/* push FCGI params */
+		iov[c].iov_base = fp;
+		iov[c++].iov_len = sizeof(*fp);
+	}
+	if (proc_composev(ps, PROC_SERVER, IMSG_CFG_FCGI, iov, c) != 0) {
+		log_warn("%s: failed to compose IMSG_CFG_FCGI imsg for "
+		    "`%s'", __func__, srv_conf->name);
+		free(iov);
+		return (-1);
+	}
+	free(iov);
 
 	return (0);
 }
@@ -398,13 +497,6 @@ config_getserver_config(struct httpd *env, struct server *srv,
 		f = SRVFLAG_AUTO_INDEX|SRVFLAG_NO_AUTO_INDEX;
 		if ((srv_conf->flags & f) == 0)
 			srv_conf->flags |= parent->flags & f;
-
-		f = SRVFLAG_SOCKET|SRVFLAG_FCGI;
-		if ((srv_conf->flags & f) == SRVFLAG_FCGI) {
-			srv_conf->flags |= f;
-			(void)strlcpy(srv_conf->socket, HTTPD_FCGI_SOCKET,
-			    sizeof(srv_conf->socket));
-		}
 
 		f = SRVFLAG_ROOT;
 		if ((srv_conf->flags & f) == 0) {
@@ -584,7 +676,6 @@ config_getserver(struct httpd *env, struct imsg *imsg)
 		if ((srv->srv_conf.return_uri = get_data(p + s,
 		    srv->srv_conf.return_uri_len)) == NULL)
 			goto fail;
-		s += srv->srv_conf.return_uri_len;
 	}
 
 	return (0);

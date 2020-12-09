@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_wi.c,v 1.168 2018/02/19 08:59:52 mpi Exp $	*/
+/*	$OpenBSD: if_wi.c,v 1.174 2020/07/10 13:26:37 patrick Exp $	*/
 
 /*
  * Copyright (c) 1997, 1998, 1999
@@ -512,7 +512,7 @@ wi_intr(void *vsc)
 	if (status == 0)
 		return (0);
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		wi_start(ifp);
 
 	return (1);
@@ -1542,7 +1542,7 @@ wi_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 	 * process is tsleep'ing in it.
 	 */
 	while ((sc->wi_flags & WI_FLAGS_BUSY) && error == 0)
-		error = tsleep(&sc->wi_flags, PCATCH, "wiioc", 0);
+		error = tsleep_nsec(&sc->wi_flags, PCATCH, "wiioc", INFSLP);
 	if (error != 0) {
 		splx(s);
 		return error;
@@ -1865,8 +1865,8 @@ wi_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 		timeout_add(&sc->wi_scan_timeout, len);
 
 		/* Let the userspace process wait for completion */
-		error = tsleep(&sc->wi_scan_lock, PCATCH, "wiscan",
-		    hz * IEEE80211_SCAN_TIMEOUT);
+		error = tsleep_nsec(&sc->wi_scan_lock, PCATCH, "wiscan",
+		    SEC_TO_NSEC(IEEE80211_SCAN_TIMEOUT));
 		break;
 	case SIOCG80211ALLNODES:
 	    {
@@ -1963,8 +1963,7 @@ wi_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 			}
 			sc->wi_enh_security = letoh16(wreq->wi_val[0]);
 			if (sc->wi_enh_security == WI_HIDESSID_IGNPROBES)
-				ifr->ifr_flags |= IEEE80211_F_HIDENWID >>
-				    IEEE80211_F_USERSHIFT;
+				ifr->ifr_flags |= IEEE80211_F_HIDENWID;
 		}
 		break;
 	case SIOCS80211FLAGS:
@@ -1974,7 +1973,7 @@ wi_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 			error = EINVAL;
 			break;
 		}
-		flags = (u_int32_t)ifr->ifr_flags << IEEE80211_F_USERSHIFT;
+		flags = (u_int32_t)ifr->ifr_flags;
 		if (sc->wi_flags & WI_FLAGS_HAS_ENH_SECURITY) {
 			sc->wi_enh_security = (flags & IEEE80211_F_HIDENWID) ?
 			    WI_HIDESSID_IGNPROBES : 0;
@@ -2330,7 +2329,7 @@ wi_start(struct ifnet *ifp)
 		return;
 
 nextpkt:
-	IFQ_DEQUEUE(&ifp->if_snd, m0);
+	m0 = ifq_dequeue(&ifp->if_snd);
 	if (m0 == NULL)
 		return;
 
@@ -2907,30 +2906,18 @@ wi_set_nwkey(struct wi_softc *sc, struct ieee80211_nwkey *nwkey)
 STATIC int
 wi_get_nwkey(struct wi_softc *sc, struct ieee80211_nwkey *nwkey)
 {
-	int i, len, error;
-	struct wi_ltv_keys *wk = &sc->wi_keys;
+	int i;
 
 	if (!(sc->wi_flags & WI_FLAGS_HAS_WEP))
 		return ENODEV;
 	nwkey->i_wepon = sc->wi_use_wep;
 	nwkey->i_defkid = sc->wi_tx_key + 1;
 
-	/* do not show any keys to non-root user */
-	error = suser(curproc);
 	for (i = 0; i < IEEE80211_WEP_NKID; i++) {
 		if (nwkey->i_key[i].i_keydat == NULL)
 			continue;
-		/* error holds results of suser() for the first time */
-		if (error)
-			return error;
-		len = letoh16(wk->wi_keys[i].wi_keylen);
-		if (nwkey->i_key[i].i_keylen < len)
-			return ENOSPC;
-		nwkey->i_key[i].i_keylen = len;
-		error = copyout(wk->wi_keys[i].wi_keydat,
-		    nwkey->i_key[i].i_keydat, len);
-		if (error)
-			return error;
+		/* do not show any keys to userland */
+		return EPERM;
 	}
 	return 0;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: aic6360.c,v 1.29 2017/09/08 05:36:52 deraadt Exp $	*/
+/*	$OpenBSD: aic6360.c,v 1.38 2020/09/22 19:32:52 krw Exp $	*/
 /*	$NetBSD: aic6360.c,v 1.52 1996/12/10 21:27:51 thorpej Exp $	*/
 
 #ifdef DDB
@@ -151,7 +151,6 @@
 int aic_debug = 0x00; /* AIC_SHOWSTART|AIC_SHOWMISC|AIC_SHOWTRACE; */
 #endif
 
-void	aic_minphys(struct buf *, struct scsi_link *);
 void 	aic_init(struct aic_softc *);
 void	aic_done(struct aic_softc *, struct aic_acb *);
 void	aic_dequeue(struct aic_softc *, struct aic_acb *);
@@ -186,14 +185,7 @@ struct cfdriver aic_cd = {
 };
 
 struct scsi_adapter aic_switch = {
-	aic_scsi_cmd,
-#ifdef notyet
-	aic_minphys,
-#else
-	scsi_minphys,
-#endif
-	0,
-	0,
+	aic_scsi_cmd, NULL, NULL, NULL, NULL
 };
 
 /*
@@ -244,7 +236,7 @@ aic_find(bus_space_tag_t iot, bus_space_handle_t ioh)
 	return (1);
 }
 
-/* 
+/*
  * Attach the AIC6360, fill out some high and low level data structures
  */
 void
@@ -271,17 +263,14 @@ aicattach(struct aic_softc *sc)
 
 	aic_init(sc);	/* init chip and driver */
 
-	/*
-	 * Fill in the prototype scsi_link
-	 */
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.adapter_target = sc->sc_initiator;
-	sc->sc_link.adapter = &aic_switch;
-	sc->sc_link.openings = 2;
-	sc->sc_link.pool = &sc->sc_iopool;
-
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter_target = sc->sc_initiator;
+	saa.saa_adapter = &aic_switch;
+	saa.saa_luns = saa.saa_adapter_buswidth = 8;
+	saa.saa_openings = 2;
+	saa.saa_pool = &sc->sc_iopool;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 
 	config_found(&sc->sc_dev, &saa, scsiprint);
 }
@@ -489,12 +478,12 @@ void
 aic_scsi_cmd(struct scsi_xfer *xs)
 {
 	struct scsi_link *sc_link = xs->sc_link;
-	struct aic_softc *sc = sc_link->adapter_softc;
+	struct aic_softc *sc = sc_link->bus->sb_adapter_softc;
 	struct aic_acb *acb;
 	int s, flags;
 
 	AIC_TRACE(("aic_scsi_cmd  "));
-	AIC_CMDS(("[0x%x, %d]->%d ", (int)xs->cmd->opcode, xs->cmdlen,
+	AIC_CMDS(("[0x%x, %d]->%d ", (int)xs->cmd.opcode, xs->cmdlen,
 	    sc_link->target));
 
 	flags = xs->flags;
@@ -510,7 +499,7 @@ aic_scsi_cmd(struct scsi_xfer *xs)
 		acb->scsi_cmd_length = 0;
 		acb->data_length = 0;
 	} else {
-		bcopy(xs->cmd, &acb->scsi_cmd, xs->cmdlen);
+		bcopy(&xs->cmd, &acb->scsi_cmd, xs->cmdlen);
 		acb->scsi_cmd_length = xs->cmdlen;
 		acb->data_addr = xs->data;
 		acb->data_length = xs->datalen;
@@ -535,21 +524,6 @@ aic_scsi_cmd(struct scsi_xfer *xs)
 			aic_timeout(acb);
 	}
 }
-
-#ifdef notyet
-/*
- * Adjust transfer size in buffer structure
- */
-void
-aic_minphys(struct buf *bp, struct scsi_link *sl)
-{
-
-	AIC_TRACE(("aic_minphys  "));
-	if (bp->b_bcount > (AIC_NSEG << PGSHIFT))
-		bp->b_bcount = (AIC_NSEG << PGSHIFT);
-	minphys(bp);
-}
-#endif
 
 /*
  * Used when interrupt driven I/O isn't allowed, e.g. during boot.
@@ -1997,7 +1971,7 @@ aic_timeout(void *arg)
 	struct aic_acb *acb = arg;
 	struct scsi_xfer *xs = acb->xs;
 	struct scsi_link *sc_link = xs->sc_link;
-	struct aic_softc *sc = sc_link->adapter_softc;
+	struct aic_softc *sc = sc_link->bus->sb_adapter_softc;
 	int s;
 
 	sc_print_addr(sc_link);

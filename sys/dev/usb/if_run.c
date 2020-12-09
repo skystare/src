@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_run.c,v 1.125 2018/01/30 20:56:38 zhuk Exp $	*/
+/*	$OpenBSD: if_run.c,v 1.132 2020/11/27 14:45:03 krw Exp $	*/
 
 /*-
  * Copyright (c) 2008-2010 Damien Bergamini <damien.bergamini@free.fr>
@@ -137,7 +137,6 @@ static const struct usb_devno run_devs[] = {
 	USB_ID(CONCEPTRONIC2,	RT2870_1),
 	USB_ID(CONCEPTRONIC2,	RT2870_2),
 	USB_ID(CONCEPTRONIC2,	RT2870_3),
-	USB_ID(CONCEPTRONIC2,	RT2870_4),
 	USB_ID(CONCEPTRONIC2,	RT2870_5),
 	USB_ID(CONCEPTRONIC2,	RT2870_6),
 	USB_ID(CONCEPTRONIC2,	RT2870_7),
@@ -376,7 +375,8 @@ void		run_calibrate_to(void *);
 void		run_calibrate_cb(struct run_softc *, void *);
 void		run_newassoc(struct ieee80211com *, struct ieee80211_node *,
 		    int);
-void		run_rx_frame(struct run_softc *, uint8_t *, int);
+void		run_rx_frame(struct run_softc *, uint8_t *, int,
+		    struct mbuf_list *);
 void		run_rxeof(struct usbd_xfer *, void *, usbd_status);
 void		run_txeof(struct usbd_xfer *, void *, usbd_status);
 int		run_tx(struct run_softc *, struct mbuf *,
@@ -750,7 +750,6 @@ run_free_rx_ring(struct run_softc *sc)
 	int i;
 
 	if (rxq->pipeh != NULL) {
-		usbd_abort_pipe(rxq->pipeh);
 		usbd_close_pipe(rxq->pipeh);
 		rxq->pipeh = NULL;
 	}
@@ -809,7 +808,6 @@ run_free_tx_ring(struct run_softc *sc, int qid)
 	int i;
 
 	if (txq->pipeh != NULL) {
-		usbd_abort_pipe(txq->pipeh);
 		usbd_close_pipe(txq->pipeh);
 		txq->pipeh = NULL;
 	}
@@ -1693,10 +1691,10 @@ run_media_change(struct ifnet *ifp)
 	if ((ifp->if_flags & (IFF_UP | IFF_RUNNING)) ==
 	    (IFF_UP | IFF_RUNNING)) {
 		run_stop(ifp, 0);
-		run_init(ifp);
+		error = run_init(ifp);
 	}
 
-	return 0;
+	return error;
 }
 
 void
@@ -1923,19 +1921,24 @@ run_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	/* do it in a process context */
 	cmd.key = *k;
-	cmd.associd = (ni != NULL) ? ni->ni_associd : 0;
+	cmd.ni = ni;
 	run_do_async(sc, run_set_key_cb, &cmd, sizeof cmd);
-	return 0;
+	sc->sc_key_tasks++;
+
+	return EBUSY;
 }
 
 void
 run_set_key_cb(struct run_softc *sc, void *arg)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
 	struct run_cmd_key *cmd = arg;
 	struct ieee80211_key *k = &cmd->key;
 	uint32_t attr;
 	uint16_t base;
 	uint8_t mode, wcid, iv[8];
+
+	sc->sc_key_tasks--;
 
 	/* map net80211 cipher to RT2860 security mode */
 	switch (k->k_cipher) {
@@ -1952,6 +1955,9 @@ run_set_key_cb(struct run_softc *sc, void *arg)
 		mode = RT2860_MODE_AES_CCMP;
 		break;
 	default:
+		IEEE80211_SEND_MGMT(ic, cmd->ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+		    IEEE80211_REASON_AUTH_LEAVE);
+		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 		return;
 	}
 
@@ -1959,7 +1965,7 @@ run_set_key_cb(struct run_softc *sc, void *arg)
 		wcid = 0;	/* NB: update WCID0 for group keys */
 		base = RT2860_SKEY(0, k->k_id);
 	} else {
-		wcid = RUN_AID2WCID(cmd->associd);
+		wcid = RUN_AID2WCID(cmd->ni->ni_associd);
 		base = RT2860_PKEY(wcid);
 	}
 
@@ -2010,6 +2016,11 @@ run_set_key_cb(struct run_softc *sc, void *arg)
 		attr = (attr & ~0xf) | (mode << 1) | RT2860_RX_PKEY_EN;
 		run_write(sc, RT2860_WCID_ATTR(wcid), attr);
 	}
+
+	if (sc->sc_key_tasks == 0) {
+		cmd->ni->ni_port_valid = 1;
+		ieee80211_set_link_state(ic, LINK_STATE_UP);
+	}
 }
 
 void
@@ -2025,7 +2036,7 @@ run_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	/* do it in a process context */
 	cmd.key = *k;
-	cmd.associd = (ni != NULL) ? ni->ni_associd : 0;
+	cmd.ni = ni;
 	run_do_async(sc, run_delete_key_cb, &cmd, sizeof cmd);
 }
 
@@ -2045,7 +2056,7 @@ run_delete_key_cb(struct run_softc *sc, void *arg)
 
 	} else {
 		/* remove pairwise key */
-		wcid = RUN_AID2WCID(cmd->associd);
+		wcid = RUN_AID2WCID(cmd->ni->ni_associd);
 		run_read(sc, RT2860_WCID_ATTR(wcid), &attr);
 		attr &= ~0xf;
 		run_write(sc, RT2860_WCID_ATTR(wcid), attr);
@@ -2158,7 +2169,8 @@ run_maxrssi_chain(struct run_softc *sc, const struct rt2860_rxwi *rxwi)
 }
 
 void
-run_rx_frame(struct run_softc *sc, uint8_t *buf, int dmalen)
+run_rx_frame(struct run_softc *sc, uint8_t *buf, int dmalen,
+    struct mbuf_list *ml)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -2295,7 +2307,7 @@ run_rx_frame(struct run_softc *sc, uint8_t *buf, int dmalen)
 	ni = ieee80211_find_rxnode(ic, wh);
 	rxi.rxi_rssi = rssi;
 	rxi.rxi_tstamp = 0;	/* unused */
-	ieee80211_input(ifp, m, ni, &rxi);
+	ieee80211_inputm(ifp, m, ni, &rxi, ml);
 
 	/* node is no longer needed */
 	ieee80211_release_node(ic, ni);
@@ -2305,6 +2317,7 @@ run_rx_frame(struct run_softc *sc, uint8_t *buf, int dmalen)
 void
 run_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct run_rx_data *data = priv;
 	struct run_softc *sc = data->sc;
 	uint8_t *buf;
@@ -2348,10 +2361,11 @@ run_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 			    dmalen + 8, xferlen));
 			break;
 		}
-		run_rx_frame(sc, buf + sizeof (uint32_t), dmalen);
+		run_rx_frame(sc, buf + sizeof (uint32_t), dmalen, &ml);
 		buf += dmalen + 8;
 		xferlen -= dmalen + 8;
 	}
+	if_input(&sc->sc_ic.ic_if, &ml);
 
 skip:	/* setup a new transfer */
 	usbd_setup_xfer(xfer, sc->rxq.pipeh, data, data->buf, RUN_MAX_RXSZ,
@@ -2484,7 +2498,6 @@ run_tx(struct run_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		tap->wt_rate = rt2860_rates[ridx].rate;
 		tap->wt_chan_freq = htole16(ic->ic_bss->ni_chan->ic_freq);
 		tap->wt_chan_flags = htole16(ic->ic_bss->ni_chan->ic_flags);
-		tap->wt_hwqueue = qid;
 		if (mcs & RT2860_PHY_SHPRE)
 			tap->wt_flags |= IEEE80211_RADIOTAP_F_SHORTPRE;
 
@@ -2544,7 +2557,7 @@ run_start(struct ifnet *ifp)
 			break;
 
 		/* encapsulate and send data frames */
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 #if NBPFILTER > 0

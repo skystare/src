@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_glue.c,v 1.73 2017/05/08 09:32:19 mpi Exp $	*/
+/*	$OpenBSD: uvm_glue.c,v 1.77 2020/12/07 16:55:29 mpi Exp $	*/
 /*	$NetBSD: uvm_glue.c,v 1.44 2001/02/06 19:54:44 eeh Exp $	*/
 
 /* 
@@ -103,33 +103,27 @@ uvm_kernacc(caddr_t addr, size_t len, int rw)
 /*
  * uvm_vslock: wire user memory for I/O
  *
- * - called from physio and sys_sysctl
+ * - called from sys_sysctl
  */
-
 int
 uvm_vslock(struct proc *p, caddr_t addr, size_t len, vm_prot_t access_type)
 {
-	struct vm_map *map;
+	struct vm_map *map = &p->p_vmspace->vm_map;
 	vaddr_t start, end;
-	int rv;
 
-	map = &p->p_vmspace->vm_map;
 	start = trunc_page((vaddr_t)addr);
 	end = round_page((vaddr_t)addr + len);
 	if (end <= start)
 		return (EINVAL);
 
-	rv = uvm_fault_wire(map, start, end, access_type);
-
-	return (rv);
+	return uvm_fault_wire(map, start, end, access_type);
 }
 
 /*
  * uvm_vsunlock: unwire user memory wired by uvm_vslock()
  *
- * - called from physio and sys_sysctl
+ * - called from sys_sysctl
  */
-
 void
 uvm_vsunlock(struct proc *p, caddr_t addr, size_t len)
 {
@@ -137,8 +131,7 @@ uvm_vsunlock(struct proc *p, caddr_t addr, size_t len)
 
 	start = trunc_page((vaddr_t)addr);
 	end = round_page((vaddr_t)addr + len);
-	if (end <= start)
-		return;
+	KASSERT(end > start);
 
 	uvm_fault_unwire(&p->p_vmspace->vm_map, start, end);
 }
@@ -146,19 +139,21 @@ uvm_vsunlock(struct proc *p, caddr_t addr, size_t len)
 /*
  * uvm_vslock_device: wire user memory, make sure it's device reachable
  *  and bounce if necessary.
- * Always bounces for now.
+ *
+ * - called from physio
  */
 int
 uvm_vslock_device(struct proc *p, void *addr, size_t len,
     vm_prot_t access_type, void **retp)
 {
+	struct vm_map *map = &p->p_vmspace->vm_map;
 	struct vm_page *pg;
 	struct pglist pgl;
 	int npages;
 	vaddr_t start, end, off;
 	vaddr_t sva, va;
 	vsize_t sz;
-	int error, i;
+	int error, mapv, i;
 
 	start = trunc_page((vaddr_t)addr);
 	end = round_page((vaddr_t)addr + len);
@@ -167,17 +162,23 @@ uvm_vslock_device(struct proc *p, void *addr, size_t len,
 	if (end <= start)
 		return (EINVAL);
 
-	if ((error = uvm_fault_wire(&p->p_vmspace->vm_map, start, end,
-	    access_type))) {
+	vm_map_lock_read(map);
+retry:
+	mapv = map->timestamp;
+	vm_map_unlock_read(map);
+
+	if ((error = uvm_fault_wire(map, start, end, access_type)))
 		return (error);
-	}
+
+	vm_map_lock_read(map);
+	if (mapv != map->timestamp)
+		goto retry;
 
 	npages = atop(sz);
 	for (i = 0; i < npages; i++) {
 		paddr_t pa;
 
-		if (!pmap_extract(p->p_vmspace->vm_map.pmap,
-		    start + ptoa(i), &pa)) {
+		if (!pmap_extract(map->pmap, start + ptoa(i), &pa)) {
 			error = EFAULT;
 			goto out_unwire;
 		}
@@ -219,10 +220,16 @@ uvm_vslock_device(struct proc *p, void *addr, size_t len,
 out_unmap:
 	uvm_km_free(kernel_map, sva, sz);
 out_unwire:
-	uvm_fault_unwire(&p->p_vmspace->vm_map, start, end);
+	uvm_fault_unwire_locked(map, start, end);
+	vm_map_unlock_read(map);
 	return (error);
 }
 
+/*
+ * uvm_vsunlock_device: unwire user memory wired by uvm_vslock_device()
+ *
+ * - called from physio
+ */
 void
 uvm_vsunlock_device(struct proc *p, void *addr, size_t len, void *map)
 {
@@ -232,13 +239,14 @@ uvm_vsunlock_device(struct proc *p, void *addr, size_t len, void *map)
 
 	start = trunc_page((vaddr_t)addr);
 	end = round_page((vaddr_t)addr + len);
+	KASSERT(end > start);
 	sz = end - start;
-	if (end <= start)
-		return;
 
 	if (map)
 		copyout(map, addr, len);
-	uvm_fault_unwire(&p->p_vmspace->vm_map, start, end);
+
+	uvm_fault_unwire_locked(&p->p_vmspace->vm_map, start, end);
+	vm_map_unlock_read(&p->p_vmspace->vm_map);
 
 	if (!map)
 		return;
@@ -285,8 +293,10 @@ uvm_uarea_free(struct proc *p)
 void
 uvm_exit(struct process *pr)
 {
-	uvmspace_free(pr->ps_vmspace);
+	struct vmspace *vm = pr->ps_vmspace;
+
 	pr->ps_vmspace = NULL;
+	uvmspace_free(vm);
 }
 
 /*
@@ -295,20 +305,19 @@ uvm_exit(struct process *pr)
  * - called for process 0 and then inherited by all others.
  */
 void
-uvm_init_limits(struct proc *p)
+uvm_init_limits(struct plimit *limit0)
 {
-
 	/*
 	 * Set up the initial limits on process VM.  Set the maximum
 	 * resident set size to be all of (reasonably) available memory.
 	 * This causes any single, large process to start random page
 	 * replacement once it fills memory.
 	 */
-	p->p_rlimit[RLIMIT_STACK].rlim_cur = DFLSSIZ;
-	p->p_rlimit[RLIMIT_STACK].rlim_max = MAXSSIZ;
-	p->p_rlimit[RLIMIT_DATA].rlim_cur = DFLDSIZ;
-	p->p_rlimit[RLIMIT_DATA].rlim_max = MAXDSIZ;
-	p->p_rlimit[RLIMIT_RSS].rlim_cur = ptoa(uvmexp.free);
+	limit0->pl_rlimit[RLIMIT_STACK].rlim_cur = DFLSSIZ;
+	limit0->pl_rlimit[RLIMIT_STACK].rlim_max = MAXSSIZ;
+	limit0->pl_rlimit[RLIMIT_DATA].rlim_cur = DFLDSIZ;
+	limit0->pl_rlimit[RLIMIT_DATA].rlim_max = MAXDSIZ;
+	limit0->pl_rlimit[RLIMIT_RSS].rlim_cur = ptoa(uvmexp.free);
 }
 
 #ifdef DEBUG
@@ -360,7 +369,7 @@ uvm_swapout_threads(void)
 		 * the smallest p_slptime
 		 */
 		slpp = NULL;
-		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
+		SMR_TAILQ_FOREACH_LOCKED(p, &pr->ps_threads, p_thr_link) {
 			switch (p->p_stat) {
 			case SRUN:
 			case SONPROC:

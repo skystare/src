@@ -1,4 +1,4 @@
-#	$OpenBSD: 4.4BSD.dist,v 1.303 2018/08/16 17:40:54 millert Exp $
+#	$OpenBSD: 4.4BSD.dist,v 1.315 2020/06/29 17:26:24 deraadt Exp $
 
 /set type=dir uname=root gname=wheel mode=0755
 
@@ -90,6 +90,8 @@ etc
     ..
     rc.d
     ..
+    rpki
+    ..
     skel
         .ssh			uname=root mode=0700
         ..
@@ -103,9 +105,8 @@ etc
     ssl
         private			uname=root mode=0700
         ..
-        lib
-        ..
     ..
+
 ..
 
 # ./home
@@ -434,6 +435,8 @@ usr
             ..
             fortune
             ..
+            hack
+            ..
             quiz.db
             ..
         ..
@@ -505,9 +508,9 @@ usr
                 ..
                 octeon
                 ..
-                sgi
+                powerpc64
                 ..
-                socppc
+                sgi
                 ..
                 sparc64
                 ..
@@ -515,6 +518,8 @@ usr
 
             # ./usr/share/man/man5
             man5
+                sparc64
+                ..
             ..
             man6
             ..
@@ -545,9 +550,9 @@ usr
                 ..
                 octeon
                 ..
-                sgi
+                powerpc64
                 ..
-                socppc
+                sgi
                 ..
                 sparc64
                 ..
@@ -610,6 +615,10 @@ var
     ..
     crash			mode=770
     ..
+    cache			mode=755
+        rpki-client		uname=_rpki-client gname=wheel mode=0755
+        ..
+    ..
 
     # ./var/cron
     cron			mode=0555
@@ -627,6 +636,8 @@ var
         ..
         ns
         ..
+        rpki-client		uname=_rpki-client mode=0755
+        ..
         pkg
         ..
         yubikey			uname=root gname=auth mode=0770
@@ -635,10 +646,6 @@ var
 
     # ./var/games
     games			uname=root gname=games mode=0775
-        hackdir			uname=root gname=games mode=0775
-            save		uname=root gname=games mode=0770
-            ..
-        ..
         save			uname=root gname=games mode=0775
         ..
         phantasia		uname=root gname=games mode=0775

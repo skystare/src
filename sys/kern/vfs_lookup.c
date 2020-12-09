@@ -1,4 +1,4 @@
-/*	$OpenBSD: vfs_lookup.c,v 1.74 2018/08/13 23:11:44 deraadt Exp $	*/
+/*	$OpenBSD: vfs_lookup.c,v 1.83 2019/09/11 15:01:40 beck Exp $	*/
 /*	$NetBSD: vfs_lookup.c,v 1.17 1996/02/09 19:00:59 christos Exp $	*/
 
 /*
@@ -57,8 +57,28 @@
 #include <sys/ktrace.h>
 #endif
 
-void unveil_check_component(struct proc *p, struct nameidata *ni, struct vnode *dp );
-int unveil_check_final(struct proc *p, struct nameidata *ni);
+int
+component_push(struct componentname *cnp, char *component, size_t len)
+{
+	if (cnp->cn_rpi + len + 1 >= MAXPATHLEN)
+		return 0;
+	if (cnp->cn_rpi > 1)
+		cnp->cn_rpbuf[cnp->cn_rpi++] = '/';
+	memcpy(cnp->cn_rpbuf + cnp->cn_rpi,  component, len);
+	cnp->cn_rpi+=len;
+	cnp->cn_rpbuf[cnp->cn_rpi] = '\0';
+	return 1;
+}
+
+void
+component_pop(struct componentname *cnp)
+{
+	while(cnp->cn_rpi && cnp->cn_rpbuf[cnp->cn_rpi] != '/' )
+		cnp->cn_rpi--;
+	if (cnp->cn_rpi == 0 && cnp->cn_rpbuf[0] == '/')
+		cnp->cn_rpi++;
+	cnp->cn_rpbuf[cnp->cn_rpi] = '\0';
+}
 
 void
 ndinitat(struct nameidata *ndp, u_long op, u_long flags,
@@ -187,13 +207,17 @@ fail:
 	 * Check if starting from root directory or current directory.
 	 */
 	if (cnp->cn_pnbuf[0] == '/') {
-		curproc->p_p->ps_uvpcwd = NULL;
-		curproc->p_p->ps_uvpcwdgone = 0;
 		dp = ndp->ni_rootdir;
 		vref(dp);
+		if (cnp->cn_flags & REALPATH && cnp->cn_rpi == 0) {
+			cnp->cn_rpbuf[0] = '/';
+			cnp->cn_rpbuf[1] = '\0';
+			cnp->cn_rpi = 1;
+		}
 	} else if (ndp->ni_dirfd == AT_FDCWD) {
 		dp = fdp->fd_cdir;
 		vref(dp);
+		unveil_start_relative(p, ndp, NULL);
 		unveil_check_component(p, ndp, dp);
 	} else {
 		struct file *fp = fd_getfile(fdp, ndp->ni_dirfd);
@@ -208,6 +232,7 @@ fail:
 			return (ENOTDIR);
 		}
 		vref(dp);
+		unveil_start_relative(p, ndp, dp);
 		unveil_check_component(p, ndp, dp);
 		FRELE(fp, p);
 	}
@@ -234,7 +259,7 @@ fail:
 				if ((cnp->cn_flags & LOCKPARENT) &&
 				    (cnp->cn_flags & ISLASTCN) &&
 				    (ndp->ni_vp != ndp->ni_dvp))
-					VOP_UNLOCK(ndp->ni_dvp);
+					vput(ndp->ni_dvp);
 				if (ndp->ni_vp) {
 					if ((cnp->cn_flags & LOCKLEAF))
 						vput(ndp->ni_vp);
@@ -302,16 +327,15 @@ badlink:
 			dp = ndp->ni_rootdir;
 			vref(dp);
 			ndp->ni_unveil_match = NULL;
-			curproc->p_p->ps_uvpcwd = NULL;
 			unveil_check_component(p, ndp, dp);
-		} else {
-			/*
-			 * this is a relative link, so remember our
-			 * unveil match from this point
-			 */
-			curproc->p_p->ps_uvpcwd = ndp->ni_unveil_match;
+			if (cnp->cn_flags & REALPATH) {
+				cnp->cn_rpbuf[0] = '/';
+				cnp->cn_rpbuf[1] = '\0';
+				cnp->cn_rpi = 1;
+			}
+		} else if (cnp->cn_flags & REALPATH) {
+			component_pop(cnp);
 		}
-
 	}
 	pool_put(&namei_pool, cnp->cn_pnbuf);
 	vrele(ndp->ni_dvp);
@@ -449,6 +473,19 @@ dirloop:
 	printf("{%s}: ", cnp->cn_nameptr);
 	*cp = c; }
 #endif
+	if (cnp->cn_flags & REALPATH) {
+		size_t len = cp - cnp->cn_nameptr;
+		if (len == 2 && cnp->cn_nameptr[0] == '.' &&
+		    cnp->cn_nameptr[1] == '.')
+			component_pop(cnp);
+		else if (!(len == 1 && cnp->cn_nameptr[0] == '.')) {
+			if (!component_push(cnp, cnp->cn_nameptr, len)) {
+				error = ENAMETOOLONG;
+				goto bad;
+			}
+		}
+	}
+
 	ndp->ni_pathlen -= cnp->cn_namelen;
 	ndp->ni_next = cp;
 	/*
@@ -501,20 +538,11 @@ dirloop:
 	 */
 	if (cnp->cn_flags & ISDOTDOT) {
 		for (;;) {
-			if (curproc->p_p->ps_uvvcount > 0) {
-#if 0
-				error = ENOENT;
-				goto bad;
-#else
-				ndp->ni_unveil_match = NULL;
-#endif
-			}
 			if (dp == ndp->ni_rootdir || dp == rootvnode) {
 				ndp->ni_dvp = dp;
 				ndp->ni_vp = dp;
 				vref(dp);
-				curproc->p_p->ps_uvpcwd = NULL;
-				curproc->p_p->ps_uvpcwdgone = 0;
+				ndp->ni_unveil_match = NULL;
 				goto nextname;
 			}
 			if ((dp->v_flag & VROOT) == 0 ||
@@ -546,10 +574,11 @@ dirloop:
 		printf("not found\n");
 #endif
 		/*
-		 * Allow for unveiling of a file in a directory
-		 * where we don't have access to create it ourselves
+		 * Allow for unveiling a file in a directory which we cannot
+		 * create ourselves.
 		 */
-		if (ndp->ni_pledge == PLEDGE_UNVEIL && error == EACCES)
+		if (ndp->ni_pledge == PLEDGE_UNVEIL &&
+		    (error == EPERM || error == EACCES || error == EROFS))
 			error = EJUSTRETURN;
 
 		if (error != EJUSTRETURN)
@@ -825,3 +854,5 @@ bad:
 	*vpp = NULL;
 	return (error);
 }
+
+

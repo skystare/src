@@ -1,4 +1,4 @@
-/*	$OpenBSD: dwmmc.c,v 1.19 2018/08/27 20:13:16 kettenis Exp $	*/
+/*	$OpenBSD: dwmmc.c,v 1.23 2020/01/22 11:56:41 patrick Exp $	*/
 /*
  * Copyright (c) 2017 Mark Kettenis
  *
@@ -283,7 +283,7 @@ dwmmc_attach(struct device *parent, struct device *self, void *aux)
 	struct dwmmc_softc *sc = (struct dwmmc_softc *)self;
 	struct fdt_attach_args *faa = aux;
 	struct sdmmcbus_attach_args saa;
-	uint32_t freq, div = 0;
+	uint32_t freq = 0, div = 0;
 	uint32_t hcon, width;
 	uint32_t fifoth;
 	int error, timeout;
@@ -345,7 +345,11 @@ dwmmc_attach(struct device *parent, struct device *self, void *aux)
 	    OF_is_compatible(faa->fa_node, "hisilicon,hi3670-dw-mshc"))
 		div = 7;
 
-	freq = OF_getpropint(faa->fa_node, "clock-frequency", 0);
+	/* Force the base clock to 50MHz on Rockchip SoCs. */
+	if (OF_is_compatible(faa->fa_node, "rockchip,rk3288-dw-mshc"))
+		freq = 50000000;
+
+	freq = OF_getpropint(faa->fa_node, "clock-frequency", freq);
 	if (freq > 0)
 		clock_set_frequency(faa->fa_node, "ciu", (div + 1) * freq);
 
@@ -406,6 +410,7 @@ dwmmc_attach(struct device *parent, struct device *self, void *aux)
 	saa.sch = sc;
 	saa.dmat = sc->sc_dmat;
 	saa.dmap = sc->sc_dmap;
+	saa.caps |= SMC_CAPS_DMA;
 
 	if (OF_getproplen(sc->sc_node, "cap-mmc-highspeed") == 0)
 		saa.caps |= SMC_CAPS_MMC_HIGHSPEED;
@@ -417,14 +422,6 @@ dwmmc_attach(struct device *parent, struct device *self, void *aux)
 		saa.caps |= SMC_CAPS_8BIT_MODE;
 	if (width >= 4)
 		saa.caps |= SMC_CAPS_4BIT_MODE;
-
-	/* XXX DMA doesn't work on all variants yet. */
-	if (OF_is_compatible(faa->fa_node, "hisilicon,hi3660-dw-mshc") ||
-	    OF_is_compatible(faa->fa_node, "hisilicon,hi3670-dw-mshc") ||
-	    OF_is_compatible(faa->fa_node, "rockchip,rk3328-dw-mshc") ||
-	    OF_is_compatible(faa->fa_node, "rockchip,rk3399-dw-mshc") ||
-	    OF_is_compatible(faa->fa_node, "samsung,exynos5420-dw-mshc"))
-		saa.caps |= SMC_CAPS_DMA;
 
 	sc->sc_sdmmc = config_found(self, &saa, NULL);
 	return;
@@ -548,6 +545,7 @@ dwmmc_intr(void *arg)
 
 	stat = HREAD4(sc, SDMMC_MINTSTS);
 	if (stat & SDMMC_RINTSTS_SDIO) {
+		HWRITE4(sc, SDMMC_RINTSTS, SDMMC_RINTSTS_SDIO);
 		HCLR4(sc, SDMMC_INTMASK, SDMMC_RINTSTS_SDIO);
 		sdmmc_card_intr(sc->sc_sdmmc);
 		handled = 1;
@@ -572,7 +570,6 @@ dwmmc_card_intr_ack(sdmmc_chipset_handle_t sch)
 {
 	struct dwmmc_softc *sc = sch;
 
-	HWRITE4(sc, SDMMC_RINTSTS, SDMMC_RINTSTS_SDIO);
 	HSET4(sc, SDMMC_INTMASK, SDMMC_RINTSTS_SDIO);
 }
 
@@ -1010,7 +1007,8 @@ dwmmc_exec_command(sdmmc_chipset_handle_t sch, struct sdmmc_command *cmd)
 	
 	if (cmd->c_datalen > 0 && cmd->c_dmamap) {
 		while (sc->sc_idsts == 0) {
-			error = tsleep(&sc->sc_idsts, PWAIT, "idsts", hz);
+			error = tsleep_nsec(&sc->sc_idsts, PWAIT, "idsts",
+			    SEC_TO_NSEC(1));
 			if (error) {
 				cmd->c_error = error;
 				dwmmc_dma_reset(sc, cmd);

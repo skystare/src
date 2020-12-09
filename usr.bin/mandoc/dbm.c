@@ -1,4 +1,4 @@
-/*	$OpenBSD: dbm.c,v 1.3 2016/10/18 22:26:20 schwarze Exp $ */
+/*	$OpenBSD: dbm.c,v 1.5 2019/07/01 22:43:03 schwarze Exp $ */
 /*
  * Copyright (c) 2016 Ingo Schwarze <schwarze@openbsd.org>
  *
@@ -141,17 +141,17 @@ dbm_page_get(int32_t ip)
 	assert(ip < npages);
 	res.name = dbm_get(pages[ip].name);
 	if (res.name == NULL)
-		res.name = "(NULL)";
+		res.name = "(NULL)\0";
 	res.sect = dbm_get(pages[ip].sect);
 	if (res.sect == NULL)
-		res.sect = "(NULL)";
+		res.sect = "(NULL)\0";
 	res.arch = pages[ip].arch ? dbm_get(pages[ip].arch) : NULL;
 	res.desc = dbm_get(pages[ip].desc);
 	if (res.desc == NULL)
 		res.desc = "(NULL)";
 	res.file = dbm_get(pages[ip].file);
 	if (res.file == NULL)
-		res.file = " (NULL)";
+		res.file = " (NULL)\0";
 	res.addr = dbm_addr(pages + ip);
 	return &res;
 }
@@ -223,7 +223,7 @@ static struct dbm_res
 page_bytitle(enum iter arg_iter, const struct dbm_match *arg_match)
 {
 	static const struct dbm_match	*match;
-	static const char		*cp;	
+	static const char		*cp;
 	static int32_t			 ip;
 	struct dbm_res			 res = {-1, 0};
 
@@ -305,7 +305,7 @@ page_byarch(const struct dbm_match *arg_match)
 	static const struct dbm_match	*match;
 	struct dbm_res			 res = {-1, 0};
 	static int32_t			 ip;
-	const char			*cp;	
+	const char			*cp;
 
 	/* Initialize for a new iteration. */
 

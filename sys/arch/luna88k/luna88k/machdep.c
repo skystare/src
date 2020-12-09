@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.127 2017/12/11 05:27:40 deraadt Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.134 2020/05/31 06:23:57 dlg Exp $	*/
 /*
  * Copyright (c) 1998, 1999, 2000, 2001 Steve Murphree, Jr.
  * Copyright (c) 1996 Nivas Madhur
@@ -76,7 +76,6 @@
 #include <sys/extent.h>
 #include <sys/core.h>
 #include <sys/kcore.h>
-#include <dev/rndvar.h>
 
 #include <machine/asm.h>
 #include <machine/asm_macro.h>
@@ -93,7 +92,7 @@
 #include <dev/cons.h>
 
 #include <net/if.h>
-#include <uvm/uvm.h>
+#include <uvm/uvm_extern.h>
 
 #include "ksyms.h"
 #if DDB
@@ -418,6 +417,9 @@ cpu_startup()
 __dead void
 boot(int howto)
 {
+	if ((howto & RB_RESET) != 0)
+		goto doreset;
+
 	if (curproc && curproc->p_addr)
 		savectx(curpcb);
 
@@ -459,6 +461,7 @@ haltsys:
 	if ((howto & RB_HALT) != 0) {
 		printf("halted\n\n");
 	} else {
+doreset:
 		/* Reset all cpus, which causes reboot */
 		*((volatile uint32_t *)RESET_CPU_ALL) = 0;
 	}
@@ -646,7 +649,8 @@ cpu_setup_secondary_processors()
 	 * so that we can still run in degraded mode if hell gets loose.
 	 */
 	for (cpu = 0; cpu < hatch_pending_count; cpu++)
-		hatch_stacks[cpu] = uvm_km_zalloc(kernel_map, USPACE);
+		hatch_stacks[cpu] = (vaddr_t)km_alloc(USPACE, &kv_any,
+		    &kp_zero, &kd_waitok);
 #endif
 
 	__cpu_simple_unlock(&cpu_hatch_mutex);
@@ -886,6 +890,11 @@ luna88k_ext_int(struct trapframe *eframe)
 
 		cur_isr = *(volatile uint32_t *)ci->ci_intr_mask;
 		cur_int_level = cur_isr >> 29;
+
+		/* Again, ignore 'hardware lied' interrupt */
+		if ( !(cur_isr & (1 << (cur_int_level + 17))))
+			goto out;
+
 	} while (cur_int_level != 0);
 
 out:
@@ -1346,3 +1355,12 @@ m88k_broadcast_ipi(int ipi)
 	}
 }
 #endif
+
+unsigned int
+cpu_rnd_messybits(void)
+{
+	struct timespec ts;
+
+	nanotime(&ts);
+	return (ts.tv_nsec ^ (ts.tv_sec << 20));
+}

@@ -1,4 +1,4 @@
-/*	$OpenBSD: kern_sysctl.c,v 1.346 2018/07/12 01:23:38 cheloha Exp $	*/
+/*	$OpenBSD: kern_sysctl.c,v 1.384 2020/12/07 16:55:29 mpi Exp $	*/
 /*	$NetBSD: kern_sysctl.c,v 1.17 1996/05/20 17:49:05 mrg Exp $	*/
 
 /*-
@@ -79,12 +79,12 @@
 #include <sys/sched.h>
 #include <sys/mount.h>
 #include <sys/syscallargs.h>
+#include <sys/wait.h>
 #include <sys/witness.h>
 
 #include <uvm/uvm_extern.h>
 
 #include <dev/cons.h>
-#include <dev/rndvar.h>
 
 #include <net/route.h>
 #include <netinet/in.h>
@@ -114,6 +114,7 @@
 #endif
 
 #include "audio.h"
+#include "pf.h"
 
 extern struct forkstat forkstat;
 extern struct nchstats nchstats;
@@ -121,14 +122,12 @@ extern int nselcoll, fscale;
 extern struct disklist_head disklist;
 extern fixpt_t ccpu;
 extern  long numvnodes;
-extern u_int net_livelocks;
 #if NAUDIO > 0
 extern int audio_record_enable;
 #endif
 
 int allowkmem;
-
-extern void nmbclust_update(void);
+int allowdt;
 
 int sysctl_diskinit(int, struct proc *);
 int sysctl_proc_args(int *, u_int, void *, size_t *, struct proc *);
@@ -142,6 +141,8 @@ int sysctl_cptime2(int *, u_int, void *, size_t *, void *, size_t);
 #if NAUDIO > 0
 int sysctl_audio(int *, u_int, void *, size_t *, void *, size_t);
 #endif
+int sysctl_cpustats(int *, u_int, void *, size_t *, void *, size_t);
+int sysctl_utc_offset(void *, size_t *, void *, size_t);
 
 void fill_file(struct kinfo_file *, struct file *, struct filedesc *, int,
     struct vnode *, struct process *, struct proc *, struct socket *, int);
@@ -212,7 +213,7 @@ sys_sysctl(struct proc *p, void *v, register_t *retval)
 	case CTL_MACHDEP:
 		fn = cpu_sysctl;
 		break;
-#ifdef DEBUG
+#ifdef DEBUG_SYSCTL
 	case CTL_DEBUG:
 		fn = debug_sysctl;
 		break;
@@ -274,6 +275,76 @@ struct diskstats *diskstats = NULL;
 size_t diskstatslen;
 int securelevel;
 
+/* morally const values reported by sysctl_bounded_arr */
+static int arg_max = ARG_MAX;
+static int openbsd = OpenBSD;
+static int posix_version = _POSIX_VERSION;
+static int ngroups_max = NGROUPS_MAX;
+static int int_zero = 0;
+static int int_one = 1;
+static int maxpartitions = MAXPARTITIONS;
+static int raw_part = RAW_PART;
+
+extern int somaxconn, sominconn;
+extern int nosuidcoredump;
+extern int maxlocksperuid;
+extern int uvm_wxabort;
+extern int global_ptrace;
+
+const struct sysctl_bounded_args kern_vars[] = {
+	{KERN_OSREV, &openbsd, 1, 0},
+	{KERN_MAXVNODES, &maxvnodes, 0, INT_MAX},
+	{KERN_MAXPROC, &maxprocess, 0, INT_MAX},
+	{KERN_MAXFILES, &maxfiles, 0, INT_MAX},
+	{KERN_NFILES, &numfiles, 1, 0},
+	{KERN_TTYCOUNT, &tty_count, 1, 0},
+	{KERN_ARGMAX, &arg_max, 1, 0},
+	{KERN_NSELCOLL, &nselcoll, 1, 0},
+	{KERN_POSIX1, &posix_version, 1, 0},
+	{KERN_NGROUPS, &ngroups_max, 1, 0},
+	{KERN_JOB_CONTROL, &int_one, 1, 0},
+	{KERN_SAVED_IDS, &int_one, 1, 0},
+	{KERN_MAXPARTITIONS, &maxpartitions, 1, 0},
+	{KERN_RAWPARTITION, &raw_part, 1, 0},
+	{KERN_MAXTHREAD, &maxthread, 0, INT_MAX},
+	{KERN_NTHREADS, &nthreads, 1, 0},
+	{KERN_SOMAXCONN, &somaxconn, 0, SHRT_MAX},
+	{KERN_SOMINCONN, &sominconn, 0, SHRT_MAX},
+	{KERN_NOSUIDCOREDUMP, &nosuidcoredump, 0, 3},
+	{KERN_FSYNC, &int_one, 1, 0},
+	{KERN_SYSVMSG,
+#ifdef SYSVMSG
+	 &int_one,
+#else
+	 &int_zero,
+#endif
+	 1, 0},
+	{KERN_SYSVSEM,
+#ifdef SYSVSEM
+	 &int_one,
+#else
+	 &int_zero,
+#endif
+	 1, 0},
+	{KERN_SYSVSHM,
+#ifdef SYSVSHM
+	 &int_one,
+#else
+	 &int_zero,
+#endif
+	 1, 0},
+	{KERN_FSCALE, &fscale, 1, 0},
+	{KERN_CCPU, &ccpu, 1, 0},
+	{KERN_NPROCS, &nprocesses, 1, 0},
+	{KERN_SPLASSERT, &splassert_ctl, 0, 3},
+	{KERN_MAXLOCKSPERUID, &maxlocksperuid, 0, INT_MAX},
+	{KERN_WXABORT, &uvm_wxabort, 0, 1},
+	{KERN_NETLIVELOCKS, &int_zero, 1, 0},
+#ifdef PTRACE
+	{KERN_GLOBAL_PTRACE, &global_ptrace, 0, 1},
+#endif
+};
+
 /*
  * kernel related system variables.
  */
@@ -283,11 +354,7 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 {
 	int error, level, inthostid, stackgap;
 	dev_t dev;
-	extern int somaxconn, sominconn;
-	extern int nosuidcoredump;
-	extern int maxlocksperuid;
 	extern int pool_debug;
-	extern int uvm_wxabort;
 
 	/* all sysctl names at this level are terminal except a ton of them */
 	if (namelen != 1) {
@@ -310,7 +377,9 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		case KERN_TIMECOUNTER:
 		case KERN_CPTIME2:
 		case KERN_FILE:
+		case KERN_WITNESS:
 		case KERN_AUDIO:
+		case KERN_CPUSTATS:
 			break;
 		default:
 			return (ENOTDIR);	/* overloaded */
@@ -322,28 +391,12 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdstring(oldp, oldlenp, newp, ostype));
 	case KERN_OSRELEASE:
 		return (sysctl_rdstring(oldp, oldlenp, newp, osrelease));
-	case KERN_OSREV:
-		return (sysctl_rdint(oldp, oldlenp, newp, OpenBSD));
 	case KERN_OSVERSION:
 		return (sysctl_rdstring(oldp, oldlenp, newp, osversion));
 	case KERN_VERSION:
 		return (sysctl_rdstring(oldp, oldlenp, newp, version));
-	case KERN_MAXVNODES:
-		return(sysctl_int(oldp, oldlenp, newp, newlen, &maxvnodes));
-	case KERN_MAXPROC:
-		return (sysctl_int(oldp, oldlenp, newp, newlen, &maxprocess));
-	case KERN_MAXFILES:
-		return (sysctl_int(oldp, oldlenp, newp, newlen, &maxfiles));
-	case KERN_NFILES:
-		return (sysctl_rdint(oldp, oldlenp, newp, numfiles));
-	case KERN_TTYCOUNT:
-		return (sysctl_rdint(oldp, oldlenp, newp, tty_count));
-	case KERN_NUMVNODES:
+	case KERN_NUMVNODES:  /* XXX numvnodes is a long */
 		return (sysctl_rdint(oldp, oldlenp, newp, numvnodes));
-	case KERN_ARGMAX:
-		return (sysctl_rdint(oldp, oldlenp, newp, ARG_MAX));
-	case KERN_NSELCOLL:
-		return (sysctl_rdint(oldp, oldlenp, newp, nselcoll));
 	case KERN_SECURELVL:
 		level = securelevel;
 		if ((error = sysctl_int(oldp, oldlenp, newp, newlen, &level)) ||
@@ -354,12 +407,14 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 			return (EPERM);
 		securelevel = level;
 		return (0);
+	case KERN_ALLOWDT:
+		if (securelevel > 0)
+			return (sysctl_rdint(oldp, oldlenp, newp, allowdt));
+		return (sysctl_int(oldp, oldlenp, newp, newlen,  &allowdt));
 	case KERN_ALLOWKMEM:
 		if (securelevel > 0)
-			return (sysctl_rdint(oldp, oldlenp, newp,
-			    allowkmem));
-		return (sysctl_int(oldp, oldlenp, newp, newlen,
-		    &allowkmem));
+			return (sysctl_rdint(oldp, oldlenp, newp, allowkmem));
+		return (sysctl_int(oldp, oldlenp, newp, newlen, &allowkmem));
 	case KERN_HOSTNAME:
 		error = sysctl_tstring(oldp, oldlenp, newp, newlen,
 		    hostname, sizeof(hostname));
@@ -382,7 +437,7 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case KERN_BOOTTIME: {
 		struct timeval bt;
 		memset(&bt, 0, sizeof bt);
-		TIMESPEC_TO_TIMEVAL(&bt, &boottime);
+		microboottime(&bt);
 		return (sysctl_rdstruct(oldp, oldlenp, newp, &bt, sizeof bt));
 	  }
 #ifndef SMALL_KERNEL
@@ -426,64 +481,6 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_doprof(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
 #endif
-	case KERN_POSIX1:
-		return (sysctl_rdint(oldp, oldlenp, newp, _POSIX_VERSION));
-	case KERN_NGROUPS:
-		return (sysctl_rdint(oldp, oldlenp, newp, NGROUPS_MAX));
-	case KERN_JOB_CONTROL:
-		return (sysctl_rdint(oldp, oldlenp, newp, 1));
-	case KERN_SAVED_IDS:
-		return (sysctl_rdint(oldp, oldlenp, newp, 1));
-	case KERN_MAXPARTITIONS:
-		return (sysctl_rdint(oldp, oldlenp, newp, MAXPARTITIONS));
-	case KERN_RAWPARTITION:
-		return (sysctl_rdint(oldp, oldlenp, newp, RAW_PART));
-	case KERN_MAXTHREAD:
-		return (sysctl_int(oldp, oldlenp, newp, newlen, &maxthread));
-	case KERN_NTHREADS:
-		return (sysctl_rdint(oldp, oldlenp, newp, nthreads));
-	case KERN_SOMAXCONN: {
-		int val = somaxconn;
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &val);
-		if (error)
-			return error;
-		if (val < 0 || val > SHRT_MAX)
-			return EINVAL;
-		somaxconn = val;
-		return 0;
-	}
-	case KERN_SOMINCONN: {
-		int val = sominconn;
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &val);
-		if (error)
-			return error;
-		if (val < 0 || val > SHRT_MAX)
-			return EINVAL;
-		sominconn = val;
-		return 0;
-	}
-	case KERN_NOSUIDCOREDUMP:
-		return (sysctl_int(oldp, oldlenp, newp, newlen, &nosuidcoredump));
-	case KERN_FSYNC:
-		return (sysctl_rdint(oldp, oldlenp, newp, 1));
-	case KERN_SYSVMSG:
-#ifdef SYSVMSG
-		return (sysctl_rdint(oldp, oldlenp, newp, 1));
-#else
-		return (sysctl_rdint(oldp, oldlenp, newp, 0));
-#endif
-	case KERN_SYSVSEM:
-#ifdef SYSVSEM
-		return (sysctl_rdint(oldp, oldlenp, newp, 1));
-#else
-		return (sysctl_rdint(oldp, oldlenp, newp, 0));
-#endif
-	case KERN_SYSVSHM:
-#ifdef SYSVSHM
-		return (sysctl_rdint(oldp, oldlenp, newp, 1));
-#else
-		return (sysctl_rdint(oldp, oldlenp, newp, 0));
-#endif
 	case KERN_MSGBUFSIZE:
 	case KERN_CONSBUFSIZE: {
 		struct msgbuf *mp;
@@ -517,17 +514,20 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		CPU_INFO_ITERATOR cii;
 		struct cpu_info *ci;
 		long cp_time[CPUSTATES];
-		int i;
+		int i, n = 0;
 
 		memset(cp_time, 0, sizeof(cp_time));
 
 		CPU_INFO_FOREACH(cii, ci) {
+			if (!cpu_is_online(ci))
+				continue;
+			n++;
 			for (i = 0; i < CPUSTATES; i++)
 				cp_time[i] += ci->ci_schedstate.spc_cp_time[i];
 		}
 
 		for (i = 0; i < CPUSTATES; i++)
-			cp_time[i] /= ncpus;
+			cp_time[i] /= n;
 
 		return (sysctl_rdstruct(oldp, oldlenp, newp, &cp_time,
 		    sizeof(cp_time)));
@@ -541,12 +541,6 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case KERN_TTY:
 		return (sysctl_tty(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
-	case KERN_FSCALE:
-		return (sysctl_rdint(oldp, oldlenp, newp, fscale));
-	case KERN_CCPU:
-		return (sysctl_rdint(oldp, oldlenp, newp, ccpu));
-	case KERN_NPROCS:
-		return (sysctl_rdint(oldp, oldlenp, newp, nprocesses));
 	case KERN_POOL:
 		return (sysctl_dopool(name + 1, namelen - 1, oldp, oldlenp));
 	case KERN_STACKGAPRANDOM:
@@ -566,9 +560,6 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case KERN_SYSVIPC_INFO:
 		return (sysctl_sysvipc(name + 1, namelen - 1, oldp, oldlenp));
 #endif
-	case KERN_SPLASSERT:
-		return (sysctl_int(oldp, oldlenp, newp, newlen,
-		    &splassert_ctl));
 #ifdef SYSVSEM
 	case KERN_SEMINFO:
 		return (sysctl_sysvsem(name + 1, namelen - 1, oldp, oldlenp,
@@ -586,11 +577,13 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_wdog(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
 #endif
-	case KERN_MAXCLUSTERS:
-		error = sysctl_int(oldp, oldlenp, newp, newlen, &nmbclust);
-		if (!error)
-			nmbclust_update();
+	case KERN_MAXCLUSTERS: {
+		int val = nmbclust;
+		error = sysctl_int(oldp, oldlenp, newp, newlen, &val);
+		if (error == 0 && val != nmbclust)
+			error = nmbclust_update(val);
 		return (error);
+	}
 #ifndef SMALL_KERNEL
 	case KERN_EVCOUNT:
 		return (evcount_sysctl(name + 1, namelen - 1, oldp, oldlenp,
@@ -599,8 +592,6 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	case KERN_TIMECOUNTER:
 		return (sysctl_tc(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
-	case KERN_MAXLOCKSPERUID:
-		return (sysctl_int(oldp, oldlenp, newp, newlen, &maxlocksperuid));
 	case KERN_CPTIME2:
 		return (sysctl_cptime2(name + 1, namelen -1, oldp, oldlenp,
 		    newp, newlen));
@@ -624,16 +615,12 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		}
 		return(0);
 	}
-	case KERN_WXABORT:
-		return (sysctl_int(oldp, oldlenp, newp, newlen, &uvm_wxabort));
 	case KERN_CONSDEV:
 		if (cn_tab != NULL)
 			dev = cn_tab->cn_dev;
 		else
 			dev = NODEV;
 		return sysctl_rdstruct(oldp, oldlenp, newp, &dev, sizeof(dev));
-	case KERN_NETLIVELOCKS:
-		return (sysctl_rdint(oldp, oldlenp, newp, net_livelocks));
 	case KERN_POOL_DEBUG: {
 		int old_pool_debug = pool_debug;
 
@@ -643,34 +630,32 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 			pool_reclaim_all();
 		return (error);
 	}
-#ifdef PTRACE
-	case KERN_GLOBAL_PTRACE: {
-		extern int global_ptrace;
-
-		return sysctl_int(oldp, oldlenp, newp, newlen, &global_ptrace);
-	}
-#endif
-	case KERN_DNSJACKPORT: {
-		extern uint16_t dnsjackport;
-		int port = dnsjackport;
-		if ((error = sysctl_int(oldp, oldlenp, newp, newlen, &port)))
-			return error;
-		if (port < 0 || port > USHRT_MAX)
-			return EINVAL;
-		dnsjackport = port;
-		return 0;
-	}
 #ifdef WITNESS
 	case KERN_WITNESSWATCH:
 		return witness_sysctl_watch(oldp, oldlenp, newp, newlen);
+	case KERN_WITNESS:
+		return witness_sysctl(name + 1, namelen - 1, oldp, oldlenp,
+		    newp, newlen);
 #endif
 #if NAUDIO > 0
 	case KERN_AUDIO:
 		return (sysctl_audio(name + 1, namelen - 1, oldp, oldlenp,
 		    newp, newlen));
 #endif
+	case KERN_CPUSTATS:
+		return (sysctl_cpustats(name + 1, namelen - 1, oldp, oldlenp,
+		    newp, newlen));
+#if NPF > 0
+	case KERN_PFSTATUS:
+		return (pf_sysctl(oldp, oldlenp, newp, newlen));
+#endif
+	case KERN_TIMEOUT_STATS:
+		return (timeout_sysctl(oldp, oldlenp, newp, newlen));
+	case KERN_UTC_OFFSET:
+		return (sysctl_utc_offset(oldp, oldlenp, newp, newlen));
 	default:
-		return (EOPNOTSUPP);
+		return (sysctl_bounded_arr(kern_vars, nitems(kern_vars), name,
+		    namelen, oldp, oldlenp, newp, newlen));
 	}
 	/* NOTREACHED */
 }
@@ -680,6 +665,18 @@ kern_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
  */
 char *hw_vendor, *hw_prod, *hw_uuid, *hw_serial, *hw_ver;
 int allowpowerdown = 1;
+
+/* morally const values reported by sysctl_bounded_arr */
+static int byte_order = BYTE_ORDER;
+static int page_size = PAGE_SIZE;
+
+const struct sysctl_bounded_args hw_vars[] = {
+	{HW_NCPU, &ncpus, 1, 0},
+	{HW_NCPUFOUND, &ncpusfound, 1, 0},
+	{HW_BYTEORDER, &byte_order, 1, 0},
+	{HW_PAGESIZE, &page_size, 1, 0},
+	{HW_DISKCOUNT, &disk_count, 1, 0},
+};
 
 int
 hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
@@ -697,22 +694,14 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_rdstring(oldp, oldlenp, newp, machine));
 	case HW_MODEL:
 		return (sysctl_rdstring(oldp, oldlenp, newp, cpu_model));
-	case HW_NCPU:
-		return (sysctl_rdint(oldp, oldlenp, newp, ncpus));
-	case HW_NCPUFOUND:
-		return (sysctl_rdint(oldp, oldlenp, newp, ncpusfound));
 	case HW_NCPUONLINE:
 		return (sysctl_rdint(oldp, oldlenp, newp,
 		    sysctl_hwncpuonline()));
-	case HW_BYTEORDER:
-		return (sysctl_rdint(oldp, oldlenp, newp, BYTE_ORDER));
 	case HW_PHYSMEM:
 		return (sysctl_rdint(oldp, oldlenp, newp, ptoa(physmem)));
 	case HW_USERMEM:
 		return (sysctl_rdint(oldp, oldlenp, newp,
 		    ptoa(physmem - uvmexp.wired)));
-	case HW_PAGESIZE:
-		return (sysctl_rdint(oldp, oldlenp, newp, PAGE_SIZE));
 	case HW_DISKNAMES:
 		err = sysctl_diskinit(0, p);
 		if (err)
@@ -728,8 +717,6 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 			return err;
 		return (sysctl_rdstruct(oldp, oldlenp, newp, diskstats,
 		    disk_count * sizeof(struct diskstats)));
-	case HW_DISKCOUNT:
-		return (sysctl_rdint(oldp, oldlenp, newp, disk_count));
 	case HW_CPUSPEED:
 		if (!cpu_cpuspeed)
 			return (EOPNOTSUPP);
@@ -790,22 +777,24 @@ hw_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (sysctl_hwsmt(oldp, oldlenp, newp, newlen));
 #endif
 	default:
-		return (EOPNOTSUPP);
+		return sysctl_bounded_arr(hw_vars, nitems(hw_vars), name,
+		    namelen, oldp, oldlenp, newp, newlen);
 	}
 	/* NOTREACHED */
 }
 
-#ifdef DEBUG
+#ifdef DEBUG_SYSCTL
 /*
  * Debugging related system variables.
  */
-extern struct ctldebug debug0, debug1;
-struct ctldebug debug2, debug3, debug4;
+extern struct ctldebug debug_vfs_busyprt;
+struct ctldebug debug1, debug2, debug3, debug4;
 struct ctldebug debug5, debug6, debug7, debug8, debug9;
 struct ctldebug debug10, debug11, debug12, debug13, debug14;
 struct ctldebug debug15, debug16, debug17, debug18, debug19;
 static struct ctldebug *debugvars[CTL_DEBUG_MAXID] = {
-	&debug0, &debug1, &debug2, &debug3, &debug4,
+	&debug_vfs_busyprt,
+	&debug1, &debug2, &debug3, &debug4,
 	&debug5, &debug6, &debug7, &debug8, &debug9,
 	&debug10, &debug11, &debug12, &debug13, &debug14,
 	&debug15, &debug16, &debug17, &debug18, &debug19,
@@ -834,7 +823,7 @@ debug_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 	}
 	/* NOTREACHED */
 }
-#endif /* DEBUG */
+#endif /* DEBUG_SYSCTL */
 
 /*
  * Reads, or writes that lower the value
@@ -863,17 +852,32 @@ sysctl_int_lower(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int *va
 int
 sysctl_int(void *oldp, size_t *oldlenp, void *newp, size_t newlen, int *valp)
 {
+	return (sysctl_int_bounded(oldp, oldlenp, newp, newlen, valp, 0, 0));
+}
+
+int
+sysctl_int_bounded(void *oldp, size_t *oldlenp, void *newp, size_t newlen,
+    int *valp, int minimum, int maximum)
+{
 	int error = 0;
+	int val;
 
 	if (oldp && *oldlenp < sizeof(int))
 		return (ENOMEM);
 	if (newp && newlen != sizeof(int))
 		return (EINVAL);
 	*oldlenp = sizeof(int);
+	val = *valp;
 	if (oldp)
-		error = copyout(valp, oldp, sizeof(int));
+		error = copyout(&val, oldp, sizeof(int));
 	if (error == 0 && newp)
-		error = copyin(newp, valp, sizeof(int));
+		error = copyin(newp, &val, sizeof(int));
+	if (error)
+		return (error);
+	if (minimum == maximum || (minimum <= val && val <= maximum))
+		*valp = val;
+	else
+		error = EINVAL;
 	return (error);
 }
 
@@ -896,17 +900,29 @@ sysctl_rdint(void *oldp, size_t *oldlenp, void *newp, int val)
 }
 
 /*
- * Array of integer values.
+ * Array of bounded integer values.
  */
 int
-sysctl_int_arr(int **valpp, int *name, u_int namelen, void *oldp,
-    size_t *oldlenp, void *newp, size_t newlen)
+sysctl_bounded_arr(const struct sysctl_bounded_args *valpp, u_int valplen,
+    int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
+    size_t newlen)
 {
-	if (namelen > 1)
+	u_int i;
+	if (namelen != 1)
 		return (ENOTDIR);
-	if (name[0] < 0 || valpp[name[0]] == NULL)
-		return (EOPNOTSUPP);
-	return (sysctl_int(oldp, oldlenp, newp, newlen, valpp[name[0]]));
+	for (i = 0; i < valplen; ++i) {
+		if (valpp[i].mib == name[0]) {
+			if (valpp[i].minimum <= valpp[i].maximum) {
+				return (sysctl_int_bounded(oldp, oldlenp, newp,
+				    newlen, valpp[i].var, valpp[i].minimum,
+				    valpp[i].maximum));
+			} else {
+				return (sysctl_rdint(oldp, oldlenp, newp,
+				    *valpp[i].var));
+			}
+		}
+	}
+	return (EOPNOTSUPP);
 }
 
 /*
@@ -1092,8 +1108,8 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 		kf->f_usecount = 0;
 
 		if (suser(p) == 0 || p->p_ucred->cr_uid == fp->f_cred->cr_uid) {
-			kf->f_offset = fp->f_offset;
 			mtx_enter(&fp->f_mtx);
+			kf->f_offset = fp->f_offset;
 			kf->f_rxfer = fp->f_rxfer;
 			kf->f_rwfer = fp->f_wxfer;
 			kf->f_seek = fp->f_seek;
@@ -1144,8 +1160,19 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 		break;
 
 	case DTYPE_SOCKET: {
-		if (so == NULL)
+		int locked = 0;
+
+		if (so == NULL) {
 			so = (struct socket *)fp->f_data;
+			/* if so is passed as parameter it is already locked */
+			switch (so->so_proto->pr_domain->dom_family) {
+			case AF_INET:
+			case AF_INET6:
+				NET_LOCK();
+				locked = 1;
+				break;
+			}
+		}
 
 		kf->so_type = so->so_type;
 		kf->so_state = so->so_state;
@@ -1164,12 +1191,16 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 			kf->so_splicelen = so->so_sp->ssp_len;
 		} else if (issplicedback(so))
 			kf->so_splicelen = -1;
-		if (!so->so_pcb)
+		if (so->so_pcb == NULL) {
+			if (locked)
+				NET_UNLOCK();
 			break;
+		}
 		switch (kf->so_family) {
 		case AF_INET: {
 			struct inpcb *inpcb = so->so_pcb;
 
+			NET_ASSERT_LOCKED();
 			if (show_pointers)
 				kf->inp_ppcb = PTRTOINT64(inpcb->inp_ppcb);
 			kf->inp_lport = inpcb->inp_lport;
@@ -1191,6 +1222,7 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 		case AF_INET6: {
 			struct inpcb *inpcb = so->so_pcb;
 
+			NET_ASSERT_LOCKED();
 			if (show_pointers)
 				kf->inp_ppcb = PTRTOINT64(inpcb->inp_ppcb);
 			kf->inp_lport = inpcb->inp_lport;
@@ -1236,6 +1268,8 @@ fill_file(struct kinfo_file *kf, struct file *fp, struct filedesc *fdp,
 			break;
 		    }
 		}
+		if (locked)
+			NET_UNLOCK();
 		break;
 	    }
 
@@ -1463,7 +1497,7 @@ sysctl_doproc(int *name, u_int namelen, char *where, size_t *sizep)
 	buflen = where != NULL ? *sizep : 0;
 	needed = error = 0;
 
-	if (namelen != 4 || name[2] < 0 || name[3] < 0 ||
+	if (namelen != 4 || name[2] <= 0 || name[3] < 0 ||
 	    name[2] > sizeof(*kproc))
 		return (EINVAL);
 	op = name[0];
@@ -1562,7 +1596,7 @@ again:
 		if (!dothreads)
 			continue;
 
-		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
+		SMR_TAILQ_FOREACH_LOCKED(p, &pr->ps_threads, p_thr_link) {
 			if (buflen >= elem_size && elem_count > 0) {
 				fill_kproc(pr, kproc, p, show_pointers);
 				error = copyout(kproc, dp, elem_size);
@@ -1606,7 +1640,7 @@ fill_kproc(struct process *pr, struct kinfo_proc *ki, struct proc *p,
 	struct session *s = pr->ps_session;
 	struct tty *tp;
 	struct vmspace *vm = pr->ps_vmspace;
-	struct timespec ut, st;
+	struct timespec booted, st, ut, utc;
 	int isthread;
 
 	isthread = p != NULL;
@@ -1643,6 +1677,12 @@ fill_kproc(struct process *pr, struct kinfo_proc *ki, struct proc *p,
 		ki->p_ustime_sec = st.tv_sec;
 		ki->p_ustime_usec = st.tv_nsec/1000;
 
+		/* Convert starting uptime to a starting UTC time. */
+		nanoboottime(&booted);
+		timespecadd(&booted, &pr->ps_start, &utc);
+		ki->p_ustart_sec = utc.tv_sec;
+		ki->p_ustart_usec = utc.tv_nsec / 1000;
+
 #ifdef MULTIPROCESSOR
 		if (p->p_cpu != NULL)
 			ki->p_cpuid = CPU_INFO_UNIT(p->p_cpu);
@@ -1656,7 +1696,7 @@ fill_kproc(struct process *pr, struct kinfo_proc *ki, struct proc *p,
 	} else {
 		ki->p_pctcpu = 0;
 		ki->p_stat = (pr->ps_flags & PS_ZOMBIE) ? SDEAD : SIDL;
-		TAILQ_FOREACH(p, &pr->ps_threads, p_thr_link) {
+		SMR_TAILQ_FOREACH_LOCKED(p, &pr->ps_threads, p_thr_link) {
 			ki->p_pctcpu += p->p_pctcpu;
 			/* find best state: ONPROC > RUN > STOP > SLEEP > .. */
 			if (p->p_stat == SONPROC || ki->p_stat == SONPROC)
@@ -1723,7 +1763,7 @@ sysctl_proc_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	/* Execing - danger. */
 	if ((vpr->ps_flags & PS_INEXEC))
 		return (EBUSY);
-	
+
 	/* Only owner or root can get env */
 	if ((op == KERN_PROC_NENV || op == KERN_PROC_ENV) &&
 	    (vpr->ps_ucred->cr_uid != cp->p_ucred->cr_uid &&
@@ -1732,7 +1772,7 @@ sysctl_proc_args(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 
 	ps_strings = vpr->ps_strings;
 	vm = vpr->ps_vmspace;
-	vm->vm_refcnt++;
+	uvmspace_addref(vm);
 	vpr = NULL;
 
 	buf = malloc(PAGE_SIZE, M_TEMP, M_WAITOK);
@@ -2402,3 +2442,63 @@ sysctl_audio(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	return (sysctl_int(oldp, oldlenp, newp, newlen, &audio_record_enable));
 }
 #endif
+
+int
+sysctl_cpustats(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+    void *newp, size_t newlen)
+{
+	CPU_INFO_ITERATOR cii;
+	struct cpustats cs;
+	struct cpu_info *ci;
+	int found = 0;
+
+	if (namelen != 1)
+		return (ENOTDIR);
+
+	CPU_INFO_FOREACH(cii, ci) {
+		if (name[0] == CPU_INFO_UNIT(ci)) {
+			found = 1;
+			break;
+		}
+	}
+	if (!found)
+		return (ENOENT);
+
+	memcpy(&cs.cs_time, &ci->ci_schedstate.spc_cp_time, sizeof(cs.cs_time));
+	cs.cs_flags = 0;
+	if (cpu_is_online(ci))
+		cs.cs_flags |= CPUSTATS_ONLINE;
+
+	return (sysctl_rdstruct(oldp, oldlenp, newp, &cs, sizeof(cs)));
+}
+
+int
+sysctl_utc_offset(void *oldp, size_t *oldlenp, void *newp, size_t newlen)
+{
+	struct timespec adjusted, now;
+	int adjustment_seconds, error, new_offset_minutes, old_offset_minutes;
+
+	old_offset_minutes = utc_offset / 60;	/* seconds -> minutes */
+	if (securelevel > 0)
+		return sysctl_rdint(oldp, oldlenp, newp, old_offset_minutes);
+
+	new_offset_minutes = old_offset_minutes;
+	error = sysctl_int(oldp, oldlenp, newp, newlen, &new_offset_minutes);
+	if (error)
+		return error;
+	if (new_offset_minutes < -24 * 60 || new_offset_minutes > 24 * 60)
+		return EINVAL;
+	if (new_offset_minutes == old_offset_minutes)
+		return 0;
+
+	utc_offset = new_offset_minutes * 60;	/* minutes -> seconds */
+	adjustment_seconds = (new_offset_minutes - old_offset_minutes) * 60;
+
+	nanotime(&now);
+	adjusted = now;
+	adjusted.tv_sec -= adjustment_seconds;
+	tc_setrealtimeclock(&adjusted);
+	resettodr();
+
+	return 0;
+}

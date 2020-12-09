@@ -1,4 +1,4 @@
-/*	$OpenBSD: vm.c,v 1.38 2018/07/17 13:47:06 mlarkin Exp $	*/
+/*	$OpenBSD: vm.c,v 1.58 2020/06/28 16:52:45 pd Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -61,12 +61,13 @@
 #include "i8259.h"
 #include "ns8250.h"
 #include "mc146818.h"
+#include "fw_cfg.h"
 #include "atomicio.h"
 
 io_fn_t ioports_map[MAX_PORTS];
 
-int run_vm(int, int *, int *, struct vmop_create_params *,
-    struct vcpu_reg_state *);
+int run_vm(int, int[][VM_MAX_BASE_PER_DISK], int *,
+    struct vmop_create_params *, struct vcpu_reg_state *);
 void vm_dispatch_vmm(int, short, void *);
 void *event_thread(void *);
 void *vcpu_run_loop(void *);
@@ -75,9 +76,12 @@ int vcpu_reset(uint32_t, uint32_t, struct vcpu_reg_state *);
 void create_memory_map(struct vm_create_params *);
 int alloc_guest_mem(struct vm_create_params *);
 int vmm_create_vm(struct vm_create_params *);
-void init_emulated_hw(struct vmop_create_params *, int, int *, int *);
-void restore_emulated_hw(struct vm_create_params *, int, int *, int *,int);
+void init_emulated_hw(struct vmop_create_params *, int,
+    int[][VM_MAX_BASE_PER_DISK], int *);
+void restore_emulated_hw(struct vm_create_params *, int, int *,
+    int[][VM_MAX_BASE_PER_DISK],int);
 void vcpu_exit_inout(struct vm_run_params *);
+int vcpu_exit_eptviolation(struct vm_run_params *);
 uint8_t vcpu_exit_pci(struct vm_run_params *);
 int vcpu_pic_intr(uint32_t, uint32_t, uint8_t);
 int loadfile_bios(FILE *, struct vcpu_reg_state *);
@@ -87,8 +91,11 @@ int dump_vmr(int , struct vm_mem_range *);
 int dump_mem(int, struct vm_create_params *);
 void restore_vmr(int, struct vm_mem_range *);
 void restore_mem(int, struct vm_create_params *);
+int restore_vm_params(int, struct vm_create_params *);
 void pause_vm(struct vm_create_params *);
 void unpause_vm(struct vm_create_params *);
+
+int translate_gva(struct vm_exit*, uint64_t, uint64_t *, int);
 
 static struct vm_mem_range *find_gpa_range(struct vm_create_params *, paddr_t,
     size_t);
@@ -105,6 +112,9 @@ pthread_cond_t threadcond;
 
 pthread_cond_t vcpu_run_cond[VMM_MAX_VCPUS_PER_VM];
 pthread_mutex_t vcpu_run_mtx[VMM_MAX_VCPUS_PER_VM];
+pthread_barrier_t vm_pause_barrier;
+pthread_cond_t vcpu_unpause_cond[VMM_MAX_VCPUS_PER_VM];
+pthread_mutex_t vcpu_unpause_mtx[VMM_MAX_VCPUS_PER_VM];
 uint8_t vcpu_hlt[VMM_MAX_VCPUS_PER_VM];
 uint8_t vcpu_done[VMM_MAX_VCPUS_PER_VM];
 
@@ -124,16 +134,10 @@ uint8_t vcpu_done[VMM_MAX_VCPUS_PER_VM];
  *        features of the CPU in use.
  */
 static const struct vcpu_reg_state vcpu_init_flat64 = {
-#ifdef __i386__
-	.vrs_gprs[VCPU_REGS_EFLAGS] = 0x2,
-	.vrs_gprs[VCPU_REGS_EIP] = 0x0,
-	.vrs_gprs[VCPU_REGS_ESP] = 0x0,
-#else
 	.vrs_gprs[VCPU_REGS_RFLAGS] = 0x2,
 	.vrs_gprs[VCPU_REGS_RIP] = 0x0,
 	.vrs_gprs[VCPU_REGS_RSP] = 0x0,
-#endif
-	.vrs_crs[VCPU_REGS_CR0] = CR0_CD | CR0_NW | CR0_ET | CR0_PE | CR0_PG,
+	.vrs_crs[VCPU_REGS_CR0] = CR0_ET | CR0_PE | CR0_PG,
 	.vrs_crs[VCPU_REGS_CR3] = PML4_PAGE,
 	.vrs_crs[VCPU_REGS_CR4] = CR4_PAE | CR4_PSE,
 	.vrs_crs[VCPU_REGS_PDPTE0] = 0ULL,
@@ -151,7 +155,12 @@ static const struct vcpu_reg_state vcpu_init_flat64 = {
 	.vrs_sregs[VCPU_REGS_LDTR] = { 0x0, 0xFFFF, 0x0082, 0x0},
 	.vrs_sregs[VCPU_REGS_TR] = { 0x0, 0xFFFF, 0x008B, 0x0},
 	.vrs_msrs[VCPU_REGS_EFER] = EFER_LME | EFER_LMA,
-#ifndef __i386__
+	.vrs_drs[VCPU_REGS_DR0] = 0x0,
+	.vrs_drs[VCPU_REGS_DR1] = 0x0,
+	.vrs_drs[VCPU_REGS_DR2] = 0x0,
+	.vrs_drs[VCPU_REGS_DR3] = 0x0,
+	.vrs_drs[VCPU_REGS_DR6] = 0xFFFF0FF0,
+	.vrs_drs[VCPU_REGS_DR7] = 0x400,
 	.vrs_msrs[VCPU_REGS_STAR] = 0ULL,
 	.vrs_msrs[VCPU_REGS_LSTAR] = 0ULL,
 	.vrs_msrs[VCPU_REGS_CSTAR] = 0ULL,
@@ -159,7 +168,6 @@ static const struct vcpu_reg_state vcpu_init_flat64 = {
 	.vrs_msrs[VCPU_REGS_KGSBASE] = 0ULL,
 	.vrs_msrs[VCPU_REGS_MISC_ENABLE] = 0ULL,
 	.vrs_crs[VCPU_REGS_XCR0] = XCR0_X87
-#endif
 };
 
 /*
@@ -167,15 +175,9 @@ static const struct vcpu_reg_state vcpu_init_flat64 = {
  * as a flat 16 bit address space.
  */
 static const struct vcpu_reg_state vcpu_init_flat16 = {
-#ifdef __i386__
-	.vrs_gprs[VCPU_REGS_EFLAGS] = 0x2,
-	.vrs_gprs[VCPU_REGS_EIP] = 0xFFF0,
-	.vrs_gprs[VCPU_REGS_ESP] = 0x0,
-#else
 	.vrs_gprs[VCPU_REGS_RFLAGS] = 0x2,
 	.vrs_gprs[VCPU_REGS_RIP] = 0xFFF0,
 	.vrs_gprs[VCPU_REGS_RSP] = 0x0,
-#endif
 	.vrs_crs[VCPU_REGS_CR0] = 0x60000010,
 	.vrs_crs[VCPU_REGS_CR3] = 0,
 	.vrs_sregs[VCPU_REGS_CS] = { 0xF000, 0xFFFF, 0x809F, 0xF0000},
@@ -189,14 +191,18 @@ static const struct vcpu_reg_state vcpu_init_flat16 = {
 	.vrs_sregs[VCPU_REGS_LDTR] = { 0x0, 0xFFFF, 0x0082, 0x0},
 	.vrs_sregs[VCPU_REGS_TR] = { 0x0, 0xFFFF, 0x008B, 0x0},
 	.vrs_msrs[VCPU_REGS_EFER] = 0ULL,
-#ifndef __i386__
+	.vrs_drs[VCPU_REGS_DR0] = 0x0,
+	.vrs_drs[VCPU_REGS_DR1] = 0x0,
+	.vrs_drs[VCPU_REGS_DR2] = 0x0,
+	.vrs_drs[VCPU_REGS_DR3] = 0x0,
+	.vrs_drs[VCPU_REGS_DR6] = 0xFFFF0FF0,
+	.vrs_drs[VCPU_REGS_DR7] = 0x400,
 	.vrs_msrs[VCPU_REGS_STAR] = 0ULL,
 	.vrs_msrs[VCPU_REGS_LSTAR] = 0ULL,
 	.vrs_msrs[VCPU_REGS_CSTAR] = 0ULL,
 	.vrs_msrs[VCPU_REGS_SFMASK] = 0ULL,
 	.vrs_msrs[VCPU_REGS_KGSBASE] = 0ULL,
 	.vrs_crs[VCPU_REGS_XCR0] = XCR0_X87
-#endif
 };
 
 /*
@@ -266,7 +272,8 @@ loadfile_bios(FILE *fp, struct vcpu_reg_state *vrs)
 int
 start_vm(struct vmd_vm *vm, int fd)
 {
-	struct vm_create_params	*vcp = &vm->vm_params.vmc_params;
+	struct vmop_create_params *vmc = &vm->vm_params;
+	struct vm_create_params	*vcp = &vmc->vmc_params;
 	struct vcpu_reg_state	 vrs;
 	int			 nicfds[VMM_MAX_NICS_PER_VM];
 	int			 ret;
@@ -279,7 +286,7 @@ start_vm(struct vmd_vm *vm, int fd)
 	setproctitle("%s", vcp->vcp_name);
 	log_procinit(vcp->vcp_name);
 
-	if (!vm->vm_received)
+	if (!(vm->vm_state & VM_STATE_RECEIVED))
 		create_memory_map(vcp);
 
 	ret = alloc_guest_mem(vcp);
@@ -311,7 +318,7 @@ start_vm(struct vmd_vm *vm, int fd)
 	if (pledge("stdio vmm recvfd", NULL) == -1)
 		fatal("pledge");
 
-	if (vm->vm_received) {
+	if (vm->vm_state & VM_STATE_RECEIVED) {
 		ret = read(vm->vm_receive_fd, &vrp, sizeof(vrp));
 		if (ret != sizeof(vrp)) {
 			fatal("received incomplete vrp - exiting");
@@ -326,12 +333,13 @@ start_vm(struct vmd_vm *vm, int fd)
 
 		/* Find and open kernel image */
 		if ((fp = vmboot_open(vm->vm_kernel,
-		    vm->vm_disks[0], &vmboot)) == NULL)
+		    vm->vm_disks[0], vmc->vmc_diskbases[0],
+		    vmc->vmc_disktypes[0], &vmboot)) == NULL)
 			fatalx("failed to open kernel - exiting");
 
 		/* Load kernel image */
 		ret = loadfile_elf(fp, vcp, &vrs,
-		    vmboot.vbp_bootdev, vmboot.vbp_howto);
+		    vmboot.vbp_bootdev, vmboot.vbp_howto, vmc->vmc_bootdevice);
 
 		/*
 		 * Try BIOS as a fallback (only if it was provided as an image
@@ -358,11 +366,13 @@ start_vm(struct vmd_vm *vm, int fd)
 
 	event_init();
 
-	if (vm->vm_received) {
+	if (vm->vm_state & VM_STATE_RECEIVED) {
 		restore_emulated_hw(vcp, vm->vm_receive_fd, nicfds,
 		    vm->vm_disks, vm->vm_cdrom);
-		mc146818_start();
 		restore_mem(vm->vm_receive_fd, vcp);
+		if (restore_vm_params(vm->vm_receive_fd, vcp))
+			fatal("restore vm params failed");
+		unpause_vm(vcp);
 	}
 
 	if (vmm_pipe(vm, fd, vm_dispatch_vmm) == -1)
@@ -370,6 +380,9 @@ start_vm(struct vmd_vm *vm, int fd)
 
 	/* Execute the vcpu run loop(s) for this VM */
 	ret = run_vm(vm->vm_cdrom, vm->vm_disks, nicfds, &vm->vm_params, &vrs);
+
+	/* Ensure that any in-flight data is written back */
+	virtio_shutdown(vm);
 
 	return (ret);
 }
@@ -456,6 +469,10 @@ vm_dispatch_vmm(int fd, short event, void *arg)
 			    IMSG_VMDOP_SEND_VM_RESPONSE,
 			    imsg.hdr.peerid, imsg.hdr.pid, -1, &vmr,
 			    sizeof(vmr));
+			if (!vmr.vmr_result) {
+				imsg_flush(&current_vm->vm_iev.ibuf);
+				_exit(0);
+			}
 			break;
 		default:
 			fatalx("%s: got invalid imsg %d from %s",
@@ -497,6 +514,7 @@ int
 send_vm(int fd, struct vm_create_params *vcp)
 {
 	struct vm_rwregs_params	   vrp;
+	struct vm_rwvmparams_params vpp;
 	struct vmop_create_params *vmc;
 	struct vm_terminate_params vtp;
 	unsigned int		   flags = 0;
@@ -524,6 +542,8 @@ send_vm(int fd, struct vm_create_params *vcp)
 	vmc->vmc_flags = flags;
 	vrp.vrwp_vm_id = vcp->vcp_id;
 	vrp.vrwp_mask = VM_RWREGS_ALL;
+	vpp.vpp_mask = VM_RWVMPARAMS_ALL;
+	vpp.vpp_vm_id = vcp->vcp_id;
 
 	sz = atomicio(vwrite, fd, vmc,sizeof(struct vmop_create_params));
 	if (sz != sizeof(struct vmop_create_params)) {
@@ -555,6 +575,8 @@ send_vm(int fd, struct vm_create_params *vcp)
 		goto err;
 	if ((ret = mc146818_dump(fd)))
 		goto err;
+	if ((ret = fw_cfg_dump(fd)))
+		goto err;
 	if ((ret = pci_dump(fd)))
 		goto err;
 	if ((ret = virtio_dump(fd)))
@@ -562,8 +584,24 @@ send_vm(int fd, struct vm_create_params *vcp)
 	if ((ret = dump_mem(fd, vcp)))
 		goto err;
 
+	for (i = 0; i < vcp->vcp_ncpus; i++) {
+		vpp.vpp_vcpu_id = i;
+		if ((ret = ioctl(env->vmd_fd, VMM_IOC_READVMPARAMS, &vpp))) {
+			log_warn("%s: readvmparams failed", __func__);
+			goto err;
+		}
+
+		sz = atomicio(vwrite, fd, &vpp,
+		    sizeof(struct vm_rwvmparams_params));
+		if (sz != sizeof(struct vm_rwvmparams_params)) {
+			log_warn("%s: dumping vm params failed", __func__);
+			ret = -1;
+			goto err;
+		}
+	}
+
 	vtp.vtp_vm_id = vcp->vcp_id;
-	if (ioctl(env->vmd_fd, VMM_IOC_TERM, &vtp) < 0) {
+	if (ioctl(env->vmd_fd, VMM_IOC_TERM, &vtp) == -1) {
 		log_warnx("%s: term IOC error: %d, %d", __func__,
 		    errno, ENOENT);
 	}
@@ -578,6 +616,9 @@ int
 dump_send_header(int fd) {
 	struct vm_dump_header	   vmh;
 	int			   i;
+
+	memcpy(&vmh.vmh_signature, VM_DUMP_SIGNATURE,
+	    sizeof(vmh.vmh_signature));
 
 	vmh.vmh_cpuids[0].code = 0x00;
 	vmh.vmh_cpuids[0].leaf = 0x00;
@@ -623,6 +664,26 @@ dump_mem(int fd, struct vm_create_params *vcp)
 		ret = dump_vmr(fd, vmr);
 		if (ret)
 			return ret;
+	}
+	return (0);
+}
+
+int
+restore_vm_params(int fd, struct vm_create_params *vcp) {
+	unsigned int			i;
+	struct vm_rwvmparams_params    vpp;
+
+	for (i = 0; i < vcp->vcp_ncpus; i++) {
+		if (atomicio(read, fd, &vpp, sizeof(vpp)) != sizeof(vpp)) {
+			log_warn("%s: error restoring vm params", __func__);
+			return (-1);
+		}
+		vpp.vpp_vm_id = vcp->vcp_id;
+		vpp.vpp_vcpu_id = i;
+		if (ioctl(env->vmd_fd, VMM_IOC_WRITEVMPARAMS, &vpp) < 0) {
+			log_debug("%s: writing vm params failed", __func__);
+			return (-1);
+		}
 	}
 	return (0);
 }
@@ -679,32 +740,70 @@ restore_vmr(int fd, struct vm_mem_range *vmr)
 void
 pause_vm(struct vm_create_params *vcp)
 {
-	if (current_vm->vm_paused)
+	unsigned int n;
+	int ret;
+	if (current_vm->vm_state & VM_STATE_PAUSED)
 		return;
 
-	current_vm->vm_paused = 1;
+	current_vm->vm_state |= VM_STATE_PAUSED;
 
-	/* XXX: vcpu_run_loop is running in another thread and we have to wait
-	 * for the vm to exit before returning */
-	sleep(1);
+	ret = pthread_barrier_init(&vm_pause_barrier, NULL, vcp->vcp_ncpus + 1);
+	if (ret) {
+		log_warnx("%s: cannot initialize pause barrier (%d)",
+		    __progname, ret);
+		return;
+	}
+
+	for (n = 0; n < vcp->vcp_ncpus; n++) {
+		ret = pthread_cond_broadcast(&vcpu_run_cond[n]);
+		if (ret) {
+			log_warnx("%s: can't broadcast vcpu run cond (%d)",
+			    __func__, (int)ret);
+			return;
+		}
+	}
+	ret = pthread_barrier_wait(&vm_pause_barrier);
+	if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
+		log_warnx("%s: could not wait on pause barrier (%d)",
+		    __func__, (int)ret);
+		return;
+	}
+
+	ret = pthread_barrier_destroy(&vm_pause_barrier);
+	if (ret) {
+		log_warnx("%s: could not destroy pause barrier (%d)",
+		    __progname, ret);
+		return;
+	}
 
 	i8253_stop();
 	mc146818_stop();
+	ns8250_stop();
+	virtio_stop(vcp);
 }
 
 void
 unpause_vm(struct vm_create_params *vcp)
 {
 	unsigned int n;
-	if (!current_vm->vm_paused)
+	int ret;
+	if (!(current_vm->vm_state & VM_STATE_PAUSED))
 		return;
 
-	current_vm->vm_paused = 0;
+	current_vm->vm_state &= ~VM_STATE_PAUSED;
+	for (n = 0; n < vcp->vcp_ncpus; n++) {
+		ret = pthread_cond_broadcast(&vcpu_unpause_cond[n]);
+		if (ret) {
+			log_warnx("%s: can't broadcast vcpu unpause cond (%d)",
+			    __func__, (int)ret);
+			return;
+		}
+	}
 
 	i8253_start();
 	mc146818_start();
-	for (n = 0; n <= vcp->vcp_ncpus; n++)
-		pthread_cond_broadcast(&vcpu_run_cond[n]);
+	ns8250_start();
+	virtio_start(vcp);
 }
 
 /*
@@ -735,7 +834,7 @@ vcpu_reset(uint32_t vmid, uint32_t vcpu_id, struct vcpu_reg_state *vrs)
 
 	log_debug("%s: resetting vcpu %d for vm %d", __func__, vcpu_id, vmid);
 
-	if (ioctl(env->vmd_fd, VMM_IOC_RESETCPU, &vrp) < 0)
+	if (ioctl(env->vmd_fd, VMM_IOC_RESETCPU, &vrp) == -1)
 		return (errno);
 
 	return (0);
@@ -886,7 +985,7 @@ vmm_create_vm(struct vm_create_params *vcp)
 	if (vcp->vcp_nnics > VMM_MAX_NICS_PER_VM)
 		return (EINVAL);
 
-	if (ioctl(env->vmd_fd, VMM_IOC_CREATE, vcp) < 0)
+	if (ioctl(env->vmd_fd, VMM_IOC_CREATE, vcp) == -1)
 		return (errno);
 
 	return (0);
@@ -899,7 +998,7 @@ vmm_create_vm(struct vm_create_params *vcp)
  */
 void
 init_emulated_hw(struct vmop_create_params *vmc, int child_cdrom,
-    int *child_disks, int *child_taps)
+    int child_disks[][VM_MAX_BASE_PER_DISK], int *child_taps)
 {
 	struct vm_create_params *vcp = &vmc->vmc_params;
 	int i;
@@ -943,6 +1042,13 @@ init_emulated_hw(struct vmop_create_params *vmc, int child_cdrom,
 	for (i = COM1_DATA; i <= COM1_SCR; i++)
 		ioports_map[i] = vcpu_exit_com;
 
+	/* Init QEMU fw_cfg interface */
+	fw_cfg_init(vmc);
+	ioports_map[FW_CFG_IO_SELECT] = vcpu_exit_fw_cfg;
+	ioports_map[FW_CFG_IO_DATA] = vcpu_exit_fw_cfg;
+	ioports_map[FW_CFG_IO_DMA_ADDR_HIGH] = vcpu_exit_fw_cfg_dma;
+	ioports_map[FW_CFG_IO_DMA_ADDR_LOW] = vcpu_exit_fw_cfg_dma;
+
 	/* Initialize PCI */
 	for (i = VMM_PCI_IO_BAR_BASE; i <= VMM_PCI_IO_BAR_END; i++)
 		ioports_map[i] = vcpu_exit_pci;
@@ -964,7 +1070,7 @@ init_emulated_hw(struct vmop_create_params *vmc, int child_cdrom,
  */
 void
 restore_emulated_hw(struct vm_create_params *vcp, int fd,
-    int *child_taps, int *child_disks, int child_cdrom)
+    int *child_taps, int child_disks[][VM_MAX_BASE_PER_DISK], int child_cdrom)
 {
 	/* struct vm_create_params *vcp = &vmc->vmc_params; */
 	int i;
@@ -993,6 +1099,13 @@ restore_emulated_hw(struct vm_create_params *vcp, int fd,
 	mc146818_restore(fd, vcp->vcp_id);
 	ioports_map[IO_RTC] = vcpu_exit_mc146818;
 	ioports_map[IO_RTC + 1] = vcpu_exit_mc146818;
+
+	/* Init QEMU fw_cfg interface */
+	fw_cfg_restore(fd);
+	ioports_map[FW_CFG_IO_SELECT] = vcpu_exit_fw_cfg;
+	ioports_map[FW_CFG_IO_DATA] = vcpu_exit_fw_cfg;
+	ioports_map[FW_CFG_IO_DMA_ADDR_HIGH] = vcpu_exit_fw_cfg_dma;
+	ioports_map[FW_CFG_IO_DMA_ADDR_LOW] = vcpu_exit_fw_cfg_dma;
 
 	/* Initialize PCI */
 	for (i = VMM_PCI_IO_BAR_BASE; i <= VMM_PCI_IO_BAR_END; i++)
@@ -1025,8 +1138,9 @@ restore_emulated_hw(struct vm_create_params *vcp, int fd,
  *  !0 : the VM exited abnormally or failed to start
  */
 int
-run_vm(int child_cdrom, int *child_disks, int *child_taps,
-    struct vmop_create_params *vmc, struct vcpu_reg_state *vrs)
+run_vm(int child_cdrom, int child_disks[][VM_MAX_BASE_PER_DISK],
+    int *child_taps, struct vmop_create_params *vmc,
+    struct vcpu_reg_state *vrs)
 {
 	struct vm_create_params *vcp = &vmc->vmc_params;
 	struct vm_rwregs_params vregsp;
@@ -1073,7 +1187,7 @@ run_vm(int child_cdrom, int *child_disks, int *child_taps,
 	log_debug("%s: initializing hardware for vm %s", __func__,
 	    vcp->vcp_name);
 
-	if (!current_vm->vm_received)
+	if (!(current_vm->vm_state & VM_STATE_RECEIVED))
 		init_emulated_hw(vmc, child_cdrom, child_disks, child_taps);
 
 	ret = pthread_mutex_init(&threadmutex, NULL);
@@ -1125,13 +1239,13 @@ run_vm(int child_cdrom, int *child_disks, int *child_taps,
 		}
 
 		/* once more because reset_cpu changes regs */
-		if (current_vm->vm_received) {
+		if (current_vm->vm_state & VM_STATE_RECEIVED) {
 			vregsp.vrwp_vm_id = vcp->vcp_id;
 			vregsp.vrwp_vcpu_id = i;
 			vregsp.vrwp_regs = *vrs;
 			vregsp.vrwp_mask = VM_RWREGS_ALL;
 			if ((ret = ioctl(env->vmd_fd, VMM_IOC_WRITEREGS,
-			    &vregsp)) < 0) {
+			    &vregsp)) == -1) {
 				log_warn("%s: writeregs failed", __func__);
 				return (ret);
 			}
@@ -1147,6 +1261,20 @@ run_vm(int child_cdrom, int *child_disks, int *child_taps,
 		ret = pthread_mutex_init(&vcpu_run_mtx[i], NULL);
 		if (ret) {
 			log_warnx("%s: cannot initialize mtx (%d)",
+			    __progname, ret);
+			return (ret);
+		}
+
+		ret = pthread_cond_init(&vcpu_unpause_cond[i], NULL);
+		if (ret) {
+			log_warnx("%s: cannot initialize unpause var (%d)",
+			    __progname, ret);
+			return (ret);
+		}
+
+		ret = pthread_mutex_init(&vcpu_unpause_mtx[i], NULL);
+		if (ret) {
+			log_warnx("%s: cannot initialize unpause mtx (%d)",
 			    __progname, ret);
 			return (ret);
 		}
@@ -1272,32 +1400,50 @@ vcpu_run_loop(void *arg)
 			return ((void *)ret);
 		}
 
-		/* If we are halted or paused, wait */
-		if (vcpu_hlt[n]) {
-			while (current_vm->vm_paused == 1) {
-				ret = pthread_cond_wait(&vcpu_run_cond[n],
-				    &vcpu_run_mtx[n]);
-				if (ret) {
-					log_warnx(
-					    "%s: can't wait on cond (%d)",
-					    __func__, (int)ret);
-					(void)pthread_mutex_unlock(
-					    &vcpu_run_mtx[n]);
-					break;
-				}
+		/* If we are halted and need to pause, pause */
+		if (vcpu_hlt[n] && (current_vm->vm_state & VM_STATE_PAUSED)) {
+			ret = pthread_barrier_wait(&vm_pause_barrier);
+			if (ret != 0 && ret != PTHREAD_BARRIER_SERIAL_THREAD) {
+				log_warnx("%s: could not wait on pause barrier (%d)",
+				    __func__, (int)ret);
+				return ((void *)ret);
 			}
-			if (vcpu_hlt[n]) {
-				ret = pthread_cond_wait(&vcpu_run_cond[n],
-				    &vcpu_run_mtx[n]);
 
-				if (ret) {
-					log_warnx(
-					    "%s: can't wait on cond (%d)",
-					    __func__, (int)ret);
-					(void)pthread_mutex_unlock(
-					    &vcpu_run_mtx[n]);
-					break;
-				}
+			ret = pthread_mutex_lock(&vcpu_unpause_mtx[n]);
+			if (ret) {
+				log_warnx("%s: can't lock vcpu unpause mtx (%d)",
+				    __func__, (int)ret);
+				return ((void *)ret);
+			}
+
+			ret = pthread_cond_wait(&vcpu_unpause_cond[n],
+			    &vcpu_unpause_mtx[n]);
+			if (ret) {
+				log_warnx(
+				    "%s: can't wait on unpause cond (%d)",
+				    __func__, (int)ret);
+				break;
+			}
+			ret = pthread_mutex_unlock(&vcpu_unpause_mtx[n]);
+			if (ret) {
+				log_warnx("%s: can't unlock unpause mtx (%d)",
+				    __func__, (int)ret);
+				break;
+			}
+		}
+
+		/* If we are halted and not paused, wait */
+		if (vcpu_hlt[n]) {
+			ret = pthread_cond_wait(&vcpu_run_cond[n],
+			    &vcpu_run_mtx[n]);
+
+			if (ret) {
+				log_warnx(
+				    "%s: can't wait on cond (%d)",
+				    __func__, (int)ret);
+				(void)pthread_mutex_unlock(
+				    &vcpu_run_mtx[n]);
+				break;
 			}
 		}
 
@@ -1329,7 +1475,7 @@ vcpu_run_loop(void *arg)
 			}
 		}
 
-		if (ioctl(env->vmd_fd, VMM_IOC_RUN, vrp) < 0) {
+		if (ioctl(env->vmd_fd, VMM_IOC_RUN, vrp) == -1) {
 			/* If run ioctl failed, exit */
 			ret = errno;
 			log_warn("%s: vm %d / vcpu %d run ioctl failed",
@@ -1373,7 +1519,7 @@ vcpu_pic_intr(uint32_t vm_id, uint32_t vcpu_id, uint8_t intr)
 	vip.vip_vcpu_id = vcpu_id; /* XXX always 0? */
 	vip.vip_intr = intr;
 
-	if (ioctl(env->vmd_fd, VMM_IOC_INTR, &vip) < 0)
+	if (ioctl(env->vmd_fd, VMM_IOC_INTR, &vip) == -1)
 		return (errno);
 
 	return (0);
@@ -1446,6 +1592,38 @@ vcpu_exit_inout(struct vm_run_params *vrp)
 }
 
 /*
+ * vcpu_exit_eptviolation
+ *
+ * handle an EPT Violation
+ *
+ *
+ * Parameters:
+ *  vrp: vcpu run parameters containing guest state for this exit
+ *
+ * Return values:
+ *  0: no action required
+ *  EAGAIN: a protection fault occured, kill the vm.
+ */
+int
+vcpu_exit_eptviolation(struct vm_run_params *vrp)
+{
+	struct vm_exit *ve = vrp->vrp_exit;
+	/*
+	 * vmd may be exiting to vmd to handle a pending interrupt
+	 * but last exit type may have bee VMX_EXIT_EPT_VIOLATION,
+	 * check the fault_type to ensure we really are processing
+	 * a VMX_EXIT_EPT_VIOLATION.
+	 */
+	if (ve->vee.vee_fault_type == VEE_FAULT_PROTECT) {
+		log_debug("%s: EPT Violation: rip=0x%llx",
+		    __progname, vrp->vrp_exit->vrs.vrs_gprs[VCPU_REGS_RIP]);
+		return (EAGAIN);
+	}
+
+	return (0);
+}
+
+/*
  * vcpu_exit
  *
  * Handle a vcpu exit. This function is called when it is determined that
@@ -1475,7 +1653,6 @@ vcpu_exit(struct vm_run_params *vrp)
 	case VMX_EXIT_CPUID:
 	case VMX_EXIT_EXTINT:
 	case SVM_VMEXIT_INTR:
-	case VMX_EXIT_EPT_VIOLATION:
 	case SVM_VMEXIT_NPF:
 	case SVM_VMEXIT_MSR:
 	case SVM_VMEXIT_CPUID:
@@ -1486,6 +1663,12 @@ vcpu_exit(struct vm_run_params *vrp)
 		 * here (and falling through to the default case below results
 		 * in more vmd log spam).
 		 */
+		break;
+	case VMX_EXIT_EPT_VIOLATION:
+		ret = vcpu_exit_eptviolation(vrp);
+		if (ret)
+			return (ret);
+
 		break;
 	case VMX_EXIT_IO:
 	case SVM_VMEXIT_IOIO:
@@ -1614,7 +1797,7 @@ vaddr_mem(paddr_t gpa, size_t len)
  *
  * Parameters:
  *  dst: the destination paddr_t in the guest VM
- *  buf: data to copy
+ *  buf: data to copy (or NULL to zero the data)
  *  len: number of bytes to copy
  *
  * Return values:
@@ -1645,9 +1828,12 @@ write_mem(paddr_t dst, const void *buf, size_t len)
 			n = len;
 
 		to = (char *)vmr->vmr_va + off;
-		memcpy(to, from, n);
-
-		from += n;
+		if (buf == NULL)
+			memset(to, 0, n);
+		else {
+			memcpy(to, from, n);
+			from += n;
+		}
 		len -= n;
 		off = 0;
 		vmr++;
@@ -1922,4 +2108,208 @@ get_input_data(struct vm_exit *vei, uint32_t *data)
 		    vei->vei.vei_size);
 	}
 
+}
+
+/*
+ * translate_gva
+ *
+ * Translates a guest virtual address to a guest physical address by walking
+ * the currently active page table (if needed).
+ *
+ * Note - this function can possibly alter the supplied VCPU state.
+ *  Specifically, it may inject exceptions depending on the current VCPU
+ *  configuration, and may alter %cr2 on #PF. Consequently, this function
+ *  should only be used as part of instruction emulation.
+ *
+ * Parameters:
+ *  exit: The VCPU this translation should be performed for (guest MMU settings
+ *   are gathered from this VCPU)
+ *  va: virtual address to translate
+ *  pa: pointer to paddr_t variable that will receive the translated physical
+ *   address. 'pa' is unchanged on error.
+ *  mode: one of PROT_READ, PROT_WRITE, PROT_EXEC indicating the mode in which
+ *   the address should be translated
+ *
+ * Return values:
+ *  0: the address was successfully translated - 'pa' contains the physical
+ *     address currently mapped by 'va'.
+ *  EFAULT: the PTE for 'VA' is unmapped. A #PF will be injected in this case
+ *     and %cr2 set in the vcpu structure.
+ *  EINVAL: an error occurred reading paging table structures
+ */
+int
+translate_gva(struct vm_exit* exit, uint64_t va, uint64_t* pa, int mode)
+{
+	int level, shift, pdidx;
+	uint64_t pte, pt_paddr, pte_paddr, mask, low_mask, high_mask;
+	uint64_t shift_width, pte_size;
+	struct vcpu_reg_state *vrs;
+
+	vrs = &exit->vrs;
+
+	if (!pa)
+		return (EINVAL);
+
+	if (!(vrs->vrs_crs[VCPU_REGS_CR0] & CR0_PG)) {
+		log_debug("%s: unpaged, va=pa=0x%llx", __func__, va);
+		*pa = va;
+		return (0);
+	}
+
+	pt_paddr = vrs->vrs_crs[VCPU_REGS_CR3];
+
+	log_debug("%s: guest %%cr0=0x%llx, %%cr3=0x%llx", __func__,
+	    vrs->vrs_crs[VCPU_REGS_CR0], vrs->vrs_crs[VCPU_REGS_CR3]);
+
+	if (vrs->vrs_crs[VCPU_REGS_CR0] & CR0_PE) {
+		if (vrs->vrs_crs[VCPU_REGS_CR4] & CR4_PAE) {
+			pte_size = sizeof(uint64_t);
+			shift_width = 9;
+
+			if (vrs->vrs_msrs[VCPU_REGS_EFER] & EFER_LMA) {
+				/* 4 level paging */
+				level = 4;
+				mask = L4_MASK;
+				shift = L4_SHIFT;
+			} else {
+				/* 32 bit with PAE paging */
+				level = 3;
+				mask = L3_MASK;
+				shift = L3_SHIFT;
+			}
+		} else {
+			/* 32 bit paging */
+			level = 2;
+			shift_width = 10;
+			mask = 0xFFC00000;
+			shift = 22;
+			pte_size = sizeof(uint32_t);
+		}
+	} else
+		return (EINVAL);
+
+	/* XXX: Check for R bit in segment selector and set A bit */
+
+	for (;level > 0; level--) {
+		pdidx = (va & mask) >> shift;
+		pte_paddr = (pt_paddr) + (pdidx * pte_size);
+
+		log_debug("%s: read pte level %d @ GPA 0x%llx", __func__,
+		    level, pte_paddr);
+		if (read_mem(pte_paddr, &pte, pte_size)) {
+			log_warn("%s: failed to read pte", __func__);
+			return (EFAULT);
+		}
+
+		log_debug("%s: PTE @ 0x%llx = 0x%llx", __func__, pte_paddr,
+		    pte);
+
+		/* XXX: Set CR2  */
+		if (!(pte & PG_V))
+			return (EFAULT);
+
+		/* XXX: Check for SMAP */
+		if ((mode == PROT_WRITE) && !(pte & PG_RW))
+			return (EPERM);
+
+		if ((exit->cpl > 0) && !(pte & PG_u))
+			return (EPERM);
+
+		pte = pte | PG_U;
+		if (mode == PROT_WRITE)
+			pte = pte | PG_M;
+		if (write_mem(pte_paddr, &pte, pte_size)) {
+			log_warn("%s: failed to write back flags to pte",
+			    __func__);
+			return (EIO);
+		}
+
+		/* XXX: EINVAL if in 32bit and  PG_PS is 1 but CR4.PSE is 0 */
+		if (pte & PG_PS)
+			break;
+
+		if (level > 1) {
+			pt_paddr = pte & PG_FRAME;
+			shift -= shift_width;
+			mask = mask >> shift_width;
+		}
+	}
+
+	low_mask = (1 << shift) - 1;
+	high_mask = (((uint64_t)1ULL << ((pte_size * 8) - 1)) - 1) ^ low_mask;
+	*pa = (pte & high_mask) | (va & low_mask);
+
+	log_debug("%s: final GPA for GVA 0x%llx = 0x%llx\n", __func__, va, *pa);
+
+	return (0);
+}
+
+/*
+ * vm_pipe_init
+ *
+ * Initialize a vm_dev_pipe, setting up its file descriptors and its
+ * event structure with the given callback.
+ *
+ * Parameters:
+ *  p: pointer to vm_dev_pipe struct to initizlize
+ *  cb: callback to use for READ events on the read end of the pipe
+ */
+void
+vm_pipe_init(struct vm_dev_pipe *p, void (*cb)(int, short, void *))
+{
+	int ret;
+	int fds[2];
+
+	memset(p, 0, sizeof(struct vm_dev_pipe));
+
+	ret = pipe(fds);
+	if (ret)
+		fatal("failed to create vm_dev_pipe pipe");
+
+	p->read = fds[0];
+	p->write = fds[1];
+
+	event_set(&p->read_ev, p->read, EV_READ | EV_PERSIST, cb, NULL);
+}
+
+/*
+ * vm_pipe_send
+ *
+ * Send a message to an emulated device vie the provided vm_dev_pipe.
+ *
+ * Parameters:
+ *  p: pointer to initialized vm_dev_pipe
+ *  msg: message to send in the channel
+ */
+void
+vm_pipe_send(struct vm_dev_pipe *p, enum pipe_msg_type msg)
+{
+	size_t n;
+	n = write(p->write, &msg, sizeof(msg));
+	if (n != sizeof(msg))
+		fatal("failed to write to device pipe");
+}
+
+/*
+ * vm_pipe_recv
+ *
+ * Receive a message for an emulated device via the provided vm_dev_pipe.
+ * Returns the message value, otherwise will exit on failure.
+ *
+ * Parameters:
+ *  p: pointer to initialized vm_dev_pipe
+ *
+ * Return values:
+ *  a value of enum pipe_msg_type or fatal exit on read(2) error
+ */
+enum pipe_msg_type
+vm_pipe_recv(struct vm_dev_pipe *p)
+{
+	size_t n;
+	enum pipe_msg_type msg;
+	n = read(p->read, &msg, sizeof(msg));
+	if (n != sizeof(msg))
+		fatal("failed to read from device pipe");
+
+	return msg;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mpls.h,v 1.38 2018/01/09 06:24:15 dlg Exp $	*/
+/*	$OpenBSD: mpls.h,v 1.44 2020/08/19 19:22:53 gnezdo Exp $	*/
 
 /*
  * Copyright (C) 1999, 2000 and 2001 AYAME Project, WIDE Project.
@@ -110,7 +110,6 @@ struct rt_mpls {
  */
 #define MPLSCTL_ENABLE			1
 #define	MPLSCTL_DEFTTL			2
-#define	MPLSCTL_MAXINKLOOP		4
 #define MPLSCTL_MAPTTL_IP		5
 #define MPLSCTL_MAPTTL_IP6		6
 #define MPLSCTL_MAXID			7	
@@ -120,19 +119,9 @@ struct rt_mpls {
 	{ NULL, 0 }, \
 	{ "ttl", CTLTYPE_INT }, \
 	{ "ifq", CTLTYPE_NODE },\
-	{ "maxloop_inkernel", CTLTYPE_INT }, \
+	{ NULL, 0 }, \
 	{ "mapttl_ip", CTLTYPE_INT }, \
 	{ "mapttl_ip6", CTLTYPE_INT } \
-}
-
-#define MPLSCTL_VARS { \
-	NULL, \
-	NULL, \
-	&mpls_defttl, \
-	NULL, \
-	&mpls_inkloop, \
-	&mpls_mapttl_ip, \
-	&mpls_mapttl_ip6 \
 }
 
 #define IMR_TYPE_NONE			0
@@ -153,35 +142,24 @@ struct ifmpwreq {
 
 #ifdef _KERNEL
 
+#define MPLS_LABEL2SHIM(_l)	(htonl((_l) << MPLS_LABEL_OFFSET))
+#define MPLS_SHIM2LABEL(_s)	(ntohl((_s)) >> MPLS_LABEL_OFFSET)
+
 extern	struct domain mplsdomain;
-
-struct mpe_softc {
-	struct ifnet		sc_if;		/* the interface */
-	struct ifaddr		sc_ifa;
-	int			sc_unit;
-	struct sockaddr_mpls	sc_smpls;
-	LIST_ENTRY(mpe_softc)	sc_list;
-};
-
-#define MPE_HDRLEN	sizeof(struct shim_hdr)
-#define MPE_MTU		1500
-#define MPE_MTU_MIN	256
-#define MPE_MTU_MAX	8192
-
-void	mpe_input(struct mbuf *, struct ifnet *, struct sockaddr_mpls *,
-	    u_int8_t);
-void	mpe_input6(struct mbuf *, struct ifnet *, struct sockaddr_mpls *,
-	    u_int8_t);
 
 extern int		mpls_defttl;
 extern int		mpls_mapttl_ip;
 extern int		mpls_mapttl_ip6;
-extern int		mpls_inkloop;
 
 
 struct mbuf	*mpls_shim_pop(struct mbuf *);
 struct mbuf	*mpls_shim_swap(struct mbuf *, struct rt_mpls *);
 struct mbuf	*mpls_shim_push(struct mbuf *, struct rt_mpls *);
+
+struct mbuf	*mpls_ip_adjttl(struct mbuf *, u_int8_t);
+#ifdef INET6
+struct mbuf	*mpls_ip6_adjttl(struct mbuf *, u_int8_t);
+#endif
 
 int		 mpls_output(struct ifnet *, struct mbuf *, struct sockaddr *,
 		    struct rtentry *);

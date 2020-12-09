@@ -1,7 +1,8 @@
-/*	$OpenBSD: machdep.c,v 1.106 2018/06/13 14:38:42 visa Exp $ */
+/*	$OpenBSD: machdep.c,v 1.127 2020/07/18 08:37:44 visa Exp $ */
 
 /*
  * Copyright (c) 2009, 2010 Miodrag Vallat.
+ * Copyright (c) 2019 Visa Hankala.
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -86,6 +87,8 @@
 #include <machine/octeonvar.h>
 #include <machine/octeon_model.h>
 
+#include "octboot.h"
+
 /* The following is used externally (sysctl_hw) */
 char	machine[] = MACHINE;		/* Machine "architecture" */
 char	cpu_model[64];
@@ -96,6 +99,7 @@ struct uvm_constraint_range *uvm_md_constraints[] = { NULL };
 vm_map_t exec_map;
 vm_map_t phys_map;
 
+extern struct timecounter cp0_timecounter;
 extern uint8_t dt_blob_start[];
 
 struct boot_desc *octeon_boot_desc;
@@ -103,8 +107,6 @@ struct boot_info *octeon_boot_info;
 
 void		*octeon_fdt;
 unsigned int	 octeon_ver;
-
-char uboot_rootdev[OCTEON_ARGV_MAX];
 
 /*
  * safepri is a safe priority for sleep to set for a spin-wait
@@ -130,17 +132,16 @@ struct phys_mem_desc mem_layout[MAXMEMSEGS];
 void		dumpsys(void);
 void		dumpconf(void);
 vaddr_t		mips_init(register_t, register_t, register_t, register_t);
-boolean_t 	is_memory_range(paddr_t, psize_t, psize_t);
+int		is_memory_range(paddr_t, psize_t, psize_t);
 void		octeon_memory_init(struct boot_info *);
+void		octeon_sync_tc(vaddr_t, uint64_t, uint64_t);
 int		octeon_cpuspeed(int *);
 void		octeon_tlb_init(void);
 static void	process_bootargs(void);
 static uint64_t	get_ncpusfound(void);
 
-extern void 	parse_uboot_root(void);
-
-cons_decl(cn30xxuart);
-struct consdev uartcons = cons_init(cn30xxuart);
+cons_decl(octuart);
+struct consdev uartcons = cons_init(octuart);
 
 u_int		ioclock_get_timecount(struct timecounter *);
 
@@ -152,9 +153,40 @@ struct timecounter ioclock_timecounter = {
 	.tc_name = "ioclock",
 	.tc_quality = 0,		/* ioclock can be overridden
 					 * by cp0 counter */
-	.tc_priv = 0			/* clock register,
+	.tc_priv = 0,			/* clock register,
 					 * determined at runtime */
+	.tc_user = 0,			/* expose to user */
 };
+
+static int
+atoi(const char *s)
+{
+	int n, neg;
+
+	n = 0;
+	neg = 0;
+
+	while (*s == '-') {
+		s++;
+		neg = !neg;
+	}
+
+	while (*s != '\0') {
+		if (*s < '0' || *s > '9')
+			break;
+
+		n = (10 * n) + (*s - '0');
+		s++;
+	}
+
+	return (neg ? -n : n);
+}
+
+static struct octeon_bootmem_block *
+pa_to_block(paddr_t addr)
+{
+	return (struct octeon_bootmem_block *)PHYS_TO_XKPHYS(addr, CCA_CACHED);
+}
 
 void
 octeon_memory_init(struct boot_info *boot_info)
@@ -182,10 +214,22 @@ octeon_memory_init(struct boot_info *boot_info)
 	if (blockaddr == 0)
 		panic("bootmem list is empty");
 	for (i = 0; i < MAXMEMSEGS && blockaddr != 0; blockaddr = block->next) {
-		block = (struct octeon_bootmem_block *)PHYS_TO_XKPHYS(
-		    blockaddr, CCA_CACHED);
+		block = pa_to_block(blockaddr);
 		printf("avail phys mem 0x%016lx - 0x%016lx\n", blockaddr,
 		    (paddr_t)(blockaddr + block->size));
+
+#if NOCTBOOT > 0
+		/*
+		 * Reserve the physical memory below the boot kernel
+		 * for loading the actual kernel.
+		 */
+		extern char start[];
+		if (blockaddr < CKSEG_SIZE &&
+		    PHYS_TO_CKSEG0(blockaddr) < (vaddr_t)start) {
+			printf("skipped\n");
+			continue;
+		}
+#endif
 
 		fp = atop(round_page(blockaddr));
 		lp = atop(trunc_page(blockaddr + block->size));
@@ -213,6 +257,13 @@ octeon_memory_init(struct boot_info *boot_info)
 	for (i = 0; mem_layout[i].mem_last_page; i++) {
 		printf("mem_layout[%d] page 0x%016llX -> 0x%016llX\n", i,
 		    mem_layout[i].mem_first_page, mem_layout[i].mem_last_page);
+
+#if NOCTBOOT > 0
+		fp = mem_layout[i].mem_first_page;
+		lp = mem_layout[i].mem_last_page;
+		if (bootmem_alloc_region(ptoa(fp), ptoa(lp) - ptoa(fp)) != 0)
+			panic("%s: bootmem allocation failed", __func__);
+#endif
 	}
 }
 
@@ -225,12 +276,14 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 {
 	uint prid;
 	vaddr_t xtlb_handler;
+	size_t len;
 	int i;
 	struct boot_desc *boot_desc;
 	struct boot_info *boot_info;
+	int32_t *symptr;
 	uint32_t config4;
 
-	extern char start[], edata[], end[];
+	extern char start[], end[];
 	extern char exception[], e_exception[];
 	extern void xtlb_miss;
 
@@ -238,17 +291,20 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 	boot_info = (struct boot_info *)
 	    PHYS_TO_XKPHYS(boot_desc->boot_info_addr, CCA_CACHED);
 
+	/*
+	 * Save the pointers for future reference.
+	 * The descriptors are located outside the free memory,
+	 * and the kernel should preserve them.
+	 */
+	octeon_boot_desc = boot_desc;
+	octeon_boot_info = boot_info;
+
 #ifdef MULTIPROCESSOR
 	/*
 	 * Set curcpu address on primary processor.
 	 */
 	setcurcpu(&cpu_info_primary);
 #endif
-	/*
-	 * Clear the compiled BSS segment in OpenBSD code.
-	 */
-
-	bzero(edata, end - edata);
 
 	/*
 	 * Set up early console output.
@@ -258,13 +314,14 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 	/*
 	 * Reserve space for the symbol table, if it exists.
 	 */
-	ssym = (char *)(vaddr_t)*(int32_t *)end;
+	symptr = (int32_t *)roundup((vaddr_t)end, BOOTMEM_BLOCK_ALIGN);
+	ssym = (char *)(vaddr_t)symptr[0];
 	if (((long)ssym - (long)end) >= 0 &&
 	    ((long)ssym - (long)end) <= 0x1000 &&
 	    ssym[0] == ELFMAG0 && ssym[1] == ELFMAG1 &&
 	    ssym[2] == ELFMAG2 && ssym[3] == ELFMAG3) {
 		/* Pointers exist directly after kernel. */
-		esym = (char *)(vaddr_t)*((int32_t *)end + 1);
+		esym = (char *)(vaddr_t)symptr[1];
 		ekern = esym;
 	} else {
 		/* Pointers aren't setup either... */
@@ -285,10 +342,14 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 		octeon_ver = OCTEON_PLUS;
 		break;
 	case OCTEON_MODEL_FAMILY_CN61XX:
+	case OCTEON_MODEL_FAMILY_CN63XX:
+	case OCTEON_MODEL_FAMILY_CN66XX:
+	case OCTEON_MODEL_FAMILY_CN68XX:
 		octeon_ver = OCTEON_2;
 		break;
 	case OCTEON_MODEL_FAMILY_CN71XX:
 	case OCTEON_MODEL_FAMILY_CN73XX:
+	case OCTEON_MODEL_FAMILY_CN78XX:
 		octeon_ver = OCTEON_3;
 		break;
 	}
@@ -373,14 +434,6 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 	Octeon_SyncCache(curcpu());
 
 	octeon_tlb_init();
-
-	/*
-	 * Save the the boot information for future reference since we can't
-	 * retrieve it anymore after we've fully bootstrapped the kernel.
-	 */
-
-	bcopy(&boot_info, &octeon_boot_info, sizeof(octeon_boot_info));
-	bcopy(&boot_desc, &octeon_boot_desc, sizeof(octeon_boot_desc));
 
 	snprintf(cpu_model, sizeof(cpu_model), "Cavium OCTEON (rev %d.%d) @ %d MHz",
 		 (bootcpu_hwinfo.c0prid >> 4) & 0x0f,
@@ -475,6 +528,17 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 		panic("cannot run without physical CPU 0");
 
 	/*
+	 * Use bits of board information to improve initial entropy.
+	 */
+	enqueue_randomness((octeon_boot_info->board_type << 16) |
+	    (octeon_boot_info->board_rev_major << 8) |
+	    octeon_boot_info->board_rev_minor);
+	len = strnlen(octeon_boot_info->board_serial,
+	    sizeof(octeon_boot_info->board_serial));
+	for (i = 0; i < len; i++)
+		enqueue_randomness(octeon_boot_info->board_serial[i]);
+
+	/*
 	 * Init message buffer.
 	 */
 	msgbufbase = (caddr_t)pmap_steal_memory(MSGBUFSIZE, NULL,NULL);
@@ -526,6 +590,7 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 
 	switch (octeon_model_family(prid)) {
 	case OCTEON_MODEL_FAMILY_CN73XX:
+	case OCTEON_MODEL_FAMILY_CN78XX:
 		ioclock_timecounter.tc_priv = (void *)FPA3_CLK_COUNT;
 		break;
 	default:
@@ -534,6 +599,10 @@ mips_init(register_t a0, register_t a1, register_t a2, register_t a3)
 	}
 	ioclock_timecounter.tc_frequency = octeon_ioclock_speed();
 	tc_init(&ioclock_timecounter);
+
+	cpu_has_synced_cp0_count = 1;
+	cp0_timecounter.tc_quality = 1000;
+	cp0_timecounter.tc_user = TC_CP0_COUNT;
 
 	/*
 	 * Return the new kernel stack pointer.
@@ -607,7 +676,6 @@ cpu_startup()
 int
 octeon_cpuspeed(int *freq)
 {
-	extern struct boot_info *octeon_boot_info;
 	*freq = octeon_boot_info->eclock / 1000000;
 	return (0);
 }
@@ -615,7 +683,6 @@ octeon_cpuspeed(int *freq)
 int
 octeon_ioclock_speed(void)
 {
-	extern struct boot_info *octeon_boot_info;
 	u_int64_t mio_rst_boot, rst_boot;
 
 	switch (octeon_ver) {
@@ -635,7 +702,7 @@ octeon_ioclock_speed(void)
 void
 octeon_tlb_init(void)
 {
-	uint64_t cvmmemctl;
+	uint64_t clk_reg, cvmmemctl, frac, cmul, imul, val;
 	uint32_t hwrena = 0;
 	uint32_t pgrain = 0;
 	int chipid;
@@ -656,6 +723,58 @@ octeon_tlb_init(void)
 	 * Make sure Coprocessor 2 is disabled.
 	 */
 	setsr(getsr() & ~SR_COP_2_BIT);
+
+	/*
+	 * Synchronize this core's cycle counter with the system-wide
+	 * IO clock counter.
+	 *
+	 * The IO clock counter's value has to be scaled from the IO clock
+	 * frequency domain to the core clock frequency domain:
+	 *
+	 * cclk / cmul = iclk / imul
+	 * cclk = iclk * cmul / imul
+	 *
+	 * Division is very slow and possibly variable-time on the system,
+	 * so the synchronization routine uses multiplication:
+	 *
+	 * cclk = iclk * cmul * frac / 2^64,
+	 *
+	 * where frac = 2^64 / imul is precomputed.
+	 */
+	switch (octeon_model_family(chipid)) {
+	case OCTEON_MODEL_FAMILY_CN73XX:
+	case OCTEON_MODEL_FAMILY_CN78XX:
+		clk_reg = FPA3_CLK_COUNT;
+		break;
+	default:
+		clk_reg = IPD_CLK_COUNT;
+		break;
+	}
+	switch (octeon_ver) {
+	case OCTEON_2:
+		val = octeon_xkphys_read_8(MIO_RST_BOOT);
+		cmul = (val >> MIO_RST_BOOT_C_MUL_SHIFT) &
+		    MIO_RST_BOOT_C_MUL_MASK;
+		imul = (val >> MIO_RST_BOOT_PNR_MUL_SHIFT) &
+		    MIO_RST_BOOT_PNR_MUL_MASK;
+		break;
+	case OCTEON_3:
+		val = octeon_xkphys_read_8(RST_BOOT);
+		cmul = (val >> RST_BOOT_C_MUL_SHIFT) &
+		    RST_BOOT_C_MUL_MASK;
+		imul = (val >> RST_BOOT_PNR_MUL_SHIFT) &
+		    RST_BOOT_PNR_MUL_MASK;
+		break;
+	default:
+		cmul = 1;
+		imul = 1;
+		break;
+	}
+	frac = ((1ULL << 63) / imul) * 2;
+	octeon_sync_tc(PHYS_TO_XKPHYS(clk_reg, CCA_NC), cmul, frac);
+
+	/* Let userspace access the cycle counter. */
+	hwrena |= HWRENA_CC;
 
 	/*
 	 * If the UserLocal register is available, let userspace
@@ -681,9 +800,20 @@ octeon_tlb_init(void)
 static u_int64_t
 get_ncpusfound(void)
 {
-	extern struct boot_desc *octeon_boot_desc;
-	uint64_t core_mask = octeon_boot_desc->core_mask;
+	uint64_t core_mask;
 	uint64_t i, ncpus = 0;
+	int chipid;
+
+	chipid = octeon_get_chipid();
+	switch (octeon_model_family(chipid)) {
+	case OCTEON_MODEL_FAMILY_CN73XX:
+	case OCTEON_MODEL_FAMILY_CN78XX:
+		core_mask = octeon_xkphys_read_8(OCTEON_CIU3_BASE + CIU3_FUSE);
+		break;
+	default:
+		core_mask = octeon_xkphys_read_8(OCTEON_CIU_BASE + CIU_FUSE);
+		break;
+	}
 
 	/* There has to be 1-to-1 mapping between cpuids and coreids. */
 	for (i = 0; i < OCTEON_MAXCPUS && (core_mask & (1ul << i)) != 0; i++)
@@ -695,8 +825,8 @@ get_ncpusfound(void)
 static void
 process_bootargs(void)
 {
+	const char *cp;
 	int i;
-	extern struct boot_desc *octeon_boot_desc;
 
 	/*
 	 * U-Boot doesn't pass us anything by default, we need to explicitly
@@ -713,16 +843,39 @@ process_bootargs(void)
 		printf("boot_desc->argv[%d] = %s\n", i, arg);
 #endif
 
-		/*
-		 * XXX: We currently only expect one other argument,
-		 * rootdev=ROOTDEV.
-		 */
+		if (strncmp(arg, "boothowto=", 10) == 0) {
+			boothowto = atoi(arg + 10);
+			continue;
+		}
+
 		if (strncmp(arg, "rootdev=", 8) == 0) {
-			if (*uboot_rootdev == '\0') {
-				strlcpy(uboot_rootdev, arg,
-					sizeof(uboot_rootdev));
-				parse_uboot_root();
-                        }
+			parse_uboot_root(arg + 8);
+			continue;
+		}
+
+		if (*arg != '-')
+			continue;
+
+		for (cp = arg + 1; *cp != '\0'; cp++) {
+			switch (*cp) {
+			case '-':
+				break;
+			case 'a':
+				boothowto |= RB_ASKNAME;
+				break;
+			case 'c':
+				boothowto |= RB_CONFIG;
+				break;
+			case 'd':
+				boothowto |= RB_KDB;
+				break;
+			case 's':
+				boothowto |= RB_SINGLE;
+				break;
+			default:
+				printf("unrecognized option `%c'", *cp);
+				break;
+			}
 		}
 	}
 }
@@ -749,6 +902,9 @@ int	waittime = -1;
 __dead void
 boot(int howto)
 {
+	if ((howto & RB_RESET) != 0)
+		goto doreset;
+
 	if (curproc)
 		savectx(curproc->p_addr, 0);
 
@@ -788,6 +944,7 @@ haltsys:
 		else
 			printf("System Halt.\n");
 	} else {
+doreset:
 		printf("System restart.\n");
 		(void)disableintr();
 		tlb_set_wired(0);
@@ -840,9 +997,10 @@ dumpsys()
 	/* XXX TBD */
 }
 
-boolean_t
+int
 is_memory_range(paddr_t pa, psize_t len, psize_t limit)
 {
+	extern char start[];
 	struct phys_mem_desc *seg;
 	uint64_t fp, lp;
 	int i;
@@ -851,13 +1009,18 @@ is_memory_range(paddr_t pa, psize_t len, psize_t limit)
 	lp = atop(round_page(pa + len));
 
 	if (limit != 0 && lp > atop(limit))
-		return FALSE;
+		return 0;
+
+	/* The kernel is linked in CKSEG0. */
+	if (fp >= atop(trunc_page(CKSEG0_TO_PHYS((vaddr_t)start))) &&
+	    lp <= atop(round_page(CKSEG0_TO_PHYS((vaddr_t)ekern))))
+		return 1;
 
 	for (i = 0, seg = mem_layout; i < MAXMEMSEGS; i++, seg++)
 		if (fp >= seg->mem_first_page && lp <= seg->mem_last_page)
-			return TRUE;
+			return 1;
 
-	return FALSE;
+	return 0;
 }
 
 u_int
@@ -867,6 +1030,215 @@ ioclock_get_timecount(struct timecounter *tc)
 
 	return octeon_xkphys_read_8(reg);
 }
+
+#if NOCTBOOT > 0
+static uint64_t
+size_trunc(uint64_t size)
+{
+	return (size & ~BOOTMEM_BLOCK_MASK);
+}
+
+void
+bootmem_dump(void)
+{
+	struct octeon_bootmem_desc *memdesc = (struct octeon_bootmem_desc *)
+	    PHYS_TO_XKPHYS(octeon_boot_info->phys_mem_desc_addr, CCA_CACHED);
+	struct octeon_bootmem_block *block;
+	paddr_t pa;
+
+	pa = memdesc->head_addr;
+	while (pa != 0) {
+		block = pa_to_block(pa);
+		printf("free 0x%lx - 0x%lx\n", pa, pa + (size_t)block->size);
+		pa = block->next;
+	}
+}
+
+/*
+ * Allocate the given region from the free memory list.
+ */
+int
+bootmem_alloc_region(paddr_t pa, size_t size)
+{
+	struct octeon_bootmem_desc *memdesc = (struct octeon_bootmem_desc *)
+	    PHYS_TO_XKPHYS(octeon_boot_info->phys_mem_desc_addr, CCA_CACHED);
+	struct octeon_bootmem_block *block, *next, nblock;
+	paddr_t bpa;
+
+	if (pa == 0 || size < BOOTMEM_BLOCK_MIN_SIZE ||
+	    (pa & BOOTMEM_BLOCK_MASK) != 0 ||
+	    (size & BOOTMEM_BLOCK_MASK) != 0)
+		return EINVAL;
+
+	if (memdesc->head_addr == 0 || pa < memdesc->head_addr)
+		return ENOMEM;
+
+	/* Check if the region is at the head of the free list. */
+	if (pa == memdesc->head_addr) {
+		block = pa_to_block(memdesc->head_addr);
+		if (block->size < size)
+			return ENOMEM;
+		if (size_trunc(block->size) == size) {
+			memdesc->head_addr = block->next;
+		} else {
+			KASSERT(block->size > size);
+			nblock.next = block->next;
+			nblock.size = block->size - size;
+			KASSERT(nblock.size >= BOOTMEM_BLOCK_MIN_SIZE);
+			memdesc->head_addr += size;
+			*pa_to_block(memdesc->head_addr) = nblock;
+		}
+		return 0;
+	}
+
+	/* Find the block that immediately precedes or is at `pa'. */
+	bpa = memdesc->head_addr;
+	block = pa_to_block(bpa);
+	while (block->next != 0 && block->next < pa) {
+		bpa = block->next;
+		block = pa_to_block(bpa);
+	}
+
+	/* Refuse to play if the block is not properly aligned. */
+	if ((bpa & BOOTMEM_BLOCK_MASK) != 0)
+		return ENOMEM;
+
+	if (block->next == pa) {
+		next = pa_to_block(block->next);
+		if (next->size < size)
+			return ENOMEM;
+		if (size_trunc(next->size) == size) {
+			block->next = next->next;
+		} else {
+			KASSERT(next->size > size);
+			nblock.next = next->next;
+			nblock.size = next->size - size;
+			KASSERT(nblock.size >= BOOTMEM_BLOCK_MIN_SIZE);
+			block->next += size;
+			*pa_to_block(block->next) = nblock;
+		}
+	} else {
+		KASSERT(bpa < pa);
+		KASSERT(block->next == 0 || block->next > pa);
+
+		if (bpa + block->size < pa + size)
+			return ENOMEM;
+		if (bpa + size_trunc(block->size) == pa + size) {
+			block->size = pa - bpa;
+		} else {
+			KASSERT(bpa + block->size > pa + size);
+			nblock.next = block->next;
+			nblock.size = block->size - (pa - bpa) - size;
+			KASSERT(nblock.size >= BOOTMEM_BLOCK_MIN_SIZE);
+			block->next = pa + size;
+			block->size = pa - bpa;
+			*pa_to_block(block->next) = nblock;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Release the given region to the free memory list.
+ */
+void
+bootmem_free(paddr_t pa, size_t size)
+{
+	struct octeon_bootmem_desc *memdesc = (struct octeon_bootmem_desc *)
+	    PHYS_TO_XKPHYS(octeon_boot_info->phys_mem_desc_addr, CCA_CACHED);
+	struct octeon_bootmem_block *block, *next, *prev;
+	paddr_t prevpa;
+
+	if (pa == 0 || size < BOOTMEM_BLOCK_MIN_SIZE ||
+	    (pa & BOOTMEM_BLOCK_MASK) != 0 ||
+	    (size & BOOTMEM_BLOCK_MASK) != 0)
+		panic("%s: invalid block 0x%lx @ 0x%lx", __func__, size, pa);
+
+	/* If the list is empty, insert at the head. */
+	if (memdesc->head_addr == 0) {
+		block = pa_to_block(pa);
+		block->next = 0;
+		block->size = size;
+		memdesc->head_addr = pa;
+		return;
+	}
+
+	/* If the block precedes the current head, insert before, or merge. */
+	if (pa <= memdesc->head_addr) {
+		block = pa_to_block(pa);
+		if (pa + size < memdesc->head_addr) {
+			block->next = memdesc->head_addr;
+			block->size = size;
+			memdesc->head_addr = pa;
+		} else if (pa + size == memdesc->head_addr) {
+			next = pa_to_block(memdesc->head_addr);
+			block->next = next->next;
+			block->size = next->size + size;
+			memdesc->head_addr = pa;
+		} else {
+			panic("%s: overlap 1: 0x%lx @ 0x%lx / 0x%llx @ 0x%llx",
+			    __func__, size, pa,
+			    pa_to_block(memdesc->head_addr)->size,
+			    memdesc->head_addr);
+		}
+		return;
+	}
+
+	/* Find the immediate predecessor. */
+	prevpa = memdesc->head_addr;
+	prev = pa_to_block(prevpa);
+	while (prev->next != 0 && prev->next < pa) {
+		prevpa = prev->next;
+		prev = pa_to_block(prevpa);
+	}
+	if (prevpa + prev->size > pa) {
+		panic("%s: overlap 2: 0x%llx @ 0x%lx / 0x%lx @ 0x%lx",
+		    __func__, prev->size, prevpa, size, pa);
+	}
+
+	/* Merge with or insert after the predecessor. */
+	if (prevpa + prev->size == pa) {
+		if (prev->next == 0) {
+			prev->size += size;
+			return;
+		}
+		next = pa_to_block(prev->next);
+		if (prevpa + prev->size + size < prev->next) {
+			prev->size += size;
+		} else if (prevpa + prev->size + size == prev->next) {
+			prev->next = next->next;
+			prev->size += size + next->size;
+		} else {
+			panic("%s: overlap 3: 0x%llx @ 0x%lx / 0x%lx @ 0x%lx / "
+			    "0x%llx @ 0x%llx", __func__,
+			    prev->size, prevpa, size, pa,
+			    next->size, prev->next);
+		}
+	} else {
+		/* The block is disjoint with prev. */
+		KASSERT(prevpa + prev->size < pa);
+
+		block = pa_to_block(pa);
+		if (pa + size < prev->next || prev->next == 0) {
+			block->next = prev->next;
+			block->size = size;
+			prev->next = pa;
+		} else if (pa + size == prev->next) {
+			next = pa_to_block(prev->next);
+			block->next = next->next;
+			block->size = next->size + size;
+			prev->next = pa;
+		} else {
+			next = pa_to_block(prev->next);
+			panic("%s: overlap 4: 0x%llx @ 0x%lx / "
+			    "0x%lx @ 0x%lx / 0x%llx @ 0x%llx",
+			    __func__, prev->size, prevpa, size, pa,
+			    next->size, prev->next);
+		}
+	}
+}
+#endif /* NOCTBOOT > 0 */
 
 #ifdef MULTIPROCESSOR
 uint32_t cpu_spinup_mask = 0;

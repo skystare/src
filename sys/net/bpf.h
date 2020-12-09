@@ -1,4 +1,4 @@
-/*	$OpenBSD: bpf.h,v 1.65 2018/02/03 13:37:37 mpi Exp $	*/
+/*	$OpenBSD: bpf.h,v 1.70 2020/08/03 03:21:24 dlg Exp $	*/
 /*	$NetBSD: bpf.h,v 1.15 1996/12/13 07:57:33 mikel Exp $	*/
 
 /*
@@ -123,8 +123,15 @@ struct bpf_version {
 /*
  * Direction filters for BIOCSDIRFILT/BIOCGDIRFILT
  */
-#define BPF_DIRECTION_IN	1
-#define BPF_DIRECTION_OUT	(1<<1)
+#define BPF_DIRECTION_IN	(1 << 0)
+#define BPF_DIRECTION_OUT	(1 << 1)
+
+/*
+ * Values for BIOCGFILDROP/BIOCSFILDROP
+ */
+#define BPF_FILDROP_PASS	0 /* capture, pass */
+#define BPF_FILDROP_CAPTURE	1 /* capture, drop */
+#define BPF_FILDROP_DROP	2 /* no capture, drop */
 
 struct bpf_timeval {
 	u_int32_t	tv_sec;
@@ -140,22 +147,21 @@ struct bpf_hdr {
 	u_int32_t	bh_datalen;	/* original length of packet */
 	u_int16_t	bh_hdrlen;	/* length of bpf header (this struct
 					   plus alignment padding) */
+	u_int16_t	bh_ifidx;	/* receive interface index */
+
+	u_int16_t	bh_flowid;
+	u_int8_t	bh_flags;
+#define BPF_F_PRI_MASK		0x07
+#define BPF_F_FLOWID		0x08
+#define BPF_F_DIR_SHIFT		4
+#define BPF_F_DIR_MASK		(0x3 << BPF_F_DIR_SHIFT)
+#define BPF_F_DIR_IN		(BPF_DIRECTION_IN << BPF_F_DIR_SHIFT)
+#define BPF_F_DIR_OUT		(BPF_DIRECTION_OUT << BPF_F_DIR_SHIFT)
+	u_int8_t	bh_drops;
 };
-/*
- * Because the structure above is not a multiple of 4 bytes, some compilers
- * will insist on inserting padding; hence, sizeof(struct bpf_hdr) won't work.
- * Only the kernel needs to know about it; applications use bh_hdrlen.
- * XXX To save a few bytes on 32-bit machines, we avoid end-of-struct
- * XXX padding by using the size of the header data elements.  This is
- * XXX fail-safe: on new machines, we just use the 'safe' sizeof.
- */
+
 #ifdef _KERNEL
-#if defined(__arm__) || defined(__i386__) || defined(__mips__) || \
-    defined(__sparc64__)
-#define SIZEOF_BPF_HDR 18
-#else
 #define SIZEOF_BPF_HDR sizeof(struct bpf_hdr)
-#endif
 #endif
 
 /*
@@ -231,6 +237,7 @@ struct bpf_hdr {
 #define		BPF_MEM		0x60
 #define		BPF_LEN		0x80
 #define		BPF_MSH		0xa0
+#define		BPF_RND		0xc0
 
 /* alu/jmp fields */
 #define BPF_OP(code)	((code) & 0xf0)
@@ -308,8 +315,7 @@ struct mbuf;
 
 int	 bpf_validate(struct bpf_insn *, int);
 int	 bpf_mtap(caddr_t, const struct mbuf *, u_int);
-int	 bpf_mtap_hdr(caddr_t, caddr_t, u_int, const struct mbuf *, u_int,
-	    void (*)(const void *, void *, size_t));
+int	 bpf_mtap_hdr(caddr_t, const void *, u_int, const struct mbuf *, u_int);
 int	 bpf_mtap_af(caddr_t, u_int32_t, const struct mbuf *, u_int);
 int	 bpf_mtap_ether(caddr_t, const struct mbuf *, u_int);
 int	 bpf_tap_hdr(caddr_t, const void *, u_int, const void *, u_int, u_int);

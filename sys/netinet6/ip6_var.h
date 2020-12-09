@@ -1,4 +1,4 @@
-/*	$OpenBSD: ip6_var.h,v 1.83 2018/02/10 05:52:08 florian Exp $	*/
+/*	$OpenBSD: ip6_var.h,v 1.86 2019/12/08 11:08:22 sashan Exp $	*/
 /*	$KAME: ip6_var.h,v 1.33 2000/06/11 14:59:20 jinmei Exp $	*/
 
 /*
@@ -76,6 +76,7 @@ struct	ip6q {
 	int		ip6q_nfrag;	/* # of fragments */
 	u_int32_t	ip6q_ident;	/* fragment identification */
 	u_int8_t	ip6q_nxt;	/* ip6f_nxt in first fragment */
+	u_int8_t	ip6q_ecn;
 	u_int8_t	ip6q_ttl;	/* time to live in slowtimo units */
 };
 
@@ -85,7 +86,6 @@ struct	ip6asfrag {
 	int		ip6af_offset;	/* offset in ip6af_m to next header */
 	int		ip6af_frglen;	/* fragmentable part length */
 	int		ip6af_off;	/* fragment offset */
-	u_int32_t	ip6af_flow;	/* ip header flow id */
 	u_int16_t	ip6af_mff;	/* more fragment bit in frag off */
 };
 
@@ -198,6 +198,7 @@ struct	ip6stat {
 
 	u_int64_t ip6s_forward_cachehit;
 	u_int64_t ip6s_forward_cachemiss;
+	u_int64_t ip6s_wrongif;
 };
 
 #ifdef _KERNEL
@@ -243,6 +244,7 @@ enum ip6stat_counters {
 	ip6s_sources_deprecated = ip6s_sources_otherscope + 16,
 	ip6s_forward_cachehit = ip6s_sources_deprecated + 16,
 	ip6s_forward_cachemiss,
+	ip6s_wrongif,
 	ip6s_ncounters,
 };
 
@@ -279,7 +281,7 @@ extern int	ip6_mcast_pmtu;		/* path MTU discovery for multicast */
 extern int	ip6_neighborgcthresh; /* Threshold # of NDP entries for GC */
 extern int	ip6_maxdynroutes; /* Max # of routes created via redirect */
 
-extern struct socket *ip6_mrouter[RT_TABLEID_MAX]; /* multicast routing daemon */
+extern struct socket *ip6_mrouter[RT_TABLEID_MAX + 1]; /* multicast routing daemon */
 extern int	ip6_sendredirects;	/* send IP redirects when forwarding? */
 extern int	ip6_maxfragpackets; /* Maximum packets in reassembly queue */
 extern int	ip6_maxfrags;	/* Maximum fragments in reassembly queue */

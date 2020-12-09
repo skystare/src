@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtable.h,v 1.21 2018/09/09 10:07:38 henning Exp $ */
+/*	$OpenBSD: rtable.h,v 1.26 2020/11/07 09:51:40 denis Exp $ */
 
 /*
  * Copyright (c) 2014-2016 Martin Pieuchot
@@ -19,20 +19,6 @@
 #ifndef	_NET_RTABLE_H_
 #define	_NET_RTABLE_H_
 
-#if !defined(_KERNEL) && !defined(ART)
-
-/*
- * Traditional BSD routing table implementation based on a radix tree.
- */
-#include <net/radix.h>
-
-#define	rt_key(rt)	(((struct sockaddr *)(rt)->rt_nodes[0].rn_key))
-#define	rt_mask(rt)	(((struct sockaddr *)(rt)->rt_nodes[0].rn_mask))
-#define	rt_plen(rt)	(rtable_satoplen(rt_key(rt)->sa_family, rt_mask(rt)))
-#define	RT_ROOT(rt)	((rt)->rt_nodes[0].rn_flags & RNF_ROOT)
-
-#else /* defined(_KERNEL) || defined(ART) */
-
 /*
  * Newer routing table implementation based on ART (Allotment Routing
  * Table).
@@ -42,8 +28,6 @@
 #define	rt_key(rt)	((rt)->rt_dest)
 #define	rt_plen(rt)	((rt)->rt_plen)
 #define	RT_ROOT(rt)	(0)
-
-#endif /* defined(_KERNEL) || defined(ART) */
 
 int		 rtable_satoplen(sa_family_t, struct sockaddr *);
 
@@ -55,6 +39,9 @@ unsigned int	 rtable_l2(unsigned int);
 unsigned int	 rtable_loindex(unsigned int);
 void		 rtable_l2set(unsigned int, unsigned int, unsigned int);
 
+int		 rtable_setsource(unsigned int, int, struct sockaddr *);
+struct sockaddr *rtable_getsource(unsigned int, int);
+void		 rtable_clearsource(unsigned int, struct sockaddr *);
 struct rtentry	*rtable_lookup(unsigned int, struct sockaddr *,
 		     struct sockaddr *, struct sockaddr *, uint8_t);
 struct rtentry	*rtable_match(unsigned int, struct sockaddr *, uint32_t *);
@@ -64,12 +51,13 @@ int		 rtable_insert(unsigned int, struct sockaddr *,
 		     struct rtentry *);
 int		 rtable_delete(unsigned int, struct sockaddr *,
 		     struct sockaddr *, struct rtentry *);
-int		 rtable_walk(unsigned int, sa_family_t,
+int		 rtable_walk(unsigned int, sa_family_t, struct rtentry **,
 		     int (*)(struct rtentry *, void *, unsigned int), void *);
 
 int		 rtable_mpath_capable(unsigned int, sa_family_t);
 struct rtentry	*rtable_mpath_match(unsigned int, struct rtentry *,
 		     struct sockaddr *, uint8_t);
-int		 rtable_mpath_reprio(unsigned int, struct sockaddr *,
-		     struct sockaddr *, uint8_t, struct rtentry *);
+int		 rtable_mpath_reprio(unsigned int, struct sockaddr *, int,
+		     uint8_t, struct rtentry *);
+
 #endif /* _NET_RTABLE_H_ */

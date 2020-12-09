@@ -1,7 +1,7 @@
-/*	$OpenBSD: term_ascii.c,v 1.48 2018/08/21 16:01:38 schwarze Exp $ */
+/* $OpenBSD: term_ascii.c,v 1.52 2020/09/09 13:40:24 schwarze Exp $ */
 /*
  * Copyright (c) 2010, 2011 Kristaps Dzonsons <kristaps@bsd.lv>
- * Copyright (c) 2014, 2015, 2017, 2018 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2014,2015,2017,2018,2020 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -33,6 +33,8 @@
 #include "term.h"
 #include "manconf.h"
 #include "main.h"
+
+#define UTF8_LOCALE	"en_US.UTF-8"
 
 static	struct termp	 *ascii_init(enum termenc, const struct manoutput *);
 static	int		  ascii_hspan(const struct termp *,
@@ -79,7 +81,7 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 	p->setwidth = ascii_setwidth;
 	p->width = ascii_width;
 
-	if (TERMENC_ASCII != enc) {
+	if (enc != TERMENC_ASCII) {
 
 		/*
 		 * Do not change any of this to LC_ALL.  It might break
@@ -88,9 +90,9 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 		 * worst case, it might even cause buffer overflows.
 		 */
 
-		v = TERMENC_LOCALE == enc ?
+		v = enc == TERMENC_LOCALE ?
 		    setlocale(LC_CTYPE, "") :
-		    setlocale(LC_CTYPE, "en_US.UTF-8");
+		    setlocale(LC_CTYPE, UTF8_LOCALE);
 
 		/*
 		 * We only support UTF-8,
@@ -102,7 +104,7 @@ ascii_init(enum termenc enc, const struct manoutput *outopts)
 			v = setlocale(LC_CTYPE, "C");
 
 		if (v != NULL && MB_CUR_MAX > 1) {
-			p->enc = enc;
+			p->enc = TERMENC_UTF8;
 			p->advance = locale_advance;
 			p->endline = locale_endline;
 			p->letter = locale_letter;
@@ -220,7 +222,10 @@ ascii_endline(struct termp *p)
 {
 
 	p->line++;
-	p->tcol->offset -= p->ti;
+	if ((int)p->tcol->offset > p->ti)
+		p->tcol->offset -= p->ti;
+	else
+		p->tcol->offset = 0;
 	p->ti = 0;
 	putchar('\n');
 }
@@ -230,7 +235,14 @@ ascii_advance(struct termp *p, size_t len)
 {
 	size_t		i;
 
-	assert(len < UINT16_MAX);
+	/*
+	 * XXX We used to have "assert(len < UINT16_MAX)" here.
+	 * that is not quite right because the input document
+	 * can trigger that by merely providing large input.
+	 * For now, simply truncate.
+	 */
+	if (len > 256)
+		len = 256;
 	for (i = 0; i < len; i++)
 		putchar(' ');
 }
@@ -367,7 +379,14 @@ locale_advance(struct termp *p, size_t len)
 {
 	size_t		i;
 
-	assert(len < UINT16_MAX);
+	/*
+	 * XXX We used to have "assert(len < UINT16_MAX)" here.
+	 * that is not quite right because the input document
+	 * can trigger that by merely providing large input.
+	 * For now, simply truncate.
+	 */
+	if (len > 256)
+		len = 256;
 	for (i = 0; i < len; i++)
 		putwchar(L' ');
 }
@@ -377,7 +396,10 @@ locale_endline(struct termp *p)
 {
 
 	p->line++;
-	p->tcol->offset -= p->ti;
+	if ((int)p->tcol->offset > p->ti)
+		p->tcol->offset -= p->ti;
+	else 
+		p->tcol->offset = 0;
 	p->ti = 0;
 	putwchar(L'\n');
 }

@@ -1,20 +1,21 @@
-# $OpenBSD: Makefile,v 1.2 2017/07/09 15:28:36 espie Exp $
+# $OpenBSD: Makefile,v 1.4 2020/08/03 14:45:29 patrick Exp $
 
 LIB=	clangSema
 NOPIC=
 NOPROFILE=
 
-CPPFLAGS+=	${CLANG_INCLUDES}
+CPPFLAGS+=	-I${.OBJDIR}/../include/clang/Sema \
+		${CLANG_INCLUDES}
 
 .include <bsd.own.mk>
 SRCS=	AnalysisBasedWarnings.cpp \
-	AttributeList.cpp \
 	CodeCompleteConsumer.cpp \
 	DeclSpec.cpp \
 	DelayedDiagnostic.cpp \
 	IdentifierResolver.cpp \
 	JumpDiagnostics.cpp \
 	MultiplexExternalSemaSource.cpp \
+	ParsedAttr.cpp \
 	Scope.cpp \
 	ScopeInfo.cpp \
 	Sema.cpp \
@@ -24,6 +25,7 @@ SRCS=	AnalysisBasedWarnings.cpp \
 	SemaCast.cpp \
 	SemaChecking.cpp \
 	SemaCodeComplete.cpp \
+	SemaConcept.cpp \
 	SemaConsumer.cpp \
 	SemaCoroutine.cpp \
 	SemaCUDA.cpp \
@@ -40,6 +42,7 @@ SRCS=	AnalysisBasedWarnings.cpp \
 	SemaInit.cpp \
 	SemaLambda.cpp \
 	SemaLookup.cpp \
+	SemaModule.cpp \
 	SemaObjCProperty.cpp \
 	SemaOpenMP.cpp \
 	SemaOverload.cpp \
@@ -55,7 +58,7 @@ SRCS=	AnalysisBasedWarnings.cpp \
 	SemaType.cpp \
 	TypeLocBuilder.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/tools/clang/lib/Sema
+.PATH:	${.CURDIR}/../../../llvm/clang/lib/Sema
 
 install:
 	@# Nothing here so far ...

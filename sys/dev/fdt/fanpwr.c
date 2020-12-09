@@ -1,4 +1,4 @@
-/*	$OpenBSD: fanpwr.c,v 1.2 2018/07/31 10:07:13 kettenis Exp $	*/
+/*	$OpenBSD: fanpwr.c,v 1.4 2020/11/12 10:47:07 patrick Exp $	*/
 /*
  * Copyright (c) 2018 Mark Kettenis <kettenis@openbsd.org>
  *
@@ -21,6 +21,7 @@
 #include <sys/malloc.h>
 
 #include <dev/ofw/openfirm.h>
+#include <dev/ofw/ofw_pinctrl.h>
 #include <dev/ofw/ofw_regulator.h>
 #include <dev/ofw/fdt.h>
 
@@ -76,11 +77,10 @@ int
 fanpwr_match(struct device *parent, void *match, void *aux)
 {
 	struct i2c_attach_args *ia = aux;
-	int node = *(int *)ia->ia_cookie;
 
-	return (OF_is_compatible(node, "fcs,fan53555") ||
-	    OF_is_compatible(node, "silergy,syr827") ||
-	    OF_is_compatible(node, "silergy,syr828"));
+	return (strcmp(ia->ia_name, "fcs,fan53555") == 0 ||
+	    strcmp(ia->ia_name, "silergy,syr827") == 0 ||
+	    strcmp(ia->ia_name, "silergy,syr828") == 0);
 }
 
 void
@@ -91,6 +91,8 @@ fanpwr_attach(struct device *parent, struct device *self, void *aux)
 	int node = *(int *)ia->ia_cookie;
 	uint32_t voltage, ramp_delay;
 	uint8_t id1, id2;
+
+	pinctrl_byname(node, "default");
 
 	sc->sc_tag = ia->ia_tag;
 	sc->sc_addr = ia->ia_addr;

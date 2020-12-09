@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_ixl.c,v 1.7 2017/12/21 03:58:27 dlg Exp $ */
+/*	$OpenBSD: if_ixl.c,v 1.69 2020/11/02 00:25:49 dlg Exp $ */
 
 /*
  * Copyright (c) 2013-2015, Intel Corporation
@@ -48,9 +48,11 @@
  */
 
 #include "bpfilter.h"
+#include "kstat.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/proc.h>
 #include <sys/sockio.h>
 #include <sys/mbuf.h>
 #include <sys/kernel.h>
@@ -60,6 +62,8 @@
 #include <sys/queue.h>
 #include <sys/timeout.h>
 #include <sys/task.h>
+#include <sys/syslog.h>
+#include <sys/intrmap.h>
 
 #include <machine/bus.h>
 #include <machine/intr.h>
@@ -67,9 +71,14 @@
 #include <net/if.h>
 #include <net/if_dl.h>
 #include <net/if_media.h>
+#include <net/toeplitz.h>
 
 #if NBPFILTER > 0
 #include <net/bpf.h>
+#endif
+
+#if NKSTAT > 0
+#include <sys/kstat.h>
 #endif
 
 #include <netinet/in.h>
@@ -78,6 +87,16 @@
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcidevs.h>
+
+#ifdef __sparc64__
+#include <dev/ofw/openfirm.h>
+#endif
+
+#ifndef CACHE_LINE_SIZE
+#define CACHE_LINE_SIZE 64
+#endif
+
+#define IXL_MAX_VECTORS			8 /* XXX this is pretty arbitrary */
 
 #define I40E_MASK(mask, shift)		((mask) << (shift))
 #define I40E_PF_RESET_WAIT_COUNT	200
@@ -153,12 +172,16 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_MAC_ADDRESS_READ	0x0107
 #define IXL_AQ_OP_CLEAR_PXE_MODE	0x0110
 #define IXL_AQ_OP_SWITCH_GET_CONFIG	0x0200
+#define IXL_AQ_OP_RX_CTL_READ		0x0206
+#define IXL_AQ_OP_RX_CTL_WRITE		0x0207
 #define IXL_AQ_OP_ADD_VSI		0x0210
 #define IXL_AQ_OP_UPD_VSI_PARAMS	0x0211
 #define IXL_AQ_OP_GET_VSI_PARAMS	0x0212
 #define IXL_AQ_OP_ADD_VEB		0x0230
 #define IXL_AQ_OP_UPD_VEB_PARAMS	0x0231
 #define IXL_AQ_OP_GET_VEB_PARAMS	0x0232
+#define IXL_AQ_OP_ADD_MACVLAN		0x0250
+#define IXL_AQ_OP_REMOVE_MACVLAN	0x0251
 #define IXL_AQ_OP_SET_VSI_PROMISC	0x0254
 #define IXL_AQ_OP_PHY_GET_ABILITIES	0x0600
 #define IXL_AQ_OP_PHY_SET_CONFIG	0x0601
@@ -166,6 +189,8 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_PHY_RESTART_AN	0x0605
 #define IXL_AQ_OP_PHY_LINK_STATUS	0x0607
 #define IXL_AQ_OP_PHY_SET_EVENT_MASK	0x0613
+#define IXL_AQ_OP_PHY_SET_REGISTER	0x0628
+#define IXL_AQ_OP_PHY_GET_REGISTER	0x0629
 #define IXL_AQ_OP_LLDP_GET_MIB		0x0a00
 #define IXL_AQ_OP_LLDP_MIB_CHG_EV	0x0a01
 #define IXL_AQ_OP_LLDP_ADD_TLV		0x0a02
@@ -175,6 +200,10 @@ struct ixl_aq_desc {
 #define IXL_AQ_OP_LLDP_START_AGENT	0x0a06
 #define IXL_AQ_OP_LLDP_GET_CEE_DCBX	0x0a07
 #define IXL_AQ_OP_LLDP_SPECIFIC_AGENT	0x0a09
+#define IXL_AQ_OP_SET_RSS_KEY		0x0b02 /* 722 only */
+#define IXL_AQ_OP_SET_RSS_LUT		0x0b03 /* 722 only */
+#define IXL_AQ_OP_GET_RSS_KEY		0x0b04 /* 722 only */
+#define IXL_AQ_OP_GET_RSS_LUT		0x0b05 /* 722 only */
 
 struct ixl_aq_mac_addresses {
 	uint8_t		pf_lan[ETHER_ADDR_LEN];
@@ -313,12 +342,12 @@ struct ixl_aq_phy_abilities {
 	uint32_t	phy_type;
 
 	uint8_t		link_speed;
-#define IXL_AQ_PHY_LINK_SPEED_100MB	0x1
-#define IXL_AQ_PHY_LINK_SPEED_1000MB	0x2
-#define IXL_AQ_PHY_LINK_SPEED_10GB	0x3
-#define IXL_AQ_PHY_LINK_SPEED_40GB	0x4
-#define IXL_AQ_PHY_LINK_SPEED_20GB	0x5
-#define IXL_AQ_PHY_LINK_SPEED_25GB	0x6
+#define IXL_AQ_PHY_LINK_SPEED_100MB	(1 << 1)
+#define IXL_AQ_PHY_LINK_SPEED_1000MB	(1 << 2)
+#define IXL_AQ_PHY_LINK_SPEED_10GB	(1 << 3)
+#define IXL_AQ_PHY_LINK_SPEED_40GB	(1 << 4)
+#define IXL_AQ_PHY_LINK_SPEED_20GB	(1 << 5)
+#define IXL_AQ_PHY_LINK_SPEED_25GB	(1 << 6)
 	uint8_t		abilities;
 	uint16_t	eee_capability;
 
@@ -343,10 +372,24 @@ struct ixl_aq_phy_abilities {
 	uint8_t		phy_id[4];
 
 	uint8_t		module_type[3];
+#define IXL_SFF8024_ID_SFP		0x03
+#define IXL_SFF8024_ID_QSFP		0x0c
+#define IXL_SFF8024_ID_QSFP_PLUS	0x0d
+#define IXL_SFF8024_ID_QSFP28		0x11
 	uint8_t		qualified_module_count;
 #define IXL_AQ_PHY_MAX_QMS		16
 	struct ixl_aq_module_desc
 			qualified_module[IXL_AQ_PHY_MAX_QMS];
+} __packed __aligned(4);
+
+struct ixl_aq_link_param {
+	uint8_t		notify;
+#define IXL_AQ_LINK_NOTIFY	0x03
+	uint8_t		_reserved1;
+	uint8_t		phy;
+	uint8_t		speed;
+	uint8_t		status;
+	uint8_t		_reserved2[11];
 } __packed __aligned(4);
 
 struct ixl_aq_vsi_param {
@@ -370,6 +413,43 @@ struct ixl_aq_vsi_param {
 
 	uint32_t	addr_hi;
 	uint32_t	addr_lo;
+} __packed __aligned(16);
+
+struct ixl_aq_add_macvlan {
+	uint16_t	num_addrs;
+	uint16_t	seid0;
+	uint16_t	seid1;
+	uint16_t	seid2;
+	uint32_t	addr_hi;
+	uint32_t	addr_lo;
+} __packed __aligned(16);
+
+struct ixl_aq_add_macvlan_elem {
+	uint8_t		macaddr[6];
+	uint16_t	vlan;
+	uint16_t	flags;
+#define IXL_AQ_OP_ADD_MACVLAN_PERFECT_MATCH	0x0001
+#define IXL_AQ_OP_ADD_MACVLAN_IGNORE_VLAN	0x0004
+	uint16_t	queue;
+	uint32_t	_reserved;
+} __packed __aligned(16);
+
+struct ixl_aq_remove_macvlan {
+	uint16_t	num_addrs;
+	uint16_t	seid0;
+	uint16_t	seid1;
+	uint16_t	seid2;
+	uint32_t	addr_hi;
+	uint32_t	addr_lo;
+} __packed __aligned(16);
+
+struct ixl_aq_remove_macvlan_elem {
+	uint8_t		macaddr[6];
+	uint16_t	vlan;
+	uint8_t		flags;
+#define IXL_AQ_OP_REMOVE_MACVLAN_PERFECT_MATCH	0x0001
+#define IXL_AQ_OP_REMOVE_MACVLAN_IGNORE_VLAN	0x0008
+	uint8_t		_reserved[7];
 } __packed __aligned(16);
 
 struct ixl_aq_vsi_reply {
@@ -419,7 +499,7 @@ struct ixl_aq_vsi_data {
 #define IXL_AQ_VSI_PVLAN_MODE_SHIFT	0
 #define IXL_AQ_VSI_PVLAN_MODE_MASK	(0x3 << IXL_AQ_VSI_PVLAN_MODE_SHIFT)
 #define IXL_AQ_VSI_PVLAN_MODE_TAGGED	(0x1 << IXL_AQ_VSI_PVLAN_MODE_SHIFT)
-#define IXL_AQ_VSI_PVLAN_MODE_UNTAGGED 	(0x2 << IXL_AQ_VSI_PVLAN_MODE_SHIFT)
+#define IXL_AQ_VSI_PVLAN_MODE_UNTAGGED	(0x2 << IXL_AQ_VSI_PVLAN_MODE_SHIFT)
 #define IXL_AQ_VSI_PVLAN_MODE_ALL	(0x3 << IXL_AQ_VSI_PVLAN_MODE_SHIFT)
 #define IXL_AQ_VSI_PVLAN_INSERT_PVID	(0x4 << IXL_AQ_VSI_PVLAN_MODE_SHIFT)
 #define IXL_AQ_VSI_PVLAN_EMOD_SHIFT	0x3
@@ -545,6 +625,20 @@ struct ixl_aq_veb_reply {
 #define IXL_AQ_PHY_REPORT_QUAL		(1 << 0)
 #define IXL_AQ_PHY_REPORT_INIT		(1 << 1)
 
+struct ixl_aq_phy_reg_access {
+	uint8_t		phy_iface;
+#define IXL_AQ_PHY_IF_INTERNAL		0
+#define IXL_AQ_PHY_IF_EXTERNAL		1
+#define IXL_AQ_PHY_IF_MODULE		2
+	uint8_t		dev_addr;
+	uint16_t	recall;
+#define IXL_AQ_PHY_QSFP_DEV_ADDR	0
+#define IXL_AQ_PHY_QSFP_LAST		1
+	uint32_t	reg;
+	uint32_t	val;
+	uint32_t	_reserved2;
+} __packed __aligned(16);
+
 /* RESTART_AN param[0] */
 #define IXL_AQ_PHY_RESTART_AN		(1 << 1)
 #define IXL_AQ_PHY_LINK_ENABLE		(1 << 2)
@@ -558,6 +652,10 @@ struct ixl_aq_link_status { /* this occupies the iaq_param space */
 #define IXL_AQ_LSE_IS_ENABLED		0x1 /* only set in response */
 	uint8_t		phy_type;
 	uint8_t		link_speed;
+#define IXL_AQ_LINK_SPEED_1GB		(1 << 2)
+#define IXL_AQ_LINK_SPEED_10GB		(1 << 3)
+#define IXL_AQ_LINK_SPEED_40GB		(1 << 4)
+#define IXL_AQ_LINK_SPEED_25GB		(1 << 6)
 	uint8_t		link_info;
 #define IXL_AQ_LINK_UP_FUNCTION		0x01
 #define IXL_AQ_LINK_FAULT		0x02
@@ -621,6 +719,35 @@ struct ixl_aq_link_status { /* this occupies the iaq_param space */
 #define IXL_AQ_PHY_EV_AN_COMPLETED	(1 << 7)
 #define IXL_AQ_PHY_EV_MODULE_QUAL_FAIL	(1 << 8)
 #define IXL_AQ_PHY_EV_PORT_TX_SUSPENDED	(1 << 9)
+
+struct ixl_aq_rss_lut { /* 722 */
+#define IXL_AQ_SET_RSS_LUT_VSI_VALID	(1 << 15)
+#define IXL_AQ_SET_RSS_LUT_VSI_ID_SHIFT	0
+#define IXL_AQ_SET_RSS_LUT_VSI_ID_MASK	\
+	(0x3FF << IXL_AQ_SET_RSS_LUT_VSI_ID_SHIFT)
+
+	uint16_t	vsi_number;
+#define IXL_AQ_SET_RSS_LUT_TABLE_TYPE_SHIFT 0
+#define IXL_AQ_SET_RSS_LUT_TABLE_TYPE_MASK \
+	(0x1 << IXL_AQ_SET_RSS_LUT_TABLE_TYPE_SHIFT)
+#define IXL_AQ_SET_RSS_LUT_TABLE_TYPE_VSI	0
+#define IXL_AQ_SET_RSS_LUT_TABLE_TYPE_PF	1
+	uint16_t	flags;
+	uint8_t		_reserved[4];
+	uint32_t	addr_hi;
+	uint32_t	addr_lo;
+} __packed __aligned(16);
+
+struct ixl_aq_get_set_rss_key { /* 722 */
+#define IXL_AQ_SET_RSS_KEY_VSI_VALID	(1 << 15)
+#define IXL_AQ_SET_RSS_KEY_VSI_ID_SHIFT	0
+#define IXL_AQ_SET_RSS_KEY_VSI_ID_MASK	\
+	(0x3FF << IXL_AQ_SET_RSS_KEY_VSI_ID_SHIFT)
+	uint16_t	vsi_number;
+	uint8_t		_reserved[6];
+	uint32_t	addr_hi;
+	uint32_t	addr_lo;
+} __packed __aligned(16);
 
 /* aq response codes */
 #define IXL_AQ_RC_OK			0  /* success */
@@ -726,11 +853,11 @@ struct ixl_rx_wb_desc_16 {
 #define IXL_RX_DESC_UMB_BCAST		(0x2 << IXL_RX_DESC_UMB_SHIFT)
 #define IXL_RX_DESC_UMB_MIRROR		(0x3 << IXL_RX_DESC_UMB_SHIFT)
 #define IXL_RX_DESC_FLM			(1 << 11)
-#define IXL_RX_DESC_FLTSTAT_SHIFT 	12
-#define IXL_RX_DESC_FLTSTAT_MASK 	(0x3 << IXL_RX_DESC_FLTSTAT_SHIFT)
-#define IXL_RX_DESC_FLTSTAT_NODATA 	(0x0 << IXL_RX_DESC_FLTSTAT_SHIFT)
-#define IXL_RX_DESC_FLTSTAT_FDFILTID 	(0x1 << IXL_RX_DESC_FLTSTAT_SHIFT)
-#define IXL_RX_DESC_FLTSTAT_RSS 	(0x3 << IXL_RX_DESC_FLTSTAT_SHIFT)
+#define IXL_RX_DESC_FLTSTAT_SHIFT	12
+#define IXL_RX_DESC_FLTSTAT_MASK	(0x3 << IXL_RX_DESC_FLTSTAT_SHIFT)
+#define IXL_RX_DESC_FLTSTAT_NODATA	(0x0 << IXL_RX_DESC_FLTSTAT_SHIFT)
+#define IXL_RX_DESC_FLTSTAT_FDFILTID	(0x1 << IXL_RX_DESC_FLTSTAT_SHIFT)
+#define IXL_RX_DESC_FLTSTAT_RSS		(0x3 << IXL_RX_DESC_FLTSTAT_SHIFT)
 #define IXL_RX_DESC_LPBK		(1 << 14)
 #define IXL_RX_DESC_IPV6EXTADD		(1 << 15)
 #define IXL_RX_DESC_INT_UDP_0		(1 << 18)
@@ -762,7 +889,7 @@ struct ixl_rx_wb_desc_32 {
 #define IXL_TX_QUEUE_ALIGN		128
 #define IXL_RX_QUEUE_ALIGN		128
 
-#define IXL_HARDMTU			9706 /* - ETHER_HEADER_LEN? */
+#define IXL_HARDMTU			9712 /* 9726 - ETHER_HDR_LEN */
 
 #define IXL_PCIREG			PCI_MAPREG_START
 
@@ -775,6 +902,54 @@ struct ixl_rx_wb_desc_32 {
 #define IXL_AQ_MASK			(IXL_AQ_NUM - 1)
 #define IXL_AQ_ALIGN			64 /* lol */
 #define IXL_AQ_BUFLEN			4096
+
+/* Packet Classifier Types for filters */
+/* bits 0-28 are reserved for future use */
+#define IXL_PCT_NONF_IPV4_UDP_UCAST	(1ULL << 29)	/* 722 */
+#define IXL_PCT_NONF_IPV4_UDP_MCAST	(1ULL << 30)	/* 722 */
+#define IXL_PCT_NONF_IPV4_UDP		(1ULL << 31)
+#define IXL_PCT_NONF_IPV4_TCP_SYN_NOACK	(1ULL << 32)	/* 722 */
+#define IXL_PCT_NONF_IPV4_TCP		(1ULL << 33)
+#define IXL_PCT_NONF_IPV4_SCTP		(1ULL << 34)
+#define IXL_PCT_NONF_IPV4_OTHER		(1ULL << 35)
+#define IXL_PCT_FRAG_IPV4		(1ULL << 36)
+/* bits 37-38 are reserved for future use */
+#define IXL_PCT_NONF_IPV6_UDP_UCAST	(1ULL << 39)	/* 722 */
+#define IXL_PCT_NONF_IPV6_UDP_MCAST	(1ULL << 40)	/* 722 */
+#define IXL_PCT_NONF_IPV6_UDP		(1ULL << 41)
+#define IXL_PCT_NONF_IPV6_TCP_SYN_NOACK	(1ULL << 42)	/* 722 */
+#define IXL_PCT_NONF_IPV6_TCP		(1ULL << 43)
+#define IXL_PCT_NONF_IPV6_SCTP		(1ULL << 44)
+#define IXL_PCT_NONF_IPV6_OTHER		(1ULL << 45)
+#define IXL_PCT_FRAG_IPV6		(1ULL << 46)
+/* bit 47 is reserved for future use */
+#define IXL_PCT_FCOE_OX			(1ULL << 48)
+#define IXL_PCT_FCOE_RX			(1ULL << 49)
+#define IXL_PCT_FCOE_OTHER		(1ULL << 50)
+/* bits 51-62 are reserved for future use */
+#define IXL_PCT_L2_PAYLOAD		(1ULL << 63)
+
+#define IXL_RSS_HENA_BASE_DEFAULT		\
+	IXL_PCT_NONF_IPV4_UDP |			\
+	IXL_PCT_NONF_IPV4_TCP |			\
+	IXL_PCT_NONF_IPV4_SCTP |		\
+	IXL_PCT_NONF_IPV4_OTHER |		\
+	IXL_PCT_FRAG_IPV4 |			\
+	IXL_PCT_NONF_IPV6_UDP |			\
+	IXL_PCT_NONF_IPV6_TCP |			\
+	IXL_PCT_NONF_IPV6_SCTP |		\
+	IXL_PCT_NONF_IPV6_OTHER |		\
+	IXL_PCT_FRAG_IPV6 |			\
+	IXL_PCT_L2_PAYLOAD
+
+#define IXL_RSS_HENA_BASE_710		IXL_RSS_HENA_BASE_DEFAULT
+#define IXL_RSS_HENA_BASE_722		IXL_RSS_HENA_BASE_DEFAULT | \
+	IXL_PCT_NONF_IPV4_UDP_UCAST |		\
+	IXL_PCT_NONF_IPV4_UDP_MCAST |		\
+	IXL_PCT_NONF_IPV6_UDP_UCAST |		\
+	IXL_PCT_NONF_IPV6_UDP_MCAST |		\
+	IXL_PCT_NONF_IPV4_TCP_SYN_NOACK |	\
+	IXL_PCT_NONF_IPV6_TCP_SYN_NOACK
 
 #define IXL_HMC_ROUNDUP			512
 #define IXL_HMC_PGSIZE			4096
@@ -969,6 +1144,23 @@ static const struct ixl_hmc_pack ixl_hmc_pack_txq[] = {
 
 #define IXL_HMC_TXQ_MINSIZE (94 + (7*128) + 1)
 
+struct ixl_rss_key {
+	uint32_t		 key[13];
+};
+
+struct ixl_rss_lut_128 {
+	uint32_t		 entries[128 / sizeof(uint32_t)];
+};
+
+struct ixl_rss_lut_512 {
+	uint32_t		 entries[512 / sizeof(uint32_t)];
+};
+
+/* driver structures */
+
+struct ixl_vector;
+struct ixl_chip;
+
 struct ixl_tx_map {
 	struct mbuf		*txm_m;
 	bus_dmamap_t		 txm_map;
@@ -976,6 +1168,10 @@ struct ixl_tx_map {
 };
 
 struct ixl_tx_ring {
+	struct ixl_softc	*txr_sc;
+	struct ixl_vector	*txr_vector;
+	struct ifqueue		*txr_ifq;
+
 	unsigned int		 txr_prod;
 	unsigned int		 txr_cons;
 
@@ -984,7 +1180,7 @@ struct ixl_tx_ring {
 
 	bus_size_t		 txr_tail;
 	unsigned int		 txr_qid;
-};
+} __aligned(CACHE_LINE_SIZE);
 
 struct ixl_rx_map {
 	struct mbuf		*rxm_m;
@@ -993,6 +1189,8 @@ struct ixl_rx_map {
 
 struct ixl_rx_ring {
 	struct ixl_softc	*rxr_sc;
+	struct ixl_vector	*rxr_vector;
+	struct ifiqueue		*rxr_ifiq;
 
 	struct if_rxring	 rxr_acct;
 	struct timeout		 rxr_refill;
@@ -1008,10 +1206,27 @@ struct ixl_rx_ring {
 
 	bus_size_t		 rxr_tail;
 	unsigned int		 rxr_qid;
+} __aligned(CACHE_LINE_SIZE);
+
+struct ixl_atq {
+	struct ixl_aq_desc	  iatq_desc;
+	void			 *iatq_arg;
+	void			(*iatq_fn)(struct ixl_softc *, void *);
 };
+SIMPLEQ_HEAD(ixl_atq_list, ixl_atq);
+
+struct ixl_vector {
+	struct ixl_softc	*iv_sc;
+	struct ixl_rx_ring	*iv_rxr;
+	struct ixl_tx_ring	*iv_txr;
+	int			 iv_qid;
+	void			*iv_ihc;
+	char			 iv_name[16];
+} __aligned(CACHE_LINE_SIZE);
 
 struct ixl_softc {
 	struct device		 sc_dev;
+	const struct ixl_chip	*sc_chip;
 	struct arpcom		 sc_ac;
 	struct ifmedia		 sc_media;
 	uint64_t		 sc_media_status;
@@ -1027,6 +1242,8 @@ struct ixl_softc {
 	bus_space_handle_t	 sc_memh;
 	bus_size_t		 sc_mems;
 
+	uint16_t		 sc_api_major;
+	uint16_t		 sc_api_minor;
 	uint8_t			 sc_pf_id;
 	uint16_t		 sc_uplink_seid;	/* le */
 	uint16_t		 sc_downlink_seid;	/* le */
@@ -1034,13 +1251,13 @@ struct ixl_softc {
 	uint16_t		 sc_vsi_number;		/* le */
 	uint16_t		 sc_seid;
 	unsigned int		 sc_base_queue;
+	unsigned int		 sc_port;
 
-	struct ixl_dmamem	 sc_vsi;
+	struct ixl_dmamem	 sc_scratch;
 
 	const struct ixl_aq_regs *
 				 sc_aq_regs;
 
-	struct mutex		 sc_atq_mtx;
 	struct ixl_dmamem	 sc_atq;
 	unsigned int		 sc_atq_prod;
 	unsigned int		 sc_atq_cons;
@@ -1053,25 +1270,34 @@ struct ixl_softc {
 	unsigned int		 sc_arq_prod;
 	unsigned int		 sc_arq_cons;
 
+	struct mutex		 sc_link_state_mtx;
+	struct task		 sc_link_state_task;
+	struct ixl_atq		 sc_link_state_atq;
+
 	struct ixl_dmamem	 sc_hmc_sd;
 	struct ixl_dmamem	 sc_hmc_pd;
 	struct ixl_hmc_entry	 sc_hmc_entries[IXL_HMC_COUNT];
 
-	unsigned int		 sc_nrings;
-
 	unsigned int		 sc_tx_ring_ndescs;
 	unsigned int		 sc_rx_ring_ndescs;
 	unsigned int		 sc_nqueues;	/* 1 << sc_nqueues */
+
+	struct intrmap		*sc_intrmap;
+	struct ixl_vector	*sc_vectors;
+
+	struct rwlock		 sc_cfg_lock;
+	unsigned int		 sc_dead;
+
+	uint8_t			 sc_enaddr[ETHER_ADDR_LEN];
+
+#if NKSTAT > 0
+	struct mutex		 sc_kstat_mtx;
+	struct timeout		 sc_kstat_tmo;
+	struct kstat		*sc_port_kstat;
+	struct kstat		*sc_vsi_kstat;
+#endif
 };
 #define DEVNAME(_sc) ((_sc)->sc_dev.dv_xname)
-
-struct ixl_atq {
-	SIMPLEQ_ENTRY(ixl_atq)	  iatq_entry;
-	struct ixl_aq_desc	  iatq_desc;
-	void			 *iatq_arg;
-	void			(*iatq_fn)(struct ixl_softc *, void *);
-};
-SIMPLEQ_HEAD(ixl_atq_list, ixl_atq);
 
 #define delaymsec(_ms)	delay(1000 * (_ms))
 
@@ -1099,7 +1325,7 @@ static int	ixl_lldp_shut(struct ixl_softc *);
 static int	ixl_get_mac(struct ixl_softc *);
 static int	ixl_get_switch_config(struct ixl_softc *);
 static int	ixl_phy_mask_ints(struct ixl_softc *);
-static int	ixl_get_phy_abilities(struct ixl_softc *, uint64_t *);
+static int	ixl_get_phy_types(struct ixl_softc *, uint64_t *);
 static int	ixl_restart_an(struct ixl_softc *);
 static int	ixl_hmc(struct ixl_softc *);
 static void	ixl_hmc_free(struct ixl_softc *);
@@ -1108,9 +1334,20 @@ static int	ixl_set_vsi(struct ixl_softc *);
 static int	ixl_get_link_status(struct ixl_softc *);
 static int	ixl_set_link_status(struct ixl_softc *,
 		    const struct ixl_aq_desc *);
+static int	ixl_add_macvlan(struct ixl_softc *, uint8_t *, uint16_t,
+		    uint16_t);
+static int	ixl_remove_macvlan(struct ixl_softc *, uint8_t *, uint16_t,
+		    uint16_t);
+static void	ixl_link_state_update(void *);
 static void	ixl_arq(void *);
 static void	ixl_hmc_pack(void *, const void *,
 		    const struct ixl_hmc_pack *, unsigned int);
+
+static int	ixl_get_sffpage(struct ixl_softc *, struct if_sffpage *);
+static int	ixl_sff_get_byte(struct ixl_softc *, uint8_t, uint32_t,
+		    uint8_t *);
+static int	ixl_sff_set_byte(struct ixl_softc *, uint8_t, uint32_t,
+		    uint8_t);
 
 static int	ixl_match(struct device *, void *, void *);
 static void	ixl_attach(struct device *, struct device *, void *);
@@ -1121,7 +1358,8 @@ static void	ixl_media_status(struct ifnet *, struct ifmediareq *);
 static void	ixl_watchdog(struct ifnet *);
 static int	ixl_ioctl(struct ifnet *, u_long, caddr_t);
 static void	ixl_start(struct ifqueue *);
-static int	ixl_intr(void *);
+static int	ixl_intr0(void *);
+static int	ixl_intr_vector(void *);
 static int	ixl_up(struct ixl_softc *);
 static int	ixl_down(struct ixl_softc *);
 static int	ixl_iff(struct ixl_softc *);
@@ -1135,7 +1373,7 @@ static int	ixl_txr_disabled(struct ixl_softc *, struct ixl_tx_ring *);
 static void	ixl_txr_unconfig(struct ixl_softc *, struct ixl_tx_ring *);
 static void	ixl_txr_clean(struct ixl_softc *, struct ixl_tx_ring *);
 static void	ixl_txr_free(struct ixl_softc *, struct ixl_tx_ring *);
-static int	ixl_txeof(struct ixl_softc *, struct ifqueue *);
+static int	ixl_txeof(struct ixl_softc *, struct ixl_tx_ring *);
 
 static struct ixl_rx_ring *
 		ixl_rxr_alloc(struct ixl_softc *, unsigned int);
@@ -1145,9 +1383,14 @@ static int	ixl_rxr_disabled(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxr_unconfig(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxr_clean(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxr_free(struct ixl_softc *, struct ixl_rx_ring *);
-static int	ixl_rxeof(struct ixl_softc *, struct ifiqueue *);
+static int	ixl_rxeof(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxfill(struct ixl_softc *, struct ixl_rx_ring *);
 static void	ixl_rxrefill(void *);
+static int	ixl_rxrinfo(struct ixl_softc *, struct if_rxrinfo *);
+
+#if NKSTAT > 0
+static void	ixl_kstat_attach(struct ixl_softc *);
+#endif
 
 struct cfdriver ixl_cd = {
 	NULL,
@@ -1199,12 +1442,10 @@ static const struct ixl_phy_type ixl_phy_type_map[] = {
 };
 
 static const struct ixl_speed_type ixl_speed_type_map[] = {
-	{ IXL_AQ_PHY_LINK_SPEED_40GB,		IF_Gbps(40) },
-	{ IXL_AQ_PHY_LINK_SPEED_25GB,		IF_Gbps(25) },
-	{ IXL_AQ_PHY_LINK_SPEED_20GB,		IF_Gbps(20) },
-	{ IXL_AQ_PHY_LINK_SPEED_10GB,		IF_Gbps(10) },
-	{ IXL_AQ_PHY_LINK_SPEED_1000MB,		IF_Mbps(1000) },
-	{ IXL_AQ_PHY_LINK_SPEED_100MB,		IF_Mbps(100) },
+	{ IXL_AQ_LINK_SPEED_40GB,		IF_Gbps(40) },
+	{ IXL_AQ_LINK_SPEED_25GB,		IF_Gbps(25) },
+	{ IXL_AQ_LINK_SPEED_10GB,		IF_Gbps(10) },
+	{ IXL_AQ_LINK_SPEED_1GB,		IF_Gbps(1) },
 };
 
 static const struct ixl_aq_regs ixl_pf_aq_regs = {
@@ -1227,28 +1468,6 @@ static const struct ixl_aq_regs ixl_pf_aq_regs = {
 	.arq_len_enable	= I40E_PF_ARQLEN_ARQENABLE_MASK,
 };
 
-#ifdef notyet
-static const struct ixl_aq_regs ixl_vf_aq_regs = {
-	.atq_tail	= I40E_VF_ATQT1,
-	.atq_tail_mask	= I40E_VF_ATQT1_ATQT_MASK;
-	.atq_head	= I40E_VF_ATQH1,
-	.atq_head_mask	= I40E_VF_ARQH1_ARQH_MASK;
-	.atq_len	= I40E_VF_ATQLEN1,
-	.atq_bal	= I40E_VF_ATQBAL1,
-	.atq_bah	= I40E_VF_ATQBAH1,
-	.atq_len_enable	= I40E_VF_ATQLEN1_ATQENABLE_MASK,
-
-	.arq_tail	= I40E_VF_ARQT1,
-	.arq_tail_mask	= I40E_VF_ARQT1_ARQT_MASK;
-	.arq_head	= I40E_VF_ARQH1,
-	.arq_head_mask	= I40E_VF_ARQH1_ARQH_MASK;
-	.arq_len	= I40E_VF_ARQLEN1,
-	.arq_bal	= I40E_VF_ARQBAL1,
-	.arq_bah	= I40E_VF_ARQBAH1,
-	.arq_len_enable	= I40E_VF_ARQLEN1_ARQENABLE_MASK,
-};
-#endif
-
 #define ixl_rd(_s, _r) \
 	bus_space_read_4((_s)->sc_memt, (_s)->sc_memh, (_r))
 #define ixl_wr(_s, _r, _v) \
@@ -1268,7 +1487,7 @@ static const struct ixl_aq_regs ixl_vf_aq_regs = {
 #define ixl_dmamem_hi(_ixm)	0
 #endif
 
-#define ixl_dmamem_lo(_ixm) 	(uint32_t)IXL_DMA_DVA(_ixm)
+#define ixl_dmamem_lo(_ixm)	(uint32_t)IXL_DMA_DVA(_ixm)
 
 static inline void
 ixl_aq_dva(struct ixl_aq_desc *iaq, bus_addr_t addr)
@@ -1287,29 +1506,150 @@ ixl_aq_dva(struct ixl_aq_desc *iaq, bus_addr_t addr)
 #define HTOLE16(_x)	(_x)
 #endif
 
-static const struct pci_matchid ixl_devices[] = {
-#ifdef notyet
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_VF },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_VF_HV },
-#endif
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_X710_10G_SFP },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_40G_BP },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_X710_10G_BP },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_QSFP_1 },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_QSFP_2 },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_X710_10G_QSFP },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_X710_10G_BASET },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_20G_BP_1 },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XL710_20G_BP_2 },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_X710_T4_10G },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XXV710_25G_BP },
-	{ PCI_VENDOR_INTEL,	PCI_PRODUCT_INTEL_XXV710_25G_SFP28 },
+static struct rwlock ixl_sff_lock = RWLOCK_INITIALIZER("ixlsff");
+
+/* deal with differences between chips */
+
+struct ixl_chip {
+	uint64_t		  ic_rss_hena;
+	uint32_t		(*ic_rd_ctl)(struct ixl_softc *, uint32_t);
+	void			(*ic_wr_ctl)(struct ixl_softc *, uint32_t,
+				      uint32_t);
+
+	int			(*ic_set_rss_key)(struct ixl_softc *,
+				      const struct ixl_rss_key *);
+	int			(*ic_set_rss_lut)(struct ixl_softc *,
+				      const struct ixl_rss_lut_128 *);
 };
+
+static inline uint64_t
+ixl_rss_hena(struct ixl_softc *sc)
+{
+	return (sc->sc_chip->ic_rss_hena);
+}
+
+static inline uint32_t
+ixl_rd_ctl(struct ixl_softc *sc, uint32_t r)
+{
+	return ((*sc->sc_chip->ic_rd_ctl)(sc, r));
+}
+
+static inline void
+ixl_wr_ctl(struct ixl_softc *sc, uint32_t r, uint32_t v)
+{
+	(*sc->sc_chip->ic_wr_ctl)(sc, r, v);
+}
+
+static inline int
+ixl_set_rss_key(struct ixl_softc *sc, const struct ixl_rss_key *rsskey)
+{
+	return ((*sc->sc_chip->ic_set_rss_key)(sc, rsskey));
+}
+
+static inline int
+ixl_set_rss_lut(struct ixl_softc *sc, const struct ixl_rss_lut_128 *lut)
+{
+	return ((*sc->sc_chip->ic_set_rss_lut)(sc, lut));
+}
+
+/* 710 chip specifics */
+
+static uint32_t		ixl_710_rd_ctl(struct ixl_softc *, uint32_t);
+static void		ixl_710_wr_ctl(struct ixl_softc *, uint32_t, uint32_t);
+static int		ixl_710_set_rss_key(struct ixl_softc *,
+			    const struct ixl_rss_key *);
+static int		ixl_710_set_rss_lut(struct ixl_softc *,
+			    const struct ixl_rss_lut_128 *);
+
+static const struct ixl_chip ixl_710 = {
+	.ic_rss_hena =		IXL_RSS_HENA_BASE_710,
+	.ic_rd_ctl =		ixl_710_rd_ctl,
+	.ic_wr_ctl =		ixl_710_wr_ctl,
+	.ic_set_rss_key =	ixl_710_set_rss_key,
+	.ic_set_rss_lut =	ixl_710_set_rss_lut,
+};
+
+/* 722 chip specifics */
+
+static uint32_t		ixl_722_rd_ctl(struct ixl_softc *, uint32_t);
+static void		ixl_722_wr_ctl(struct ixl_softc *, uint32_t, uint32_t);
+static int		ixl_722_set_rss_key(struct ixl_softc *,
+			    const struct ixl_rss_key *);
+static int		ixl_722_set_rss_lut(struct ixl_softc *,
+			    const struct ixl_rss_lut_128 *);
+
+static const struct ixl_chip ixl_722 = {
+	.ic_rss_hena =		IXL_RSS_HENA_BASE_722,
+	.ic_rd_ctl =		ixl_722_rd_ctl,
+	.ic_wr_ctl =		ixl_722_wr_ctl,
+	.ic_set_rss_key =	ixl_722_set_rss_key,
+	.ic_set_rss_lut =	ixl_722_set_rss_lut,
+};
+
+/*
+ * 710 chips using an older firmware/API use the same ctl ops as
+ * 722 chips. or 722 chips use the same ctl ops as 710 chips in early
+ * firmware/API versions?
+*/
+
+static const struct ixl_chip ixl_710_decrepit = {
+	.ic_rss_hena =		IXL_RSS_HENA_BASE_710,
+	.ic_rd_ctl =		ixl_722_rd_ctl,
+	.ic_wr_ctl =		ixl_722_wr_ctl,
+	.ic_set_rss_key =	ixl_710_set_rss_key,
+	.ic_set_rss_lut =	ixl_710_set_rss_lut,
+};
+
+/* driver code */
+
+struct ixl_device {
+	const struct ixl_chip	*id_chip;
+	pci_vendor_id_t		 id_vid;
+	pci_product_id_t	 id_pid;
+};
+
+static const struct ixl_device ixl_devices[] = {
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X710_10G_SFP },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XL710_40G_BP },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X710_10G_BP, },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XL710_QSFP_1 },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XL710_QSFP_2 },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X710_10G_QSFP },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X710_10G_BASET },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XL710_20G_BP_1 },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XL710_20G_BP_2 },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X710_T4_10G },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XXV710_25G_BP },
+	{ &ixl_710, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_XXV710_25G_SFP28, },
+	{ &ixl_722, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X722_10G_KX },
+	{ &ixl_722, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X722_10G_QSFP },
+	{ &ixl_722, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X722_10G_SFP_1 },
+	{ &ixl_722, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X722_1G },
+	{ &ixl_722, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X722_10G_T },
+	{ &ixl_722, PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_X722_10G_SFP_2 },
+};
+
+static const struct ixl_device *
+ixl_device_lookup(struct pci_attach_args *pa)
+{
+	pci_vendor_id_t vid = PCI_VENDOR(pa->pa_id);
+	pci_product_id_t pid = PCI_PRODUCT(pa->pa_id);
+	const struct ixl_device *id;
+	unsigned int i;
+
+	for (i = 0; i < nitems(ixl_devices); i++) {
+		id = &ixl_devices[i];
+		if (id->id_vid == vid && id->id_pid == pid)
+			return (id);
+	}
+
+	return (NULL);
+}
 
 static int
 ixl_match(struct device *parent, void *match, void *aux)
 {
-	return (pci_matchbyid(aux, ixl_devices, nitems(ixl_devices)));
+	return (ixl_device_lookup(aux) != NULL);
 }
 
 void
@@ -1321,19 +1661,23 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	pcireg_t memtype;
 	uint32_t port, ari, func;
 	uint64_t phy_types = 0;
+	unsigned int nqueues, i;
 	int tries;
 
+	rw_init(&sc->sc_cfg_lock, "ixlcfg");
+
+	sc->sc_chip = ixl_device_lookup(pa)->id_chip;
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
-	sc->sc_aq_regs = &ixl_pf_aq_regs; /* VF? */
+	sc->sc_aq_regs = &ixl_pf_aq_regs;
 
 	sc->sc_nqueues = 0; /* 1 << 0 is 1 queue */
 	sc->sc_tx_ring_ndescs = 1024;
 	sc->sc_rx_ring_ndescs = 1024;
 
 	memtype = pci_mapreg_type(sc->sc_pc, sc->sc_tag, IXL_PCIREG);
-	if (pci_mapreg_map(pa, IXL_PCIREG, memtype, BUS_SPACE_MAP_PREFETCHABLE,
+	if (pci_mapreg_map(pa, IXL_PCIREG, memtype, 0,
 	    &sc->sc_memt, &sc->sc_memh, NULL, &sc->sc_mems, 0)) {
 		printf(": unable to map registers\n");
 		return;
@@ -1342,10 +1686,8 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_base_queue = (ixl_rd(sc, I40E_PFLAN_QALLOC) &
 	    I40E_PFLAN_QALLOC_FIRSTQ_MASK) >>
 	    I40E_PFLAN_QALLOC_FIRSTQ_SHIFT;
-	printf(" %u", sc->sc_base_queue);
 
 	ixl_clear_hw(sc);
-
 	if (ixl_pf_reset(sc) == -1) {
 		/* error printed by ixl_pf_reset */
 		goto unmap;
@@ -1354,6 +1696,7 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	port = ixl_rd(sc, I40E_PFGEN_PORTNUM);
 	port &= I40E_PFGEN_PORTNUM_PORT_NUM_MASK;
 	port >>= I40E_PFGEN_PORTNUM_PORT_NUM_SHIFT;
+	sc->sc_port = port;
 	printf(": port %u", port);
 
 	ari = ixl_rd(sc, I40E_GLPCI_CAPSUP);
@@ -1361,14 +1704,9 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	ari >>= I40E_GLPCI_CAPSUP_ARI_EN_SHIFT;
 
 	func = ixl_rd(sc, I40E_PF_FUNC_RID);
-	func &= I40E_GLPCI_CAPSUP_ARI_EN_MASK;
-	func >>= I40E_GLPCI_CAPSUP_ARI_EN_SHIFT;
-
 	sc->sc_pf_id = func & (ari ? 0xff : 0x7);
 
 	/* initialise the adminq */
-
-	mtx_init(&sc->sc_atq_mtx, IPL_NET);
 
 	if (ixl_dmamem_alloc(sc, &sc->sc_atq,
 	    sizeof(struct ixl_aq_desc) * IXL_AQ_NUM, IXL_AQ_ALIGN) != 0) {
@@ -1403,7 +1741,7 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	    0, IXL_DMA_LEN(&sc->sc_arq),
 	    BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
 
- 	for (tries = 0; tries < 10; tries++) { 
+	for (tries = 0; tries < 10; tries++) {
 		int rv;
 
 		sc->sc_atq_cons = 0;
@@ -1453,13 +1791,31 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 		goto shutdown;
 	}
 
-	if (pci_intr_map_msi(pa, &sc->sc_ih) != 0 &&
-	    pci_intr_map(pa, &sc->sc_ih) != 0) {
-		printf(", unable to map interrupt\n");
-		goto shutdown;
+	if (pci_intr_map_msix(pa, 0, &sc->sc_ih) == 0) {
+		int nmsix = pci_intr_msix_count(pa->pa_pc, pa->pa_tag);
+		if (nmsix > 1) { /* we used 1 (the 0th) for the adminq */
+			nmsix--;
+
+			sc->sc_intrmap = intrmap_create(&sc->sc_dev,
+			    nmsix, IXL_MAX_VECTORS, INTRMAP_POWEROF2);
+			nqueues = intrmap_count(sc->sc_intrmap);
+			KASSERT(nqueues > 0);
+			KASSERT(powerof2(nqueues));
+			sc->sc_nqueues = fls(nqueues) - 1;
+		}
+	} else {
+		if (pci_intr_map_msi(pa, &sc->sc_ih) != 0 &&
+		    pci_intr_map(pa, &sc->sc_ih) != 0) {
+			printf(", unable to map interrupt\n");
+			goto shutdown;
+		}
 	}
 
-	printf(", %s, address %s\n", pci_intr_string(sc->sc_pc, sc->sc_ih),
+	nqueues = ixl_nqueues(sc);
+
+	printf(", %s, %d queue%s, address %s\n",
+	    pci_intr_string(sc->sc_pc, sc->sc_ih), ixl_nqueues(sc),
+	    (nqueues > 1 ? "s" : ""),
 	    ether_sprintf(sc->sc_ac.ac_enaddr));
 
 	if (ixl_hmc(sc) != 0) {
@@ -1487,7 +1843,7 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 		goto free_hmc;
 	}
 
-	if (ixl_get_phy_abilities(sc, &phy_types) != 0) {
+	if (ixl_get_phy_types(sc, &phy_types) != 0) {
 		/* error printed by ixl_get_phy_abilities */
 		goto free_hmc;
 	}
@@ -1497,29 +1853,78 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 		goto free_hmc;
 	}
 
-	if (ixl_dmamem_alloc(sc, &sc->sc_vsi,
+	if (ixl_dmamem_alloc(sc, &sc->sc_scratch,
 	    sizeof(struct ixl_aq_vsi_data), 8) != 0) {
-		printf("%s: unable to allocate VSI data\n", DEVNAME(sc));
+		printf("%s: unable to allocate scratch buffer\n", DEVNAME(sc));
 		goto free_hmc;
 	}
 
 	if (ixl_get_vsi(sc) != 0) {
 		/* error printed by ixl_get_vsi */
-		goto free_vsi;
+		goto free_hmc;
 	}
 
 	if (ixl_set_vsi(sc) != 0) {
 		/* error printed by ixl_set_vsi */
-		goto free_vsi;
+		goto free_scratch;
 	}
 
 	sc->sc_ihc = pci_intr_establish(sc->sc_pc, sc->sc_ih,
-	    IPL_NET | IPL_MPSAFE, ixl_intr, sc, DEVNAME(sc));
+	    IPL_NET | IPL_MPSAFE, ixl_intr0, sc, DEVNAME(sc));
 	if (sc->sc_ihc == NULL) {
 		printf("%s: unable to establish interrupt handler\n",
 		    DEVNAME(sc));
-		goto free_vsi;
+		goto free_scratch;
 	}
+
+	sc->sc_vectors = mallocarray(sizeof(*sc->sc_vectors), nqueues,
+	    M_DEVBUF, M_WAITOK|M_CANFAIL|M_ZERO);
+	if (sc->sc_vectors == NULL) {
+		printf("%s: unable to allocate vectors\n", DEVNAME(sc));
+		goto free_scratch;
+	}
+
+	for (i = 0; i < nqueues; i++) {
+		struct ixl_vector *iv = &sc->sc_vectors[i];
+		iv->iv_sc = sc;
+		iv->iv_qid = i;
+		snprintf(iv->iv_name, sizeof(iv->iv_name),
+		    "%s:%u", DEVNAME(sc), i); /* truncated? */
+	}
+
+	if (sc->sc_intrmap) {
+		for (i = 0; i < nqueues; i++) {
+			struct ixl_vector *iv = &sc->sc_vectors[i];
+			pci_intr_handle_t ih;
+			int v = i + 1; /* 0 is used for adminq */
+
+			if (pci_intr_map_msix(pa, v, &ih)) {
+				printf("%s: unable to map msi-x vector %d\n",
+				    DEVNAME(sc), v);
+				goto free_vectors;
+			}
+
+			iv->iv_ihc = pci_intr_establish_cpu(sc->sc_pc, ih,
+			    IPL_NET | IPL_MPSAFE,
+			    intrmap_cpu(sc->sc_intrmap, i),
+			    ixl_intr_vector, iv, iv->iv_name);
+			if (iv->iv_ihc == NULL) {
+				printf("%s: unable to establish interrupt %d\n",
+				    DEVNAME(sc), v);
+				goto free_vectors;
+			}
+
+			ixl_wr(sc, I40E_PFINT_DYN_CTLN(i),
+			    I40E_PFINT_DYN_CTLN_INTENA_MASK |
+			    I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
+			    (IXL_NOITR << I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT));
+		}
+	}
+
+	/* fixup the chip ops for older fw releases */
+	if (sc->sc_chip == &ixl_710 &&
+	    sc->sc_api_major == 1 && sc->sc_api_minor < 5)
+		sc->sc_chip = &ixl_710_decrepit;
 
 	ifp->if_softc = sc;
 	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
@@ -1529,7 +1934,7 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_watchdog = ixl_watchdog;
 	ifp->if_hardmtu = IXL_HARDMTU;
 	strlcpy(ifp->if_xname, DEVNAME(sc), IFNAMSIZ);
-	IFQ_SET_MAXLEN(&ifp->if_snd, 1);
+	ifq_set_maxlen(&ifp->if_snd, sc->sc_tx_ring_ndescs);
 
 	ifp->if_capabilities = IFCAP_VLAN_MTU;
 #if 0
@@ -1547,21 +1952,46 @@ ixl_attach(struct device *parent, struct device *self, void *aux)
 	if_attach(ifp);
 	ether_ifattach(ifp);
 
-	if_attach_queues(ifp, ixl_nqueues(sc));
-	if_attach_iqueues(ifp, ixl_nqueues(sc));
+	if_attach_queues(ifp, nqueues);
+	if_attach_iqueues(ifp, nqueues);
 
+	mtx_init(&sc->sc_link_state_mtx, IPL_NET);
+	task_set(&sc->sc_link_state_task, ixl_link_state_update, sc);
 	ixl_wr(sc, I40E_PFINT_ICR0_ENA,
 	    I40E_PFINT_ICR0_ENA_LINK_STAT_CHANGE_MASK |
 	    I40E_PFINT_ICR0_ENA_ADMINQ_MASK);
 	ixl_wr(sc, I40E_PFINT_STAT_CTL0,
 	    IXL_NOITR << I40E_PFINT_STAT_CTL0_OTHER_ITR_INDX_SHIFT);
 
+	/* remove default mac filter and replace it so we can see vlans */
+	ixl_remove_macvlan(sc, sc->sc_ac.ac_enaddr, 0, 0);
+	ixl_remove_macvlan(sc, sc->sc_ac.ac_enaddr, 0,
+	    IXL_AQ_OP_REMOVE_MACVLAN_IGNORE_VLAN);
+	ixl_add_macvlan(sc, sc->sc_ac.ac_enaddr, 0,
+	    IXL_AQ_OP_ADD_MACVLAN_IGNORE_VLAN);
+	ixl_add_macvlan(sc, etherbroadcastaddr, 0,
+	    IXL_AQ_OP_ADD_MACVLAN_IGNORE_VLAN);
+	memcpy(sc->sc_enaddr, sc->sc_ac.ac_enaddr, ETHER_ADDR_LEN);
+
 	ixl_intr_enable(sc);
 
-	return;
+#if NKSTAT > 0
+	ixl_kstat_attach(sc);
+#endif
 
-free_vsi:
-	ixl_dmamem_free(sc, &sc->sc_vsi);
+	return;
+free_vectors:
+	if (sc->sc_intrmap != NULL) {
+		for (i = 0; i < nqueues; i++) {
+			struct ixl_vector *iv = &sc->sc_vectors[i];
+			if (iv->iv_ihc == NULL)
+				continue;
+			pci_intr_disestablish(sc->sc_pc, iv->iv_ihc);
+		}
+	}
+	free(sc->sc_vectors, M_DEVBUF, nqueues * sizeof(*sc->sc_vectors));
+free_scratch:
+	ixl_dmamem_free(sc, &sc->sc_scratch);
 free_hmc:
 	ixl_hmc_free(sc);
 shutdown:
@@ -1586,6 +2016,7 @@ shutdown:
 	    BUS_DMASYNC_POSTREAD|BUS_DMASYNC_POSTWRITE);
 
 	ixl_arq_unfill(sc);
+
 free_arq:
 	ixl_dmamem_free(sc, &sc->sc_arq);
 free_atq:
@@ -1593,6 +2024,9 @@ free_atq:
 unmap:
 	bus_space_unmap(sc->sc_memt, sc->sc_memh, sc->sc_mems);
 	sc->sc_mems = 0;
+
+	if (sc->sc_intrmap != NULL)
+		intrmap_destroy(sc->sc_intrmap);
 }
 
 static void
@@ -1639,7 +2073,8 @@ ixl_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
 	struct ixl_softc *sc = (struct ixl_softc *)ifp->if_softc;
 	struct ifreq *ifr = (struct ifreq *)data;
-	int error = 0;
+	uint8_t addrhi[ETHER_ADDR_LEN], addrlo[ETHER_ADDR_LEN];
+	int aqerror, error = 0;
 
 	switch (cmd) {
 	case SIOCSIFADDR:
@@ -1663,11 +2098,55 @@ ixl_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		error = ifmedia_ioctl(ifp, ifr, &sc->sc_media, cmd);
 		break;
 
-#if 0
 	case SIOCGIFRXR:
 		error = ixl_rxrinfo(sc, (struct if_rxrinfo *)ifr->ifr_data);
 		break;
-#endif
+
+	case SIOCADDMULTI:
+		if (ether_addmulti(ifr, &sc->sc_ac) == ENETRESET) {
+			error = ether_multiaddr(&ifr->ifr_addr, addrlo, addrhi);
+			if (error != 0)
+				return (error);
+
+			aqerror = ixl_add_macvlan(sc, addrlo, 0,
+			    IXL_AQ_OP_ADD_MACVLAN_IGNORE_VLAN);
+			if (aqerror == IXL_AQ_RC_ENOSPC) {
+				ether_delmulti(ifr, &sc->sc_ac);
+				error = ENOSPC;
+			}
+
+			if (sc->sc_ac.ac_multirangecnt > 0) {
+				SET(ifp->if_flags, IFF_ALLMULTI);
+				error = ENETRESET;
+			}
+		}
+		break;
+
+	case SIOCDELMULTI:
+		if (ether_delmulti(ifr, &sc->sc_ac) == ENETRESET) {
+			error = ether_multiaddr(&ifr->ifr_addr, addrlo, addrhi);
+			if (error != 0)
+				return (error);
+
+			ixl_remove_macvlan(sc, addrlo, 0,
+			    IXL_AQ_OP_REMOVE_MACVLAN_IGNORE_VLAN);
+
+			if (ISSET(ifp->if_flags, IFF_ALLMULTI) &&
+			    sc->sc_ac.ac_multirangecnt == 0) {
+				CLR(ifp->if_flags, IFF_ALLMULTI);
+				error = ENETRESET;
+			}
+		}
+		break;
+
+	case SIOCGIFSFFPAGE:
+		error = rw_enter(&ixl_sff_lock, RW_WRITE|RW_INTR);
+		if (error != 0)
+			break;
+
+		error = ixl_get_sffpage(sc, (struct if_sffpage *)data);
+		rw_exit(&ixl_sff_lock);
+		break;
 
 	default:
 		error = ether_ioctl(ifp, &sc->sc_ac, cmd, data);
@@ -1704,9 +2183,59 @@ ixl_hmc_len(struct ixl_softc *sc, unsigned int type)
 }
 
 static int
+ixl_configure_rss(struct ixl_softc *sc)
+{
+	struct ixl_rss_key rsskey;
+	struct ixl_rss_lut_128 lut;
+	uint8_t *lute = (uint8_t *)&lut;
+	uint64_t rss_hena;
+	unsigned int i, nqueues;
+	int error;
+
+#if 0
+	/* if we want to do a 512 entry LUT, do this. */
+	uint32_t v = ixl_rd_ctl(sc, I40E_PFQF_CTL_0);
+	SET(v, I40E_PFQF_CTL_0_HASHLUTSIZE_MASK);
+	ixl_wr_ctl(sc, I40E_PFQF_CTL_0, v);
+#endif
+
+	stoeplitz_to_key(&rsskey, sizeof(rsskey));
+
+	nqueues = ixl_nqueues(sc);
+	for (i = 0; i < sizeof(lut); i++) {
+		/*
+		 * ixl must have a power of 2 rings, so using mod
+		 * to populate the table is fine.
+		 */
+		lute[i] = i % nqueues;
+	}
+
+	error = ixl_set_rss_key(sc, &rsskey);
+	if (error != 0)
+		return (error);
+
+	rss_hena = (uint64_t)ixl_rd_ctl(sc, I40E_PFQF_HENA(0));
+	rss_hena |= (uint64_t)ixl_rd_ctl(sc, I40E_PFQF_HENA(1)) << 32;
+	rss_hena |= ixl_rss_hena(sc);
+	ixl_wr_ctl(sc, I40E_PFQF_HENA(0), rss_hena);
+	ixl_wr_ctl(sc, I40E_PFQF_HENA(1), rss_hena >> 32);
+
+	error = ixl_set_rss_lut(sc, &lut);
+	if (error != 0)
+		return (error);
+
+	/* nothing to clena up :( */
+
+	return (0);
+}
+
+static int
 ixl_up(struct ixl_softc *sc)
 {
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct ifqueue *ifq;
+	struct ifiqueue *ifiq;
+	struct ixl_vector *iv;
 	struct ixl_rx_ring *rxr;
 	struct ixl_tx_ring *txr;
 	unsigned int nqueues, i;
@@ -1714,7 +2243,12 @@ ixl_up(struct ixl_softc *sc)
 	int rv = ENOMEM;
 
 	nqueues = ixl_nqueues(sc);
-	KASSERT(nqueues == 1); /* XXX */
+
+	rw_enter_write(&sc->sc_cfg_lock);
+	if (sc->sc_dead) {
+		rw_exit_write(&sc->sc_cfg_lock);
+		return (ENXIO);
+	}
 
 	/* allocation is the only thing that can fail, so do it up front */
 	for (i = 0; i < nqueues; i++) {
@@ -1728,15 +2262,26 @@ ixl_up(struct ixl_softc *sc)
 			goto free;
 		}
 
-		ifp->if_iqs[i]->ifiq_softc = rxr;
-		ifp->if_ifqs[i]->ifq_softc = txr;
+		/* wire everything together */
+		iv = &sc->sc_vectors[i];
+		iv->iv_rxr = rxr;
+		iv->iv_txr = txr;
+
+		ifq = ifp->if_ifqs[i];
+		ifq->ifq_softc = txr;
+		txr->txr_ifq = ifq;
+
+		ifiq = ifp->if_iqs[i];
+		ifiq->ifiq_softc = rxr;
+		rxr->rxr_ifiq = ifiq;
 	}
 
 	/* XXX wait 50ms from completion of last RX queue disable */
 
 	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
+		iv = &sc->sc_vectors[i];
+		rxr = iv->iv_rxr;
+		txr = iv->iv_txr;
 
 		ixl_txr_qdis(sc, txr, 1);
 
@@ -1759,8 +2304,9 @@ ixl_up(struct ixl_softc *sc)
 	}
 
 	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
+		iv = &sc->sc_vectors[i];
+		rxr = iv->iv_rxr;
+		txr = iv->iv_txr;
 
 		if (ixl_rxr_enabled(sc, rxr) != 0)
 			goto down;
@@ -1769,50 +2315,84 @@ ixl_up(struct ixl_softc *sc)
 			goto down;
 	}
 
+	ixl_configure_rss(sc);
+
 	SET(ifp->if_flags, IFF_RUNNING);
 
-#if 0
-	reg = ixl_rd(sc, I40E_QINT_RQCTL(I40E_INTR_NOTX_QUEUE));
-	SET(reg, I40E_QINT_RQCTL_CAUSE_ENA_MASK);
-	ixl_wr(sc, I40E_QINT_RQCTL(I40E_INTR_NOTX_QUEUE), reg);
+	if (sc->sc_intrmap == NULL) {
+		ixl_wr(sc, I40E_PFINT_LNKLST0,
+		    (I40E_INTR_NOTX_QUEUE <<
+		     I40E_PFINT_LNKLST0_FIRSTQ_INDX_SHIFT) |
+		    (I40E_QUEUE_TYPE_RX <<
+		     I40E_PFINT_LNKLSTN_FIRSTQ_TYPE_SHIFT));
 
-	reg = ixl_rd(sc, I40E_QINT_TQCTL(I40E_INTR_NOTX_QUEUE));
-	SET(reg, I40E_QINT_TQCTL_CAUSE_ENA_MASK);
-	ixl_wr(sc, I40E_QINT_TQCTL(I40E_INTR_NOTX_QUEUE), reg);
-#endif
+		ixl_wr(sc, I40E_QINT_RQCTL(I40E_INTR_NOTX_QUEUE),
+		    (I40E_INTR_NOTX_INTR << I40E_QINT_RQCTL_MSIX_INDX_SHIFT) |
+		    (I40E_ITR_INDEX_RX << I40E_QINT_RQCTL_ITR_INDX_SHIFT) |
+		    (I40E_INTR_NOTX_RX_QUEUE <<
+		     I40E_QINT_RQCTL_MSIX0_INDX_SHIFT) |
+		    (I40E_INTR_NOTX_QUEUE << I40E_QINT_RQCTL_NEXTQ_INDX_SHIFT) |
+		    (I40E_QUEUE_TYPE_TX << I40E_QINT_RQCTL_NEXTQ_TYPE_SHIFT) |
+		    I40E_QINT_RQCTL_CAUSE_ENA_MASK);
 
-	ixl_wr(sc, I40E_PFINT_LNKLST0,
-	    (I40E_INTR_NOTX_QUEUE << I40E_PFINT_LNKLST0_FIRSTQ_INDX_SHIFT) |
-	    (I40E_QUEUE_TYPE_RX << I40E_PFINT_LNKLSTN_FIRSTQ_TYPE_SHIFT));
+		ixl_wr(sc, I40E_QINT_TQCTL(I40E_INTR_NOTX_QUEUE),
+		    (I40E_INTR_NOTX_INTR << I40E_QINT_TQCTL_MSIX_INDX_SHIFT) |
+		    (I40E_ITR_INDEX_TX << I40E_QINT_TQCTL_ITR_INDX_SHIFT) |
+		    (I40E_INTR_NOTX_TX_QUEUE <<
+		     I40E_QINT_TQCTL_MSIX0_INDX_SHIFT) |
+		    (I40E_QUEUE_TYPE_EOL << I40E_QINT_TQCTL_NEXTQ_INDX_SHIFT) |
+		    (I40E_QUEUE_TYPE_RX << I40E_QINT_TQCTL_NEXTQ_TYPE_SHIFT) |
+		    I40E_QINT_TQCTL_CAUSE_ENA_MASK);
+	} else {
+		/* vector 0 has no queues */
+		ixl_wr(sc, I40E_PFINT_LNKLST0,
+		    I40E_QUEUE_TYPE_EOL <<
+		    I40E_PFINT_LNKLST0_FIRSTQ_INDX_SHIFT);
 
-	ixl_wr(sc, I40E_QINT_RQCTL(I40E_INTR_NOTX_QUEUE),
-	    (I40E_INTR_NOTX_INTR << I40E_QINT_RQCTL_MSIX_INDX_SHIFT) |
-	    (I40E_ITR_INDEX_RX << I40E_QINT_RQCTL_ITR_INDX_SHIFT) |
-	    (I40E_INTR_NOTX_RX_QUEUE << I40E_QINT_RQCTL_MSIX0_INDX_SHIFT) |
-	    (I40E_INTR_NOTX_QUEUE << I40E_QINT_RQCTL_NEXTQ_INDX_SHIFT) |
-	    (I40E_QUEUE_TYPE_TX << I40E_QINT_RQCTL_NEXTQ_TYPE_SHIFT));
+		/* queue n is mapped to vector n+1 */
+		for (i = 0; i < nqueues; i++) {
+			/* LNKLSTN(i) configures vector i+1 */
+			ixl_wr(sc, I40E_PFINT_LNKLSTN(i),
+			    (i << I40E_PFINT_LNKLSTN_FIRSTQ_INDX_SHIFT) |
+			    (I40E_QUEUE_TYPE_RX <<
+			     I40E_PFINT_LNKLSTN_FIRSTQ_TYPE_SHIFT));
+			ixl_wr(sc, I40E_QINT_RQCTL(i),
+			    ((i+1) << I40E_QINT_RQCTL_MSIX_INDX_SHIFT) |
+			    (I40E_ITR_INDEX_RX <<
+			     I40E_QINT_RQCTL_ITR_INDX_SHIFT) |
+			    (i << I40E_QINT_RQCTL_NEXTQ_INDX_SHIFT) |
+			    (I40E_QUEUE_TYPE_TX <<
+			     I40E_QINT_RQCTL_NEXTQ_TYPE_SHIFT) |
+			    I40E_QINT_RQCTL_CAUSE_ENA_MASK);
+			ixl_wr(sc, I40E_QINT_TQCTL(i),
+			    ((i+1) << I40E_QINT_TQCTL_MSIX_INDX_SHIFT) |
+			    (I40E_ITR_INDEX_TX <<
+			     I40E_QINT_TQCTL_ITR_INDX_SHIFT) |
+			    (I40E_QUEUE_TYPE_EOL <<
+			     I40E_QINT_TQCTL_NEXTQ_INDX_SHIFT) |
+			    (I40E_QUEUE_TYPE_RX <<
+			     I40E_QINT_TQCTL_NEXTQ_TYPE_SHIFT) |
+			    I40E_QINT_TQCTL_CAUSE_ENA_MASK);
 
-	ixl_wr(sc, I40E_QINT_TQCTL(I40E_INTR_NOTX_QUEUE),
-	    (I40E_INTR_NOTX_INTR << I40E_QINT_TQCTL_MSIX_INDX_SHIFT) |
-	    (I40E_ITR_INDEX_TX << I40E_QINT_TQCTL_ITR_INDX_SHIFT) |
-	    (I40E_INTR_NOTX_TX_QUEUE << I40E_QINT_TQCTL_MSIX0_INDX_SHIFT) |
-	    (I40E_QUEUE_TYPE_EOL << I40E_QINT_TQCTL_NEXTQ_INDX_SHIFT) |
-	    (I40E_QUEUE_TYPE_RX << I40E_QINT_TQCTL_NEXTQ_TYPE_SHIFT));
+			ixl_wr(sc, I40E_PFINT_ITRN(0, i), 0x7a);
+			ixl_wr(sc, I40E_PFINT_ITRN(1, i), 0x7a);
+			ixl_wr(sc, I40E_PFINT_ITRN(2, i), 0);
+		}
+	}
 
 	ixl_wr(sc, I40E_PFINT_ITR0(0), 0x7a);
 	ixl_wr(sc, I40E_PFINT_ITR0(1), 0x7a);
 	ixl_wr(sc, I40E_PFINT_ITR0(2), 0);
 
-	printf("%s: info %08x data %08x\n", DEVNAME(sc),
-	    ixl_rd(sc, I40E_PFHMC_ERRORINFO),
-	    ixl_rd(sc, I40E_PFHMC_ERRORDATA));
+	rw_exit_write(&sc->sc_cfg_lock);
 
 	return (ENETRESET);
 
 free:
 	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
+		iv = &sc->sc_vectors[i];
+		rxr = iv->iv_rxr;
+		txr = iv->iv_txr;
 
 		if (rxr == NULL) {
 			/*
@@ -1825,8 +2405,10 @@ free:
 		ixl_txr_free(sc, txr);
 		ixl_rxr_free(sc, rxr);
 	}
+	rw_exit_write(&sc->sc_cfg_lock);
 	return (rv);
 down:
+	rw_exit_write(&sc->sc_cfg_lock);
 	ixl_down(sc);
 	return (ETIMEDOUT);
 }
@@ -1839,11 +2421,6 @@ ixl_iff(struct ixl_softc *sc)
 	struct ixl_aq_desc *iaq;
 	struct ixl_aq_vsi_promisc_param *param;
 
-#if 0
-	if (!ISSET(ifp->if_flags, IFF_ALLMULTI))
-		return (0);
-#endif
-
 	if (!ISSET(ifp->if_flags, IFF_RUNNING))
 		return (0);
 
@@ -1853,13 +2430,17 @@ ixl_iff(struct ixl_softc *sc)
 	iaq->iaq_opcode = htole16(IXL_AQ_OP_SET_VSI_PROMISC);
 
 	param = (struct ixl_aq_vsi_promisc_param *)&iaq->iaq_param;
-	param->flags = htole16(IXL_AQ_VSI_PROMISC_FLAG_BCAST);
-//	if (ISSET(ifp->if_flags, IFF_PROMISC)) {
+	param->flags = htole16(IXL_AQ_VSI_PROMISC_FLAG_BCAST |
+	    IXL_AQ_VSI_PROMISC_FLAG_VLAN);
+	if (ISSET(ifp->if_flags, IFF_PROMISC)) {
 		param->flags |= htole16(IXL_AQ_VSI_PROMISC_FLAG_UCAST |
 		    IXL_AQ_VSI_PROMISC_FLAG_MCAST);
-//	}
+	} else if (ISSET(ifp->if_flags, IFF_ALLMULTI)) {
+		param->flags |= htole16(IXL_AQ_VSI_PROMISC_FLAG_MCAST);
+	}
 	param->valid_flags = htole16(IXL_AQ_VSI_PROMISC_FLAG_UCAST |
-	    IXL_AQ_VSI_PROMISC_FLAG_MCAST | IXL_AQ_VSI_PROMISC_FLAG_BCAST);
+	    IXL_AQ_VSI_PROMISC_FLAG_MCAST | IXL_AQ_VSI_PROMISC_FLAG_BCAST |
+	    IXL_AQ_VSI_PROMISC_FLAG_VLAN);
 	param->seid = sc->sc_seid;
 
 	ixl_atq_exec(sc, &iatq, "ixliff");
@@ -1867,6 +2448,13 @@ ixl_iff(struct ixl_softc *sc)
 	if (iaq->iaq_retval != htole16(IXL_AQ_RC_OK))
 		return (EIO);
 
+	if (memcmp(sc->sc_enaddr, sc->sc_ac.ac_enaddr, ETHER_ADDR_LEN) != 0) {
+		ixl_remove_macvlan(sc, sc->sc_enaddr, 0,
+		    IXL_AQ_OP_REMOVE_MACVLAN_IGNORE_VLAN);
+		ixl_add_macvlan(sc, sc->sc_ac.ac_enaddr, 0,
+		    IXL_AQ_OP_ADD_MACVLAN_IGNORE_VLAN);
+		memcpy(sc->sc_enaddr, sc->sc_ac.ac_enaddr, ETHER_ADDR_LEN);
+	}
 	return (0);
 }
 
@@ -1874,6 +2462,7 @@ static int
 ixl_down(struct ixl_softc *sc)
 {
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct ixl_vector *iv;
 	struct ixl_rx_ring *rxr;
 	struct ixl_tx_ring *txr;
 	unsigned int nqueues, i;
@@ -1882,7 +2471,11 @@ ixl_down(struct ixl_softc *sc)
 
 	nqueues = ixl_nqueues(sc);
 
+	rw_enter_write(&sc->sc_cfg_lock);
+
 	CLR(ifp->if_flags, IFF_RUNNING);
+
+	NET_UNLOCK();
 
 	/* mask interrupts */
 	reg = ixl_rd(sc, I40E_QINT_RQCTL(I40E_INTR_NOTX_QUEUE));
@@ -1897,26 +2490,26 @@ ixl_down(struct ixl_softc *sc)
 
 	/* make sure the no hw generated work is still in flight */
 	intr_barrier(sc->sc_ihc);
-	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
+	if (sc->sc_intrmap != NULL) {
+		for (i = 0; i < nqueues; i++) {
+			iv = &sc->sc_vectors[i];
+			rxr = iv->iv_rxr;
+			txr = iv->iv_txr;
 
-		ixl_txr_qdis(sc, txr, 0);
+			ixl_txr_qdis(sc, txr, 0);
 
-		ifiq_barrier(ifp->if_iqs[i]);
-		ifq_barrier(ifp->if_ifqs[i]);
+			ifq_barrier(txr->txr_ifq);
 
-		if (!timeout_del(&rxr->rxr_refill))
-			timeout_barrier(&rxr->rxr_refill);
+			timeout_del_barrier(&rxr->rxr_refill);
+
+			intr_barrier(iv->iv_ihc);
+		}
 	}
 
 	/* XXX wait at least 400 usec for all tx queues in one go */
 	delay(500);
 
 	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
-
 		reg = ixl_rd(sc, I40E_QTX_ENA(i));
 		CLR(reg, I40E_QTX_ENA_QENA_REQ_MASK);
 		ixl_wr(sc, I40E_QTX_ENA(i), reg);
@@ -1927,28 +2520,21 @@ ixl_down(struct ixl_softc *sc)
 	}
 
 	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
+		iv = &sc->sc_vectors[i];
+		rxr = iv->iv_rxr;
+		txr = iv->iv_txr;
 
 		if (ixl_txr_disabled(sc, txr) != 0)
-			error = ETIMEDOUT;
+			goto die;
 
 		if (ixl_rxr_disabled(sc, rxr) != 0)
-			error = ETIMEDOUT;
-	}
-
-	if (error) {
-	printf("%s: info %08x data %08x\n", DEVNAME(sc),
-	    ixl_rd(sc, I40E_PFHMC_ERRORINFO),
-	    ixl_rd(sc, I40E_PFHMC_ERRORDATA));
-
-		printf("%s: failed to shut down rings\n", DEVNAME(sc));
-		return (error);
+			goto die;
 	}
 
 	for (i = 0; i < nqueues; i++) {
-		rxr = ifp->if_iqs[i]->ifiq_softc;
-		txr = ifp->if_ifqs[i]->ifq_softc;
+		iv = &sc->sc_vectors[i];
+		rxr = iv->iv_rxr;
+		txr = iv->iv_txr;
 
 		ixl_txr_unconfig(sc, txr);
 		ixl_rxr_unconfig(sc, rxr);
@@ -1963,7 +2549,15 @@ ixl_down(struct ixl_softc *sc)
 		ifp->if_ifqs[i]->ifq_softc =  NULL;
 	}
 
-	return (0);
+out:
+	rw_exit_write(&sc->sc_cfg_lock);
+	NET_LOCK();
+	return (error);
+die:
+	sc->sc_dead = 1;
+	log(LOG_CRIT, "%s: failed to shut down rings", DEVNAME(sc));
+	error = ETIMEDOUT;
+	goto out;
 }
 
 static struct ixl_tx_ring *
@@ -2049,7 +2643,7 @@ static void
 ixl_txr_config(struct ixl_softc *sc, struct ixl_tx_ring *txr)
 {
 	struct ixl_hmc_txq txq;
-	struct ixl_aq_vsi_data *data = IXL_DMA_KVA(&sc->sc_vsi);
+	struct ixl_aq_vsi_data *data = IXL_DMA_KVA(&sc->sc_scratch);
 	void *hmc;
 
 	memset(&txq, 0, sizeof(txq));
@@ -2163,7 +2757,11 @@ ixl_load_mbuf(bus_dma_tag_t dmat, bus_dmamap_t map, struct mbuf *m)
 
 	error = bus_dmamap_load_mbuf(dmat, map, m,
 	    BUS_DMA_STREAMING | BUS_DMA_NOWAIT);
-	if (error != EFBIG || m_defrag(m, M_DONTWAIT) != 0)
+	if (error != EFBIG)
+		return (error);
+
+	error = m_defrag(m, M_DONTWAIT);
+	if (error != 0)
 		return (error);
 
 	return (bus_dmamap_load_mbuf(dmat, map, m,
@@ -2219,6 +2817,7 @@ ixl_start(struct ifqueue *ifq)
 		map = txm->txm_map;
 
 		if (ixl_load_mbuf(sc->sc_dmat, map, m) != 0) {
+			ifq->ifq_errors++;
 			m_freem(m);
 			continue;
 		}
@@ -2267,9 +2866,9 @@ ixl_start(struct ifqueue *ifq)
 }
 
 static int
-ixl_txeof(struct ixl_softc *sc, struct ifqueue *ifq)
+ixl_txeof(struct ixl_softc *sc, struct ixl_tx_ring *txr)
 {
-	struct ixl_tx_ring *txr = ifq->ifq_softc;
+	struct ifqueue *ifq = txr->txr_ifq;
 	struct ixl_tx_desc *ring, *txd;
 	struct ixl_tx_map *txm;
 	bus_dmamap_t map;
@@ -2399,8 +2998,7 @@ ixl_rxr_clean(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 	bus_dmamap_t map;
 	unsigned int i;
 
-	if (!timeout_del(&rxr->rxr_refill))
-		timeout_barrier(&rxr->rxr_refill);
+	timeout_del_barrier(&rxr->rxr_refill);
 
 	maps = rxr->rxr_maps;
 	for (i = 0; i < sc->sc_rx_ring_ndescs; i++) {
@@ -2480,7 +3078,7 @@ ixl_rxr_config(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 	rxq.crcstrip = 1;
 	rxq.l2sel = 0;
 	rxq.showiv = 0;
-	rxq.rxmax = htole16(MCLBYTES); /* XXX */
+	rxq.rxmax = htole16(IXL_HARDMTU);
 	rxq.tphrdesc_ena = 0;
 	rxq.tphwdesc_ena = 0;
 	rxq.tphdata_ena = 0;
@@ -2521,9 +3119,9 @@ ixl_rxr_free(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 }
 
 static int
-ixl_rxeof(struct ixl_softc *sc, struct ifiqueue *ifiq)
+ixl_rxeof(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 {
-	struct ixl_rx_ring *rxr = ifiq->ifiq_softc;
+	struct ifiqueue *ifiq = rxr->rxr_ifiq;
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
 	struct ixl_rx_wb_desc_16 *ring, *rxd;
 	struct ixl_rx_map *rxm;
@@ -2600,8 +3198,9 @@ ixl_rxeof(struct ixl_softc *sc, struct ifiqueue *ifiq)
 
 	if (done) {
 		rxr->rxr_cons = cons;
+		if (ifiq_input(ifiq, &ml))
+			if_rxr_livelocked(&rxr->rxr_acct);
 		ixl_rxfill(sc, rxr);
-		if_input(ifp, &ml);
 	}
 
 	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&rxr->rxr_mem),
@@ -2638,8 +3237,8 @@ ixl_rxfill(struct ixl_softc *sc, struct ixl_rx_ring *rxr)
 		m = MCLGETI(NULL, M_DONTWAIT, NULL, MCLBYTES + ETHER_ALIGN);
 		if (m == NULL)
 			break;
+		m->m_data += (m->m_ext.ext_size - (MCLBYTES + ETHER_ALIGN));
 		m->m_len = m->m_pkthdr.len = MCLBYTES + ETHER_ALIGN;
-		m_adj(m, ETHER_ALIGN);
 
 		map = rxm->rxm_map;
 
@@ -2685,13 +3284,42 @@ ixl_rxrefill(void *arg)
 }
 
 static int
-ixl_intr(void *xsc)
+ixl_rxrinfo(struct ixl_softc *sc, struct if_rxrinfo *ifri)
+{
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct if_rxring_info *ifr;
+	struct ixl_rx_ring *ring;
+	int i, rv;
+
+	if (!ISSET(ifp->if_flags, IFF_RUNNING))
+		return (ENOTTY);
+
+	ifr = mallocarray(sizeof(*ifr), ixl_nqueues(sc), M_TEMP,
+	    M_WAITOK|M_CANFAIL|M_ZERO);
+	if (ifr == NULL)
+		return (ENOMEM);
+
+	for (i = 0; i < ixl_nqueues(sc); i++) {
+		ring = ifp->if_iqs[i]->ifiq_softc;
+		ifr[i].ifr_size = MCLBYTES;
+		ifr[i].ifr_info = ring->rxr_acct;
+	}
+
+	rv = if_rxr_info_ioctl(ifri, ixl_nqueues(sc), ifr);
+	free(ifr, M_TEMP, ixl_nqueues(sc) * sizeof(*ifr));
+
+	return (rv);
+}
+
+static int
+ixl_intr0(void *xsc)
 {
 	struct ixl_softc *sc = xsc;
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
 	uint32_t icr;
 	int rv = 0;
 
+	ixl_intr_enable(sc);
 	icr = ixl_rd(sc, I40E_PFINT_ICR0);
 
 	if (ISSET(icr, I40E_PFINT_ICR0_ADMINQ_MASK)) {
@@ -2700,27 +3328,85 @@ ixl_intr(void *xsc)
 		rv = 1;
 	}
 
-	if (ISSET(icr, I40E_INTR_NOTX_RX_MASK))
-		rv |= ixl_rxeof(sc, ifp->if_iqs[0]);
-	if (ISSET(icr, I40E_INTR_NOTX_TX_MASK))
-		rv |= ixl_txeof(sc, ifp->if_ifqs[0]);
+	if (ISSET(icr, I40E_PFINT_ICR0_LINK_STAT_CHANGE_MASK)) {
+		task_add(systq, &sc->sc_link_state_task);
+		rv = 1;
+	}
+
+	if (ISSET(ifp->if_flags, IFF_RUNNING)) {
+		struct ixl_vector *iv = sc->sc_vectors;
+		if (ISSET(icr, I40E_INTR_NOTX_RX_MASK))
+			rv |= ixl_rxeof(sc, iv->iv_rxr);
+		if (ISSET(icr, I40E_INTR_NOTX_TX_MASK))
+			rv |= ixl_txeof(sc, iv->iv_txr);
+	}
+
+	return (rv);
+}
+
+static int
+ixl_intr_vector(void *v)
+{
+	struct ixl_vector *iv = v;
+	struct ixl_softc *sc = iv->iv_sc;
+	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	int rv = 0;
+
+	if (ISSET(ifp->if_flags, IFF_RUNNING)) {
+		rv |= ixl_rxeof(sc, iv->iv_rxr);
+		rv |= ixl_txeof(sc, iv->iv_txr);
+	}
+
+	ixl_wr(sc, I40E_PFINT_DYN_CTLN(iv->iv_qid),
+	    I40E_PFINT_DYN_CTLN_INTENA_MASK |
+	    I40E_PFINT_DYN_CTLN_CLEARPBA_MASK |
+	    (IXL_NOITR << I40E_PFINT_DYN_CTLN_ITR_INDX_SHIFT));
 
 	return (rv);
 }
 
 static void
-ixl_arq_link_status(struct ixl_softc *sc, const struct ixl_aq_desc *iaq)
+ixl_link_state_update_iaq(struct ixl_softc *sc, void *arg)
 {
 	struct ifnet *ifp = &sc->sc_ac.ac_if;
+	struct ixl_aq_desc *iaq = arg;
+	uint16_t retval;
 	int link_state;
+	int change = 0;
 
-	NET_LOCK();
+	retval = lemtoh16(&iaq->iaq_retval);
+	if (retval != IXL_AQ_RC_OK) {
+		printf("%s: LINK STATUS error %u\n", DEVNAME(sc), retval);
+		return;
+	}
+
 	link_state = ixl_set_link_status(sc, iaq);
+	mtx_enter(&sc->sc_link_state_mtx);
 	if (ifp->if_link_state != link_state) {
 		ifp->if_link_state = link_state;
-		if_link_state_change(ifp);
+		change = 1;
 	}
-	NET_UNLOCK();
+	mtx_leave(&sc->sc_link_state_mtx);
+
+	if (change)
+		if_link_state_change(ifp);
+}
+
+static void
+ixl_link_state_update(void *xsc)
+{
+	struct ixl_softc *sc = xsc;
+	struct ixl_aq_desc *iaq;
+	struct ixl_aq_link_param *param;
+
+	memset(&sc->sc_link_state_atq, 0, sizeof(sc->sc_link_state_atq));
+	iaq = &sc->sc_link_state_atq.iatq_desc;
+	iaq->iaq_opcode = htole16(IXL_AQ_OP_PHY_LINK_STATUS);
+	param = (struct ixl_aq_link_param *)iaq->iaq_param;
+	param->notify = IXL_AQ_LINK_NOTIFY;
+
+	ixl_atq_set(&sc->sc_link_state_atq, ixl_link_state_update_iaq, iaq);
+	ixl_atq_post(sc, &sc->sc_link_state_atq);
 }
 
 #if 0
@@ -2765,12 +3451,13 @@ ixl_arq(void *xsc)
 		iaq = &arq[cons];
 
 		aqb = SIMPLEQ_FIRST(&sc->sc_arq_live);
+		SIMPLEQ_REMOVE_HEAD(&sc->sc_arq_live, aqb_entry);
 		bus_dmamap_sync(sc->sc_dmat, aqb->aqb_map, 0, IXL_AQ_BUFLEN,
 		    BUS_DMASYNC_POSTREAD);
 
 		switch (iaq->iaq_opcode) {
 		case HTOLE16(IXL_AQ_OP_PHY_LINK_STATUS):
-			ixl_arq_link_status(sc, iaq);
+			ixl_link_state_update_iaq(sc, iaq);
 			break;
 		}
 
@@ -2835,7 +3522,6 @@ ixl_atq_post(struct ixl_softc *sc, struct ixl_atq *iatq)
 static void
 ixl_atq_done(struct ixl_softc *sc)
 {
-	struct ixl_atq_list cmds = SIMPLEQ_HEAD_INITIALIZER(cmds);
 	struct ixl_aq_desc *atq, *slot;
 	struct ixl_atq *iatq;
 	unsigned int cons;
@@ -2855,12 +3541,15 @@ ixl_atq_done(struct ixl_softc *sc)
 
 	do {
 		slot = &atq[cons];
+		if (!ISSET(slot->iaq_flags, htole16(IXL_AQ_DD)))
+			break;
 
 		iatq = (struct ixl_atq *)slot->iaq_cookie;
 		iatq->iatq_desc = *slot;
-		SIMPLEQ_INSERT_TAIL(&cmds, iatq, iatq_entry);
 
 		memset(slot, 0, sizeof(*slot));
+
+		(*iatq->iatq_fn)(sc, iatq->iatq_arg);
 
 		cons++;
 		cons &= IXL_AQ_MASK;
@@ -2871,49 +3560,27 @@ ixl_atq_done(struct ixl_softc *sc)
 	    BUS_DMASYNC_PREREAD|BUS_DMASYNC_PREWRITE);
 
 	sc->sc_atq_cons = cons;
-
-	while ((iatq = SIMPLEQ_FIRST(&cmds)) != NULL) {
-		SIMPLEQ_REMOVE_HEAD(&cmds, iatq_entry);
-
-		(*iatq->iatq_fn)(sc, iatq->iatq_arg);
-	}
 }
-
-struct ixl_wakeup {
-	struct mutex mtx;
-	int notdone;
-};
 
 static void
 ixl_wakeup(struct ixl_softc *sc, void *arg)
 {
-	struct ixl_wakeup *wake = arg;
+	struct cond *c = arg;
 
-	mtx_enter(&wake->mtx);
-	wake->notdone = 0;
-	mtx_leave(&wake->mtx);
-
-	wakeup(wake);
+	cond_signal(c);
 }
 
 static void
 ixl_atq_exec(struct ixl_softc *sc, struct ixl_atq *iatq, const char *wmesg)
 {
-	struct ixl_wakeup wake = { MUTEX_INITIALIZER(IPL_NET), 1 };
+	struct cond c = COND_INITIALIZER();
 
 	KASSERT(iatq->iatq_desc.iaq_cookie == 0);
 
-	ixl_atq_set(iatq, ixl_wakeup, &wake);
+	ixl_atq_set(iatq, ixl_wakeup, &c);
 	ixl_atq_post(sc, iatq);
 
-	mtx_enter(&wake.mtx);
-	while (wake.notdone) {
-		mtx_leave(&wake.mtx);
-		ixl_atq_done(sc);
-		mtx_enter(&wake.mtx);
-		msleep(&wake, &wake.mtx, 0, wmesg, 1);
-	}
-	mtx_leave(&wake.mtx);
+	cond_wait(&c, wmesg);
 }
 
 static int
@@ -2977,9 +3644,12 @@ ixl_get_version(struct ixl_softc *sc)
 	fwver = lemtoh32(&iaq.iaq_param[2]);
 	apiver = lemtoh32(&iaq.iaq_param[3]);
 
+	sc->sc_api_major = apiver & 0xffff;
+	sc->sc_api_minor = (apiver >> 16) & 0xffff;
+
 	printf(", FW %hu.%hu.%05u API %hu.%hu", (uint16_t)fwver,
-	    (uint16_t)(fwver >> 16), fwbuild, (uint16_t)apiver,
-	    (uint16_t)(apiver >> 16));
+	    (uint16_t)(fwver >> 16), fwbuild,
+	    sc->sc_api_major, sc->sc_api_minor);
 
 	return (0);
 }
@@ -3042,6 +3712,12 @@ ixl_get_mac(struct ixl_softc *sc)
 	struct ixl_aq_desc iaq;
 	struct ixl_aq_mac_addresses *addrs;
 	int rv;
+
+#ifdef __sparc64__
+	if (OF_getprop(PCITAG_NODE(sc->sc_tag), "local-mac-address",
+	    sc->sc_ac.ac_enaddr, ETHER_ADDR_LEN) == ETHER_ADDR_LEN)
+		return (0);
+#endif
 
 	if (ixl_dmamem_alloc(sc, &idm, sizeof(*addrs), 0) != 0) {
 		printf(", unable to allocate mac addresses\n");
@@ -3197,52 +3873,61 @@ ixl_phy_mask_ints(struct ixl_softc *sc)
 }
 
 static int
-ixl_get_phy_abilities(struct ixl_softc *sc, uint64_t *phy_types_ptr)
+ixl_get_phy_abilities(struct ixl_softc *sc,struct ixl_dmamem *idm)
+{
+	struct ixl_aq_desc iaq;
+	int rv;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_flags = htole16(IXL_AQ_BUF |
+	    (IXL_DMA_LEN(idm) > I40E_AQ_LARGE_BUF ? IXL_AQ_LB : 0));
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_PHY_GET_ABILITIES);
+	htolem16(&iaq.iaq_datalen, IXL_DMA_LEN(idm));
+	iaq.iaq_param[0] = htole32(IXL_AQ_PHY_REPORT_INIT);
+	ixl_aq_dva(&iaq, IXL_DMA_DVA(idm));
+
+	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(idm), 0, IXL_DMA_LEN(idm),
+	    BUS_DMASYNC_PREREAD);
+
+	rv = ixl_atq_poll(sc, &iaq, 250);
+
+	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(idm), 0, IXL_DMA_LEN(idm),
+	    BUS_DMASYNC_POSTREAD);
+
+	if (rv != 0)
+		return (-1);
+
+	return (lemtoh16(&iaq.iaq_retval));
+}
+
+static int
+ixl_get_phy_types(struct ixl_softc *sc, uint64_t *phy_types_ptr)
 {
 	struct ixl_dmamem idm;
-	struct ixl_aq_desc iaq;
 	struct ixl_aq_phy_abilities *phy;
 	uint64_t phy_types;
 	int rv;
 
 	if (ixl_dmamem_alloc(sc, &idm, IXL_AQ_BUFLEN, 0) != 0) {
-		printf("%s: unable to allocate switch config buffer\n",
+		printf("%s: unable to allocate phy abilities buffer\n",
 		    DEVNAME(sc));
 		return (-1);
 	}
 
-	memset(&iaq, 0, sizeof(iaq));
-	iaq.iaq_flags = htole16(IXL_AQ_BUF |
-	    (IXL_AQ_BUFLEN > I40E_AQ_LARGE_BUF ? IXL_AQ_LB : 0));
-	iaq.iaq_opcode = htole16(IXL_AQ_OP_PHY_GET_ABILITIES);
-	iaq.iaq_datalen = htole16(IXL_AQ_BUFLEN);
-	iaq.iaq_param[0] = htole32(IXL_AQ_PHY_REPORT_INIT);
-	ixl_aq_dva(&iaq, IXL_DMA_DVA(&idm));
-
-	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&idm), 0, IXL_DMA_LEN(&idm),
-	    BUS_DMASYNC_PREREAD);
-
-	rv = ixl_atq_poll(sc, &iaq, 250);
-
-	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(&idm), 0, IXL_DMA_LEN(&idm),
-	    BUS_DMASYNC_POSTREAD);
-
-	if (rv != 0) {
+	rv = ixl_get_phy_abilities(sc, &idm);
+	switch (rv) {
+	case -1:
 		printf("%s: GET PHY ABILITIES timeout\n", DEVNAME(sc));
-		rv = -1;
-		goto done;
-	}
-	switch (iaq.iaq_retval) {
-	case HTOLE16(IXL_AQ_RC_OK):
+		goto err;
+	case IXL_AQ_RC_OK:
 		break;
-	case HTOLE16(IXL_AQ_RC_EIO):
-		printf("%s: unable to query phy types\n", DEVNAME(sc));
-		rv = 0;
+	case IXL_AQ_RC_EIO:
+		/* API is too old to handle this command */
+		phy_types = 0;
 		goto done;
 	default:
-		printf("%s: GET PHY ABILITIIES error\n", DEVNAME(sc));
-		rv = -1;
-		goto done;
+		printf("%s: GET PHY ABILITIIES error %u\n", DEVNAME(sc), rv);
+		goto err;
 	}
 
 	phy = IXL_DMA_KVA(&idm);
@@ -3250,9 +3935,40 @@ ixl_get_phy_abilities(struct ixl_softc *sc, uint64_t *phy_types_ptr)
 	phy_types = lemtoh32(&phy->phy_type);
 	phy_types |= (uint64_t)phy->phy_type_ext << 32;
 
+done:
 	*phy_types_ptr = phy_types;
 
 	rv = 0;
+
+err:
+	ixl_dmamem_free(sc, &idm);
+	return (rv);
+}
+
+/*
+ * this returns -2 on software/driver failure, -1 for problems
+ * talking to the hardware, or the sff module type.
+ */
+
+static int
+ixl_get_module_type(struct ixl_softc *sc)
+{
+	struct ixl_dmamem idm;
+	struct ixl_aq_phy_abilities *phy;
+	int rv;
+
+	if (ixl_dmamem_alloc(sc, &idm, IXL_AQ_BUFLEN, 0) != 0)
+		return (-2);
+
+	rv = ixl_get_phy_abilities(sc, &idm);
+	if (rv != IXL_AQ_RC_OK) {
+		rv = -1;
+		goto done;
+	}
+
+	phy = IXL_DMA_KVA(&idm);
+
+	rv = phy->module_type[0];
 
 done:
 	ixl_dmamem_free(sc, &idm);
@@ -3263,9 +3979,12 @@ static int
 ixl_get_link_status(struct ixl_softc *sc)
 {
 	struct ixl_aq_desc iaq;
+	struct ixl_aq_link_param *param;
 
 	memset(&iaq, 0, sizeof(iaq));
 	iaq.iaq_opcode = htole16(IXL_AQ_OP_PHY_LINK_STATUS);
+	param = (struct ixl_aq_link_param *)iaq.iaq_param;
+	param->notify = IXL_AQ_LINK_NOTIFY;
 
 	if (ixl_atq_poll(sc, &iaq, 250) != 0) {
 		printf("%s: GET LINK STATUS timeout\n", DEVNAME(sc));
@@ -3281,10 +4000,214 @@ ixl_get_link_status(struct ixl_softc *sc)
 	return (0);
 }
 
+struct ixl_sff_ops {
+	int (*open)(struct ixl_softc *sc, struct if_sffpage *, uint8_t *);
+	int (*get)(struct ixl_softc *sc, struct if_sffpage *, size_t);
+	int (*close)(struct ixl_softc *sc, struct if_sffpage *, uint8_t);
+};
+
+static int
+ixl_sfp_open(struct ixl_softc *sc, struct if_sffpage *sff, uint8_t *page)
+{
+	int error;
+
+	if (sff->sff_addr != IFSFF_ADDR_EEPROM)
+		return (0);
+
+	error = ixl_sff_get_byte(sc, IFSFF_ADDR_EEPROM, 127, page);
+	if (error != 0)
+		return (error);
+	if (*page == sff->sff_page)
+		return (0);
+	error = ixl_sff_set_byte(sc, IFSFF_ADDR_EEPROM, 127, sff->sff_page);
+	if (error != 0)
+		return (error);
+
+	return (0);
+}
+
+static int
+ixl_sfp_get(struct ixl_softc *sc, struct if_sffpage *sff, size_t i)
+{
+	return (ixl_sff_get_byte(sc, sff->sff_addr, i, &sff->sff_data[i]));
+}
+
+static int
+ixl_sfp_close(struct ixl_softc *sc, struct if_sffpage *sff, uint8_t page)
+{
+	int error;
+
+	if (sff->sff_addr != IFSFF_ADDR_EEPROM)
+		return (0);
+
+	if (page == sff->sff_page)
+		return (0);
+
+	error = ixl_sff_set_byte(sc, IFSFF_ADDR_EEPROM, 127, page);
+	if (error != 0)
+		return (error);
+
+	return (0);
+}
+
+static const struct ixl_sff_ops ixl_sfp_ops = {
+	ixl_sfp_open,
+	ixl_sfp_get,
+	ixl_sfp_close,
+};
+
+static int
+ixl_qsfp_open(struct ixl_softc *sc, struct if_sffpage *sff, uint8_t *page)
+{
+	if (sff->sff_addr != IFSFF_ADDR_EEPROM)
+		return (EIO);
+
+	return (0);
+}
+
+static int
+ixl_qsfp_get(struct ixl_softc *sc, struct if_sffpage *sff, size_t i)
+{
+	return (ixl_sff_get_byte(sc, sff->sff_page, i, &sff->sff_data[i]));
+}
+
+static int
+ixl_qsfp_close(struct ixl_softc *sc, struct if_sffpage *sff, uint8_t page)
+{
+	return (0);
+}
+
+static const struct ixl_sff_ops ixl_qsfp_ops = {
+	ixl_qsfp_open,
+	ixl_qsfp_get,
+	ixl_qsfp_close,
+};
+
+static int
+ixl_get_sffpage(struct ixl_softc *sc, struct if_sffpage *sff)
+{
+	const struct ixl_sff_ops *ops;
+	uint8_t page;
+	size_t i;
+	int error;
+
+	switch (ixl_get_module_type(sc)) {
+	case -2:
+		return (ENOMEM);
+	case -1:
+		return (ENXIO);
+	case IXL_SFF8024_ID_SFP:
+		ops = &ixl_sfp_ops;
+		break;
+	case IXL_SFF8024_ID_QSFP:
+	case IXL_SFF8024_ID_QSFP_PLUS:
+	case IXL_SFF8024_ID_QSFP28:
+		ops = &ixl_qsfp_ops;
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+
+	error = (*ops->open)(sc, sff, &page);
+	if (error != 0)
+		return (error);
+
+	for (i = 0; i < sizeof(sff->sff_data); i++) {
+		error = (*ops->get)(sc, sff, i);
+		if (error != 0)
+			return (error);
+	}
+
+	error = (*ops->close)(sc, sff, page);
+
+	return (0);
+}
+
+static int
+ixl_sff_get_byte(struct ixl_softc *sc, uint8_t dev, uint32_t reg, uint8_t *p)
+{
+	struct ixl_atq iatq;
+	struct ixl_aq_desc *iaq;
+	struct ixl_aq_phy_reg_access *param;
+
+	memset(&iatq, 0, sizeof(iatq));
+	iaq = &iatq.iatq_desc;
+	iaq->iaq_opcode = htole16(IXL_AQ_OP_PHY_GET_REGISTER);
+	param = (struct ixl_aq_phy_reg_access *)iaq->iaq_param;
+	param->phy_iface = IXL_AQ_PHY_IF_MODULE;
+	param->dev_addr = dev;
+	htolem32(&param->reg, reg);
+
+	ixl_atq_exec(sc, &iatq, "ixlsffget");
+
+	if (ISSET(sc->sc_ac.ac_if.if_flags, IFF_DEBUG)) {
+		printf("%s: %s(dev 0x%02x, reg 0x%02x) -> %04x\n",
+		    DEVNAME(sc), __func__,
+		    dev, reg, lemtoh16(&iaq->iaq_retval));
+	}
+
+	switch (iaq->iaq_retval) {
+	case htole16(IXL_AQ_RC_OK):
+		break;
+	case htole16(IXL_AQ_RC_EBUSY):
+		return (EBUSY);
+	case htole16(IXL_AQ_RC_ESRCH):
+		return (ENODEV);
+	case htole16(IXL_AQ_RC_EIO):
+	case htole16(IXL_AQ_RC_EINVAL):
+	default:
+		return (EIO);
+	}
+
+	*p = lemtoh32(&param->val);
+
+	return (0);
+}
+
+static int
+ixl_sff_set_byte(struct ixl_softc *sc, uint8_t dev, uint32_t reg, uint8_t v)
+{
+	struct ixl_atq iatq;
+	struct ixl_aq_desc *iaq;
+	struct ixl_aq_phy_reg_access *param;
+
+	memset(&iatq, 0, sizeof(iatq));
+	iaq = &iatq.iatq_desc;
+	iaq->iaq_opcode = htole16(IXL_AQ_OP_PHY_SET_REGISTER);
+	param = (struct ixl_aq_phy_reg_access *)iaq->iaq_param;
+	param->phy_iface = IXL_AQ_PHY_IF_MODULE;
+	param->dev_addr = dev;
+	htolem32(&param->reg, reg);
+	htolem32(&param->val, v);
+
+	ixl_atq_exec(sc, &iatq, "ixlsffset");
+
+	if (ISSET(sc->sc_ac.ac_if.if_flags, IFF_DEBUG)) {
+		printf("%s: %s(dev 0x%02x, reg 0x%02x, val 0x%02x) -> %04x\n",
+		    DEVNAME(sc), __func__,
+		    dev, reg, v, lemtoh16(&iaq->iaq_retval));
+	}
+
+	switch (iaq->iaq_retval) {
+	case htole16(IXL_AQ_RC_OK):
+		break;
+	case htole16(IXL_AQ_RC_EBUSY):
+		return (EBUSY);
+	case htole16(IXL_AQ_RC_ESRCH):
+		return (ENODEV);
+	case htole16(IXL_AQ_RC_EIO):
+	case htole16(IXL_AQ_RC_EINVAL):
+	default:
+		return (EIO);
+	}
+
+	return (0);
+}
+
 static int
 ixl_get_vsi(struct ixl_softc *sc)
 {
-	struct ixl_dmamem *vsi = &sc->sc_vsi;
+	struct ixl_dmamem *vsi = &sc->sc_scratch;
 	struct ixl_aq_desc iaq;
 	struct ixl_aq_vsi_param *param;
 	struct ixl_aq_vsi_reply *reply;
@@ -3310,7 +4233,7 @@ ixl_get_vsi(struct ixl_softc *sc)
 	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(vsi), 0, IXL_DMA_LEN(vsi),
 	    BUS_DMASYNC_POSTREAD);
 
-	if (rv != 0) { 
+	if (rv != 0) {
 		printf("%s: GET VSI timeout\n", DEVNAME(sc));
 		return (-1);
 	}
@@ -3330,7 +4253,7 @@ ixl_get_vsi(struct ixl_softc *sc)
 static int
 ixl_set_vsi(struct ixl_softc *sc)
 {
-	struct ixl_dmamem *vsi = &sc->sc_vsi;
+	struct ixl_dmamem *vsi = &sc->sc_scratch;
 	struct ixl_aq_desc iaq;
 	struct ixl_aq_vsi_param *param;
 	struct ixl_aq_vsi_data *data = IXL_DMA_KVA(vsi);
@@ -3370,7 +4293,7 @@ ixl_set_vsi(struct ixl_softc *sc)
 	bus_dmamap_sync(sc->sc_dmat, IXL_DMA_MAP(vsi), 0, IXL_DMA_LEN(vsi),
 	    BUS_DMASYNC_POSTWRITE);
 
-	if (rv != 0) { 
+	if (rv != 0) {
 		printf("%s: UPDATE VSI timeout\n", DEVNAME(sc));
 		return (-1);
 	}
@@ -3412,7 +4335,7 @@ ixl_search_link_speed(uint8_t link_speed)
 	const struct ixl_speed_type *type;
 	unsigned int i;
 
-	for (i = 0; i < nitems(ixl_phy_type_map); i++) {
+	for (i = 0; i < nitems(ixl_speed_type_map); i++) {
 		type = &ixl_speed_type_map[i];
 
 		if (ISSET(type->dev_speed, link_speed))
@@ -3481,6 +4404,72 @@ ixl_restart_an(struct ixl_softc *sc)
 	}
 
 	return (0);
+}
+
+static int
+ixl_add_macvlan(struct ixl_softc *sc, uint8_t *macaddr, uint16_t vlan, uint16_t flags)
+{
+	struct ixl_aq_desc iaq;
+	struct ixl_aq_add_macvlan *param;
+	struct ixl_aq_add_macvlan_elem *elem;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_flags = htole16(IXL_AQ_BUF | IXL_AQ_RD);
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_ADD_MACVLAN);
+	iaq.iaq_datalen = htole16(sizeof(*elem));
+	ixl_aq_dva(&iaq, IXL_DMA_DVA(&sc->sc_scratch));
+
+	param = (struct ixl_aq_add_macvlan *)&iaq.iaq_param;
+	param->num_addrs = htole16(1);
+	param->seid0 = htole16(0x8000) | sc->sc_seid;
+	param->seid1 = 0;
+	param->seid2 = 0;
+
+	elem = IXL_DMA_KVA(&sc->sc_scratch);
+	memset(elem, 0, sizeof(*elem));
+	memcpy(elem->macaddr, macaddr, ETHER_ADDR_LEN);
+	elem->flags = htole16(IXL_AQ_OP_ADD_MACVLAN_PERFECT_MATCH | flags);
+	elem->vlan = htole16(vlan);
+
+	if (ixl_atq_poll(sc, &iaq, 250) != 0) {
+		printf("%s: ADD_MACVLAN timeout\n", DEVNAME(sc));
+		return (IXL_AQ_RC_EINVAL);
+	}
+
+	return letoh16(iaq.iaq_retval);
+}
+
+static int
+ixl_remove_macvlan(struct ixl_softc *sc, uint8_t *macaddr, uint16_t vlan, uint16_t flags)
+{
+	struct ixl_aq_desc iaq;
+	struct ixl_aq_remove_macvlan *param;
+	struct ixl_aq_remove_macvlan_elem *elem;
+
+	memset(&iaq, 0, sizeof(iaq));
+	iaq.iaq_flags = htole16(IXL_AQ_BUF | IXL_AQ_RD);
+	iaq.iaq_opcode = htole16(IXL_AQ_OP_REMOVE_MACVLAN);
+	iaq.iaq_datalen = htole16(sizeof(*elem));
+	ixl_aq_dva(&iaq, IXL_DMA_DVA(&sc->sc_scratch));
+
+	param = (struct ixl_aq_remove_macvlan *)&iaq.iaq_param;
+	param->num_addrs = htole16(1);
+	param->seid0 = htole16(0x8000) | sc->sc_seid;
+	param->seid1 = 0;
+	param->seid2 = 0;
+
+	elem = IXL_DMA_KVA(&sc->sc_scratch);
+	memset(elem, 0, sizeof(*elem));
+	memcpy(elem->macaddr, macaddr, ETHER_ADDR_LEN);
+	elem->flags = htole16(IXL_AQ_OP_REMOVE_MACVLAN_PERFECT_MATCH | flags);
+	elem->vlan = htole16(vlan);
+
+	if (ixl_atq_poll(sc, &iaq, 250) != 0) {
+		printf("%s: REMOVE_MACVLAN timeout\n", DEVNAME(sc));
+		return (IXL_AQ_RC_EINVAL);
+	}
+
+	return letoh16(iaq.iaq_retval);
 }
 
 static int
@@ -3641,24 +4630,25 @@ ixl_hmc_pack(void *d, const void *s, const struct ixl_hmc_pack *packing,
 		unsigned int inbits = 0;
 
 		if (align) {
-			inbits = *in++;
-
-			*out++ |= inbits << align;
+			inbits = (*in++) << align;
+			*out++ |= (inbits & 0xff);
+			inbits >>= 8;
 
 			width -= 8 - align;
 		}
 
 		while (width >= 8) {
-			inbits <<= 8;
-			inbits |= *in++;
-
-			*out++ = inbits << align;
+			inbits |= (*in++) << align;
+			*out++ = (inbits & 0xff);
+			inbits >>= 8;
 
 			width -= 8;
 		}
 
-		if (width)
-			*out = inbits >> (8 - align);
+		if (width > 0) {
+			inbits |= (*in) << align;
+			*out |= (inbits & ((1 << width) - 1));
+		}
 	}
 }
 
@@ -3716,7 +4706,7 @@ ixl_arq_fill(struct ixl_softc *sc)
 	int post = 0;
 
 	n = if_rxr_get(&sc->sc_arq_ring, IXL_AQ_NUM);
- 	arq = IXL_DMA_KVA(&sc->sc_arq);
+	arq = IXL_DMA_KVA(&sc->sc_arq);
 
 	while (n > 0) {
 		aqb = SIMPLEQ_FIRST(&sc->sc_arq_idle);
@@ -3780,7 +4770,6 @@ ixl_clear_hw(struct ixl_softc *sc)
 	uint32_t num_vfs;
 	uint32_t i, j;
 	uint32_t val;
-	uint32_t eol = 0x7ff;
 
 	/* get number of interrupts, queues, and vfs */
 	val = ixl_rd(sc, I40E_GLPCI_CNF2);
@@ -3816,11 +4805,11 @@ ixl_clear_hw(struct ixl_softc *sc)
 		ixl_wr(sc, I40E_PFINT_DYN_CTLN(i), val);
 
 	/* Set the FIRSTQ_INDX field to 0x7FF in PFINT_LNKLSTx */
-	val = eol << I40E_PFINT_LNKLST0_FIRSTQ_INDX_SHIFT;
+	val = I40E_QUEUE_TYPE_EOL << I40E_PFINT_LNKLST0_FIRSTQ_INDX_SHIFT;
 	ixl_wr(sc, I40E_PFINT_LNKLST0, val);
 	for (i = 0; i < num_pf_int - 2; i++)
 		ixl_wr(sc, I40E_PFINT_LNKLSTN(i), val);
-	val = eol << I40E_VPINT_LNKLST0_FIRSTQ_INDX_SHIFT;
+	val = I40E_QUEUE_TYPE_EOL << I40E_VPINT_LNKLST0_FIRSTQ_INDX_SHIFT;
 	for (i = 0; i < num_vfs; i++)
 		ixl_wr(sc, I40E_VPINT_LNKLST0(i), val);
 	for (i = 0; i < num_vf_int - 2; i++)
@@ -3927,6 +4916,101 @@ ixl_pf_reset(struct ixl_softc *sc)
 	return (0);
 }
 
+static uint32_t
+ixl_710_rd_ctl(struct ixl_softc *sc, uint32_t r)
+{
+	struct ixl_atq iatq;
+	struct ixl_aq_desc *iaq;
+	uint16_t retval;
+
+	memset(&iatq, 0, sizeof(iatq));
+	iaq = &iatq.iatq_desc;
+	iaq->iaq_opcode = htole16(IXL_AQ_OP_RX_CTL_READ);
+	htolem32(&iaq->iaq_param[1], r);
+
+	ixl_atq_exec(sc, &iatq, "ixl710rd");
+
+	retval = lemtoh16(&iaq->iaq_retval);
+	if (retval != IXL_AQ_RC_OK) {
+		printf("%s: %s failed (%u)\n", DEVNAME(sc), __func__, retval);
+		return (~0U);
+	}
+
+	return (lemtoh32(&iaq->iaq_param[3]));
+}
+
+static void
+ixl_710_wr_ctl(struct ixl_softc *sc, uint32_t r, uint32_t v)
+{
+	struct ixl_atq iatq;
+	struct ixl_aq_desc *iaq;
+	uint16_t retval;
+
+	memset(&iatq, 0, sizeof(iatq));
+	iaq = &iatq.iatq_desc;
+	iaq->iaq_opcode = htole16(IXL_AQ_OP_RX_CTL_WRITE);
+	htolem32(&iaq->iaq_param[1], r);
+	htolem32(&iaq->iaq_param[3], v);
+
+	ixl_atq_exec(sc, &iatq, "ixl710wr");
+
+	retval = lemtoh16(&iaq->iaq_retval);
+	if (retval != IXL_AQ_RC_OK) {
+		printf("%s: %s %08x=%08x failed (%u)\n",
+		    DEVNAME(sc), __func__, r, v, retval);
+	}
+}
+
+static int
+ixl_710_set_rss_key(struct ixl_softc *sc, const struct ixl_rss_key *rsskey)
+{
+	unsigned int i;
+
+	for (i = 0; i < nitems(rsskey->key); i++)
+		ixl_wr_ctl(sc, I40E_PFQF_HKEY(i), rsskey->key[i]);
+
+	return (0);
+}
+
+static int
+ixl_710_set_rss_lut(struct ixl_softc *sc, const struct ixl_rss_lut_128 *lut)
+{
+	unsigned int i;
+
+	for (i = 0; i < nitems(lut->entries); i++)
+		ixl_wr(sc, I40E_PFQF_HLUT(i), lut->entries[i]);
+
+	return (0);
+}
+
+static uint32_t
+ixl_722_rd_ctl(struct ixl_softc *sc, uint32_t r)
+{
+	return (ixl_rd(sc, r));
+}
+
+static void
+ixl_722_wr_ctl(struct ixl_softc *sc, uint32_t r, uint32_t v)
+{
+	ixl_wr(sc, r, v);
+}
+
+static int
+ixl_722_set_rss_key(struct ixl_softc *sc, const struct ixl_rss_key *rsskey)
+{
+	/* XXX */
+
+	return (0);
+}
+
+static int
+ixl_722_set_rss_lut(struct ixl_softc *sc, const struct ixl_rss_lut_128 *lut)
+{
+	/* XXX */
+
+	return (0);
+}
+
 static int
 ixl_dmamem_alloc(struct ixl_softc *sc, struct ixl_dmamem *ixm,
     bus_size_t size, u_int align)
@@ -3967,3 +5051,278 @@ ixl_dmamem_free(struct ixl_softc *sc, struct ixl_dmamem *ixm)
 	bus_dmamem_free(sc->sc_dmat, &ixm->ixm_seg, 1);
 	bus_dmamap_destroy(sc->sc_dmat, ixm->ixm_map);
 }
+
+#if NKSTAT > 0
+
+CTASSERT(KSTAT_KV_U_NONE <= 0xffU);
+CTASSERT(KSTAT_KV_U_PACKETS <= 0xffU);
+CTASSERT(KSTAT_KV_U_BYTES <= 0xffU);
+
+struct ixl_counter {
+	const char		*c_name;
+	uint32_t		 c_base;
+	uint8_t			 c_width;
+	uint8_t			 c_type;
+};
+
+const struct ixl_counter ixl_port_counters[] = {
+	/* GORC */
+	{ "rx bytes",		0x00300000, 48, KSTAT_KV_U_BYTES },
+	/* MLFC */
+	{ "mac local errs",	0x00300020, 32, KSTAT_KV_U_NONE },
+	/* MRFC */
+	{ "mac remote errs",	0x00300040, 32, KSTAT_KV_U_NONE },
+	/* MSPDC */
+	{ "mac short",		0x00300060, 32, KSTAT_KV_U_PACKETS },
+	/* CRCERRS */
+	{ "crc errs",		0x00300080, 32, KSTAT_KV_U_PACKETS },
+	/* RLEC */
+	{ "rx len errs",	0x003000a0, 32, KSTAT_KV_U_PACKETS },
+	/* ERRBC */
+	{ "byte errs",		0x003000c0, 32, KSTAT_KV_U_PACKETS },
+	/* ILLERRC */
+	{ "illegal byte",	0x003000d0, 32, KSTAT_KV_U_PACKETS },
+	/* RUC */
+	{ "rx undersize",	0x00300100, 32, KSTAT_KV_U_PACKETS },
+	/* ROC */
+	{ "rx oversize",	0x00300120, 32, KSTAT_KV_U_PACKETS },
+	/* LXONRXCNT */
+	{ "rx link xon",	0x00300140, 32, KSTAT_KV_U_PACKETS },
+	/* LXOFFRXCNT */
+	{ "rx link xoff",	0x00300160, 32, KSTAT_KV_U_PACKETS },
+
+	/* Priority XON Received Count */
+	/* Priority XOFF Received Count */
+	/* Priority XON to XOFF Count */
+
+	/* PRC64 */
+	{ "rx 64B",		0x00300480, 48, KSTAT_KV_U_PACKETS },
+	/* PRC127 */
+	{ "rx 65-127B",		0x003004A0, 48, KSTAT_KV_U_PACKETS },
+	/* PRC255 */
+	{ "rx 128-255B",	0x003004C0, 48, KSTAT_KV_U_PACKETS },
+	/* PRC511 */
+	{ "rx 256-511B",	0x003004E0, 48, KSTAT_KV_U_PACKETS },
+	/* PRC1023 */
+	{ "rx 512-1023B",	0x00300500, 48, KSTAT_KV_U_PACKETS },
+	/* PRC1522 */
+	{ "rx 1024-1522B",	0x00300520, 48, KSTAT_KV_U_PACKETS },
+	/* PRC9522 */
+	{ "rx 1523-9522B",	0x00300540, 48, KSTAT_KV_U_PACKETS },
+	/* ROC */
+	{ "rx fragment",	0x00300560, 32, KSTAT_KV_U_PACKETS },
+	/* RJC */
+	{ "rx jabber",		0x00300580, 32, KSTAT_KV_U_PACKETS },
+	/* UPRC */
+	{ "rx ucasts",		0x003005a0, 48, KSTAT_KV_U_PACKETS },
+	/* MPRC */
+	{ "rx mcasts",		0x003005c0, 48, KSTAT_KV_U_PACKETS },
+	/* BPRC */
+	{ "rx bcasts",		0x003005e0, 48, KSTAT_KV_U_PACKETS },
+	/* RDPC */
+	{ "rx discards",	0x00300600, 32, KSTAT_KV_U_PACKETS },
+	/* LDPC */
+	{ "rx lo discards",	0x00300620, 32, KSTAT_KV_U_PACKETS },
+	/* RUPP */
+	{ "rx no dest",		0x00300660, 32, KSTAT_KV_U_PACKETS },
+
+	/* GOTC */
+	{ "tx bytes",		0x00300680, 48, KSTAT_KV_U_BYTES },
+	/* PTC64 */
+	{ "tx 64B",		0x003006A0, 48, KSTAT_KV_U_PACKETS },
+	/* PTC127 */
+	{ "tx 65-127B",		0x003006C0, 48, KSTAT_KV_U_PACKETS },
+	/* PTC255 */
+	{ "tx 128-255B",	0x003006E0, 48, KSTAT_KV_U_PACKETS },
+	/* PTC511 */
+	{ "tx 256-511B",	0x00300700, 48, KSTAT_KV_U_PACKETS },
+	/* PTC1023 */
+	{ "tx 512-1023B",	0x00300720, 48, KSTAT_KV_U_PACKETS },
+	/* PTC1522 */
+	{ "tx 1024-1522B",	0x00300740, 48, KSTAT_KV_U_PACKETS },
+	/* PTC9522 */
+	{ "tx 1523-9522B",	0x00300760, 48, KSTAT_KV_U_PACKETS },
+
+	/* Priority XON Transmitted Count */
+	/* Priority XOFF Transmitted Count */
+
+	/* LXONTXC */
+	{ "tx link xon",	0x00300980, 48, KSTAT_KV_U_PACKETS },
+	/* LXOFFTXC */
+	{ "tx link xoff",	0x003009a0, 48, KSTAT_KV_U_PACKETS },
+	/* UPTC */
+	{ "tx ucasts",		0x003009c0, 48, KSTAT_KV_U_PACKETS },
+	/* MPTC */
+	{ "tx mcasts",		0x003009e0, 48, KSTAT_KV_U_PACKETS },
+	/* BPTC */
+	{ "tx bcasts",		0x00300a00, 48, KSTAT_KV_U_PACKETS },
+	/* TDOLD */
+	{ "tx link down",	0x00300a20, 48, KSTAT_KV_U_PACKETS },
+};
+
+const struct ixl_counter ixl_vsi_counters[] = {
+	/* VSI RDPC */
+	{ "rx discards",	0x00310000, 32, KSTAT_KV_U_PACKETS },
+	/* VSI GOTC */
+	{ "tx bytes",		0x00328000, 48, KSTAT_KV_U_BYTES },
+	/* VSI UPTC */
+	{ "tx ucasts",		0x0033c000, 48, KSTAT_KV_U_PACKETS },
+	/* VSI MPTC */
+	{ "tx mcasts",		0x0033cc00, 48, KSTAT_KV_U_PACKETS },
+	/* VSI BPTC */
+	{ "tx bcasts",		0x0033d800, 48, KSTAT_KV_U_PACKETS },
+	/* VSI TEPC */
+	{ "tx errs",		0x00344000, 48, KSTAT_KV_U_PACKETS },
+	/* VSI TDPC */
+	{ "tx discards",	0x00348000, 48, KSTAT_KV_U_PACKETS },
+	/* VSI GORC */
+	{ "rx bytes",		0x00358000, 48, KSTAT_KV_U_BYTES },
+	/* VSI UPRC */
+	{ "rx ucasts",		0x0036c000, 48, KSTAT_KV_U_PACKETS },
+	/* VSI MPRC */
+	{ "rx mcasts",		0x0036cc00, 48, KSTAT_KV_U_PACKETS },
+	/* VSI BPRC */
+	{ "rx bcasts",		0x0036d800, 48, KSTAT_KV_U_PACKETS },
+	/* VSI RUPP */
+	{ "rx noproto",		0x0036e400, 32, KSTAT_KV_U_PACKETS },
+};
+
+struct ixl_counter_state {
+	const struct ixl_counter
+				*counters;
+	uint64_t		*values;
+	size_t			 n;
+	uint32_t		 index;
+	unsigned int		 gen;
+};
+
+static void
+ixl_rd_counters(struct ixl_softc *sc, const struct ixl_counter_state *state,
+    uint64_t *vs)
+{
+	const struct ixl_counter *c;
+	bus_addr_t r;
+	uint64_t v;
+	size_t i;
+
+	for (i = 0; i < state->n; i++) {
+		c = &state->counters[i];
+
+		r = c->c_base + (state->index * 8);
+
+		if (c->c_width == 32)
+			v = bus_space_read_4(sc->sc_memt, sc->sc_memh, r);
+		else
+			v = bus_space_read_8(sc->sc_memt, sc->sc_memh, r);
+
+		vs[i] = v;
+	}
+}
+
+static int
+ixl_kstat_read(struct kstat *ks)
+{
+	struct ixl_softc *sc = ks->ks_softc;
+	struct kstat_kv *kvs = ks->ks_data;
+	struct ixl_counter_state *state = ks->ks_ptr;
+	unsigned int gen = (state->gen++) & 1;
+	uint64_t *ovs = state->values + (gen * state->n);
+	uint64_t *nvs = state->values + (!gen * state->n);
+	size_t i;
+
+	ixl_rd_counters(sc, state, nvs);
+	getnanouptime(&ks->ks_updated);
+
+	for (i = 0; i < state->n; i++) {
+		const struct ixl_counter *c = &state->counters[i];
+		uint64_t n = nvs[i], o = ovs[i];
+
+		if (c->c_width < 64) {
+			if (n < o)
+				n += (1ULL << c->c_width);
+		}
+
+		kstat_kv_u64(&kvs[i]) += (n - o);
+	}
+
+	return (0);
+}
+
+static void
+ixl_kstat_tick(void *arg)
+{
+	struct ixl_softc *sc = arg;
+
+	timeout_add_sec(&sc->sc_kstat_tmo, 4);
+
+	mtx_enter(&sc->sc_kstat_mtx);
+
+	ixl_kstat_read(sc->sc_port_kstat);
+	ixl_kstat_read(sc->sc_vsi_kstat);
+
+	mtx_leave(&sc->sc_kstat_mtx);
+}
+
+static struct kstat *
+ixl_kstat_create(struct ixl_softc *sc, const char *name,
+    const struct ixl_counter *counters, size_t n, uint32_t index)
+{
+	struct kstat *ks;
+	struct kstat_kv *kvs;
+	struct ixl_counter_state *state;
+	const struct ixl_counter *c;
+	unsigned int i;
+
+	ks = kstat_create(DEVNAME(sc), 0, name, 0, KSTAT_T_KV, 0);
+	if (ks == NULL) {
+		/* unable to create kstats */
+		return (NULL);
+	}
+
+	kvs = mallocarray(n, sizeof(*kvs), M_DEVBUF, M_WAITOK|M_ZERO);
+	for (i = 0; i < n; i++) {
+		c = &counters[i];
+
+		kstat_kv_unit_init(&kvs[i], c->c_name,
+		    KSTAT_KV_T_COUNTER64, c->c_type);
+	}
+
+	ks->ks_data = kvs;
+	ks->ks_datalen = n * sizeof(*kvs);
+	ks->ks_read = ixl_kstat_read;
+
+	state = malloc(sizeof(*state), M_DEVBUF, M_WAITOK|M_ZERO);
+	state->counters = counters;
+	state->n = n;
+	state->values = mallocarray(n * 2, sizeof(*state->values),
+	    M_DEVBUF, M_WAITOK|M_ZERO);
+	state->index = index;
+	ks->ks_ptr = state;
+
+	kstat_set_mutex(ks, &sc->sc_kstat_mtx);
+	ks->ks_softc = sc;
+	kstat_install(ks);
+
+	/* fetch a baseline */
+	ixl_rd_counters(sc, state, state->values);
+
+	return (ks);
+}
+
+static void
+ixl_kstat_attach(struct ixl_softc *sc)
+{
+	mtx_init(&sc->sc_kstat_mtx, IPL_SOFTCLOCK);
+	timeout_set(&sc->sc_kstat_tmo, ixl_kstat_tick, sc);
+
+	sc->sc_port_kstat = ixl_kstat_create(sc, "ixl-port",
+	    ixl_port_counters, nitems(ixl_port_counters), sc->sc_port);
+	sc->sc_vsi_kstat = ixl_kstat_create(sc, "ixl-vsi",
+	    ixl_vsi_counters, nitems(ixl_vsi_counters),
+	    lemtoh16(&sc->sc_vsi_number));
+
+	/* ixl counters go up even when the interface is down */
+	timeout_add_sec(&sc->sc_kstat_tmo, 4);
+}
+
+#endif /* NKSTAT > 0 */

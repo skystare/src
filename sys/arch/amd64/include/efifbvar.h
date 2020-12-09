@@ -1,4 +1,4 @@
-/*	$OpenBSD: efifbvar.h,v 1.7 2018/04/25 00:46:28 jsg Exp $	*/
+/*	$OpenBSD: efifbvar.h,v 1.10 2019/05/04 11:34:47 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2015 YASUOKA Masahiko <yasuoka@yasuoka.net>
@@ -26,11 +26,15 @@ struct efifb_attach_args {
 struct pci_attach_args;
 
 int efifb_cnattach(void);
+void efifb_cnremap(void);
 int efifb_is_console(struct pci_attach_args *);
-void efifb_cndetach(void);
-void efifb_cnreattach(void);
+int efifb_is_primary(struct pci_attach_args *);
+void efifb_detach(void);
+void efifb_reattach(void);
 
 int efifb_cb_found(void);
 int efifb_cb_cnattach(void);
+
+psize_t efifb_stolen(void);
 
 #endif /* _MACHINE_EFIFB_H_ */

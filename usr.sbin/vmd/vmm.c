@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmm.c,v 1.89 2018/09/10 10:39:26 bluhm Exp $	*/
+/*	$OpenBSD: vmm.c,v 1.96 2020/04/30 03:50:53 pd Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -109,7 +109,7 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	struct vmop_id		 vid;
 	struct vmop_result	 vmr;
 	struct vmop_create_params vmc;
-	uint32_t		 id = 0;
+	uint32_t		 id = 0, peerid = imsg->hdr.peerid;
 	pid_t			 pid = 0;
 	unsigned int		 mode, flags;
 
@@ -149,6 +149,30 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 			res = ENOENT;
 		cmd = IMSG_VMDOP_START_VM_RESPONSE;
 		break;
+	case IMSG_VMDOP_WAIT_VM_REQUEST:
+		IMSG_SIZE_CHECK(imsg, &vid);
+		memcpy(&vid, imsg->data, sizeof(vid));
+		id = vid.vid_id;
+
+		DPRINTF("%s: recv'ed WAIT_VM for %d", __func__, id);
+
+		cmd = IMSG_VMDOP_TERMINATE_VM_RESPONSE;
+		if (id == 0) {
+			res = ENOENT;
+		} else if ((vm = vm_getbyvmid(id)) != NULL) {
+			if (vm->vm_peerid != (uint32_t)-1) {
+				peerid = vm->vm_peerid;
+				res = EINTR;
+			} else
+				cmd = 0;
+			vm->vm_peerid = imsg->hdr.peerid;
+		} else {
+			/* vm doesn't exist, cannot stop vm */
+			log_debug("%s: cannot stop vm that is not running",
+			    __func__);
+			res = VMD_VM_STOP_INVALID;
+		}
+		break;
 	case IMSG_VMDOP_TERMINATE_VM_REQUEST:
 		IMSG_SIZE_CHECK(imsg, &vid);
 		memcpy(&vid, imsg->data, sizeof(vid));
@@ -164,10 +188,10 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		} else if ((vm = vm_getbyvmid(id)) != NULL) {
 			if (flags & VMOP_FORCE) {
 				vtp.vtp_vm_id = vm_vmid2id(vm->vm_vmid, vm);
-				vm->vm_shutdown = 1;
+				vm->vm_state |= VM_STATE_SHUTDOWN;
 				(void)terminate_vm(&vtp);
 				res = 0;
-			} else if (vm->vm_shutdown == 0) {
+			} else if (!(vm->vm_state & VM_STATE_SHUTDOWN)) {
 				log_debug("%s: sending shutdown request"
 				    " to vm %d", __func__, id);
 
@@ -178,7 +202,7 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 				 * avoid being stuck in the ACPI-less powerdown
 				 * ("press any key to reboot") of the VM.
 				 */
-				vm->vm_shutdown = 1;
+				vm->vm_state |= VM_STATE_SHUTDOWN;
 				if (imsg_compose_event(&vm->vm_iev,
 				    IMSG_VMDOP_VM_REBOOT,
 				    0, 0, -1, NULL, 0) == -1)
@@ -198,9 +222,13 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 				}
 			}
 			if ((flags & VMOP_WAIT) &&
-			    res == 0 && vm->vm_shutdown == 1) {
+			    res == 0 && (vm->vm_state & VM_STATE_SHUTDOWN)) {
+				if (vm->vm_peerid != (uint32_t)-1) {
+					peerid = vm->vm_peerid;
+					res = EINTR;
+				} else
+					cmd = 0;
 				vm->vm_peerid = imsg->hdr.peerid;
-				cmd = 0;
 			}
 		} else {
 			/* vm doesn't exist, cannot stop vm */
@@ -287,7 +315,8 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		ret = vm_register(ps, &vmc, &vm,
 		    imsg->hdr.peerid, vmc.vmc_owner.uid);
 		vm->vm_tty = imsg->fd;
-		vm->vm_received = 1;
+		vm->vm_state |= VM_STATE_RECEIVED;
+		vm->vm_state |= VM_STATE_PAUSED;
 		break;
 	case IMSG_VMDOP_RECEIVE_VM_END:
 		if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
@@ -329,12 +358,12 @@ vmm_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		vmr.vmr_id = id;
 		vmr.vmr_pid = pid;
 		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd,
-		    imsg->hdr.peerid, -1, &vmr, sizeof(vmr)) == -1)
+		    peerid, -1, &vmr, sizeof(vmr)) == -1)
 			return (-1);
 		break;
 	default:
 		if (proc_compose_imsg(ps, PROC_PARENT, -1, cmd,
-		    imsg->hdr.peerid, -1, &res, sizeof(res)) == -1)
+		    peerid, -1, &res, sizeof(res)) == -1)
 			return (-1);
 		break;
 	}
@@ -376,7 +405,7 @@ vmm_sighdlr(int sig, short event, void *arg)
 					ret = WEXITSTATUS(status);
 
 				/* don't reboot on pending shutdown */
-				if (ret == EAGAIN && vm->vm_shutdown)
+				if (ret == EAGAIN && (vm->vm_state & VM_STATE_SHUTDOWN))
 					ret = 0;
 
 				vmid = vm->vm_params.vmc_params.vcp_id;
@@ -501,17 +530,13 @@ vmm_dispatch_vm(int fd, short event, void *arg)
 
 		switch (imsg.hdr.type) {
 		case IMSG_VMDOP_VM_SHUTDOWN:
-			vm->vm_shutdown = 1;
+			vm->vm_state |= VM_STATE_SHUTDOWN;
 			break;
 		case IMSG_VMDOP_VM_REBOOT:
-			vm->vm_shutdown = 0;
+			vm->vm_state &= ~VM_STATE_SHUTDOWN;
 			break;
 		case IMSG_VMDOP_SEND_VM_RESPONSE:
 			IMSG_SIZE_CHECK(&imsg, &vmr);
-			memcpy(&vmr, imsg.data, sizeof(vmr));
-			if (!vmr.vmr_result) {
-				vm_remove(vm, __func__);
-			}
 		case IMSG_VMDOP_PAUSE_VM_RESPONSE:
 		case IMSG_VMDOP_UNPAUSE_VM_RESPONSE:
 			for (i = 0; i < sizeof(procs); i++) {
@@ -562,7 +587,7 @@ terminate_vm(struct vm_terminate_params *vtp)
  * Opens the next available tap device, up to MAX_TAP.
  *
  * Parameters
- *  ifname: an optional buffer of at least IF_NAMESIZE bytes.
+ *  ifname: a buffer of at least IF_NAMESIZE bytes.
  *
  * Returns a file descriptor to the tap node opened, or -1 if no tap
  * devices were available.
@@ -573,16 +598,15 @@ opentap(char *ifname)
 	int i, fd;
 	char path[PATH_MAX];
 
-	strlcpy(ifname, "tap", IF_NAMESIZE);
 	for (i = 0; i < MAX_TAP; i++) {
 		snprintf(path, PATH_MAX, "/dev/tap%d", i);
 		fd = open(path, O_RDWR | O_NONBLOCK);
 		if (fd != -1) {
-			if (ifname != NULL)
-				snprintf(ifname, IF_NAMESIZE, "tap%d", i);
+			snprintf(ifname, IF_NAMESIZE, "tap%d", i);
 			return (fd);
 		}
 	}
+	strlcpy(ifname, "tap", IF_NAMESIZE);
 
 	return (-1);
 }
@@ -608,7 +632,7 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 	struct vmd_vm		*vm;
 	int			 ret = EINVAL;
 	int			 fds[2];
-	size_t			 i;
+	size_t			 i, j;
 
 	if ((vm = vm_getbyvmid(imsg->hdr.peerid)) == NULL) {
 		log_warnx("%s: can't find vm", __func__);
@@ -617,7 +641,7 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 	}
 	vcp = &vm->vm_params.vmc_params;
 
-	if (!vm->vm_received) {
+	if (!(vm->vm_state & VM_STATE_RECEIVED)) {
 		if ((vm->vm_tty = imsg->fd) == -1) {
 			log_warnx("%s: can't get tty", __func__);
 			goto err;
@@ -643,8 +667,11 @@ vmm_start_vm(struct imsg *imsg, uint32_t *id, pid_t *pid)
 		close(fds[1]);
 
 		for (i = 0 ; i < vcp->vcp_ndisks; i++) {
-			close(vm->vm_disks[i]);
-			vm->vm_disks[i] = -1;
+			for (j = 0; j < VM_MAX_BASE_PER_DISK; j++) {
+				if (vm->vm_disks[i][j] != -1)
+					close(vm->vm_disks[i][j]);
+				vm->vm_disks[i][j] = -1;
+			}
 		}
 		for (i = 0 ; i < vcp->vcp_nnics; i++) {
 			close(vm->vm_ifs[i].vif_fd);
@@ -738,7 +765,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 	memset(&vir, 0, sizeof(vir));
 
 	/* First ioctl to see how many bytes needed (vip.vip_size) */
-	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) < 0)
+	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) == -1)
 		return (errno);
 
 	if (vip.vip_info_ct != 0)
@@ -750,7 +777,7 @@ get_info_vm(struct privsep *ps, struct imsg *imsg, int terminate)
 
 	/* Second ioctl to get the actual list */
 	vip.vip_info = info;
-	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) < 0) {
+	if (ioctl(env->vmd_fd, VMM_IOC_INFO, &vip) == -1) {
 		ret = errno;
 		free(info);
 		return (ret);

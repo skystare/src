@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.h,v 1.63 2016/05/07 22:46:54 kettenis Exp $	*/
+/*	$OpenBSD: cpu.h,v 1.68 2020/06/05 14:25:05 naddy Exp $	*/
 /*	$NetBSD: cpu.h,v 1.1 1996/09/30 16:34:21 ws Exp $	*/
 
 /*
@@ -38,6 +38,7 @@
 
 #include <sys/device.h>
 #include <sys/sched.h>
+#include <sys/srp.h>
 
 struct cpu_info {
 	struct device *ci_dev;		/* our device */
@@ -159,6 +160,16 @@ extern int ppc_proc_is_64b;
 extern int ppc_nobat;
 
 void	cpu_bootstrap(void);
+
+static inline unsigned int
+cpu_rnd_messybits(void)
+{
+	unsigned int hi, lo;
+
+	__asm volatile("mftbu %0; mftb %1" : "=r" (hi), "=r" (lo));
+
+	return (hi ^ lo);
+}
 
 /*
  * This is used during profiling to integrate system time.
@@ -335,7 +346,7 @@ ppc_mftb(void)
 	u_long scratch;
 	u_int64_t tb;
 
-	__asm volatile ("1: mftbu %0; mftb %0+1; mftbu %1;"
+	__asm volatile ("1: mftbu %0; mftb %L0; mftbu %1;"
 	    " cmpw 0,%0,%1; bne 1b" : "=r"(tb), "=r"(scratch));
 	return tb;
 }
@@ -407,6 +418,18 @@ ppc_intr_disable(void)
 	dmsr = emsr & ~PSL_EE;
 	ppc_mtmsr(dmsr);
 	return (emsr & PSL_EE);
+}
+
+static __inline u_long
+intr_disable(void)
+{
+	return ppc_intr_disable();
+}
+
+static __inline void
+intr_restore(u_long s)
+{
+	ppc_intr_enable(s);
 }
 
 int ppc_cpuspeed(int *);

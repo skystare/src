@@ -1,4 +1,4 @@
-/*	$OpenBSD: in6.h,v 1.103 2018/09/11 21:04:03 bluhm Exp $	*/
+/*	$OpenBSD: in6.h,v 1.107 2020/08/24 16:40:07 gnezdo Exp $	*/
 /*	$KAME: in6.h,v 1.83 2001/03/29 02:55:07 jinmei Exp $	*/
 
 /*
@@ -280,11 +280,11 @@ struct route_in6 {
 
 #define IFA6_IS_DEPRECATED(a) \
 	((a)->ia6_lifetime.ia6t_pltime != ND6_INFINITE_LIFETIME && \
-	 (u_int32_t)((time_uptime - (a)->ia6_updatetime)) > \
+	 (u_int32_t)((getuptime() - (a)->ia6_updatetime)) > \
 	 (a)->ia6_lifetime.ia6t_pltime)
 #define IFA6_IS_INVALID(a) \
 	((a)->ia6_lifetime.ia6t_vltime != ND6_INFINITE_LIFETIME && \
-	 (u_int32_t)((time_uptime - (a)->ia6_updatetime)) > \
+	 (u_int32_t)((getuptime() - (a)->ia6_updatetime)) > \
 	 (a)->ia6_lifetime.ia6t_vltime)
 
 #endif /* _KERNEL */
@@ -408,18 +408,22 @@ extern const u_char inet6ctlerrmap[];
 extern const struct in6_addr zeroin6_addr;
 
 struct mbuf;
+struct sockaddr;
+struct sockaddr_in6;
+struct ifaddr;
+struct in6_ifaddr;
 struct ifnet;
-struct cmsghdr;
 
 void	ipv6_input(struct ifnet *, struct mbuf *);
 
-int	in6_cksum(struct mbuf *, u_int8_t, u_int32_t, u_int32_t);
+int	in6_cksum(struct mbuf *, uint8_t, uint32_t, uint32_t);
 void	in6_proto_cksum_out(struct mbuf *, struct ifnet *);
 int	in6_localaddr(struct in6_addr *);
 int	in6_addrscope(struct in6_addr *);
 struct	in6_ifaddr *in6_ifawithscope(struct ifnet *, struct in6_addr *, u_int);
 int	in6_mask2len(struct in6_addr *, u_char *);
 int	in6_nam2sin6(const struct mbuf *, struct sockaddr_in6 **);
+int	in6_sa2sin6(struct sockaddr *, struct sockaddr_in6 **);
 
 struct inpcb;
 
@@ -427,11 +431,6 @@ int	in6_embedscope(struct in6_addr *, const struct sockaddr_in6 *,
 	    struct inpcb *);
 void	in6_recoverscope(struct sockaddr_in6 *, const struct in6_addr *);
 void	in6_clearscope(struct in6_addr *);
-
-struct sockaddr;
-struct sockaddr_in6;
-struct ifaddr;
-struct in6_ifaddr;
 
 /*
  * Convert between address family specific and general structs.
@@ -652,63 +651,6 @@ ifatoia6(struct ifaddr *ifa)
 	{ "mrtmif", CTLTYPE_STRUCT }, \
 	{ "mrtmfc", CTLTYPE_STRUCT }, \
 	{ "soiikey", CTLTYPE_STRING }, /* binary string */ \
-}
-
-#define IPV6CTL_VARS { \
-	NULL, \
-	&ip6_forwarding, \
-	&ip6_sendredirects, \
-	&ip6_defhlim, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	&ip6_maxfragpackets, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	&ip6_log_interval, \
-	&ip6_hdrnestlimit, \
-	&ip6_dad_count, \
-	&ip6_auto_flowlabel, \
-	&ip6_defmcasthlim, \
-	NULL, \
-	NULL, \
-	&ip6_use_deprecated, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	&ip6_maxfrags, \
-	&ip6_mforwarding, \
-	&ip6_multipath, \
-	&ip6_mcast_pmtu, \
-	&ip6_neighborgcthresh, \
-	NULL, \
-	NULL, \
-	&ip6_maxdynroutes, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
 }
 
 __BEGIN_DECLS

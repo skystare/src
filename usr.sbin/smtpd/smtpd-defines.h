@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd-defines.h,v 1.9 2018/05/24 13:03:11 gilles Exp $	*/
+/*	$OpenBSD: smtpd-defines.h,v 1.12 2020/02/24 16:16:08 millert Exp $	*/
 
 /*
  * Copyright (c) 2013 Gilles Chehade <gilles@poolp.org>
@@ -30,12 +30,15 @@
 
 /* buffer size for virtual username (can be email addresses) */
 #define	SMTPD_VUSERNAME_SIZE	 (255 + 1)
+#define	SMTPD_SUBADDRESS_SIZE	 (255 + 1)
 
 #define SMTPD_USER		"_smtpd"
 #define PATH_CHROOT		"/var/empty"
 #define SMTPD_QUEUE_USER	"_smtpq"
 #define SMTPD_QUEUE_GROUP	"_smtpq"
 #define PATH_SPOOL		"/var/spool/smtpd"
+#define	PATH_MAILLOCAL		"/usr/libexec/mail.local"
+#define PATH_MAKEMAP		"/usr/sbin/makemap"
 
 #define SUBADDRESSING_DELIMITER	"+"
 

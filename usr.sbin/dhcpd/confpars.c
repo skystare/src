@@ -1,4 +1,4 @@
-/*	$OpenBSD: confpars.c,v 1.33 2017/04/24 14:58:36 krw Exp $ */
+/*	$OpenBSD: confpars.c,v 1.36 2020/04/23 15:00:27 krw Exp $ */
 
 /*
  * Copyright (c) 1995, 1996, 1997 The Internet Software Consortium.
@@ -43,8 +43,11 @@
 
 #include <net/if.h>
 
+#include <limits.h>
 #include <netdb.h>
+#include <resolv.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -850,40 +853,40 @@ parse_group_declaration(FILE *cfile, struct group *group)
  * bit-count :== 0..32
  */
 int
-parse_cidr(FILE *cfile, unsigned char *addr, unsigned char *prefix)
+parse_cidr(FILE *cfile, unsigned char *subnet, unsigned char *subnetlen)
 {
-	const char *errstr;
-	char *val;
-	int token;
-	int len = 4;
+	uint8_t		 cidr[5];
+	const char	*errstr;
+	char		*val;
+	long long	 numval;
+	unsigned int	 i;
+	int		 token;
 
-	token = peek_token(&val, cfile);
+	memset(cidr, 0, sizeof(cidr));
+	i = 1;	/* Last four octets hold subnet, first octet the # of bits. */
+	do {
+		token = next_token(&val, cfile);
+		if (i == 0)
+			numval = strtonum(val, 0, 32, &errstr);
+		else
+			numval = strtonum(val, 0, UINT8_MAX, &errstr);
+		if (errstr != NULL)
+			break;
+		cidr[i++] = numval;
+		if (i == 1) {
+			memcpy(subnet, &cidr[1], 4); /* XXX Need cidr_t */
+			*subnetlen = cidr[0];
+			return 1;
+		}
+		token = next_token(NULL, cfile);
+		if (token == '/')
+			i = 0;
+		if (i == sizeof(cidr))
+			break;
+	} while (token == '.' || token == '/');
 
-	if (!parse_numeric_aggregate(cfile, addr, &len, '.', 10, 8)) {
-		parse_warn("Expecting CIDR subnet");
-		goto nocidr;
-	}
+	parse_warn("expecting IPv4 CIDR block.");
 
-	token = next_token(&val, cfile);
-	if (token != '/') {
-		parse_warn("Expecting '/'");
-		goto nocidr;
-	}
-
-	token = next_token(&val, cfile);
-
-	if (token == TOK_NUMBER_OR_NAME)
-		*prefix = strtonum(val, 0, 32, &errstr);
-
-	if (token != TOK_NUMBER_OR_NAME || errstr) {
-		*prefix = 0;
-		parse_warn("Expecting CIDR prefix length, got '%s'", val);
-		goto nocidr;
-	}
-
-	return 1;
-
-nocidr:
 	if (token != ';')
 		skip_to_semi(cfile);
 	return 0;
@@ -1207,6 +1210,12 @@ parse_option_param(FILE *cfile, struct group *group)
 					tree = tree_concat(tree, tree_const(
 					    buf, (cprefix + 7) / 8));
 				break;
+			case 'D':
+				t = parse_domain_and_comp(cfile);
+				if (!t)
+					return;
+				tree = tree_concat(tree, t);
+				break;
 			default:
 				log_warnx("Bad format %c in "
 				    "parse_option_param.", *fmt);
@@ -1467,4 +1476,91 @@ parse_address_range(FILE *cfile, struct subnet *subnet)
 
 	/* Create the new address range. */
 	new_address_range(low, high, subnet, dynamic);
+}
+
+static void
+push_domain_list(char ***domains, size_t *count, char *domain)
+{
+	*domains = reallocarray(*domains, *count + 1, sizeof **domains);
+	if (!*domains)
+		fatalx("Can't allocate domain list");
+
+	(*domains)[*count] = domain;
+	++*count;
+}
+
+static void
+free_domain_list(char **domains, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		free(domains[i]);
+	free(domains);
+}
+
+struct tree *
+parse_domain_and_comp(FILE *cfile)
+{
+	struct tree	 *rv = NULL;
+	char		**domains = NULL;
+	char		 *val, *domain;
+	unsigned char	 *buf = NULL;
+	unsigned char	**bufptrs = NULL;
+	size_t		  bufsiz = 0, bufn = 0, count = 0, i;
+	int		  token = ';';
+
+	do {
+		if (token == ',')
+			token = next_token(&val, cfile);
+
+		token = next_token(&val, cfile);
+		if (token != TOK_STRING) {
+			parse_warn("string expected");
+			goto error;
+		}
+		domain = strdup(val);
+		if (domain == NULL)
+			fatalx("Can't allocate domain to compress");
+		push_domain_list(&domains, &count, domain);
+
+		/*
+		 * openbsd.org normally compresses to [7]openbsd[3]org[0].
+		 * +2 to string length provides space for leading and
+		 * trailing (root) prefix lengths not already accounted for
+		 * by dots, and also provides sufficient space for pointer
+		 * compression.
+		 */
+		bufsiz = bufsiz + 2 + strlen(domain);
+		token = peek_token(NULL, cfile);
+	} while (token == ',');
+
+	buf = malloc(bufsiz);
+	if (!buf)
+		fatalx("Can't allocate compressed domain buffer");
+	bufptrs = calloc(count + 1, sizeof *bufptrs);
+	if (!bufptrs)
+		fatalx("Can't allocate compressed pointer list");
+	bufptrs[0] = buf;
+
+	/* dn_comp takes an int for the output buffer size */
+	if (!(bufsiz <= INT_MAX))
+		fatalx("Size of compressed domain buffer too large");
+	for (i = 0; i < count; i++) {
+		int n;
+
+		/* see bufsiz <= INT_MAX assertion, above */
+		n = dn_comp(domains[i], &buf[bufn], bufsiz - bufn, bufptrs,
+		    &bufptrs[count + 1]);
+		if (n == -1)
+			fatalx("Can't compress domain");
+		bufn += (size_t)n;
+	}
+
+	rv = tree_const(buf, bufn);
+error:
+	free_domain_list(domains, count);
+	free(buf);
+	free(bufptrs);
+	return rv;
 }

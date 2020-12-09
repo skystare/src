@@ -1,4 +1,4 @@
-.\"	$OpenBSD: ripd.conf.5,v 1.15 2018/06/18 06:04:25 jmc Exp $
+.\"	$OpenBSD: ripd.conf.5,v 1.20 2020/05/16 16:58:12 jmc Exp $
 .\"
 .\" Copyright (c) 2006 Michele Marchetto <mydecay@openbeer.it>
 .\" Copyright (c) 2005, 2006 Esben Norby <norby@openbsd.org>
@@ -18,7 +18,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: June 18 2018 $
+.Dd $Mdocdate: May 16 2020 $
 .Dt RIPD.CONF 5
 .Os
 .Sh NAME
@@ -66,6 +66,11 @@ interface em0 {
 Global settings concerns the main behaviour of the daemon.
 .Pp
 .Bl -tag -width Ds -compact
+.It Ic fib-priority Ar prio
+Set the routing priority to
+.Ar prio .
+The default is 40.
+.Pp
 .It Xo
 .Ic fib-update
 .Pq Ic yes Ns | Ns Ic no
@@ -149,14 +154,17 @@ The default is
 .Xc
 Immediately trigger responses when a route changes.
 The default is
-.Ic yes .
+.Ic no .
 .El
 .Sh INTERFACES
 Each interface can have several parameters configured individually, otherwise
 they are inherited.
 .Bd -literal -offset indent
 interface em0 {
+	cost 9
+	auth-type none
 }
+interface ix1
 .Ed
 .Pp
 Interface-specific parameters are listed below.
@@ -215,10 +223,12 @@ state is active again.
 Prevent transmission and reception of RIP packets on this interface.
 .El
 .Sh FILES
-.Bl -tag -width "/etc/ripd.conf" -compact
+.Bl -tag -width /etc/examples/ripd.conf -compact
 .It Pa /etc/ripd.conf
 .Xr ripd 8
-configuration file
+configuration file.
+.It Pa /etc/examples/ripd.conf
+Example configuration file.
 .El
 .Sh SEE ALSO
 .Xr rc.conf.local 8 ,

@@ -1,4 +1,4 @@
-/*	$OpenBSD: print-frag6.c,v 1.8 2015/11/16 00:16:39 mmcc Exp $	*/
+/*	$OpenBSD: print-frag6.c,v 1.10 2020/01/24 22:46:36 procter Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1993, 1994
@@ -20,8 +20,6 @@
  * WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTIES OF
  * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE.
  */
-
-#ifdef INET6
 
 #include <sys/time.h>
 #include <sys/types.h>
@@ -76,12 +74,11 @@ frag6_print(const u_char *bp, const u_char *bp2)
 		return 65535;
 	else
 	{
-		fputs(" ", stdout);
+		printf(" ");
 		return sizeof(struct ip6_frag);
 	}
 trunc:
-	fputs("[|frag]", stdout);
+	printf("[|frag]");
 	return 65535;
 #undef TCHECK
 }
-#endif /* INET6 */

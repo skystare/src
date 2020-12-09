@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtp.c,v 1.159 2018/07/25 16:00:48 eric Exp $	*/
+/*	$OpenBSD: smtp.c,v 1.166 2019/08/10 16:07:01 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -46,10 +46,19 @@ static void smtp_setup_events(void);
 static void smtp_pause(void);
 static void smtp_resume(void);
 static void smtp_accept(int, short, void *);
+static void smtp_dropped(struct listener *, int, const struct sockaddr_storage *);
 static int smtp_enqueue(void);
 static int smtp_can_accept(void);
 static void smtp_setup_listeners(void);
 static int smtp_sni_callback(SSL *, int *, void *);
+
+int
+proxy_session(struct listener *listener, int sock,
+    const struct sockaddr_storage *ss,
+    void (*accepted)(struct listener *, int,
+	const struct sockaddr_storage *, struct io *),
+    void (*dropped)(struct listener *, int,
+	const struct sockaddr_storage *));
 
 static void smtp_accepted(struct listener *, int, const struct sockaddr_storage *, struct io *);
 
@@ -66,8 +75,8 @@ smtp_imsg(struct mproc *p, struct imsg *imsg)
 	case IMSG_SMTP_EXPAND_RCPT:
 	case IMSG_SMTP_LOOKUP_HELO:
 	case IMSG_SMTP_AUTHENTICATE:
-	case IMSG_SMTP_TLS_INIT:
-	case IMSG_SMTP_TLS_VERIFY:
+	case IMSG_FILTER_SMTP_PROTOCOL:
+	case IMSG_FILTER_SMTP_DATA_BEGIN:
 		smtp_session_imsg(p, imsg);
 		return;
 
@@ -138,7 +147,7 @@ smtp_setup_listeners(void)
 		}
 		opt = 1;
 		if (setsockopt(l->fd, SOL_SOCKET, SO_REUSEADDR, &opt,
-			sizeof(opt)) < 0)
+		    sizeof(opt)) == -1)
 			fatal("smtpd: setsockopt");
 		if (bind(l->fd, (struct sockaddr *)&l->ss, l->ss.ss_len) == -1)
 			fatal("smtpd: bind");
@@ -266,6 +275,16 @@ smtp_accept(int fd, short event, void *p)
 		fatal("smtp_accept");
 	}
 
+	if (listener->flags & F_PROXY) {
+		io_set_nonblocking(sock);
+		if (proxy_session(listener, sock, &ss,
+			smtp_accepted, smtp_dropped) == -1) {
+			close(sock);
+			return;
+		}
+		return;
+	}
+
 	smtp_accepted(listener, sock, &ss, NULL);
 	return;
 
@@ -321,10 +340,7 @@ smtp_accepted(struct listener *listener, int sock, const struct sockaddr_storage
 {
 	int     ret;
 
-	if (listener->filter[0])
-		ret = smtpf_session(listener, sock, ss, NULL);
-	else
-		ret = smtp_session(listener, sock, ss, NULL, io);
+	ret = smtp_session(listener, sock, ss, NULL, io);
 	if (ret == -1) {
 		log_warn("warn: Failed to create SMTP session");
 		close(sock);
@@ -340,4 +356,11 @@ smtp_accepted(struct listener *listener, int sock, const struct sockaddr_storage
 		stat_increment("smtp.session.inet4", 1);
 	if (listener->ss.ss_family == AF_INET6)
 		stat_increment("smtp.session.inet6", 1);
+}
+
+static void
+smtp_dropped(struct listener *listener, int sock, const struct sockaddr_storage *ss)
+{
+	close(sock);
+	sessions--;
 }

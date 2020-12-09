@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.131 2018/01/27 22:55:23 naddy Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.138 2020/08/26 03:29:06 visa Exp $	*/
 /*	$NetBSD: autoconf.c,v 1.51 2001/07/24 19:32:11 eeh Exp $ */
 
 /*
@@ -122,9 +122,6 @@ int	optionsnode;	/* node ID of ROM's options */
 
 static	int rootnode;
 
-/* for hw.product/vendor see sys/kern/kern_sysctl.c */
-extern char *hw_prod, *hw_vendor;
-
 static	char *str2hex(char *, long *);
 static	int mbprint(void *, const char *);
 void	sync_crash(void);
@@ -172,6 +169,7 @@ char sun4v_soft_state_booting[] __align32 = "OpenBSD booting";
 char sun4v_soft_state_running[] __align32 = "OpenBSD running";
 
 void	sun4v_interrupt_init(void);
+void	sun4v_sdio_init(void);
 #endif
 
 #ifdef DEBUG
@@ -434,11 +432,21 @@ bootstrap(int nctx)
 	ncpus = get_ncpus();
 	pmap_bootstrap(KERNBASE, (u_long)&end, nctx, ncpus);
 
+	/*
+	 * This length check deliberately checks BOOTDATA_LEN_SOFTRAID
+	 * instead of BOOTDATA_LEN_BOOTHOWTO.  See the ofwboot code
+	 * for an explanation.
+	 */
+	if (obd.version == BOOTDATA_VERSION &&
+	    obd.len >= BOOTDATA_LEN_SOFTRAID)
+		boothowto = obd.boothowto;
+
 #ifdef SUN4V
 	if (CPU_ISSUN4V) {
 		sun4v_soft_state_init();
 		sun4v_set_soft_state(SIS_TRANSITION, sun4v_soft_state_booting);
 		sun4v_interrupt_init();
+		sun4v_sdio_init();
 	}
 #endif
 }
@@ -537,7 +545,7 @@ bootpath_build(void)
 	bp->name[0] = 0;
 	
 	bootpath_nodes(bootpath, nbootpath);
-	
+
 	/* Setup pointer to boot flags */
 	OF_getprop(chosen, "bootargs", buf, sizeof(buf));
 	cp = buf;
@@ -689,7 +697,7 @@ cpu_configure(void)
 #endif
 
 	if (obd.version == BOOTDATA_VERSION &&
-	    obd.len == sizeof(struct openbsd_bootdata)) {
+	    obd.len >= BOOTDATA_LEN_SOFTRAID) {
 #if NSOFTRAID > 0
 		memcpy(sr_bootuuid.sui_id, obd.sr_uuid,
 		    sizeof(sr_bootuuid.sui_id));
@@ -736,8 +744,9 @@ cpu_configure(void)
 
 #ifdef SUN4V
 
-#define HSVC_GROUP_INTERRUPT  0x002
-#define HSVC_GROUP_SOFT_STATE 0x003
+#define HSVC_GROUP_INTERRUPT	0x002
+#define HSVC_GROUP_SOFT_STATE	0x003
+#define HSVC_GROUP_SDIO		0x108
 
 int sun4v_soft_state_initialized = 0;
 
@@ -777,8 +786,19 @@ sun4v_interrupt_init(void)
 
 	if (prom_set_sun4v_api_version(HSVC_GROUP_INTERRUPT, 3, 0, &minor))
 		return;
-	
+
 	sun4v_group_interrupt_major = 3;
+}
+
+void
+sun4v_sdio_init(void)
+{
+	uint64_t minor;
+
+	if (prom_set_sun4v_api_version(HSVC_GROUP_SDIO, 1, 0, &minor))
+		return;
+
+	sun4v_group_sdio_major = 1;
 }
 
 #endif
@@ -1435,28 +1455,35 @@ device_register(struct device *dev, void *aux)
 		 */
 		struct scsi_attach_args *sa = aux;
 		struct scsi_link *sl = sa->sa_sc_link;
-		struct scsibus_softc *sbsc =
-		    (struct scsibus_softc *)dev->dv_parent;
 		u_int target = bp->val[0];
 		u_int lun = bp->val[1];
 
 		if (bp->val[0] & 0xffffffff00000000 && bp->val[0] != -1) {
-			/* Fibre channel? */
+			/* Hardware RAID or Fibre channel? */
 			if (bp->val[0] == sl->port_wwn && lun == sl->lun) {
 				nail_bootdev(dev, bp);
 			}
+
+			/*
+			 * sata devices on some controllers don't get
+			 * port_wwn filled in, so look at devid too.
+			 */
+			if (sl->id && sl->id->d_len == 8 &&
+			    sl->id->d_type == DEVID_NAA &&
+			    memcmp(sl->id + 1, &bp->val[0], 8) == 0)
+				nail_bootdev(dev, bp);
 			return;
 		}
 
 		/* Check the controller that this scsibus is on. */
-		if ((bp-1)->dev != sbsc->sc_dev.dv_parent)
+		if ((bp-1)->dev != sl->bus->sc_dev.dv_parent)
 			return;
 
 		/*
 		 * Bounds check: we know the target and lun widths.
 		 */
-		if (target >= sl->adapter_buswidth ||
-		    lun >= sl->luns) {
+		if (target >= sl->bus->sb_adapter_buswidth ||
+		    lun >= sl->bus->sb_luns) {
 			printf("SCSI disk bootpath component not accepted: "
 			       "target %u; lun %u\n", target, lun);
 			return;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: ehci.c,v 1.200 2017/05/15 10:52:08 mpi Exp $ */
+/*	$OpenBSD: ehci.c,v 1.213 2020/11/27 20:41:21 mglocker Exp $ */
 /*	$NetBSD: ehci.c,v 1.66 2004/06/30 03:11:56 mycroft Exp $	*/
 
 /*
@@ -356,7 +356,7 @@ ehci_init(struct ehci_softc *sc)
 		return (USBD_IOERROR);
 	}
 	err = usb_allocmem(&sc->sc_bus, sc->sc_flsize * sizeof(ehci_link_t),
-	    EHCI_FLALIGN_ALIGN, &sc->sc_fldma);
+	    EHCI_FLALIGN_ALIGN, USB_DMA_COHERENT, &sc->sc_fldma);
 	if (err)
 		return (err);
 	DPRINTF(("%s: flsize=%d\n", sc->sc_bus.bdev.dv_xname,sc->sc_flsize));
@@ -856,6 +856,10 @@ ehci_isoc_idone(struct usbd_xfer *xfer)
 #endif
 	xfer->actlen = actlen;
 	xfer->status = USBD_NORMAL_COMPLETION;
+
+	usb_syncmem(&xfer->dmabuf, 0, xfer->length,
+	    usbd_xfer_isread(xfer) ?
+	    BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE);
 	usb_transfer_complete(xfer);
 }
 
@@ -911,9 +915,10 @@ ehci_idone(struct usbd_xfer *xfer)
 	} else
 		xfer->status = USBD_NORMAL_COMPLETION;
 
-	/* XXX transfer_complete memcpys out transfer data (for in endpoints)
-	 * during this call, before methods->done is called: dma sync required
-	 * beforehand? */
+	if (xfer->actlen)
+		usb_syncmem(&xfer->dmabuf, 0, xfer->actlen,
+		    usbd_xfer_isread(xfer) ?
+		    BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE);
 	usb_transfer_complete(xfer);
 	DPRINTFN(/*12*/2, ("ehci_idone: ex=%p done\n", ex));
 }
@@ -1354,7 +1359,7 @@ ehci_open(struct usbd_pipe *pipe)
 	struct ehci_softc *sc = (struct ehci_softc *)dev->bus;
 	usb_endpoint_descriptor_t *ed = pipe->endpoint->edesc;
 	u_int8_t addr = dev->address;
-	u_int8_t xfertype = ed->bmAttributes & UE_XFERTYPE;
+	u_int8_t xfertype = UE_GET_XFERTYPE(ed->bmAttributes);
 	struct ehci_pipe *epipe = (struct ehci_pipe *)pipe;
 	struct ehci_soft_qh *sqh;
 	usbd_status err;
@@ -1406,7 +1411,12 @@ ehci_open(struct usbd_pipe *pipe)
 		panic("ehci_open: bad device speed %d", dev->speed);
 	}
 
-	naks = 8;		/* XXX */
+	/*
+	 * NAK reload count:
+	 * must be zero with using periodic transfer.
+	 * Linux 4.20's driver (ehci-q.c) sets 4, we use same value.
+	 */
+	naks = ((xfertype == UE_CONTROL) || (xfertype == UE_BULK)) ? 4 : 0;
 
 	/* Allocate sqh for everything, save isoc xfers */
 	if (xfertype != UE_ISOCHRONOUS) {
@@ -1424,15 +1434,30 @@ ehci_open(struct usbd_pipe *pipe)
 		    EHCI_QH_CTL : 0) |
 		    EHCI_QH_SET_NRL(naks)
 		);
+		/*
+		 * To reduce conflict with split isochronous transfer,
+		 * schedule (split) interrupt transfer at latter half of
+		 * 1ms frame:
+		 *
+		 *         |<-------------- H-Frame -------------->|
+		 *         .H0  :H1   H2   H3   H4   H5   H6   H7  .H0" :H1"
+		 *         .    :                                  .    :
+		 * [HS]    .    :          SS        CS   CS'  CS" .    :
+		 * [FS/LS] .    :               |<== >>>> >>>|     .    :
+		 *         .    :                                  .    :
+		 *         .B7' :B0   B1   B2   B3   B4   B5   B6  .B7  :B0"
+		 *              |<-------------- B-Frame -------------->|
+		 *
+		 */
 		sqh->qh.qh_endphub = htole32(
 		    EHCI_QH_SET_MULT(1) |
-		    EHCI_QH_SET_SMASK(xfertype == UE_INTERRUPT ? 0x01 : 0)
+		    EHCI_QH_SET_SMASK(xfertype == UE_INTERRUPT ? 0x08 : 0)
 		);
 		if (speed != EHCI_QH_SPEED_HIGH) {
 			sqh->qh.qh_endphub |= htole32(
 			    EHCI_QH_SET_HUBA(hshubaddr) |
 			    EHCI_QH_SET_PORT(hshubport) |
-			    EHCI_QH_SET_CMASK(0x1c) /* XXX */
+			    EHCI_QH_SET_CMASK(0xe0)
 			);
 		}
 		sqh->qh.qh_curqtd = htole32(EHCI_LINK_TERMINATE);
@@ -1450,7 +1475,7 @@ ehci_open(struct usbd_pipe *pipe)
 	switch (xfertype) {
 	case UE_CONTROL:
 		err = usb_allocmem(&sc->sc_bus, sizeof(usb_device_request_t),
-		    0, &epipe->u.ctl.reqdma);
+		    0, USB_DMA_COHERENT, &epipe->u.ctl.reqdma);
 		if (err) {
 			ehci_free_sqh(sc, sqh);
 			return (err);
@@ -1608,7 +1633,8 @@ ehci_sync_hc(struct ehci_softc *sc)
 	do {
 		EOWRITE4(sc, EHCI_USBCMD, EOREAD4(sc, EHCI_USBCMD) |
 		    EHCI_CMD_IAAD);
-		error = tsleep(&sc->sc_async_head, PZERO, "ehcidi", hz / 2);
+		error = tsleep_nsec(&sc->sc_async_head, PZERO, "ehcidi",
+		    MSEC_TO_NSEC(500));
 	} while (error && ++tries < 10);
 	splx(s);
 	/* release doorbell */
@@ -1713,7 +1739,7 @@ usb_config_descriptor_t ehci_confd = {
 	1,
 	1,
 	0,
-	UC_SELF_POWERED,
+	UC_BUS_POWERED | UC_SELF_POWERED,
 	0			/* max power */
 };
 
@@ -1826,10 +1852,6 @@ ehci_root_ctrl_start(struct usbd_xfer *xfer)
 			USETW(ehci_devd.idVendor, sc->sc_id_vendor);
 			memcpy(buf, &ehci_devd, l);
 			break;
-		/*
-		 * We can't really operate at another speed, but the spec says
-		 * we need this descriptor.
-		 */
 		case UDESC_DEVICE_QUALIFIER:
 			if ((value & 0xff) != 0) {
 				err = USBD_IOERROR;
@@ -2237,7 +2259,7 @@ ehci_alloc_sqh(struct ehci_softc *sc)
 	if (sc->sc_freeqhs == NULL) {
 		DPRINTFN(2, ("ehci_alloc_sqh: allocating chunk\n"));
 		err = usb_allocmem(&sc->sc_bus, EHCI_SQH_SIZE * EHCI_SQH_CHUNK,
-		    EHCI_PAGE_SIZE, &dma);
+		    EHCI_PAGE_SIZE, USB_DMA_COHERENT, &dma);
 		if (err)
 			goto out;
 		for (i = 0; i < EHCI_SQH_CHUNK; i++) {
@@ -2285,7 +2307,7 @@ ehci_alloc_sqtd(struct ehci_softc *sc)
 	if (sc->sc_freeqtds == NULL) {
 		DPRINTFN(2, ("ehci_alloc_sqtd: allocating chunk\n"));
 		err = usb_allocmem(&sc->sc_bus, EHCI_SQTD_SIZE*EHCI_SQTD_CHUNK,
-		    EHCI_PAGE_SIZE, &dma);
+		    EHCI_PAGE_SIZE, USB_DMA_COHERENT, &dma);
 		if (err)
 			goto out;
 		for(i = 0; i < EHCI_SQTD_CHUNK; i++) {
@@ -2335,7 +2357,7 @@ ehci_alloc_sqtd_chain(struct ehci_softc *sc, u_int alen, struct usbd_xfer *xfer,
 	DPRINTFN(alen<4*4096,("ehci_alloc_sqtd_chain: start len=%d\n", alen));
 
 	len = alen;
-	iscontrol = (xfer->pipe->endpoint->edesc->bmAttributes & UE_XFERTYPE) ==
+	iscontrol = UE_GET_XFERTYPE(xfer->pipe->endpoint->edesc->bmAttributes) ==
 	    UE_CONTROL;
 
 	dataphys = DMAADDR(dma, 0);
@@ -2371,24 +2393,20 @@ ehci_alloc_sqtd_chain(struct ehci_softc *sc, u_int alen, struct usbd_xfer *xfer,
 			/* must use multiple TDs, fill as much as possible. */
 			curlen = EHCI_QTD_NBUFFERS * EHCI_PAGE_SIZE -
 				 EHCI_PAGE_OFFSET(dataphys);
-#ifdef DIAGNOSTIC
+
 			if (curlen > len) {
-				printf("ehci_alloc_sqtd_chain: curlen=%u "
+				DPRINTFN(1,("ehci_alloc_sqtd_chain: curlen=%u "
 				    "len=%u offs=0x%x\n", curlen, len,
-				    EHCI_PAGE_OFFSET(dataphys));
-				printf("lastpage=0x%x page=0x%x phys=0x%x\n",
-				    dataphyslastpage, dataphyspage, dataphys);
+				    EHCI_PAGE_OFFSET(dataphys)));
+				DPRINTFN(1,("lastpage=0x%x page=0x%x phys=0x%x\n",
+				    dataphyslastpage, dataphyspage, dataphys));
 				curlen = len;
 			}
-#endif
+
 			/* the length must be a multiple of the max size */
 			curlen -= curlen % mps;
 			DPRINTFN(1,("ehci_alloc_sqtd_chain: multiple QTDs, "
 			    "curlen=%u\n", curlen));
-#ifdef DIAGNOSTIC
-			if (curlen == 0)
-				panic("ehci_alloc_std: curlen == 0");
-#endif
 		}
 
 		DPRINTFN(4,("ehci_alloc_sqtd_chain: dataphys=0x%08x "
@@ -2503,8 +2521,6 @@ ehci_alloc_itd(struct ehci_softc *sc)
 
 	freeitd = NULL;
 	LIST_FOREACH(itd, &sc->sc_freeitds, u.free_list) {
-		if (itd == NULL)
-			break;
 		if (itd->slot != frindex && itd->slot != previndex) {
 			freeitd = itd;
 			break;
@@ -2513,7 +2529,7 @@ ehci_alloc_itd(struct ehci_softc *sc)
 
 	if (freeitd == NULL) {
 		err = usb_allocmem(&sc->sc_bus, EHCI_ITD_SIZE * EHCI_ITD_CHUNK,
-		    EHCI_PAGE_SIZE, &dma);
+		    EHCI_PAGE_SIZE, USB_DMA_COHERENT, &dma);
 		if (err) {
 			splx(s);
 			return (NULL);
@@ -2628,7 +2644,7 @@ ehci_abort_xfer(struct usbd_xfer *xfer, usbd_status status)
 		DPRINTFN(2, ("ehci_abort_xfer: waiting for abort to finish\n"));
 		ex->ehci_xfer_flags |= EHCI_XFER_ABORTWAIT;
 		while (ex->ehci_xfer_flags & EHCI_XFER_ABORTING)
-			tsleep(&ex->ehci_xfer_flags, PZERO, "ehciaw", 0);
+			tsleep_nsec(&ex->ehci_xfer_flags, PZERO, "ehciaw", INFSLP);
 		return;
 	}
 
@@ -2679,7 +2695,7 @@ ehci_abort_xfer(struct usbd_xfer *xfer, usbd_status status)
 	s = splusb();
 	sc->sc_softwake = 1;
 	usb_schedsoftintr(&sc->sc_bus);
-	tsleep(&sc->sc_softwake, PZERO, "ehciab", 0);
+	tsleep_nsec(&sc->sc_softwake, PZERO, "ehciab", INFSLP);
 
 #ifdef DIAGNOSTIC
 	ex->isdone = 1;
@@ -2769,7 +2785,7 @@ ehci_abort_isoc_xfer(struct usbd_xfer *xfer, usbd_status status)
 
 	sc->sc_softwake = 1;
 	usb_schedsoftintr(&sc->sc_bus);
-	tsleep(&sc->sc_softwake, PZERO, "ehciab", 0);
+	tsleep_nsec(&sc->sc_softwake, PZERO, "ehciab", INFSLP);
 
 	usb_transfer_complete(xfer);
 }
@@ -3189,9 +3205,6 @@ ehci_device_intr_done(struct usbd_xfer *xfer)
 	if (xfer->pipe->repeat) {
 		ehci_free_sqtd_chain(sc, ex);
 
-		usb_syncmem(&xfer->dmabuf, 0, xfer->length,
-		    usbd_xfer_isread(xfer) ?
-		    BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE);
 		sqh = epipe->sqh;
 
 		err = ehci_alloc_sqtd_chain(sc, xfer->length, xfer, &data, &dataend);
@@ -3389,6 +3402,9 @@ ehci_alloc_itd_chain(struct ehci_softc *sc, struct usbd_xfer *xfer)
 	if (nframes == 0)
 		return (1);
 
+	usb_syncmem(&xfer->dmabuf, 0, xfer->length,
+	    usbd_xfer_isread(xfer) ?
+	    BUS_DMASYNC_PREREAD : BUS_DMASYNC_PREWRITE);
 	for (i = 0; i < nframes; i++) {
 		uint32_t froffs = offs;
 
@@ -3503,6 +3519,9 @@ ehci_alloc_sitd_chain(struct ehci_softc *sc, struct usbd_xfer *xfer)
 	if (usbd_xfer_isread(xfer))
 		endp |= EHCI_SITD_SET_DIR(1);
 
+	usb_syncmem(&xfer->dmabuf, 0, xfer->length,
+	    usbd_xfer_isread(xfer) ?
+	    BUS_DMASYNC_PREREAD : BUS_DMASYNC_PREWRITE);
 	for (i = 0; i < nframes; i++) {
 		uint32_t addr = DMAADDR(&xfer->dmabuf, offs);
 		uint32_t page = EHCI_PAGE(addr + xfer->frlengths[i] - 1);

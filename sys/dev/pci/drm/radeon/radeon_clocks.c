@@ -25,11 +25,16 @@
  *          Alex Deucher
  *          Jerome Glisse
  */
-#include <dev/pci/drm/drmP.h>
-#include <dev/pci/drm/radeon_drm.h>
-#include "radeon_reg.h"
-#include "radeon.h"
+
+#include <linux/pci.h>
+
+#include <drm/drm_device.h>
+#include <drm/radeon_drm.h>
+
 #include "atom.h"
+#include "radeon.h"
+#include "radeon_asic.h"
+#include "radeon_reg.h"
 
 #if defined(__macppc__) || defined(__sparc64__)
 #include <dev/ofw/openfirm.h>
@@ -116,7 +121,7 @@ static bool radeon_read_clocks_OF(struct drm_device *dev)
 		return false;
 	val = of_get_property(dp, "ATY,RefCLK", NULL);
 	if (!val || !*val) {
-		printk(KERN_WARNING "radeonfb: No ATY,RefCLK property !\n");
+		pr_warn("radeonfb: No ATY,RefCLK property !\n");
 		return false;
 	}
 	p1pll->reference_freq = p2pll->reference_freq = (*val) / 10;
@@ -254,7 +259,7 @@ static bool radeon_read_clocks_OF(struct drm_device *dev)
 }
 #endif /* CONFIG_OF */
 
-#endif
+#endif /* !__linux__ */
 
 void radeon_get_clock_info(struct drm_device *dev)
 {

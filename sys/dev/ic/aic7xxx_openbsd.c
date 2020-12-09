@@ -1,4 +1,4 @@
-/*	$OpenBSD: aic7xxx_openbsd.c,v 1.56 2017/12/12 12:33:36 krw Exp $	*/
+/*	$OpenBSD: aic7xxx_openbsd.c,v 1.71 2020/09/22 19:32:52 krw Exp $	*/
 /*	$NetBSD: aic7xxx_osm.c,v 1.14 2003/11/02 11:07:44 wiz Exp $	*/
 
 /*
@@ -53,7 +53,6 @@ void	ahc_execute_scb(void *, bus_dma_segment_t *, int);
 int	ahc_poll(struct ahc_softc *, int);
 void	ahc_setup_data(struct ahc_softc *, struct scsi_xfer *, struct scb *);
 
-void	ahc_minphys(struct buf *, struct scsi_link *);
 void	ahc_adapter_req_set_xfer_mode(struct ahc_softc *, struct scb *);
 
 
@@ -61,12 +60,8 @@ struct cfdriver ahc_cd = {
 	NULL, "ahc", DV_DULL
 };
 
-static struct scsi_adapter ahc_switch =
-{
-	ahc_action,
-	ahc_minphys,
-	0,
-	0,
+static struct scsi_adapter ahc_switch = {
+	ahc_action, NULL, NULL, NULL, NULL
 };
 
 /*
@@ -79,23 +74,6 @@ ahc_attach(struct ahc_softc *ahc)
 	int s;
 
         s = splbio();
-
-	/*
-	 * fill in the prototype scsi_links.
-	 */
-	ahc->sc_channel.adapter_target = ahc->our_id;
-	if (ahc->features & AHC_WIDE)
-		ahc->sc_channel.adapter_buswidth = 16;
-	ahc->sc_channel.adapter_softc = ahc;
-	ahc->sc_channel.adapter = &ahc_switch;
-	ahc->sc_channel.openings = 16;
-	ahc->sc_channel.pool = &ahc->sc_iopool;
-
-	if (ahc->features & AHC_TWIN) {
-		/* Configure the second scsi bus */
-		ahc->sc_channel_b = ahc->sc_channel;
-		ahc->sc_channel_b.adapter_target = ahc->our_id_b;
-	}
 
 #ifndef DEBUG
 	if (bootverbose) {
@@ -112,25 +90,32 @@ ahc_attach(struct ahc_softc *ahc)
 	if ((ahc->features & AHC_TWIN) && ahc->flags & AHC_RESET_BUS_B)
 		ahc_reset_channel(ahc, 'B', TRUE);
 
-	bzero(&saa, sizeof(saa));
+	saa.saa_adapter_buswidth = (ahc->features & AHC_WIDE) ? 16 :8;
+	saa.saa_adapter_softc = ahc;
+	saa.saa_adapter = &ahc_switch;
+	saa.saa_luns = saa.saa_adapter_buswidth = 8;
+	saa.saa_openings = 16;
+	saa.saa_pool = &ahc->sc_iopool;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 	if ((ahc->flags & AHC_PRIMARY_CHANNEL) == 0) {
-		saa.saa_sc_link = &ahc->sc_channel;
-		ahc->sc_child = config_found((void *)&ahc->sc_dev,
-		    &saa, scsiprint);
+		saa.saa_adapter_target = ahc->our_id;
+		ahc->sc_child = (struct scsibus_softc *)config_found(
+		    (void *)&ahc->sc_dev, &saa, scsiprint);
 		if (ahc->features & AHC_TWIN) {
-			saa.saa_sc_link = &ahc->sc_channel_b;
-			ahc->sc_child_b = config_found((void *)&ahc->sc_dev,
-			    &saa, scsiprint);
+			saa.saa_adapter_target = ahc->our_id_b;
+			ahc->sc_child_b = (struct scsibus_softc *)config_found(
+			    (void *)&ahc->sc_dev, &saa, scsiprint);
 		}
 	} else {
 		if (ahc->features & AHC_TWIN) {
-			saa.saa_sc_link = &ahc->sc_channel_b;
-			ahc->sc_child = config_found((void *)&ahc->sc_dev,
-			    &saa, scsiprint);
+			saa.saa_adapter_target = ahc->our_id_b;
+			ahc->sc_child = (struct scsibus_softc *)config_found(
+			    (void *)&ahc->sc_dev, &saa, scsiprint);
 		}
-		saa.saa_sc_link = &ahc->sc_channel;
-		ahc->sc_child_b = config_found((void *)&ahc->sc_dev,
-		    &saa, scsiprint);
+		saa.saa_adapter_target = ahc->our_id;
+		ahc->sc_child_b = (struct scsibus_softc *)config_found(
+		    (void *)&ahc->sc_dev, &saa, scsiprint);
 	}
 
 	splx(s);
@@ -258,22 +243,6 @@ ahc_done(struct ahc_softc *ahc, struct scb *scb)
 }
 
 void
-ahc_minphys(struct buf *bp, struct scsi_link *sl)
-{
-	/*
-	 * Even though the card can transfer up to 16megs per command
-	 * we are limited by the number of segments in the dma segment
-	 * list that we can hold.  The worst case is that all pages are
-	 * discontinuous physically, hence the "page per segment" limit
-	 * enforced here.
-	 */
-	if (bp->b_bcount > ((AHC_NSEG - 1) * PAGE_SIZE)) {
-		bp->b_bcount = ((AHC_NSEG - 1) * PAGE_SIZE);
-	}
-	minphys(bp);
-}
-
-void
 ahc_action(struct scsi_xfer *xs)
 {
 	struct ahc_softc *ahc;
@@ -282,8 +251,10 @@ ahc_action(struct scsi_xfer *xs)
 	u_int target_id;
 	u_int our_id;
 
-	SC_DEBUG(xs->sc_link, SDEV_DB3, ("ahc_action\n"));
-	ahc = (struct ahc_softc *)xs->sc_link->adapter_softc;
+#ifdef AHC_DEBUG
+	printf("%s: ahc_action\n", ahc_name(ahc));
+#endif
+	ahc = xs->sc_link->bus->sb_adapter_softc;
 
 	target_id = xs->sc_link->target;
 	our_id = SCSI_SCSI_ID(ahc, xs->sc_link);
@@ -300,7 +271,9 @@ ahc_action(struct scsi_xfer *xs)
 	hscb->control = 0;
 	ahc->scb_data->scbindex[hscb->tag] = NULL;
 
-	SC_DEBUG(xs->sc_link, SDEV_DB3, ("start scb(%p)\n", scb));
+#ifdef AHC_DEBUG
+	printf("%s: start scb(%p)\n", ahc_name(ahc), scb);
+#endif
 	scb->xs = xs;
 	timeout_set(&xs->stimeout, ahc_timeout, scb);
 
@@ -337,7 +310,7 @@ ahc_execute_scb(void *arg, bus_dma_segment_t *dm_segs, int nsegments)
 	xs = scb->xs;
 	xs->error = CAM_REQ_INPROG;
 	xs->status = 0;
-	ahc = (struct ahc_softc *)xs->sc_link->adapter_softc;
+	ahc = xs->sc_link->bus->sb_adapter_softc;
 
 	if (nsegments != 0) {
 		struct	  ahc_dma_seg *sg;
@@ -488,7 +461,9 @@ ahc_execute_scb(void *arg, bus_dma_segment_t *dm_segs, int nsegments)
 	 * If we can't use interrupts, poll for completion
 	 */
 poll:
-	SC_DEBUG(xs->sc_link, SDEV_DB3, ("cmd_poll\n"));
+#ifdef AHC_DEBUG
+	printf("%s: cmd_poll\n", ahc_name(ahc));
+#endif
 
 	do {
 		if (ahc_poll(ahc, xs->timeout)) {
@@ -538,10 +513,10 @@ ahc_setup_data(struct ahc_softc *ahc, struct scsi_xfer *xs,
 	}
 
 	if (hscb->cdb_len > 12) {
-		memcpy(hscb->cdb32, xs->cmd, hscb->cdb_len);
+		memcpy(hscb->cdb32, &xs->cmd, hscb->cdb_len);
 		scb->flags |= SCB_CDB32_PTR;
 	} else {
-		memcpy(hscb->shared_data.cdb, xs->cmd, hscb->cdb_len);
+		memcpy(hscb->shared_data.cdb, &xs->cmd, hscb->cdb_len);
 	}
 
 	/* Only use S/G if there is a transfer */
@@ -579,8 +554,8 @@ ahc_timeout(void *arg)
 	int	found;
 	char	channel;
 
-	scb = (struct scb *)arg;
-	ahc = (struct ahc_softc *)scb->xs->sc_link->adapter_softc;
+	scb = arg;
+	ahc = scb->xs->sc_link->bus->sb_adapter_softc;
 
 	s = splbio();
 

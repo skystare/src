@@ -1,4 +1,4 @@
-/*	$OpenBSD: aic6250.c,v 1.4 2017/09/08 05:36:52 deraadt Exp $	*/
+/*	$OpenBSD: aic6250.c,v 1.13 2020/09/22 19:32:52 krw Exp $	*/
 
 /*
  * Copyright (c) 2010, 2013 Miodrag Vallat.
@@ -132,7 +132,6 @@
 int aic6250_debug = 0x00; /* AIC_SHOWSTART|AIC_SHOWMISC|AIC_SHOWTRACE; */
 #endif
 
-void	aic6250_minphys(struct buf *, struct scsi_link *);
 void 	aic6250_init(struct aic6250_softc *);
 void	aic6250_done(struct aic6250_softc *, struct aic6250_acb *);
 void	aic6250_dequeue(struct aic6250_softc *, struct aic6250_acb *);
@@ -168,12 +167,7 @@ struct cfdriver oaic_cd = {
 };
 
 struct scsi_adapter aic6250_switch = {
-	.scsi_cmd = aic6250_scsi_cmd,
-#ifdef notyet
-	.scsi_minphys = aic6250_minphys,
-#else
-	.scsi_minphys = scsi_minphys,
-#endif
+	aic6250_scsi_cmd, NULL, NULL, NULL, NULL
 };
 
 /*
@@ -208,17 +202,14 @@ aic6250_attach(struct aic6250_softc *sc)
 
 	aic6250_init(sc);	/* init chip and driver */
 
-	/*
-	 * Fill in the prototype scsi_link
-	 */
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.adapter_target = sc->sc_initiator;
-	sc->sc_link.adapter = &aic6250_switch;
-	sc->sc_link.openings = 2;
-	sc->sc_link.pool = &sc->sc_iopool;
-
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter_target = sc->sc_initiator;
+	saa.saa_adapter = &aic6250_switch;
+	saa.saa_luns = saa.saa_adapter_buswidth = 8;
+ 	saa.saa_openings = 2;
+	saa.saa_pool = &sc->sc_iopool;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
+	saa.saa_quirks = saa.saa_flags = 0;
 
 	config_found(&sc->sc_dev, &saa, scsiprint);
 }
@@ -394,12 +385,12 @@ void
 aic6250_scsi_cmd(struct scsi_xfer *xs)
 {
 	struct scsi_link *sc_link = xs->sc_link;
-	struct aic6250_softc *sc = sc_link->adapter_softc;
+	struct aic6250_softc *sc = sc_link->bus->sb_adapter_softc;
 	struct aic6250_acb *acb;
 	int s, flags;
 
 	AIC_TRACE(("aic6250_scsi_cmd  "));
-	AIC_CMDS(("[0x%x, %d]->%d ", (int)xs->cmd->opcode, xs->cmdlen,
+	AIC_CMDS(("[0x%x, %d]->%d ", (int)xs->cmd.opcode, xs->cmdlen,
 	    sc_link->target));
 
 	flags = xs->flags;
@@ -415,7 +406,7 @@ aic6250_scsi_cmd(struct scsi_xfer *xs)
 		acb->scsi_cmd_length = 0;
 		acb->data_length = 0;
 	} else {
-		bcopy(xs->cmd, &acb->scsi_cmd, xs->cmdlen);
+		bcopy(&xs->cmd, &acb->scsi_cmd, xs->cmdlen);
 		acb->scsi_cmd_length = xs->cmdlen;
 		acb->data_addr = xs->data;
 		acb->data_length = xs->datalen;
@@ -440,21 +431,6 @@ aic6250_scsi_cmd(struct scsi_xfer *xs)
 			aic6250_timeout(acb);
 	}
 }
-
-#ifdef notyet
-/*
- * Adjust transfer size in buffer structure
- */
-void
-aic6250_minphys(struct buf *bp, struct scsi_link *sl)
-{
-
-	AIC_TRACE(("aic6250_minphys  "));
-	if (bp->b_bcount > (AIC_NSEG << PGSHIFT))
-		bp->b_bcount = (AIC_NSEG << PGSHIFT);
-	minphys(bp);
-}
-#endif
 
 /*
  * Used when interrupt driven I/O isn't allowed, e.g. during boot.
@@ -1088,7 +1064,7 @@ out:
 	AIC_MISC(("n=%d imess=0x%02x  ", n, sc->sc_imess[0]));
 
 	/*
-	 * We need to explicitely un-busy.
+	 * We need to explicitly un-busy.
 	 */
 	(*sc->sc_write)(sc, AIC_SCSI_SIGNAL_REG,
 	    (*sc->sc_read)(sc, AIC_SCSI_SIGNAL_REG) &
@@ -1814,7 +1790,7 @@ aic6250_timeout(void *arg)
 	struct aic6250_acb *acb = arg;
 	struct scsi_xfer *xs = acb->xs;
 	struct scsi_link *sc_link = xs->sc_link;
-	struct aic6250_softc *sc = sc_link->adapter_softc;
+	struct aic6250_softc *sc = sc_link->bus->sb_adapter_softc;
 	int s;
 
 	sc_print_addr(sc_link);

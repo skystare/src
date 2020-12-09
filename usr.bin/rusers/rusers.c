@@ -1,7 +1,7 @@
-/*	$OpenBSD: rusers.c,v 1.40 2017/01/21 11:32:04 guenther Exp $	*/
+/*	$OpenBSD: rusers.c,v 1.42 2019/06/28 13:35:03 deraadt Exp $	*/
 
 /*
- * Copyright (c) 2001, 2003 Todd C. Miller <Todd.Miller@courtesan.com>
+ * Copyright (c) 2001, 2003 Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -421,7 +421,7 @@ retry:
 	fromlen = sizeof(raddr);
 	inlen = recvfrom(sock, inbuf, sizeof(inbuf), 0,
 	    (struct sockaddr *)&raddr, &fromlen);
-	if (inlen < 0) {
+	if (inlen == -1) {
 		if (errno == EINTR)
 			goto retry;
 		return (RPC_CANTRECV);
@@ -457,10 +457,10 @@ rpc_setup(int *fdp, XDR *xdr, struct rpc_msg *msg, struct rmtcallargs *args,
 {
 	int on = 1;
 
-	if ((*fdp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0)
+	if ((*fdp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1)
 		return(RPC_CANTSEND);
 
-	if (setsockopt(*fdp, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) < 0)
+	if (setsockopt(*fdp, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) == -1)
 		return(RPC_CANTSEND);
 
 	msg->rm_xid = arc4random();

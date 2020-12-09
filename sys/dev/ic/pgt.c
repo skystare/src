@@ -1,4 +1,4 @@
-/*	$OpenBSD: pgt.c,v 1.93 2018/04/28 16:05:56 phessler Exp $  */
+/*	$OpenBSD: pgt.c,v 1.99 2020/07/10 13:26:37 patrick Exp $  */
 
 /*
  * Copyright (c) 2006 Claudio Jeker <claudio@openbsd.org>
@@ -170,7 +170,7 @@ void	 node_mark_active_ap(void *, struct ieee80211_node *);
 void	 node_mark_active_adhoc(void *, struct ieee80211_node *);
 void	 pgt_watchdog(struct ifnet *);
 int	 pgt_init(struct ifnet *);
-void	 pgt_update_hw_from_sw(struct pgt_softc *, int, int);
+void	 pgt_update_hw_from_sw(struct pgt_softc *, int);
 void	 pgt_hostap_handle_mlme(struct pgt_softc *, uint32_t,
 	     struct pgt_obj_mlme *);
 void	 pgt_update_sw_from_hw(struct pgt_softc *,
@@ -521,7 +521,7 @@ trying_again:
 		sc->sc_flags |= SC_NEEDS_FIRMWARE;
 		error = pgt_reset(sc);
 		if (error == 0) {
-			tsleep(&sc->sc_flags, 0, "pgtres", hz);
+			tsleep_nsec(&sc->sc_flags, 0, "pgtres", SEC_TO_NSEC(1));
 			if (sc->sc_flags & SC_UNINITIALIZED) {
 				printf("%s: not responding\n",
 				    sc->sc_dev.dv_xname);
@@ -544,8 +544,7 @@ trying_again:
 		sc->sc_flags &= ~flag;
 		if (ic->ic_if.if_flags & IFF_RUNNING)
 			pgt_update_hw_from_sw(sc,
-			    ic->ic_state != IEEE80211_S_INIT,
-			    ic->ic_opmode != IEEE80211_M_MONITOR);
+			    ic->ic_state != IEEE80211_S_INIT);
 	}
 
 	ic->ic_if.if_flags &= ~IFF_RUNNING;
@@ -590,7 +589,7 @@ pgt_attach(struct device *self)
 	if (error)
 		return;
 
-	tsleep(&sc->sc_flags, 0, "pgtres", hz);
+	tsleep_nsec(&sc->sc_flags, 0, "pgtres", SEC_TO_NSEC(1));
 	if (sc->sc_flags & SC_UNINITIALIZED) {
 		printf("%s: not responding\n", sc->sc_dev.dv_xname);
 		sc->sc_flags |= SC_NEEDS_FIRMWARE;
@@ -900,6 +899,7 @@ void
 pgt_input_frames(struct pgt_softc *sc, struct mbuf *m)
 {
 	struct ether_header eh;
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct ifnet *ifp;
 	struct ieee80211_channel *chan;
 	struct ieee80211_rxinfo rxi;
@@ -1023,7 +1023,7 @@ input:
 			rxi.rxi_flags = 0;
 			ni->ni_rssi = rxi.rxi_rssi = rssi;
 			ni->ni_rstamp = rxi.rxi_tstamp = rstamp;
-			ieee80211_input(ifp, m, ni, &rxi);
+			ieee80211_inputm(ifp, m, ni, &rxi, &ml);
 			/*
 			 * The frame may have caused the node to be marked for
 			 * reclamation (e.g. in response to a DEAUTH message)
@@ -1037,6 +1037,7 @@ input:
 			ifp->if_ierrors++;
 		}
 	}
+	if_input(ifp, &ml);
 }
 
 void
@@ -1127,7 +1128,7 @@ pgt_per_device_kthread(void *argp)
 	while (!sck->sck_exit) {
 		if (!sck->sck_update && !sck->sck_reset &&
 		    TAILQ_EMPTY(&sck->sck_traps))
-			tsleep(&sc->sc_kthread, 0, "pgtkth", 0);
+			tsleep_nsec(&sc->sc_kthread, 0, "pgtkth", INFSLP);
 		if (sck->sck_reset) {
 			DPRINTF(("%s: [thread] async reset\n",
 			    sc->sc_dev.dv_xname));
@@ -1238,7 +1239,7 @@ pgt_intr(void *arg)
 		    pgt_read_4(sc, PGT_REG_CTRL_STAT)));
 	}
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		pgt_start(ifp);
 
 	return (1);
@@ -1647,7 +1648,7 @@ pgt_mgmt_request(struct pgt_softc *sc, struct pgt_mgmt_desc *pmd)
 {
 	struct pgt_desc *pd;
 	struct pgt_mgmt_frame *pmf;
-	int error, i;
+	int error, i, ret;
 
 	if (sc->sc_flags & (SC_DYING | SC_NEEDS_RESET))
 		return (EIO);
@@ -1694,7 +1695,8 @@ pgt_mgmt_request(struct pgt_softc *sc, struct pgt_mgmt_desc *pmd)
 	 */
 	i = 0;
 	do {
-		if (tsleep(pmd, 0, "pgtmgm", hz / 10) != EWOULDBLOCK)
+		ret = tsleep_nsec(pmd, 0, "pgtmgm", MSEC_TO_NSEC(100));
+		if (ret != EWOULDBLOCK)
 			break;
 		if (pmd->pmd_error != EINPROGRESS)
 			break;
@@ -1876,7 +1878,7 @@ pgt_net_attach(struct pgt_softc *sc)
 	ifp->if_flags = IFF_SIMPLEX | IFF_BROADCAST | IFF_MULTICAST;
 	strlcpy(ifp->if_xname, sc->sc_dev.dv_xname, IFNAMSIZ);
 
-	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
+	ifq_set_maxlen(&ifp->if_snd, IFQ_MAXLEN);
 
 	/*
 	 * Set channels
@@ -2015,7 +2017,7 @@ pgt_media_change(struct ifnet *ifp)
 
         error = ieee80211_media_change(ifp);
         if (error == ENETRESET) {
-                pgt_update_hw_from_sw(sc, 0, 0);
+                pgt_update_hw_from_sw(sc, 0);
                 error = 0;
         }
 
@@ -2114,7 +2116,7 @@ pgt_start(struct ifnet *ifp)
 	 * net80211 management queue.
 	 */
 	for (; sc->sc_dirtyq_count[PGT_QUEUE_DATA_LOW_TX] <
-	    PGT_QUEUE_FULL_THRESHOLD && !IFQ_IS_EMPTY(&ifp->if_snd);) {
+	    PGT_QUEUE_FULL_THRESHOLD && !ifq_empty(&ifp->if_snd);) {
 		pd = TAILQ_FIRST(&sc->sc_freeq[PGT_QUEUE_DATA_LOW_TX]);
 		m = ifq_deq_begin(&ifp->if_snd);
 		if (m == NULL)
@@ -2367,7 +2369,7 @@ pgt_ioctl(struct ifnet *ifp, u_long cmd, caddr_t req)
 	}
 
 	if (error == ENETRESET) {
-		pgt_update_hw_from_sw(sc, 0, 0);
+		pgt_update_hw_from_sw(sc, 0);
 		error = 0;
 	}
 	splx(s);
@@ -2501,8 +2503,7 @@ pgt_init(struct ifnet *ifp)
 
 	if (!(sc->sc_flags & (SC_DYING | SC_UNINITIALIZED)))
 		pgt_update_hw_from_sw(sc,
-		    ic->ic_state != IEEE80211_S_INIT,
-		    ic->ic_opmode != IEEE80211_M_MONITOR);
+		    ic->ic_state != IEEE80211_S_INIT);
 
 	ifp->if_flags |= IFF_RUNNING;
 	ifq_clr_oactive(&ifp->if_snd);
@@ -2522,7 +2523,7 @@ pgt_init(struct ifnet *ifp)
  * back to the BSS had before.
  */
 void
-pgt_update_hw_from_sw(struct pgt_softc *sc, int keepassoc, int keepnodes)
+pgt_update_hw_from_sw(struct pgt_softc *sc, int keepassoc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct arpcom *ac = &ic->ic_ac;
@@ -2769,8 +2770,6 @@ badopmode:
 	splx(s);
 
 	if (success) {
-		if (shouldbeup && keepnodes)
-			sc->sc_flags |= SC_NOFREE_ALLNODES;
 		if (shouldbeup)
 			ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 		else
@@ -2942,11 +2941,7 @@ pgt_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	case IEEE80211_S_SCAN:
 		ic->ic_if.if_timer = 1;
 		ic->ic_mgt_timer = 0;
-		if (sc->sc_flags & SC_NOFREE_ALLNODES)
-			sc->sc_flags &= ~SC_NOFREE_ALLNODES;
-		else
-			ieee80211_free_allnodes(ic, 1);
-
+		ieee80211_node_cleanup(ic, ic->ic_bss);
 		ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 #ifndef IEEE80211_STA_ONLY
 		/* Just use any old channel; we override it anyway. */
@@ -3262,7 +3257,7 @@ pgt_activate(struct device *self, int act)
 	case DVACT_SUSPEND:
 		if (ifp->if_flags & IFF_RUNNING) {
 			pgt_stop(sc, SC_NEEDS_RESET);
-			pgt_update_hw_from_sw(sc, 0, 0);
+			pgt_update_hw_from_sw(sc, 0);
 		}
 		if (sc->sc_power != NULL)
 			(*sc->sc_power)(sc, act);
@@ -3283,10 +3278,10 @@ pgt_wakeup(struct pgt_softc *sc)
 		(*sc->sc_power)(sc, DVACT_RESUME);
 
 	pgt_stop(sc, SC_NEEDS_RESET);
-	pgt_update_hw_from_sw(sc, 0, 0);
+	pgt_update_hw_from_sw(sc, 0);
 
 	if (ifp->if_flags & IFF_UP) {
 		pgt_init(ifp);
-		pgt_update_hw_from_sw(sc, 0, 0);
+		pgt_update_hw_from_sw(sc, 0);
 	}
 }

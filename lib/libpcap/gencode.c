@@ -1,4 +1,4 @@
-/*	$OpenBSD: gencode.c,v 1.49 2018/06/03 10:29:28 sthen Exp $	*/
+/*	$OpenBSD: gencode.c,v 1.56 2020/09/12 09:27:22 kn Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998
@@ -37,6 +37,8 @@ struct rtentry;
 #include <net/if_pflog.h>
 #include <net/pfvar.h>
 
+#include <netmpls/mpls.h>
+
 #include <net80211/ieee80211.h>
 #include <net80211/ieee80211_radiotap.h>
 
@@ -69,6 +71,7 @@ static pcap_t *bpf_pcap;
 
 /* Hack for updating VLAN offsets. */
 static u_int	orig_linktype = -1, orig_nl = -1, orig_nl_nosnap = -1;
+static u_int	mpls_stack = 0;
 
 /* XXX */
 #ifdef PCAP_FDDIPAD
@@ -767,7 +770,7 @@ init_linktype(type)
 		return;
 
 	case DLT_LOOP:
-		off_linktype = -1;
+		off_linktype = 0;
 		off_nl = 4;
 		return;
 
@@ -837,11 +840,11 @@ gen_linktype(proto)
 	struct block *b0, *b1;
 
 	/* If we're not using encapsulation and checking for IP, we're done */
-	if (off_linktype == -1 && proto == ETHERTYPE_IP)
+	if ((off_linktype == -1 || mpls_stack > 0) && proto == ETHERTYPE_IP)
 		return gen_true();
 #ifdef INET6
 	/* this isn't the right thing to do, but sometimes necessary */
-	if (off_linktype == -1 && proto == ETHERTYPE_IPV6)
+	if ((off_linktype == -1 || mpls_stack > 0) && proto == ETHERTYPE_IPV6)
 		return gen_true();
 #endif
 
@@ -909,16 +912,33 @@ gen_linktype(proto)
 	case DLT_LOOP:
 	case DLT_ENC:
 	case DLT_NULL:
-		/* XXX */
+	{
+		int v;
+
 		if (proto == ETHERTYPE_IP)
-			return (gen_cmp(0, BPF_W, (bpf_int32)htonl(AF_INET)));
+			v = AF_INET;
 #ifdef INET6
 		else if (proto == ETHERTYPE_IPV6)
-			return (gen_cmp(0, BPF_W, (bpf_int32)htonl(AF_INET6)));
+			v = AF_INET6;
 #endif /* INET6 */
 		else
 			return gen_false();
+
+		/*
+		 * For DLT_NULL, the link-layer header is a 32-bit word
+		 * containing an AF_ value in *host* byte order, and for
+		 * DLT_ENC, the link-layer header begins with a 32-bit
+		 * word containing an AF_ value in host byte order.
+		 *
+		 * For DLT_LOOP, the link-layer header is a 32-bit
+		 * word containing an AF_ value in *network* byte order.
+		 */
+		if (linktype != DLT_LOOP)
+			v = htonl(v);
+
+		return (gen_cmp(0, BPF_W, (bpf_int32)v));
 		break;
+	}
 	case DLT_PFLOG:
 		if (proto == ETHERTYPE_IP)
 			return (gen_cmp(offsetof(struct pfloghdr, af), BPF_B,
@@ -2244,7 +2264,7 @@ gen_proto(v, proto, dir)
 		bpf_error("'ah proto' is bogus");
 
 	case Q_ESP:
-		bpf_error("'ah proto' is bogus");
+		bpf_error("'esp proto' is bogus");
 
 	default:
 		abort();
@@ -2867,6 +2887,22 @@ gen_loadlen()
 }
 
 struct arth *
+gen_loadrnd()
+{
+	int regno = alloc_reg();
+	struct arth *a = (struct arth *)newchunk(sizeof(*a));
+	struct slist *s;
+
+	s = new_stmt(BPF_LD|BPF_RND);
+	s->next = new_stmt(BPF_ST);
+	s->next->s.k = regno;
+	a->s = s;
+	a->regno = regno;
+
+	return a;
+}
+
+struct arth *
 gen_loadi(val)
 	int val;
 {
@@ -3350,6 +3386,34 @@ gen_acode(eaddr, q)
 	/* NOTREACHED */
 }
 
+struct block *
+gen_mpls(label)
+	int label;
+{
+	struct block	*b0;
+
+	if (label > MPLS_LABEL_MAX)
+		bpf_error("invalid MPLS label : %d", label);
+
+	if (mpls_stack > 0) /* Bottom-Of-Label-Stack bit ? */
+		b0 = gen_mcmp(off_nl-2, BPF_B, (bpf_int32)0, 0x1);
+	else 
+		b0 = gen_linktype(ETHERTYPE_MPLS);
+
+	if (label >= 0) {
+		struct block *b1;
+
+		b1 = gen_mcmp(off_nl, BPF_W, (bpf_int32)(label << 12),
+		    MPLS_LABEL_MASK);
+		gen_and(b0, b1);
+		b0 = b1;
+	}
+	off_nl += 4;
+	off_linktype += 4;
+	mpls_stack++;
+	return (b0);
+}
+
 /*
  * support IEEE 802.1Q VLAN trunk over ethernet
  */
@@ -3361,6 +3425,11 @@ gen_vlan(vlan_num)
 
 	if (variable_nl) {
 		bpf_error("'vlan' not supported for variable DLTs");
+		/*NOTREACHED*/
+	}
+
+	if (vlan_num > 4095) {
+		bpf_error("invalid VLAN number : %d", vlan_num);
 		/*NOTREACHED*/
 	}
 
@@ -3395,10 +3464,31 @@ gen_vlan(vlan_num)
 	if (vlan_num >= 0) {
 		struct block *b1;
 
-		b1 = gen_cmp(orig_nl, BPF_H, (bpf_int32)vlan_num);
+		b1 = gen_mcmp(orig_nl, BPF_H, (bpf_int32)vlan_num, 0x0FFF);
 		gen_and(b0, b1);
 		b0 = b1;
 	}
+
+	return (b0);
+}
+
+struct block *
+gen_sample(int rate)
+{
+	struct block *b0;
+	long long threshold = 0x100000000LL; /* 0xffffffff + 1 */
+
+	if (rate < 2) {
+		bpf_error("sample %d is too low", rate);
+		/*NOTREACHED*/
+	}
+	if (rate > (1 << 20)) {
+		bpf_error("sample %d is too high", rate);
+		/*NOTREACHED*/
+	}
+
+	threshold /= rate;
+	b0 = gen_relation(BPF_JGT, gen_loadrnd(), gen_loadi(threshold), 1);
 
 	return (b0);
 }

@@ -1,6 +1,7 @@
-/*	$OpenBSD: config.c,v 1.49 2017/11/27 18:39:35 patrick Exp $	*/
+/*	$OpenBSD: config.c,v 1.74 2020/11/29 21:00:43 tobhe Exp $	*/
 
 /*
+ * Copyright (c) 2019 Tobias Heider <tobias.heider@stusta.de>
  * Copyright (c) 2010-2013 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -17,7 +18,6 @@
  */
 
 #include <sys/queue.h>
-#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 
@@ -28,7 +28,6 @@
 #include <signal.h>
 #include <errno.h>
 #include <err.h>
-#include <pwd.h>
 #include <event.h>
 
 #include <openssl/evp.h>
@@ -94,12 +93,29 @@ config_free_kex(struct iked_kex *kex)
 }
 
 void
+config_free_fragments(struct iked_frag *frag)
+{
+	size_t i;
+
+	if (frag && frag->frag_arr) {
+		for (i = 0; i < frag->frag_total; i++) {
+			if (frag->frag_arr[i] != NULL)
+				free(frag->frag_arr[i]->frag_data);
+			free(frag->frag_arr[i]);
+		}
+		free(frag->frag_arr);
+		bzero(frag, sizeof(struct iked_frag));
+	}
+}
+
+void
 config_free_sa(struct iked *env, struct iked_sa *sa)
 {
 	timer_del(env, &sa->sa_timer);
 	timer_del(env, &sa->sa_keepalive);
 	timer_del(env, &sa->sa_rekey);
 
+	config_free_fragments(&sa->sa_fragments);
 	config_free_proposals(&sa->sa_proposals, 0);
 	config_free_childsas(env, &sa->sa_childsas, NULL, NULL);
 	sa_free_flows(env, &sa->sa_flows);
@@ -150,10 +166,15 @@ config_free_sa(struct iked *env, struct iked_sa *sa)
 	ibuf_release(sa->sa_rid.id_buf);
 	ibuf_release(sa->sa_icert.id_buf);
 	ibuf_release(sa->sa_rcert.id_buf);
+	ibuf_release(sa->sa_localauth.id_buf);
+	ibuf_release(sa->sa_peerauth.id_buf);
 
 	ibuf_release(sa->sa_eap.id_buf);
 	free(sa->sa_eapid);
 	ibuf_release(sa->sa_eapmsk);
+
+	free(sa->sa_cp_addr);
+	free(sa->sa_cp_addr6);
 
 	free(sa->sa_tag);
 	free(sa);
@@ -170,6 +191,8 @@ config_new_policy(struct iked *env)
 	/* XXX caller does this again */
 	TAILQ_INIT(&pol->pol_proposals);
 	TAILQ_INIT(&pol->pol_sapeers);
+	TAILQ_INIT(&pol->pol_tssrc);
+	TAILQ_INIT(&pol->pol_tsdst);
 	RB_INIT(&pol->pol_flows);
 
 	return (pol);
@@ -179,6 +202,7 @@ void
 config_free_policy(struct iked *env, struct iked_policy *pol)
 {
 	struct iked_sa		*sa;
+	struct iked_ts	*tsi;
 
 	if (pol->pol_flags & IKED_POLICY_REFCNT)
 		goto remove;
@@ -198,6 +222,14 @@ config_free_policy(struct iked *env, struct iked_policy *pol)
 		return;
 
  remove:
+	while ((tsi = TAILQ_FIRST(&pol->pol_tssrc))) {
+		TAILQ_REMOVE(&pol->pol_tssrc, tsi, ts_entry);
+		free(tsi);
+	}
+	while ((tsi = TAILQ_FIRST(&pol->pol_tsdst))) {
+		TAILQ_REMOVE(&pol->pol_tsdst, tsi, ts_entry);
+		free(tsi);
+	}
 	config_free_proposals(&pol->pol_proposals, 0);
 	config_free_flows(env, &pol->pol_flows);
 	free(pol);
@@ -227,33 +259,36 @@ config_add_proposal(struct iked_proposals *head, unsigned int id,
 }
 
 void
+config_free_proposal(struct iked_proposals *head, struct iked_proposal *prop)
+{
+	TAILQ_REMOVE(head, prop, prop_entry);
+	if (prop->prop_nxforms)
+		free(prop->prop_xforms);
+	free(prop);
+}
+
+void
 config_free_proposals(struct iked_proposals *head, unsigned int proto)
 {
-	struct iked_proposal	*prop, *next;
+	struct iked_proposal	*prop, *proptmp;
 
-	for (prop = TAILQ_FIRST(head); prop != NULL; prop = next) {
-		next = TAILQ_NEXT(prop, prop_entry);
-
+	TAILQ_FOREACH_SAFE(prop, head, prop_entry, proptmp) {
 		/* Free any proposal or only selected SA proto */
 		if (proto != 0 && prop->prop_protoid != proto)
 			continue;
 
 		log_debug("%s: free %p", __func__, prop);
 
-		TAILQ_REMOVE(head, prop, prop_entry);
-		if (prop->prop_nxforms)
-			free(prop->prop_xforms);
-		free(prop);
+		config_free_proposal(head, prop);
 	}
 }
 
 void
 config_free_flows(struct iked *env, struct iked_flows *head)
 {
-	struct iked_flow	*flow, *next;
+	struct iked_flow	*flow;
 
-	for (flow = RB_MIN(iked_flows, head); flow != NULL; flow = next) {
-		next = RB_NEXT(iked_flows, head, flow);
+	while ((flow = RB_MIN(iked_flows, head))) {
 		log_debug("%s: free %p", __func__, flow);
 		RB_REMOVE(iked_flows, head, flow);
 		flow_free(flow);
@@ -264,14 +299,12 @@ void
 config_free_childsas(struct iked *env, struct iked_childsas *head,
     struct iked_spi *peerspi, struct iked_spi *localspi)
 {
-	struct iked_childsa	*csa, *nextcsa;
+	struct iked_childsa	*csa, *csatmp, *ipcomp;
 
 	if (localspi != NULL)
 		bzero(localspi, sizeof(*localspi));
 
-	for (csa = TAILQ_FIRST(head); csa != NULL; csa = nextcsa) {
-		nextcsa = TAILQ_NEXT(csa, csa_entry);
-
+	TAILQ_FOREACH_SAFE(csa, head, csa_entry, csatmp) {
 		if (peerspi != NULL) {
 			/* Only delete matching peer SPIs */
 			if (peerspi->spi != csa->csa_peerspi)
@@ -289,11 +322,17 @@ config_free_childsas(struct iked *env, struct iked_childsas *head,
 			RB_REMOVE(iked_activesas, &env->sc_activesas, csa);
 			(void)pfkey_sa_delete(env->sc_pfkey, csa);
 		}
+		if ((ipcomp = csa->csa_bundled) != NULL) {
+			log_debug("%s: free IPCOMP %p", __func__, ipcomp);
+			if (ipcomp->csa_loaded)
+				(void)pfkey_sa_delete(env->sc_pfkey, ipcomp);
+			childsa_free(ipcomp);
+		}
 		childsa_free(csa);
 	}
 }
 
-struct iked_transform *
+int
 config_add_transform(struct iked_proposal *prop, unsigned int type,
     unsigned int id, unsigned int length, unsigned int keylength)
 {
@@ -320,7 +359,7 @@ config_add_transform(struct iked_proposal *prop, unsigned int type,
 		break;
 	default:
 		log_debug("%s: invalid transform type %d", __func__, type);
-		return (NULL);
+		return (-2);
 	}
 
 	for (i = 0; i < prop->prop_nxforms; i++) {
@@ -328,7 +367,7 @@ config_add_transform(struct iked_proposal *prop, unsigned int type,
 		if (xform->xform_type == type &&
 		    xform->xform_id == id &&
 		    xform->xform_length == length)
-			return (xform);
+			return (0);
 	}
 
 	for (i = 0; i < prop->prop_nxforms; i++) {
@@ -351,7 +390,7 @@ config_add_transform(struct iked_proposal *prop, unsigned int type,
 
 	if ((xform = reallocarray(prop->prop_xforms,
 	    prop->prop_nxforms + 1, sizeof(*xform))) == NULL) {
-		return (NULL);
+		return (-1);
 	}
 
 	prop->prop_xforms = xform;
@@ -365,7 +404,7 @@ config_add_transform(struct iked_proposal *prop, unsigned int type,
 	xform->xform_score = score;
 	xform->xform_map = map;
 
-	return (xform);
+	return (0);
 }
 
 struct iked_transform *
@@ -403,7 +442,7 @@ config_new_user(struct iked *env, struct iked_user *new)
 
 	if ((old = RB_INSERT(iked_users, &env->sc_users, usr)) != NULL) {
 		/* Update the password of an existing user*/
-		memcpy(old, new, sizeof(*old));
+		memcpy(old->usr_pass, new->usr_pass, IKED_PASSWORD_SIZE);
 
 		log_debug("%s: updating user %s", __func__, usr->usr_name);
 		free(usr);
@@ -476,9 +515,9 @@ config_setreset(struct iked *env, unsigned int mode, enum privsep_procid id)
 int
 config_getreset(struct iked *env, struct imsg *imsg)
 {
-	struct iked_policy	*pol, *nextpol;
-	struct iked_sa		*sa, *nextsa;
-	struct iked_user	*usr, *nextusr;
+	struct iked_policy	*pol, *poltmp;
+	struct iked_sa		*sa;
+	struct iked_user	*usr;
 	unsigned int		 mode;
 
 	IMSG_SIZE_CHECK(imsg, &mode);
@@ -486,28 +525,28 @@ config_getreset(struct iked *env, struct imsg *imsg)
 
 	if (mode == RESET_ALL || mode == RESET_POLICY) {
 		log_debug("%s: flushing policies", __func__);
-		for (pol = TAILQ_FIRST(&env->sc_policies);
-		    pol != NULL; pol = nextpol) {
-			nextpol = TAILQ_NEXT(pol, pol_entry);
+		TAILQ_FOREACH_SAFE(pol, &env->sc_policies, pol_entry, poltmp) {
 			config_free_policy(env, pol);
 		}
 	}
 
 	if (mode == RESET_ALL || mode == RESET_SA) {
 		log_debug("%s: flushing SAs", __func__);
-		for (sa = RB_MIN(iked_sas, &env->sc_sas);
-		    sa != NULL; sa = nextsa) {
-			nextsa = RB_NEXT(iked_sas, &env->sc_sas, sa);
-			RB_REMOVE(iked_sas, &env->sc_sas, sa);
-			config_free_sa(env, sa);
+		while ((sa = RB_MIN(iked_sas, &env->sc_sas))) {
+			/* for RESET_SA we try send a DELETE */
+			if (mode == RESET_ALL ||
+			    ikev2_ike_sa_delete(env, sa) != 0) {
+				RB_REMOVE(iked_sas, &env->sc_sas, sa);
+				if (sa->sa_dstid_entry_valid)
+					sa_dstid_remove(env, sa);
+				config_free_sa(env, sa);
+			}
 		}
 	}
 
 	if (mode == RESET_ALL || mode == RESET_USER) {
 		log_debug("%s: flushing users", __func__);
-		for (usr = RB_MIN(iked_users, &env->sc_users);
-		    usr != NULL; usr = nextusr) {
-			nextusr = RB_NEXT(iked_users, &env->sc_users, usr);
+		while ((usr = RB_MIN(iked_users, &env->sc_users))) {
 			RB_REMOVE(iked_users, &env->sc_users, usr);
 			free(usr);
 		}
@@ -516,6 +555,10 @@ config_getreset(struct iked *env, struct imsg *imsg)
 	return (0);
 }
 
+/*
+ * The first call of this function sets the UDP socket for IKEv2.
+ * The second call is optional, setting the UDP socket used for NAT-T.
+ */
 int
 config_setsocket(struct iked *env, struct sockaddr_storage *ss,
     in_port_t port, enum privsep_procid id)
@@ -533,7 +576,7 @@ int
 config_getsocket(struct iked *env, struct imsg *imsg,
     void (*cb)(int, short, void *))
 {
-	struct iked_socket	*sock, **sptr, **nptr;
+	struct iked_socket	*sock, **sock0, **sock1;
 
 	log_debug("%s: received socket fd %d", __func__, imsg->fd);
 
@@ -548,23 +591,24 @@ config_getsocket(struct iked *env, struct imsg *imsg,
 
 	switch (sock->sock_addr.ss_family) {
 	case AF_INET:
-		sptr = &env->sc_sock4[0];
-		nptr = &env->sc_sock4[1];
+		sock0 = &env->sc_sock4[0];
+		sock1 = &env->sc_sock4[1];
 		break;
 	case AF_INET6:
-		sptr = &env->sc_sock6[0];
-		nptr = &env->sc_sock6[1];
+		sock0 = &env->sc_sock6[0];
+		sock1 = &env->sc_sock6[1];
 		break;
 	default:
-		fatal("config_getsocket: socket af");
+		fatal("config_getsocket: socket af: %u",
+		    sock->sock_addr.ss_family);
 		/* NOTREACHED */
 	}
-	if (*sptr == NULL)
-		*sptr = sock;
-	if (*nptr == NULL &&
-	    socket_getport((struct sockaddr *)&sock->sock_addr) ==
-	    IKED_NATT_PORT)
-		*nptr = sock;
+	if (*sock0 == NULL)
+		*sock0 = sock;
+	else if (*sock1 == NULL)
+		*sock1 = sock;
+	else
+		fatalx("%s: too many call", __func__);
 
 	event_set(&sock->sock_ev, sock->sock_fd,
 	    EV_READ|EV_PERSIST, cb, sock);
@@ -700,7 +744,7 @@ config_getpolicy(struct iked *env, struct imsg *imsg)
 {
 	struct iked_policy	*pol;
 	struct iked_proposal	 pp, *prop;
-	struct iked_transform	 xf, *xform;
+	struct iked_transform	 xf;
 	off_t			 offset = 0;
 	unsigned int		 i, j;
 	uint8_t			*buf = (uint8_t *)imsg->data;
@@ -714,6 +758,8 @@ config_getpolicy(struct iked *env, struct imsg *imsg)
 	memcpy(pol, buf, sizeof(*pol));
 	offset += sizeof(*pol);
 
+	TAILQ_INIT(&pol->pol_tssrc);
+	TAILQ_INIT(&pol->pol_tsdst);
 	TAILQ_INIT(&pol->pol_proposals);
 	TAILQ_INIT(&pol->pol_sapeers);
 	RB_INIT(&pol->pol_flows);
@@ -730,9 +776,9 @@ config_getpolicy(struct iked *env, struct imsg *imsg)
 			memcpy(&xf, buf + offset, sizeof(xf));
 			offset += sizeof(xf);
 
-			if ((xform = config_add_transform(prop, xf.xform_type,
+			if (config_add_transform(prop, xf.xform_type,
 			    xf.xform_id, xf.xform_length,
-			    xf.xform_keylength)) == NULL)
+			    xf.xform_keylength) != 0)
 				fatal("config_getpolicy: add transform");
 		}
 	}
@@ -802,7 +848,7 @@ config_setcompile(struct iked *env, enum privsep_procid id)
 }
 
 int
-config_getcompile(struct iked *env, struct imsg *imsg)
+config_getcompile(struct iked *env)
 {
 	/*
 	 * Do any necessary steps after configuration, for now we
@@ -815,50 +861,111 @@ config_getcompile(struct iked *env, struct imsg *imsg)
 }
 
 int
-config_setmobike(struct iked *env)
+config_setstatic(struct iked *env)
 {
-	unsigned int boolval;
-
-	boolval = env->sc_mobike;
-	proc_compose(&env->sc_ps, PROC_IKEV2, IMSG_CTL_MOBIKE,
-	    &boolval, sizeof(boolval));
+	proc_compose(&env->sc_ps, PROC_IKEV2, IMSG_CTL_STATIC,
+	    &env->sc_static, sizeof(env->sc_static));
 	return (0);
 }
 
 int
-config_getmobike(struct iked *env, struct imsg *imsg)
+config_getstatic(struct iked *env, struct imsg *imsg)
 {
-	unsigned int boolval;
+	IMSG_SIZE_CHECK(imsg, &env->sc_static);
+	memcpy(&env->sc_static, imsg->data, sizeof(env->sc_static));
 
-	IMSG_SIZE_CHECK(imsg, &boolval);
-	memcpy(&boolval, imsg->data, sizeof(boolval));
-	env->sc_mobike = boolval;
+	log_debug("%s: dpd_check_interval %llu", __func__, env->sc_alive_timeout);
+	log_debug("%s: %senforcesingleikesa", __func__,
+	    env->sc_enforcesingleikesa ? "" : "no ");
+	log_debug("%s: %sfragmentation", __func__, env->sc_frag ? "" : "no ");
 	log_debug("%s: %smobike", __func__, env->sc_mobike ? "" : "no ");
+	log_debug("%s: nattport %u", __func__, env->sc_nattport);
+	log_debug("%s: %sstickyaddress", __func__,
+	    env->sc_stickyaddress ? "" : "no ");
+
 	return (0);
 }
 
 int
 config_setocsp(struct iked *env)
 {
+	struct iovec		 iov[3];
+	int			 iovcnt = 0;
+
 	if (env->sc_opts & IKED_OPT_NOACTION)
 		return (0);
-	proc_compose(&env->sc_ps, PROC_CERT,
-	    IMSG_OCSP_URL, env->sc_ocsp_url,
-	    env->sc_ocsp_url ? strlen(env->sc_ocsp_url) : 0);
 
-	return (0);
+	iov[0].iov_base = &env->sc_ocsp_tolerate;
+	iov[0].iov_len = sizeof(env->sc_ocsp_tolerate);
+	iovcnt++;
+	iov[1].iov_base = &env->sc_ocsp_maxage;
+	iov[1].iov_len = sizeof(env->sc_ocsp_maxage);
+	iovcnt++;
+	if (env->sc_ocsp_url) {
+		iov[2].iov_base = env->sc_ocsp_url;
+		iov[2].iov_len = strlen(env->sc_ocsp_url);
+		iovcnt++;
+	}
+	return (proc_composev(&env->sc_ps, PROC_CERT, IMSG_OCSP_CFG,
+	    iov, iovcnt));
 }
 
 int
 config_getocsp(struct iked *env, struct imsg *imsg)
 {
+	size_t			 have, need;
+	u_int8_t		*ptr;
+
 	free(env->sc_ocsp_url);
-	if (IMSG_DATA_SIZE(imsg) > 0)
-		env->sc_ocsp_url = get_string(imsg->data, IMSG_DATA_SIZE(imsg));
+	ptr = (u_int8_t *)imsg->data;
+	have = IMSG_DATA_SIZE(imsg);
+
+	/* get tolerate */
+	need = sizeof(env->sc_ocsp_tolerate);
+	if (have < need)
+		fatalx("bad 'tolerate' length imsg received");
+	memcpy(&env->sc_ocsp_tolerate, ptr, need);
+	ptr += need;
+	have -= need;
+
+	/* get maxage */
+	need = sizeof(env->sc_ocsp_maxage);
+	if (have < need)
+		fatalx("bad 'maxage' length imsg received");
+	memcpy(&env->sc_ocsp_maxage, ptr, need);
+	ptr += need;
+	have -= need;
+
+	/* get url */
+	if (have > 0)
+		env->sc_ocsp_url = get_string(ptr, have);
 	else
 		env->sc_ocsp_url = NULL;
-	log_debug("%s: ocsp_url %s", __func__,
-	    env->sc_ocsp_url ? env->sc_ocsp_url : "none");
+	log_debug("%s: ocsp_url %s tolerate %ld maxage %ld", __func__,
+	    env->sc_ocsp_url ? env->sc_ocsp_url : "none",
+	    env->sc_ocsp_tolerate, env->sc_ocsp_maxage);
+	return (0);
+}
+
+int
+config_setcertpartialchain(struct iked *env)
+{
+	unsigned int boolval;
+
+	boolval = env->sc_cert_partial_chain;
+	proc_compose(&env->sc_ps, PROC_CERT, IMSG_CERT_PARTIAL_CHAIN,
+	    &boolval, sizeof(boolval));
+	return (0);
+}
+
+int
+config_getcertpartialchain(struct iked *env, struct imsg *imsg)
+{
+	unsigned int boolval;
+
+	IMSG_SIZE_CHECK(imsg, &boolval);
+	memcpy(&boolval, imsg->data, sizeof(boolval));
+	env->sc_cert_partial_chain = boolval;
 	return (0);
 }
 
@@ -944,6 +1051,8 @@ config_getkey(struct iked *env, struct imsg *imsg)
 
 	explicit_bzero(imsg->data, len);
 	ca_getkey(&env->sc_ps, &id, imsg->hdr.type);
+
+	ikev2_reset_alive_timer(env);
 
 	return (0);
 }

@@ -1,4 +1,4 @@
-/* $OpenBSD: hidmt.c,v 1.9 2018/08/25 20:31:31 jcs Exp $ */
+/* $OpenBSD: hidmt.c,v 1.12 2020/07/09 21:01:08 jcs Exp $ */
 /*
  * HID multitouch driver for devices conforming to Windows Precision Touchpad
  * standard
@@ -138,30 +138,28 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 	}
 
 	/* find maximum number of contacts being reported per input report */
-	if (!hid_locate(desc, dlen, HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACT_MAX),
+	mt->sc_num_contacts = HIDMT_MAX_CONTACTS;
+	if (hid_locate(desc, dlen, HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACT_MAX),
 	    mt->sc_rep_cap, hid_feature, &cap, NULL)) {
-		printf("\n%s: can't find maximum contacts\n", self->dv_xname);
-		return 1;
+		d = hid_get_udata(rep, capsize, &cap);
+		if (d > HIDMT_MAX_CONTACTS)
+			printf("\n%s: contacts %d > max %d\n", self->dv_xname,
+			    d, HIDMT_MAX_CONTACTS);
+		else
+			mt->sc_num_contacts = d;
 	}
-
-	d = hid_get_udata(rep, capsize, &cap);
-	if (d > HIDMT_MAX_CONTACTS) {
-		printf("\n%s: contacts %d > max %d\n", self->dv_xname, d,
-		    HIDMT_MAX_CONTACTS);
-		return 1;
-	}
-	else
-		mt->sc_num_contacts = d;
 
 	/* find whether this is a clickpad or not */
-	if (!hid_locate(desc, dlen, HID_USAGE2(HUP_DIGITIZERS, HUD_BUTTON_TYPE),
+	if (hid_locate(desc, dlen, HID_USAGE2(HUP_DIGITIZERS, HUD_BUTTON_TYPE),
 	    mt->sc_rep_cap, hid_feature, &cap, NULL)) {
-		printf("\n%s: can't find button type\n", self->dv_xname);
-		return 1;
+		d = hid_get_udata(rep, capsize, &cap);
+		mt->sc_clickpad = (d == 0);
+	} else {
+		/* if there's not a 2nd button, this is probably a clickpad */
+		if (!hid_locate(desc, dlen, HID_USAGE2(HUP_BUTTON, 2),
+		    mt->sc_rep_input, hid_input, &cap, NULL))
+			mt->sc_clickpad = 1;
 	}
-
-	d = hid_get_udata(rep, capsize, &cap);
-	mt->sc_clickpad = (d == 0);
 
 	/*
 	 * Walk HID descriptor and store usages we care about to know what to
@@ -175,6 +173,8 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 		struct hidmt_data *input;
 
 		if (h.report_ID != mt->sc_rep_input)
+			continue;
+		if (h.kind != hid_input)
 			continue;
 
 		switch (h.usage) {
@@ -202,6 +202,8 @@ hidmt_setup(struct device *self, struct hidmt *mt, void *desc, int dlen)
 		/* report level usages */
 		case HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACTCOUNT):
 		case HID_USAGE2(HUP_BUTTON, 0x01):
+		case HID_USAGE2(HUP_BUTTON, 0x02):
+		case HID_USAGE2(HUP_BUTTON, 0x03):
 			break;
 		default:
 			continue;
@@ -296,7 +298,7 @@ hidmt_input(struct hidmt *mt, uint8_t *data, u_int len)
 	struct hidmt_data *hi;
 	struct hidmt_contact hc;
 	int32_t d, firstu = 0;
-	int contactcount = 0, seencontacts = 0, tips = 0, i, s, z;
+	int contactcount = 0, seencontacts = 0, tips = 0, buttons = 0, i, s, z;
 
 	if (len != mt->sc_rep_input_size) {
 		DPRINTF(("%s: %s: length %d not %d, ignoring\n",
@@ -407,7 +409,13 @@ hidmt_input(struct hidmt *mt, uint8_t *data, u_int len)
 				contactcount = d;
 			break;
 		case HID_USAGE2(HUP_BUTTON, 0x01):
-			mt->sc_button = (d != 0);
+		case HID_USAGE2(HUP_BUTTON, 0x02):
+			if (d != 0)
+				buttons |= 1;
+			break;
+		case HID_USAGE2(HUP_BUTTON, 0x03):
+			if (d != 0)
+				buttons |= 1 << 2;
 			break;
 		}
 	}
@@ -421,7 +429,10 @@ hidmt_input(struct hidmt *mt, uint8_t *data, u_int len)
 	}
 
 	s = spltty();
-	wsmouse_buttons(mt->sc_wsmousedev, mt->sc_button);
+	if (mt->sc_buttons != buttons) {
+		wsmouse_buttons(mt->sc_wsmousedev, buttons);
+		mt->sc_buttons = buttons;
+	}
 	for (i = 0; i < HIDMT_MAX_CONTACTS; i++) {
 		if (!mt->sc_contacts[i].seen)
 			continue;
@@ -430,7 +441,7 @@ hidmt_input(struct hidmt *mt, uint8_t *data, u_int len)
 
 		DPRINTF(("%s: %s: contact %d of %d: id %d, x %d, y %d, "
 		    "touch %d, confidence %d, width %d, height %d "
-		    "(button %d)\n",
+		    "(button 0x%x)\n",
 		    mt->sc_device->dv_xname, __func__,
 		    i + 1, contactcount,
 		    mt->sc_contacts[i].contactid,
@@ -440,7 +451,7 @@ hidmt_input(struct hidmt *mt, uint8_t *data, u_int len)
 		    mt->sc_contacts[i].confidence,
 		    mt->sc_contacts[i].width,
 		    mt->sc_contacts[i].height,
-		    mt->sc_button));
+		    mt->sc_buttons));
 
 		if (mt->sc_contacts[i].tip && !mt->sc_contacts[i].confidence)
 			continue;

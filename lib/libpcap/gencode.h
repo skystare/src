@@ -1,4 +1,4 @@
-/*	$OpenBSD: gencode.h,v 1.18 2018/06/03 10:29:28 sthen Exp $	*/
+/*	$OpenBSD: gencode.h,v 1.21 2020/08/03 03:40:02 dlg Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1992, 1993, 1994, 1995, 1996
@@ -155,6 +155,7 @@ struct qual {
 struct arth *gen_loadi(int);
 struct arth *gen_load(int, struct arth *, int);
 struct arth *gen_loadlen(void);
+struct arth *gen_loadrnd(void);
 struct arth *gen_neg(struct arth *);
 struct arth *gen_arth(int, struct arth *, struct arth *);
 
@@ -177,8 +178,10 @@ struct block *gen_byteop(int, int, int);
 struct block *gen_broadcast(int);
 struct block *gen_multicast(int);
 struct block *gen_inbound(int);
+struct block *gen_sample(int);
 
 struct block *gen_vlan(int);
+struct block *gen_mpls(int);
 
 struct block *gen_pf_ifname(char *);
 struct block *gen_pf_rnr(int);

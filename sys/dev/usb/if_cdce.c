@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_cdce.c,v 1.74 2017/04/21 09:42:53 mpi Exp $ */
+/*	$OpenBSD: if_cdce.c,v 1.79 2020/07/31 10:49:32 mglocker Exp $ */
 
 /*
  * Copyright (c) 1997, 1998, 1999, 2000-2003 Bill Paul <wpaul@windriver.com>
@@ -100,7 +100,6 @@ const struct cdce_type cdce_devs[] = {
     {{ USB_VENDOR_MOTOROLA2, USB_PRODUCT_MOTOROLA2_USBLAN }, CDCE_CRC32 },
     {{ USB_VENDOR_MOTOROLA2, USB_PRODUCT_MOTOROLA2_USBLAN2 }, CDCE_CRC32 },
     {{ USB_VENDOR_GMATE, USB_PRODUCT_GMATE_YP3X00 }, 0 },
-    {{ USB_VENDOR_NETCHIP, USB_PRODUCT_NETCHIP_ETHERNETGADGET }, 0 },
     {{ USB_VENDOR_COMPAQ, USB_PRODUCT_COMPAQ_IPAQLINUX }, 0 },
     {{ USB_VENDOR_AMBIT, USB_PRODUCT_AMBIT_NTL_250 }, CDCE_SWAPUNION },
 };
@@ -376,17 +375,15 @@ cdce_start(struct ifnet *ifp)
 	if (usbd_is_dying(sc->cdce_udev) || ifq_is_oactive(&ifp->if_snd))
 		return;
 
-	m_head = ifq_deq_begin(&ifp->if_snd);
+	m_head = ifq_dequeue(&ifp->if_snd);
 	if (m_head == NULL)
 		return;
 
 	if (cdce_encap(sc, m_head, 0)) {
-		ifq_deq_rollback(&ifp->if_snd, m_head);
+		m_freem(m_head);
 		ifq_set_oactive(&ifp->if_snd);
 		return;
 	}
-
-	ifq_deq_commit(&ifp->if_snd, m_head);
 
 #if NBPFILTER > 0
 	if (ifp->if_bpf)
@@ -423,6 +420,7 @@ cdce_encap(struct cdce_softc *sc, struct mbuf *m, int idx)
 	    10000, cdce_txeof);
 	err = usbd_transfer(c->cdce_xfer);
 	if (err != USBD_IN_PROGRESS) {
+		c->cdce_mbuf = NULL;
 		cdce_stop(sc);
 		return (EIO);
 	}
@@ -444,7 +442,6 @@ cdce_stop(struct cdce_softc *sc)
 	ifq_clr_oactive(&ifp->if_snd);
 
 	if (sc->cdce_bulkin_pipe != NULL) {
-		usbd_abort_pipe(sc->cdce_bulkin_pipe);
 		err = usbd_close_pipe(sc->cdce_bulkin_pipe);
 		if (err)
 			printf("%s: close rx pipe failed: %s\n",
@@ -453,7 +450,6 @@ cdce_stop(struct cdce_softc *sc)
 	}
 
 	if (sc->cdce_bulkout_pipe != NULL) {
-		usbd_abort_pipe(sc->cdce_bulkout_pipe);
 		err = usbd_close_pipe(sc->cdce_bulkout_pipe);
 		if (err)
 			printf("%s: close tx pipe failed: %s\n",
@@ -462,7 +458,6 @@ cdce_stop(struct cdce_softc *sc)
 	}
 
 	if (sc->cdce_intr_pipe != NULL) {
-		usbd_abort_pipe(sc->cdce_intr_pipe);
 		err = usbd_close_pipe(sc->cdce_intr_pipe);
 		if (err)
 			printf("%s: close interrupt pipe failed: %s\n",
@@ -501,7 +496,7 @@ cdce_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 	int			 s, error = 0;
 
 	if (usbd_is_dying(sc->cdce_udev))
-		return (EIO);
+		return ENXIO;
 
 	s = splnet();
 
@@ -814,7 +809,7 @@ cdce_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	if (err)
 		ifp->if_oerrors++;
 
-	if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+	if (ifq_empty(&ifp->if_snd) == 0)
 		cdce_start(ifp);
 
 	splx(s);

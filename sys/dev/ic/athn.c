@@ -1,4 +1,4 @@
-/*	$OpenBSD: athn.c,v 1.99 2018/04/26 12:50:07 pirofti Exp $	*/
+/*	$OpenBSD: athn.c,v 1.109 2020/07/10 13:22:19 patrick Exp $	*/
 
 /*-
  * Copyright (c) 2009 Damien Bergamini <damien.bergamini@free.fr>
@@ -95,6 +95,10 @@ int		athn_set_key(struct ieee80211com *, struct ieee80211_node *,
 void		athn_delete_key(struct ieee80211com *, struct ieee80211_node *,
 		    struct ieee80211_key *);
 void		athn_iter_calib(void *, struct ieee80211_node *);
+int		athn_cap_noisefloor(struct athn_softc *, int);
+int		athn_nf_hist_mid(int *, int);
+void		athn_filter_noisefloor(struct athn_softc *);
+void		athn_start_noisefloor_calib(struct athn_softc *, int);
 void		athn_calib_to(void *);
 int		athn_init_calib(struct athn_softc *,
 		    struct ieee80211_channel *, struct ieee80211_channel *);
@@ -132,6 +136,14 @@ int		athn_newstate(struct ieee80211com *, enum ieee80211_state,
 		    int);
 void		athn_updateedca(struct ieee80211com *);
 int		athn_clock_rate(struct athn_softc *);
+int		athn_chan_sifs(struct ieee80211_channel *);
+void		athn_setsifs(struct athn_softc *);
+int		athn_acktimeout(struct ieee80211_channel *, int);
+void		athn_setacktimeout(struct athn_softc *,
+		    struct ieee80211_channel *, int);
+void		athn_setctstimeout(struct athn_softc *,
+		    struct ieee80211_channel *, int);
+void		athn_setclockrate(struct athn_softc *);
 void		athn_updateslot(struct ieee80211com *);
 void		athn_start(struct ifnet *);
 void		athn_watchdog(struct ifnet *);
@@ -167,6 +179,53 @@ void		ar9003_reset_txsring(struct athn_softc *);
 struct cfdriver athn_cd = {
 	NULL, "athn", DV_IFNET
 };
+
+void
+athn_config_ht(struct athn_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int i, ntxstreams, nrxstreams;
+
+	if ((sc->flags & ATHN_FLAG_11N) == 0)
+		return;
+
+	/* Set HT capabilities. */
+	ic->ic_htcaps = (IEEE80211_HTCAP_SMPS_DIS <<
+	    IEEE80211_HTCAP_SMPS_SHIFT);
+#ifdef notyet
+	ic->ic_htcaps |= IEEE80211_HTCAP_CBW20_40 |
+	    IEEE80211_HTCAP_SGI40 |
+	    IEEE80211_HTCAP_DSSSCCK40;
+#endif
+	ic->ic_htxcaps = 0;
+#ifdef notyet
+	if (AR_SREV_9271(sc) || AR_SREV_9287_10_OR_LATER(sc))
+		ic->ic_htcaps |= IEEE80211_HTCAP_SGI20;
+	if (AR_SREV_9380_10_OR_LATER(sc))
+		ic->ic_htcaps |= IEEE80211_HTCAP_LDPC;
+	if (AR_SREV_9280_10_OR_LATER(sc)) {
+		ic->ic_htcaps |= IEEE80211_HTCAP_TXSTBC;
+		ic->ic_htcaps |= 1 << IEEE80211_HTCAP_RXSTBC_SHIFT;
+	}
+#endif
+	ntxstreams = sc->ntxchains;
+	nrxstreams = sc->nrxchains;
+	if (!AR_SREV_9380_10_OR_LATER(sc)) {
+		ntxstreams = MIN(ntxstreams, 2);
+		nrxstreams = MIN(nrxstreams, 2);
+	}
+	/* Set supported HT rates. */
+	if (ic->ic_userflags & IEEE80211_F_NOMIMO)
+		ntxstreams = nrxstreams = 1;
+	memset(ic->ic_sup_mcs, 0, sizeof(ic->ic_sup_mcs));
+	for (i = 0; i < nrxstreams; i++)
+		ic->ic_sup_mcs[i] = 0xff;
+	ic->ic_tx_mcs_set = IEEE80211_TX_MCS_SET_DEFINED;
+	if (ntxstreams != nrxstreams) {
+		ic->ic_tx_mcs_set |= IEEE80211_TX_RX_MCS_NOT_EQUAL;
+		ic->ic_tx_mcs_set |= (ntxstreams - 1) << 2;
+	}
+}
 
 int
 athn_attach(struct athn_softc *sc)
@@ -232,9 +291,10 @@ athn_attach(struct athn_softc *sc)
 	/*
 	 * In HostAP mode, the number of STAs that we can handle is
 	 * limited by the number of entries in the HW key cache.
-	 * TKIP keys consume 2 entries in the cache.
+	 * TKIP keys would consume 2 entries in this cache but we
+	 * only use the hardware crypto engine for CCMP.
 	 */
-	ic->ic_max_nnodes = (sc->kc_entries / 2) - IEEE80211_WEP_NKID;
+	ic->ic_max_nnodes = sc->kc_entries - IEEE80211_WEP_NKID;
 	if (ic->ic_max_nnodes > IEEE80211_CACHE_SIZE)
 		ic->ic_max_nnodes = IEEE80211_CACHE_SIZE;
 
@@ -289,43 +349,7 @@ athn_attach(struct athn_softc *sc)
 	    IEEE80211_C_SHPREAMBLE |	/* Short preamble supported. */
 	    IEEE80211_C_PMGT;		/* Power saving supported. */
 
-	if (sc->flags & ATHN_FLAG_11N) {
-		int i, ntxstreams, nrxstreams;
-
-		/* Set HT capabilities. */
-		ic->ic_htcaps = (IEEE80211_HTCAP_SMPS_DIS <<
-		    IEEE80211_HTCAP_SMPS_SHIFT);
-#ifdef notyet
-		ic->ic_htcaps |= IEEE80211_HTCAP_CBW20_40 |
-		    IEEE80211_HTCAP_SGI40 |
-		    IEEE80211_HTCAP_DSSSCCK40;
-#endif
-		ic->ic_htxcaps = 0;
-#ifdef notyet
-		if (AR_SREV_9271(sc) || AR_SREV_9287_10_OR_LATER(sc))
-			ic->ic_htcaps |= IEEE80211_HTCAP_SGI20;
-		if (AR_SREV_9380_10_OR_LATER(sc))
-			ic->ic_htcaps |= IEEE80211_HTCAP_LDPC;
-		if (AR_SREV_9280_10_OR_LATER(sc)) {
-			ic->ic_htcaps |= IEEE80211_HTCAP_TXSTBC;
-			ic->ic_htcaps |= 1 << IEEE80211_HTCAP_RXSTBC_SHIFT;
-		}
-#endif
-		ntxstreams = sc->ntxchains;
-		nrxstreams = sc->nrxchains;
-		if (!AR_SREV_9380_10_OR_LATER(sc)) {
-			ntxstreams = MIN(ntxstreams, 2);
-			nrxstreams = MIN(nrxstreams, 2);
-		}
-		/* Set supported HT rates. */
-		for (i = 0; i < nrxstreams; i++)
-			ic->ic_sup_mcs[i] = 0xff;
-		ic->ic_tx_mcs_set |= IEEE80211_TX_MCS_SET_DEFINED;
-		if (ntxstreams != nrxstreams) {
-			ic->ic_tx_mcs_set |= IEEE80211_TX_RX_MCS_NOT_EQUAL;
-			ic->ic_tx_mcs_set |= (ntxstreams - 1) << 2;
-		}
-	}
+	athn_config_ht(sc);
 
 	/* Set supported rates. */
 	if (sc->flags & ATHN_FLAG_11G) {
@@ -361,10 +385,8 @@ athn_attach(struct athn_softc *sc)
 	ic->ic_newassoc = athn_newassoc;
 	ic->ic_updateslot = athn_updateslot;
 	ic->ic_updateedca = athn_updateedca;
-#ifdef notyet
 	ic->ic_set_key = athn_set_key;
 	ic->ic_delete_key = athn_delete_key;
-#endif
 
 	/* Override 802.11 state transition machine. */
 	sc->sc_newstate = ic->ic_newstate;
@@ -776,7 +798,7 @@ athn_init_pll(struct athn_softc *sc, const struct ieee80211_channel *c)
 		/* Switch core clock to 117MHz. */
 		AR_WRITE_BARRIER(sc);
 		DELAY(500);
-		AR_WRITE(sc, 0x50050, 0x304);
+		AR_WRITE(sc, AR9271_CLOCK_CONTROL, 0x304);
 	}
 	AR_WRITE_BARRIER(sc);
 	DELAY(100);
@@ -890,7 +912,6 @@ athn_set_chan(struct athn_softc *sc, struct ieee80211_channel *c,
 		ops->set_delta_slope(sc, c, extc);
 
 	ops->spur_mitigate(sc, c, extc);
-	/* XXX Load noisefloor values and start calibration. */
 
 	return (0);
 }
@@ -979,6 +1000,12 @@ athn_reset_key(struct athn_softc *sc, int entry)
 	 * NB: Key cache registers access special memory area that requires
 	 * two 32-bit writes to actually update the values in the internal
 	 * memory.  Consequently, writes must be grouped by pair.
+	 *
+	 * All writes to registers with an offset of 0x0 or 0x8 write to a
+	 * temporary register. A write to a register with an offset of 0x4
+	 * or 0xc writes concatenates the written value with the value in
+	 * the temporary register and writes the result to key cache memory.
+	 * The actual written memory area is 50 bits wide.
 	 */
 	AR_WRITE(sc, AR_KEYTABLE_KEY0(entry), 0);
 	AR_WRITE(sc, AR_KEYTABLE_KEY1(entry), 0);
@@ -1000,58 +1027,34 @@ athn_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
 {
 	struct athn_softc *sc = ic->ic_softc;
-	const uint8_t *txmic, *rxmic, *key, *addr;
-	uintptr_t entry, micentry;
-	uint32_t type, lo, hi;
+	const uint8_t *key, *addr;
+	uintptr_t entry;
+	uint32_t lo, hi, unicast;
 
-	switch (k->k_cipher) {
-	case IEEE80211_CIPHER_WEP40:
-		type = AR_KEYTABLE_TYPE_40;
-		break;
-	case IEEE80211_CIPHER_WEP104:
-		type = AR_KEYTABLE_TYPE_104;
-		break;
-	case IEEE80211_CIPHER_TKIP:
-		type = AR_KEYTABLE_TYPE_TKIP;
-		break;
-	case IEEE80211_CIPHER_CCMP:
-		type = AR_KEYTABLE_TYPE_CCM;
-		break;
-	default:
-		/* Fallback to software crypto for other ciphers. */
-		return (ieee80211_set_key(ic, ni, k));
+	if (k->k_cipher != IEEE80211_CIPHER_CCMP) {
+		/* Use software crypto for ciphers other than CCMP. */
+		return ieee80211_set_key(ic, ni, k);
 	}
 
-	if (!(k->k_flags & IEEE80211_KEY_GROUP))
-		entry = IEEE80211_WEP_NKID + IEEE80211_AID(ni->ni_associd);
-	else
+	if (!(k->k_flags & IEEE80211_KEY_GROUP)) {
+#ifndef IEEE80211_STA_ONLY
+		if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+			entry = IEEE80211_WEP_NKID + IEEE80211_AID(ni->ni_associd);
+		else
+#endif
+			entry = IEEE80211_WEP_NKID;
+		if (entry >= sc->kc_entries - IEEE80211_WEP_NKID)
+			return ENOSPC;
+	} else {
 		entry = k->k_id;
+		if (entry >= IEEE80211_WEP_NKID)
+			return ENOSPC;
+	}
 	k->k_priv = (void *)entry;
 
 	/* NB: See note about key cache registers access above. */
 	key = k->k_key;
-	if (type == AR_KEYTABLE_TYPE_TKIP) {
-#ifndef IEEE80211_STA_ONLY
-		if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
-			txmic = &key[16];
-			rxmic = &key[24];
-		} else
-#endif
-		{
-			rxmic = &key[16];
-			txmic = &key[24];
-		}
-		/* Tx+Rx MIC key is at entry + 64. */
-		micentry = entry + 64;
-		AR_WRITE(sc, AR_KEYTABLE_KEY0(micentry), LE_READ_4(&rxmic[0]));
-		AR_WRITE(sc, AR_KEYTABLE_KEY1(micentry), LE_READ_2(&txmic[2]));
 
-		AR_WRITE(sc, AR_KEYTABLE_KEY2(micentry), LE_READ_4(&rxmic[4]));
-		AR_WRITE(sc, AR_KEYTABLE_KEY3(micentry), LE_READ_2(&txmic[0]));
-
-		AR_WRITE(sc, AR_KEYTABLE_KEY4(micentry), LE_READ_4(&txmic[4]));
-		AR_WRITE(sc, AR_KEYTABLE_TYPE(micentry), AR_KEYTABLE_TYPE_CLR);
-	}
 	AR_WRITE(sc, AR_KEYTABLE_KEY0(entry), LE_READ_4(&key[ 0]));
 	AR_WRITE(sc, AR_KEYTABLE_KEY1(entry), LE_READ_2(&key[ 4]));
 
@@ -1059,18 +1062,45 @@ athn_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	AR_WRITE(sc, AR_KEYTABLE_KEY3(entry), LE_READ_2(&key[10]));
 
 	AR_WRITE(sc, AR_KEYTABLE_KEY4(entry), LE_READ_4(&key[12]));
-	AR_WRITE(sc, AR_KEYTABLE_TYPE(entry), type);
+	AR_WRITE(sc, AR_KEYTABLE_TYPE(entry), AR_KEYTABLE_TYPE_CCM);
 
+	unicast = AR_KEYTABLE_VALID;
 	if (!(k->k_flags & IEEE80211_KEY_GROUP)) {
 		addr = ni->ni_macaddr;
 		lo = LE_READ_4(&addr[0]);
 		hi = LE_READ_2(&addr[4]);
 		lo = lo >> 1 | hi << 31;
 		hi = hi >> 1;
-	} else
-		lo = hi = 0;
+	} else {
+#ifndef IEEE80211_STA_ONLY
+		if (ic->ic_opmode == IEEE80211_M_HOSTAP) {
+			uint8_t groupaddr[ETHER_ADDR_LEN];
+			IEEE80211_ADDR_COPY(groupaddr, ic->ic_myaddr);
+			groupaddr[0] |= 0x01;
+			lo = LE_READ_4(&groupaddr[0]);
+			hi = LE_READ_2(&groupaddr[4]);
+			lo = lo >> 1 | hi << 31;
+			hi = hi >> 1;
+			/*
+			 * KEYTABLE_VALID indicates that the address
+			 * is a unicast address which must match the
+			 * transmitter address when decrypting frames.
+			 * Not setting KEYTABLE_VALID allows hardware to
+			 * use this key for multicast frame decryption.
+			 */
+			unicast = 0;
+		} else
+#endif
+			lo = hi = 0;
+	}
 	AR_WRITE(sc, AR_KEYTABLE_MAC0(entry), lo);
-	AR_WRITE(sc, AR_KEYTABLE_MAC1(entry), hi | AR_KEYTABLE_VALID);
+	AR_WRITE(sc, AR_KEYTABLE_MAC1(entry), hi | unicast);
+
+	AR_WRITE_BARRIER(sc);
+
+	/* Enable HW crypto. */
+	AR_CLRBITS(sc, AR_DIAG_SW, AR_DIAG_ENCRYPT_DIS | AR_DIAG_DECRYPT_DIS);
+
 	AR_WRITE_BARRIER(sc);
 	return (0);
 }
@@ -1082,22 +1112,12 @@ athn_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	struct athn_softc *sc = ic->ic_softc;
 	uintptr_t entry;
 
-	switch (k->k_cipher) {
-	case IEEE80211_CIPHER_WEP40:
-	case IEEE80211_CIPHER_WEP104:
-	case IEEE80211_CIPHER_CCMP:
+	if (k->k_cipher == IEEE80211_CIPHER_CCMP) {
 		entry = (uintptr_t)k->k_priv;
 		athn_reset_key(sc, entry);
-		break;
-	case IEEE80211_CIPHER_TKIP:
-		entry = (uintptr_t)k->k_priv;
-		athn_reset_key(sc, entry);
-		athn_reset_key(sc, entry + 64);
-		break;
-	default:
-		/* Fallback to software crypto for other ciphers. */
+		explicit_bzero(k, sizeof(*k));
+	} else
 		ieee80211_delete_key(ic, ni, k);
-	}
 }
 
 void
@@ -1236,6 +1256,94 @@ athn_iter_calib(void *arg, struct ieee80211_node *ni)
 		ieee80211_amrr_choose(&sc->amrr, ni, &an->amn);
 }
 
+int
+athn_cap_noisefloor(struct athn_softc *sc, int nf)
+{
+	int16_t min, max;
+
+	if (nf == 0 || nf == -1) /* invalid measurement */
+		return AR_DEFAULT_NOISE_FLOOR;
+
+	if (IEEE80211_IS_CHAN_2GHZ(sc->sc_ic.ic_bss->ni_chan)) {
+		min = sc->cca_min_2g;
+		max = sc->cca_max_2g;
+	} else {
+		min = sc->cca_min_5g;
+		max = sc->cca_max_5g;
+	}
+
+	if (nf < min)
+		return min;
+	if (nf > max)
+		return max;
+
+	return nf;
+}
+
+int
+athn_nf_hist_mid(int *nf_vals, int nvalid)
+{
+	int nf_sorted[ATHN_NF_CAL_HIST_MAX];
+	int i, j, nf;
+
+	if (nvalid <= 1)
+		return nf_vals[0];
+
+	for (i = 0; i < nvalid; i++)
+		nf_sorted[i] = nf_vals[i];
+
+	for (i = 0; i < nvalid; i++) {
+		for (j = 1; j < nvalid - i; j++) {
+			if (nf_sorted[j] > nf_sorted[j - 1]) {
+				nf = nf_sorted[j];
+				nf_sorted[j] = nf_sorted[j - 1];
+				nf_sorted[j - 1] = nf;
+			}
+		}
+	}
+
+	return nf_sorted[nvalid / 2];
+}
+
+void
+athn_filter_noisefloor(struct athn_softc *sc)
+{
+	int nf_vals[ATHN_NF_CAL_HIST_MAX];
+	int nf_ext_vals[ATHN_NF_CAL_HIST_MAX];
+	int i, cur, n;
+
+	for (i = 0; i < sc->nrxchains; i++) {
+		if (sc->nf_hist_cur > 0)
+			cur = sc->nf_hist_cur - 1;
+		else
+			cur = ATHN_NF_CAL_HIST_MAX - 1;
+		for (n = 0; n < sc->nf_hist_nvalid; n++) {
+			nf_vals[n] = sc->nf_hist[cur].nf[i];
+			nf_ext_vals[n] = sc->nf_hist[cur].nf_ext[i];
+			if (++cur >= ATHN_NF_CAL_HIST_MAX)
+				cur = 0;
+		}
+		sc->nf_priv[i] = athn_cap_noisefloor(sc,
+		    athn_nf_hist_mid(nf_vals, sc->nf_hist_nvalid));
+		sc->nf_ext_priv[i] = athn_cap_noisefloor(sc,
+		    athn_nf_hist_mid(nf_ext_vals, sc->nf_hist_nvalid));
+	}
+}
+
+void
+athn_start_noisefloor_calib(struct athn_softc *sc, int reset_history)
+{
+	extern int ticks;
+
+	if (reset_history)
+		sc->nf_hist_nvalid = 0;
+
+	sc->nf_calib_pending = 1;
+	sc->nf_calib_ticks = ticks;
+
+	sc->ops.noisefloor_calib(sc);
+}
+
 void
 athn_calib_to(void *arg)
 {
@@ -1258,6 +1366,17 @@ athn_calib_to(void *arg)
 			ar9285_pa_calib(sc);
 	}
 
+	/* Do periodic (every 4 minutes) NF calibration. */
+	if (sc->nf_calib_pending && ops->get_noisefloor(sc)) {
+		if (sc->nf_hist_nvalid < ATHN_NF_CAL_HIST_MAX)
+			sc->nf_hist_nvalid++;
+		athn_filter_noisefloor(sc);
+		ops->apply_noisefloor(sc);
+		sc->nf_calib_pending = 0;
+	}
+	if (ticks - (sc->nf_calib_ticks + 240 * hz) >= 0)
+		athn_start_noisefloor_calib(sc, 0);
+
 	/* Do periodic (every 30 seconds) temperature compensation. */
 	if ((sc->flags & ATHN_FLAG_OLPC) &&
 	    ticks >= sc->olpc_ticks + 30 * hz) {
@@ -1268,9 +1387,20 @@ athn_calib_to(void *arg)
 #ifdef notyet
 	/* XXX ANI. */
 	athn_ani_monitor(sc);
-
-	ops->next_calib(sc);
 #endif
+
+	/* Do periodic (every 30 seconds) ADC/IQ calibration. */
+	if (sc->cur_calib_mask != 0) {
+		ops->next_calib(sc);
+		sc->iqcal_ticks = ticks;
+	} else if (sc->sup_calib_mask != 0 &&
+	    ticks >= sc->iqcal_ticks + 30 * hz) {
+		memset(&sc->calib, 0, sizeof(sc->calib));
+		sc->cur_calib_mask = sc->sup_calib_mask;
+		ops->do_calib(sc);
+		sc->iqcal_ticks = ticks;
+	}
+
 	if (ic->ic_fixed_rate == -1) {
 		if (ic->ic_opmode == IEEE80211_M_STA)
 			athn_iter_calib(sc, ic->ic_bss);
@@ -1307,9 +1437,11 @@ athn_init_calib(struct athn_softc *sc, struct ieee80211_channel *c,
 			else
 				ar9285_pa_calib(sc);
 		}
-		/* Do noisefloor calibration. */
-		ops->noisefloor_calib(sc);
 	}
+
+	/* Do noisefloor calibration. */
+	ops->init_noisefloor_calib(sc);
+
 	if (AR_SREV_9160_10_OR_LATER(sc)) {
 		/* Support IQ calibration. */
 		sc->sup_calib_mask = ATHN_CAL_IQ;
@@ -2288,6 +2420,9 @@ athn_hw_reset(struct athn_softc *sc, struct ieee80211_channel *c,
 
 	AR_SETBITS(sc, AR_PCU_MISC, AR_PCU_MIC_NEW_LOC_ENA);
 
+	athn_setsifs(sc);
+	athn_updateslot(ic);
+	athn_setclockrate(sc);
 	if (AR_SREV_9287_13_OR_LATER(sc) && !AR_SREV_9380_10_OR_LATER(sc))
 		ar9287_1_3_setup_async_fifo(sc);
 
@@ -2301,6 +2436,12 @@ athn_hw_reset(struct athn_softc *sc, struct ieee80211_channel *c,
 
 	/* Setup Rx interrupt mitigation. */
 	AR_WRITE(sc, AR_RIMT, SM(AR_RIMT_FIRST, 2000) | SM(AR_RIMT_LAST, 500));
+
+	/* Setup Tx interrupt mitigation. */
+	AR_WRITE(sc, AR_TIMT, SM(AR_TIMT_FIRST, 2000) | SM(AR_TIMT_LAST, 500));
+
+	/* Set maximum interrupt rate threshold (in micro seconds). */
+	AR_WRITE(sc, AR_MIRT, SM(AR_MIRT_RATE_THRES, 2000));
 
 	ops->init_baseband(sc);
 
@@ -2552,10 +2693,11 @@ athn_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 		if (sc->sup_calib_mask != 0) {
 			memset(&sc->calib, 0, sizeof(sc->calib));
 			sc->cur_calib_mask = sc->sup_calib_mask;
-			/* ops->do_calib(sc); */
+			sc->ops.do_calib(sc);
 		}
 		/* XXX Start ANI. */
 
+		athn_start_noisefloor_calib(sc, 1);
 		timeout_add_msec(&sc->calib_to, 500);
 		break;
 	}
@@ -2597,7 +2739,13 @@ athn_clock_rate(struct athn_softc *sc)
 	struct ieee80211com *ic = &sc->sc_ic;
 	int clockrate;	/* MHz. */
 
-	if (ic->ic_bss->ni_chan != IEEE80211_CHAN_ANYC &&
+	/*
+	 * AR9287 v1.3+ MAC runs at 117MHz (instead of 88/44MHz) when
+	 * ASYNC FIFO is enabled.
+	 */
+	if (AR_SREV_9287_13_OR_LATER(sc) && !AR_SREV_9380_10_OR_LATER(sc))
+		clockrate = 117;
+	else if (ic->ic_bss->ni_chan != IEEE80211_CHAN_ANYC &&
 	    IEEE80211_IS_CHAN_5GHZ(ic->ic_bss->ni_chan)) {
 		if (sc->flags & ATHN_FLAG_FAST_PLL_CLOCK)
 			clockrate = AR_CLOCK_RATE_FAST_5GHZ_OFDM;
@@ -2613,6 +2761,69 @@ athn_clock_rate(struct athn_softc *sc)
 	return (clockrate);
 }
 
+int
+athn_chan_sifs(struct ieee80211_channel *c)
+{
+	return IEEE80211_IS_CHAN_2GHZ(c) ? IEEE80211_DUR_DS_SIFS : 16;
+}
+
+void
+athn_setsifs(struct athn_softc *sc)
+{
+	int sifs = athn_chan_sifs(sc->sc_ic.ic_bss->ni_chan);
+	AR_WRITE(sc, AR_D_GBL_IFS_SIFS, (sifs - 2) * athn_clock_rate(sc));
+	AR_WRITE_BARRIER(sc);
+}
+
+int
+athn_acktimeout(struct ieee80211_channel *c, int slot)
+{
+	int sifs = athn_chan_sifs(c);
+	int ackto = sifs + slot;
+
+	/* Workaround for early ACK timeouts. */
+	if (IEEE80211_IS_CHAN_2GHZ(c))
+		ackto += 64 - sifs - slot;
+
+	return ackto;
+}
+
+void
+athn_setacktimeout(struct athn_softc *sc, struct ieee80211_channel *c, int slot)
+{
+	int ackto = athn_acktimeout(c, slot);
+	uint32_t reg = AR_READ(sc, AR_TIME_OUT);
+	reg = RW(reg, AR_TIME_OUT_ACK, ackto * athn_clock_rate(sc));
+	AR_WRITE(sc, AR_TIME_OUT, reg);
+	AR_WRITE_BARRIER(sc);
+}
+
+void
+athn_setctstimeout(struct athn_softc *sc, struct ieee80211_channel *c, int slot)
+{
+	int ctsto = athn_acktimeout(c, slot);
+	int sifs = athn_chan_sifs(c);
+	uint32_t reg = AR_READ(sc, AR_TIME_OUT);
+
+	/* Workaround for early CTS timeouts. */
+	if (IEEE80211_IS_CHAN_2GHZ(c))
+		ctsto += 48 - sifs - slot;
+
+	reg = RW(reg, AR_TIME_OUT_CTS, ctsto * athn_clock_rate(sc));
+	AR_WRITE(sc, AR_TIME_OUT, reg);
+	AR_WRITE_BARRIER(sc);
+}
+
+void
+athn_setclockrate(struct athn_softc *sc)
+{
+	int clockrate = athn_clock_rate(sc);
+	uint32_t reg = AR_READ(sc, AR_USEC);
+	reg = RW(reg, AR_USEC_USEC, clockrate - 1);
+	AR_WRITE(sc, AR_USEC, reg);
+	AR_WRITE_BARRIER(sc);
+}
+
 void
 athn_updateslot(struct ieee80211com *ic)
 {
@@ -2623,6 +2834,9 @@ athn_updateslot(struct ieee80211com *ic)
 	    IEEE80211_DUR_DS_SHSLOT : IEEE80211_DUR_DS_SLOT;
 	AR_WRITE(sc, AR_D_GBL_IFS_SLOT, slot * athn_clock_rate(sc));
 	AR_WRITE_BARRIER(sc);
+
+	athn_setacktimeout(sc, ic->ic_bss->ni_chan, slot);
+	athn_setctstimeout(sc, ic->ic_bss->ni_chan, slot);
 }
 
 void
@@ -2659,7 +2873,7 @@ athn_start(struct ifnet *ifp)
 			break;
 
 		/* Encapsulate and send data frames. */
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 #if NBPFILTER > 0
@@ -2847,10 +3061,6 @@ athn_init(struct ifnet *ifp)
 	else
 		athn_config_pcie(sc);
 
-	/* Reset HW key cache entries. */
-	for (i = 0; i < sc->kc_entries; i++)
-		athn_reset_key(sc, i);
-
 	ops->enable_antenna_diversity(sc);
 
 #ifdef ATHN_BT_COEXISTENCE
@@ -2872,8 +3082,14 @@ athn_init(struct ifnet *ifp)
 		goto fail;
 	}
 
+	athn_config_ht(sc);
+
 	/* Enable Rx. */
 	athn_rx_start(sc);
+
+	/* Reset HW key cache entries. */
+	for (i = 0; i < sc->kc_entries; i++)
+		athn_reset_key(sc, i);
 
 	/* Enable interrupts. */
 	athn_enable_interrupts(sc);
@@ -2910,7 +3126,7 @@ athn_stop(struct ifnet *ifp, int disable)
 {
 	struct athn_softc *sc = ifp->if_softc;
 	struct ieee80211com *ic = &sc->sc_ic;
-	int qid;
+	int qid, i;
 
 	ifp->if_timer = sc->sc_tx_timer = 0;
 	ifp->if_flags &= ~IFF_RUNNING;
@@ -2947,6 +3163,10 @@ athn_stop(struct ifnet *ifp, int disable)
 	AR_WRITE_BARRIER(sc);
 	athn_set_rxfilter(sc, 0);
 	athn_stop_rx_dma(sc);
+
+	/* Reset HW key cache entries. */
+	for (i = 0; i < sc->kc_entries; i++)
+		athn_reset_key(sc, i);
 
 	athn_reset(sc, 0);
 	athn_init_pll(sc, NULL);

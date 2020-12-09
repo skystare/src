@@ -1,4 +1,4 @@
-#	$OpenBSD: obsd-regress.t,v 1.7 2018/07/09 00:23:55 anton Exp $
+#	$OpenBSD: obsd-regress.t,v 1.12 2020/07/07 10:33:58 jca Exp $
 
 #
 # ksh regression tests from OpenBSD
@@ -92,6 +92,17 @@ stdin:
 	echo "should not print"
 arguments: !-e!
 expected-exit: e != 0
+---
+
+name: or-list-error-2
+description:
+	Test exit status of || list in -e mode
+stdin:
+	eval false || true
+	echo "should print"
+expected-stdout:
+	should print
+arguments: !-e!
 ---
 
 name: var-functions
@@ -484,4 +495,110 @@ stdin:
 expected-exit: e == 1
 expected-stderr-pattern:
 	/: 1: parameter not set$/
+---
+
+name: pwd
+description:
+	PWD and OLDPWD must be exported
+stdin:
+	d=$(printenv PWD)
+	: ${d:?"PWD not exported"}
+	cd .
+	d=$(printenv OLDPWD)
+	: ${d:?"OLDPWD not exported"}
+---
+
+name: kill-SIGNAME
+description:
+	support kill -s SIGNAME syntax
+stdin:
+	kill -s SIGINFO $$
+---
+
+name: pipeline-pipefail-1
+description:
+	check pipeline return status
+stdin:
+	set -o pipefail
+	true | true
+---
+
+name: pipeline-pipefail-2
+description:
+	check pipeline return status
+stdin:
+	set -o pipefail
+	false | true
+expected-exit: e == 1
+---
+
+name: pipeline-pipefail-3
+description:
+	check pipeline return status
+stdin:
+	set -o pipefail
+	true | false
+expected-exit: e == 1
+---
+
+name: pipeline-pipefail-4
+description:
+	check pipeline return status
+stdin:
+	set -o pipefail
+	! false | true
+---
+
+name: pipeline-pipefail-errexit-1
+description:
+	check pipeline return status
+stdin:
+	set -e
+	false | true
+	echo "ok"
+expected-stdout: ok
+---
+
+name: pipeline-pipefail-errexit-2
+description:
+	check pipeline return status
+stdin:
+	set -e
+	set -o pipefail
+	false | true
+	echo "should not print"
+expected-exit: e == 1
+expected-stdout:
+---
+
+name: pipeline-pipefail-errexit-3
+description:
+	check pipeline return status
+stdin:
+	set -e
+	set -o pipefail
+	false | true || echo "ok"
+expected-stdout: ok
+---
+
+name: pipeline-pipefail-check-time-1
+description:
+	check pipeline return status
+stdin:
+	false | true &
+	p=$!
+	set -o pipefail
+	wait $p
+---
+
+name: pipeline-pipefail-check-time-2
+description:
+	check pipeline return status
+stdin:
+	set -o pipefail
+	false | true &
+	p=$!
+	set +o pipefail
+	wait $p
+expected-exit: e == 1
 ---

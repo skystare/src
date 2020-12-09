@@ -1,4 +1,4 @@
-.\"	$OpenBSD: dhclient.conf.5,v 1.44 2018/05/12 12:50:17 krw Exp $
+.\"	$OpenBSD: dhclient.conf.5,v 1.51 2020/07/17 22:21:18 krw Exp $
 .\"
 .\" Copyright (c) 1997 The Internet Software Consortium.
 .\" All rights reserved.
@@ -36,7 +36,7 @@
 .\" see ``http://www.isc.org/isc''.  To learn more about Vixie
 .\" Enterprises, see ``http://www.vix.com''.
 .\"
-.Dd $Mdocdate: May 12 2018 $
+.Dd $Mdocdate: July 17 2020 $
 .Dt DHCLIENT.CONF 5
 .Os
 .Sh NAME
@@ -89,7 +89,7 @@ Sets the number of seconds to wait for a lease.
 If no lease is received the first valid lease in
 .Xr dhclient.leases 5
 will be used.
-The default is 30 seonds.
+The default is 30 seconds.
 .El
 .Sh DHCP OPTION DECLARATIONS
 .Bl -tag -width Ds
@@ -112,6 +112,12 @@ or
 .Ic supersede
 for
 .Ar option .
+.Pp
+If the option's data cannot be appended to, i.e. it has a fixed size,
+then
+.Ic append
+will be treated as
+.Ic default .
 .It Ic default Ar option option-value ;
 If no value for
 .Ar option
@@ -166,6 +172,12 @@ or
 .Ic supersede
 for
 .Ar option .
+.Pp
+If the option's data cannot be prepended to, i.e. it has a fixed size,
+then
+.Ic prepend
+will be treated as
+.Ic supersede .
 .It Ic request Op Ar option , ... ;
 Ask that any lease contain values
 for the listed options.
@@ -173,7 +185,7 @@ for the listed options.
 statements are cumulative, except that an empty
 list will remove all previously specified options.
 The default is to request the options
-bootfile-name
+bootfile-name,
 broadcast-address,
 classless-static-routes,
 host-name,
@@ -190,6 +202,7 @@ Discard leases that do not contain the listed options.
 .Ic require
 statements are cumulative, except that an empty
 list will remove all previously specified options.
+The default is to require the option subnet-mask.
 .It Ic send Ar option option-value ;
 Include
 .Ar option-value
@@ -205,6 +218,27 @@ for the given
 regardless of the value in the lease.
 Each
 .Ic supersede
+for
+.Ar option
+overrides any previous
+.Ic append ,
+.Ic default ,
+.Ic ignore ,
+.Ic prepend
+or
+.Ic supersede
+for
+.Ar option .
+.It Ic uselease Op Ar option , ... ;
+Use the unmodified values provided in the lease for
+any specified
+.Ar option .
+.Ic uselease
+statements are cumulative.
+If no
+.Ar option
+is specified all lease option values will be used unmodified.
+.Ic uselease
 for
 .Ar option
 overrides any previous
@@ -253,6 +287,11 @@ Use
 instead of the
 .Ic sname
 field of the DHCP offer when binding a lease.
+.El
+.Sh FILES
+.Bl -tag -width /etc/examples/dhclient.conf -compact
+.It Pa /etc/dhclient.conf
+.It Pa /etc/examples/dhclient.conf
 .El
 .Sh SEE ALSO
 .Xr dhclient.leases 5 ,

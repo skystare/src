@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.10 2018/09/16 18:58:36 bluhm Exp $	*/
+/*	$OpenBSD: parse.y,v 1.16 2020/03/30 17:47:48 florian Exp $	*/
 
 /*
  * Copyright (c) 2018 Florian Obser <florian@openbsd.org>
@@ -37,7 +37,6 @@
 #include <err.h>
 #include <errno.h>
 #include <event.h>
-#include <ifaddrs.h>
 #include <imsg.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -175,6 +174,8 @@ varset		: STRING '=' string		{
 				if (isspace((unsigned char)*s)) {
 					yyerror("macro name cannot contain "
 					    "whitespace");
+					free($1);
+					free($3);
 					YYERROR;
 				}
 			}
@@ -187,7 +188,7 @@ varset		: STRING '=' string		{
 
 conf_main	: ra_opt_block {
 			ra_options = &conf->ra_options;
-		} 
+		}
 		;
 
 ra_opt_block	: DEFAULT ROUTER yesno {
@@ -626,7 +627,8 @@ top:
 			} else if (c == '\\') {
 				if ((next = lgetc(quotec)) == EOF)
 					return (0);
-				if (next == quotec || c == ' ' || c == '\t')
+				if (next == quotec || next == ' ' ||
+				    next == '\t')
 					c = next;
 				else if (next == '\n') {
 					file->lineno++;
@@ -658,7 +660,7 @@ top:
 	if (c == '-' || isdigit(c)) {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -697,7 +699,7 @@ nodigits:
 	if (isalnum(c) || c == ':' || c == '_') {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -962,8 +964,8 @@ conf_get_ra_prefix(struct in6_addr *addr, int prefixlen)
 	if (prefix == NULL)
 		errx(1, "%s: calloc", __func__);
 	prefix->prefixlen = prefixlen;
-	prefix->vltime = 2592000;	/* 30 days */
-	prefix->pltime = 604800;	/* 7 days */
+	prefix->vltime = ADV_VALID_LIFETIME;
+	prefix->pltime = ADV_PREFERRED_LIFETIME;
 	prefix->lflag = 1;
 	prefix->aflag = 1;
 

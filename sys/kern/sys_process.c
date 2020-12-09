@@ -1,4 +1,4 @@
-/*	$OpenBSD: sys_process.c,v 1.80 2018/02/19 09:25:13 mpi Exp $	*/
+/*	$OpenBSD: sys_process.c,v 1.85 2020/12/07 16:55:29 mpi Exp $	*/
 /*	$NetBSD: sys_process.c,v 1.55 1996/05/15 06:17:47 tls Exp $	*/
 
 /*-
@@ -282,6 +282,8 @@ ptrace_ctrl(struct proc *p, int req, pid_t pid, caddr_t addr, int data)
 	case PT_TRACE_ME:
 		/* Just set the trace flag. */
 		tr = p->p_p;
+		if (ISSET(tr->ps_flags, PS_TRACED))
+			return EBUSY;
 		atomic_setbits_int(&tr->ps_flags, PS_TRACED);
 		tr->ps_oppid = tr->ps_pptr->ps_pid;
 		if (tr->ps_ptstat == NULL)
@@ -299,7 +301,7 @@ ptrace_ctrl(struct proc *p, int req, pid_t pid, caddr_t addr, int data)
 			error = ESRCH;
 			goto fail;
 		}
-		t = TAILQ_FIRST(&tr->ps_threads);
+		t = SMR_TAILQ_FIRST_LOCKED(&tr->ps_threads);
 		break;
 
 	/* calls that accept a PID or a thread ID */
@@ -474,24 +476,15 @@ ptrace_ctrl(struct proc *p, int req, pid_t pid, caddr_t addr, int data)
 			goto fail;
 #endif
 
-		/* give process back to original parent or init */
-		if (tr->ps_oppid != tr->ps_pptr->ps_pid) {
-			struct process *ppr;
-
-			ppr = prfind(tr->ps_oppid);
-			proc_reparent(tr, ppr ? ppr : initprocess);
-		}
-
-		/* not being traced any more */
-		tr->ps_oppid = 0;
-		atomic_clearbits_int(&tr->ps_flags, PS_TRACED|PS_WAITED);
+		process_untrace(tr);
+		atomic_clearbits_int(&tr->ps_flags, PS_WAITED);
 
 	sendsig:
 		memset(tr->ps_ptstat, 0, sizeof(*tr->ps_ptstat));
 
 		/* Finally, deliver the requested signal (or none). */
 		if (t->p_stat == SSTOP) {
-			t->p_xstat = data;
+			tr->ps_xsig = data;
 			SCHED_LOCK(s);
 			setrunnable(t);
 			SCHED_UNLOCK(s);
@@ -521,8 +514,7 @@ ptrace_ctrl(struct proc *p, int req, pid_t pid, caddr_t addr, int data)
 		 */
 		atomic_setbits_int(&tr->ps_flags, PS_TRACED);
 		tr->ps_oppid = tr->ps_pptr->ps_pid;
-		if (tr->ps_pptr != p->p_p)
-			proc_reparent(tr, p->p_p);
+		process_reparent(tr, p->p_p);
 		if (tr->ps_ptstat == NULL)
 			tr->ps_ptstat = malloc(sizeof(*tr->ps_ptstat),
 			    M_SUBPROC, M_WAITOK);
@@ -569,9 +561,9 @@ ptrace_kstate(struct proc *p, int req, pid_t pid, void *addr)
 				return ESRCH;
 			if (t->p_p != tr)
 				return EINVAL;
-			t = TAILQ_NEXT(t, p_thr_link);
+			t = SMR_TAILQ_NEXT_LOCKED(t, p_thr_link);
 		} else {
-			t = TAILQ_FIRST(&tr->ps_threads);
+			t = SMR_TAILQ_FIRST_LOCKED(&tr->ps_threads);
 		}
 
 		if (t == NULL)
@@ -762,7 +754,7 @@ process_tprfind(pid_t tpid, struct proc **tp)
 
 		if (tr == NULL)
 			return NULL;
-		*tp = TAILQ_FIRST(&tr->ps_threads);
+		*tp = SMR_TAILQ_FIRST_LOCKED(&tr->ps_threads);
 		return tr;
 	}
 }
@@ -858,13 +850,12 @@ process_domem(struct proc *curp, struct process *tr, struct uio *uio, int req)
 	if ((error = process_checkioperm(curp, tr)) != 0)
 		return error;
 
-	/* XXXCDC: how should locking work here? */
 	vm = tr->ps_vmspace;
 	if ((tr->ps_flags & PS_EXITING) || (vm->vm_refcnt < 1))
 		return EFAULT;
 	addr = uio->uio_offset;
 
-	vm->vm_refcnt++;
+	uvmspace_addref(vm);
 
 	error = uvm_io(&vm->vm_map, uio,
 	    (uio->uio_rw == UIO_WRITE) ? UVM_IO_FIXPROT : 0);
@@ -900,7 +891,7 @@ process_auxv_offset(struct proc *curp, struct process *tr, struct uio *uiop)
 	if ((tr->ps_flags & PS_EXITING) || (vm->vm_refcnt < 1))
 		return EFAULT;
 
-	vm->vm_refcnt++;
+	uvmspace_addref(vm);
 	error = uvm_io(&vm->vm_map, &uio, 0);
 	uvmspace_free(vm);
 

@@ -1,4 +1,4 @@
-/* $OpenBSD: machdep.c,v 1.186 2018/07/10 04:19:59 guenther Exp $ */
+/* $OpenBSD: machdep.c,v 1.195 2020/11/08 20:37:21 mpi Exp $ */
 /* $NetBSD: machdep.c,v 1.210 2000/06/01 17:12:38 thorpej Exp $ */
 
 /*-
@@ -190,9 +190,6 @@ int	alpha_fp_sync_complete = 0;	/* fp fixup if sync even without /s */
 int	alpha_led_blink = 1;
 #endif
 
-/* used by hw_sysctl */
-extern char *hw_serial;
-
 /*
  * XXX This should be dynamically sized, but we have the chicken-egg problem!
  * XXX it should also be larger than it is, because not all of the mddt
@@ -284,6 +281,7 @@ alpha_init(unused, ptb, bim, bip, biv)
 			bcopy(v1p->booted_kernel, bootinfo.booted_kernel,
 			    min(sizeof v1p->booted_kernel,
 			      sizeof bootinfo.booted_kernel));
+			boothowto = v1p->howto;
 			/* booted dev not provided in bootinfo */
 			init_prom_interface((struct rpb *)
 			    ALPHA_PHYS_TO_K0SEG(bootinfo.hwrpb_phys));
@@ -771,6 +769,8 @@ nobootinfo:
 #endif
 		hz = 1024;
 	}
+	tick = 1000000 / hz;
+	tick_nsec = 1000000000 / hz;
 }
 
 void
@@ -964,6 +964,9 @@ boot(int howto)
 	int i;
 #endif
 
+	if ((howto & RB_RESET) != 0)
+		goto doreset;
+
 	if (cold) {
 		if ((howto & RB_USERREQ) == 0)
 			howto |= RB_HALT;
@@ -1033,6 +1036,7 @@ haltsys:
 		(*platform.powerdown)();
 		printf("WARNING: powerdown failed!\n");
 	}
+doreset:
 	printf("%s\n\n",
 	    (howto & RB_HALT) != 0 ? "halted." : "rebooting...");
 	prom_halt((howto & RB_HALT) != 0);
@@ -1379,7 +1383,7 @@ regdump(framep)
 /*
  * Send an interrupt to process.
  */
-void
+int
 sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 {
 	struct proc *p = curproc;
@@ -1441,20 +1445,13 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 	if (psp->ps_siginfo & sigmask(sig)) {
 		sip = (void *)scp + kscsize;
 		if (copyout(ksip, (caddr_t)sip, fsize - kscsize) != 0)
-			goto trash;
+			return 1;
 	} else
 		sip = NULL;
 
 	ksc.sc_cookie = (long)scp ^ p->p_p->ps_sigcookie;
-	if (copyout((caddr_t)&ksc, (caddr_t)scp, kscsize) != 0) {
-trash:
-		/*
-		 * Process has trashed its stack; give it an illegal
-		 * instruction to halt it in its tracks.
-		 */
-		sigexit(p, SIGILL);
-		/* NOTREACHED */
-	}
+	if (copyout((caddr_t)&ksc, (caddr_t)scp, kscsize) != 0)
+		return 1;
 
 	/*
 	 * Set up the registers to return to sigcode.
@@ -1465,6 +1462,8 @@ trash:
 	frame->tf_regs[FRAME_A2] = (u_int64_t)scp;
 	frame->tf_regs[FRAME_T12] = (u_int64_t)catcher;		/* t12 is pv */
 	alpha_pal_wrusp((unsigned long)scp);
+
+	return 0;
 }
 
 /*

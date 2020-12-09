@@ -1,4 +1,4 @@
-/*      $OpenBSD: pmap.h,v 1.46 2016/12/22 15:33:36 visa Exp $ */
+/*      $OpenBSD: pmap.h,v 1.48 2019/08/21 16:14:34 visa Exp $ */
 
 /*
  * Copyright (c) 1987 Carnegie-Mellon University
@@ -117,6 +117,7 @@ struct pmap_asid_info {
  */
 typedef struct pmap {
 	struct mutex		pm_mtx;		/* pmap lock */
+	struct mutex		pm_swmtx;	/* pmap switch lock */
 	int			pm_count;	/* pmap reference count */
 	struct pmap_statistics	pm_stats;	/* pmap statistics */
 	struct segtab		*pm_segtab;	/* pointers to pages of PTEs */
@@ -132,7 +133,7 @@ typedef struct pmap {
 	       (sizeof(struct pmap_asid_info) * ((x) - 1))))
 
 /* machine-dependent pg_flags */
-#define	PGF_UNCACHED	PG_PMAP0	/* Page is explicitely uncached */
+#define	PGF_UNCACHED	PG_PMAP0	/* Page is explicitly uncached */
 #define	PGF_CACHED	PG_PMAP1	/* Page is currently cached */
 #define	PGF_ATTR_MOD	PG_PMAP2
 #define	PGF_ATTR_REF	PG_PMAP3

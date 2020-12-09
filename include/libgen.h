@@ -1,7 +1,7 @@
-/*	$OpenBSD: libgen.h,v 1.8 2016/01/25 12:17:48 jca Exp $	*/
+/*	$OpenBSD: libgen.h,v 1.10 2020/10/20 19:30:14 naddy Exp $	*/
 
 /*
- * Copyright (c) 1997 Todd C. Miller <Todd.Miller@courtesan.com>
+ * Copyright (c) 1997 Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,8 +22,8 @@
 #include <sys/cdefs.h>
 
 __BEGIN_DECLS
-char	*basename(const char *);
-char	*dirname(const char *);
+char	*basename(char *);
+char	*dirname(char *);
 __END_DECLS
 
 #endif /* _LIBGEN_H_ */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm.h,v 1.62 2018/04/12 17:13:44 deraadt Exp $	*/
+/*	$OpenBSD: uvm.h,v 1.68 2020/11/24 13:49:09 mpi Exp $	*/
 /*	$NetBSD: uvm.h,v 1.24 2000/11/27 08:40:02 chs Exp $	*/
 
 /*
@@ -44,18 +44,20 @@
 /*
  * uvm structure (vm global state: collected in one structure for ease
  * of reference...)
+ *
+ *  Locks used to protect struct members in this file:
+ *	Q	uvm.pageqlock
  */
-
 struct uvm {
 	/* vm_page related parameters */
 
 	/* vm_page queues */
-	struct pglist page_active;	/* allocated pages, in use */
-	struct pglist page_inactive_swp;/* pages inactive (reclaim or free) */
-	struct pglist page_inactive_obj;/* pages inactive (reclaim or free) */
+	struct pglist page_active;	/* [Q] allocated pages, in use */
+	struct pglist page_inactive_swp;/* [Q] pages inactive (reclaim/free) */
+	struct pglist page_inactive_obj;/* [Q] pages inactive (reclaim/free) */
 	/* Lock order: pageqlock, then fpageqlock. */
-	struct mutex pageqlock;		/* lock for active/inactive page q */
-	struct mutex fpageqlock;	/* lock for free page q  + pdaemon */
+	struct mutex pageqlock;		/* [] lock for active/inactive page q */
+	struct mutex fpageqlock;	/* [] lock for free page q  + pdaemon */
 	boolean_t page_init_done;	/* TRUE if uvm_page_init() finished */
 	struct uvm_pmr_control pmr_control; /* pmemrange data */
 
@@ -80,16 +82,20 @@ struct uvm {
 
 /*
  * vm_map_entry etype bits:
+ *
+ * keep in sync with KVM_ET_*
  */
-
-#define UVM_ET_OBJ		0x01	/* it is a uvm_object */
-#define UVM_ET_SUBMAP		0x02	/* it is a vm_map submap */
-#define UVM_ET_COPYONWRITE 	0x04	/* copy_on_write */
-#define UVM_ET_NEEDSCOPY	0x08	/* needs_copy */
-#define UVM_ET_HOLE		0x10	/* no backend */
-#define UVM_ET_NOFAULT		0x20	/* don't fault */
-#define UVM_ET_STACK		0x40	/* this is a stack */
-#define UVM_ET_FREEMAPPED	0x80	/* map entry is on free list (DEBUG) */
+#define UVM_ET_OBJ		0x0001	/* it is a uvm_object */
+#define UVM_ET_SUBMAP		0x0002	/* it is a vm_map submap */
+#define UVM_ET_COPYONWRITE 	0x0004	/* copy_on_write */
+#define UVM_ET_NEEDSCOPY	0x0008	/* needs_copy */
+#define UVM_ET_HOLE		0x0010	/* no backend */
+#define UVM_ET_NOFAULT		0x0020	/* don't fault */
+#define UVM_ET_STACK		0x0040	/* this is a stack */
+#define UVM_ET_WC		0x0080	/* write combining */
+#define UVM_ET_CONCEAL		0x0100	/* omit from dumps */
+#define UVM_ET_SYSCALL		0x0200	/* syscall text segment */
+#define UVM_ET_FREEMAPPED	0x8000	/* map entry is on free list (DEBUG) */
 
 #define UVM_ET_ISOBJ(E)		(((E)->etype & UVM_ET_OBJ) != 0)
 #define UVM_ET_ISSUBMAP(E)	(((E)->etype & UVM_ET_SUBMAP) != 0)
@@ -98,6 +104,8 @@ struct uvm {
 #define UVM_ET_ISHOLE(E)	(((E)->etype & UVM_ET_HOLE) != 0)
 #define UVM_ET_ISNOFAULT(E)	(((E)->etype & UVM_ET_NOFAULT) != 0)
 #define UVM_ET_ISSTACK(E)	(((E)->etype & UVM_ET_STACK) != 0)
+#define UVM_ET_ISWC(E)		(((E)->etype & UVM_ET_WC) != 0)
+#define UVM_ET_ISCONCEAL(E)	(((E)->etype & UVM_ET_CONCEAL) != 0)
 
 #ifdef _KERNEL
 
@@ -105,15 +113,6 @@ struct uvm {
  * holds all the internal UVM data
  */
 extern struct uvm uvm;
-
-/*
- * UVM_WAIT: wait... wrapper around the tsleep() function.
- */
-
-#define	UVM_WAIT(event, intr, msg, timo)				\
-do {									\
-	tsleep(event, PVM|(intr ? PCATCH : 0), msg, timo);		\
-} while (0)
 
 /*
  * UVM_PAGE_OWN: track page ownership (only if UVM_PAGE_TRKOWN)

@@ -1,4 +1,4 @@
-/*	$OpenBSD: pmap.c,v 1.203 2018/06/22 13:21:14 bluhm Exp $	*/
+/*	$OpenBSD: pmap.c,v 1.209 2020/09/24 11:36:50 deraadt Exp $	*/
 /*	$NetBSD: pmap.c,v 1.91 2000/06/02 17:46:37 thorpej Exp $	*/
 
 /*
@@ -72,8 +72,6 @@
 #include <dev/isa/isareg.h>
 #include <sys/msgbuf.h>
 #include <stand/boot/bootarg.h>
-
-#include "vmm.h"
 
 /* #define PMAP_DEBUG */
 
@@ -377,8 +375,6 @@ struct pmap __attribute__ ((aligned (32))) kernel_pmap_store;
 int nkpde = NKPTP;
 int nkptp_max = 1024 - (KERNBASE / NBPD) - 1;
 
-extern int cpu_pae;
-
 /*
  * pg_g_kern:  if CPU is affected by Meltdown pg_g_kern is 0,
  * otherwise it is is set to PG_G.  pmap_pg_g will be dervied
@@ -405,7 +401,7 @@ int pmap_pg_wc = PG_UCMINUS;
  */
 
 uint32_t protection_codes[8];		/* maps MI prot to i386 prot code */
-boolean_t pmap_initialized = FALSE;	/* pmap_init done yet? */
+int pmap_initialized = 0;	/* pmap_init done yet? */
 
 /*
  * MULTIPROCESSOR: special VAs/ PTEs are actually allocated inside a
@@ -586,6 +582,9 @@ pmap_exec_account(struct pmap *pm, vaddr_t va,
 	if ((opte ^ npte) & PG_X)
 		pmap_tlb_shootpage(pm, va);
 			
+	if (cpu_pae)
+		return;
+
 	/*
 	 * Executability was removed on the last executable change.
 	 * Reset the code segment to something conservative and
@@ -598,12 +597,12 @@ pmap_exec_account(struct pmap *pm, vaddr_t va,
 		struct trapframe *tf = curproc->p_md.md_regs;
 		struct pcb *pcb = &curproc->p_addr->u_pcb;
 
+		KERNEL_LOCK();
 		pm->pm_hiexec = I386_MAX_EXE_ADDR;
 		setcslimit(pm, tf, pcb, I386_MAX_EXE_ADDR);
+		KERNEL_UNLOCK();
 	}
 }
-
-#define SEGDESC_LIMIT(sd) (ptoa(((sd).sd_hilimit << 16) | (sd).sd_lolimit))
 
 /*
  * Fixup the code segment to cover all potential executable mappings.
@@ -611,12 +610,15 @@ pmap_exec_account(struct pmap *pm, vaddr_t va,
  * returns 0 if no changes to the code segment were made.
  */
 int
-pmap_exec_fixup(struct vm_map *map, struct trapframe *tf, struct pcb *pcb)
+pmap_exec_fixup(struct vm_map *map, struct trapframe *tf, vaddr_t gdt_cs,
+    struct pcb *pcb)
 {
 	struct vm_map_entry *ent;
 	struct pmap *pm = vm_map_pmap(map);
 	vaddr_t va = 0;
-	vaddr_t pm_cs, gdt_cs;
+	vaddr_t pm_cs;
+
+	KERNEL_LOCK();
 
 	vm_map_lock(map);
 	RBT_FOREACH_REVERSE(ent, uvm_map_addr, &map->addr) {
@@ -631,8 +633,9 @@ pmap_exec_fixup(struct vm_map *map, struct trapframe *tf, struct pcb *pcb)
 		va = trunc_page(ent->end - 1);
 	vm_map_unlock(map);
 
+	KERNEL_ASSERT_LOCKED();
+
 	pm_cs = SEGDESC_LIMIT(pm->pm_codeseg);
-	gdt_cs = SEGDESC_LIMIT(curcpu()->ci_gdt[GUCODE_SEL].sd);
 
 	/*
 	 * Another thread running on another cpu can change
@@ -644,6 +647,7 @@ pmap_exec_fixup(struct vm_map *map, struct trapframe *tf, struct pcb *pcb)
 	 */
 	if (va <= pm->pm_hiexec && pm_cs == pm->pm_hiexec &&
 	    gdt_cs == pm->pm_hiexec) {
+		KERNEL_UNLOCK();
 		return (0);
 	}
 
@@ -656,6 +660,7 @@ pmap_exec_fixup(struct vm_map *map, struct trapframe *tf, struct pcb *pcb)
 	 */
 	setcslimit(pm, tf, pcb, va);
 
+	KERNEL_UNLOCK();
 	return (1);
 }
 
@@ -848,7 +853,7 @@ pmap_kenter_pa(vaddr_t va, paddr_t pa, vm_prot_t prot)
 		((pa & PMAP_WC) ? pmap_pg_wc : 0));
 	if (pmap_valid_entry(bits)) {
 		if (pa & PMAP_NOCACHE && (bits & PG_N) == 0)
-			wbinvd();
+			wbinvd_on_all_cpus();
 		/* NB. - this should not happen. */
 		pmap_tlb_shootpage(pmap_kernel(), va);
 		pmap_tlb_shootwait();
@@ -964,11 +969,6 @@ pmap_bootstrap(vaddr_t kva_start)
 	kpm->pm_pdirpa_intel = 0;
 	kpm->pm_stats.wired_count = kpm->pm_stats.resident_count =
 		atop(kva_start - VM_MIN_KERNEL_ADDRESS);
-	kpm->pm_type = PMAP_TYPE_NORMAL;
-#if NVMM > 0
-	kpm->pm_npt_pml4 = 0;
-	kpm->pm_npt_pdpt = 0;
-#endif /* NVMM > 0 */
 
 	/*
 	 * the above is just a rough estimate and not critical to the proper
@@ -1127,7 +1127,7 @@ pmap_init(void)
 	 * done: pmap module is up (and ready for business)
 	 */
 
-	pmap_initialized = TRUE;
+	pmap_initialized = 1;
 }
 
 /*
@@ -1353,14 +1353,7 @@ pmap_create(void)
 	pmap->pm_hiexec = 0;
 	pmap->pm_flags = 0;
 
-	setsegment(&pmap->pm_codeseg, 0, atop(I386_MAX_EXE_ADDR) - 1,
-	    SDT_MEMERA, SEL_UPL, 1, 1);
-
-	pmap->pm_type = PMAP_TYPE_NORMAL;
-#if NVMM > 0
-	pmap->pm_npt_pml4 = 0;
-	pmap->pm_npt_pdpt = 0;
-#endif /* NVMM > 0 */
+	initcodesegment(&pmap->pm_codeseg);
 
 	pmap_pinit_pd(pmap);
 	return (pmap);
@@ -1457,15 +1450,6 @@ pmap_destroy(struct pmap *pmap)
 	uvm_km_free(kernel_map, pmap->pm_pdir, pmap->pm_pdirsize);
 	pmap->pm_pdir = 0;
 
-#if NVMM > 0
-	if (pmap->pm_npt_pml4)
-		km_free((void *)pmap->pm_npt_pml4, PAGE_SIZE, &kv_any,
-		    &kp_zero);
-	if (pmap->pm_npt_pdpt)
-		km_free((void *)pmap->pm_npt_pdpt, PAGE_SIZE, &kv_any,
-		    &kp_zero);
-#endif /* NVMM > 0 */
-
 	if (pmap->pm_pdir_intel) {
 		uvm_km_free(kernel_map, pmap->pm_pdir_intel, pmap->pm_pdirsize);
 		pmap->pm_pdir_intel = 0;
@@ -1547,7 +1531,7 @@ pmap_deactivate(struct proc *p)
  * pmap_extract: extract a PA for the given VA
  */
 
-boolean_t
+int
 pmap_extract_86(struct pmap *pmap, vaddr_t va, paddr_t *pap)
 {
 	pt_entry_t *ptes, pte;
@@ -1557,12 +1541,12 @@ pmap_extract_86(struct pmap *pmap, vaddr_t va, paddr_t *pap)
 		pte = ptes[atop(va)];
 		pmap_unmap_ptes_86(pmap);
 		if (!pmap_valid_entry(pte))
-			return (FALSE);
+			return 0;
 		if (pap != NULL)
 			*pap = (pte & PG_FRAME) | (va & ~PG_FRAME);
-		return (TRUE);
+		return 1;
 	}
-	return (FALSE);
+	return 0;
 }
 
 /*
@@ -1616,7 +1600,7 @@ pmap_zero_phys_86(paddr_t pa)
  * pmap_zero_page_uncached: the same, except uncached.
  */
 
-boolean_t
+int
 pmap_zero_page_uncached_86(paddr_t pa)
 {
 #ifdef MULTIPROCESSOR
@@ -1635,7 +1619,7 @@ pmap_zero_page_uncached_86(paddr_t pa)
 	pagezero(zerova, PAGE_SIZE);		/* zero */
 	*zpte = 0;
 
-	return (TRUE);
+	return 1;
 }
 
 /*
@@ -1647,7 +1631,7 @@ pmap_flush_cache(vaddr_t addr, vsize_t len)
 	vaddr_t i;
 
 	if (curcpu()->ci_cflushsz == 0) {
-		wbinvd();
+		wbinvd_on_all_cpus();
 		return;
 	}
 	
@@ -2031,7 +2015,7 @@ pmap_page_remove_86(struct vm_page *pg)
  * pmap_test_attrs: test a page's attributes
  */
 
-boolean_t
+int
 pmap_test_attrs_86(struct vm_page *pg, int testbits)
 {
 	struct pv_entry *pve;
@@ -2042,7 +2026,7 @@ pmap_test_attrs_86(struct vm_page *pg, int testbits)
 	testflags = pmap_pte2flags(testbits);
 
 	if (pg->pg_flags & testflags)
-		return (TRUE);
+		return 1;
 
 	mybits = 0;
 	mtx_enter(&pg->mdpage.pv_mtx);
@@ -2057,20 +2041,20 @@ pmap_test_attrs_86(struct vm_page *pg, int testbits)
 	mtx_leave(&pg->mdpage.pv_mtx);
 
 	if (mybits == 0)
-		return (FALSE);
+		return 0;
 
 	atomic_setbits_int(&pg->pg_flags, pmap_pte2flags(mybits));
 
-	return (TRUE);
+	return 1;
 }
 
 /*
  * pmap_clear_attrs: change a page's attributes
  *
- * => we return TRUE if we cleared one of the bits we were asked to
+ * => we return 1 if we cleared one of the bits we were asked to
  */
 
-boolean_t
+int
 pmap_clear_attrs_86(struct vm_page *pg, int clearbits)
 {
 	struct pv_entry *pve;
@@ -2097,7 +2081,7 @@ pmap_clear_attrs_86(struct vm_page *pg, int clearbits)
 
 		opte = ptes[ptei(pve->pv_va)];
 		if (opte & clearbits) {
-			result = TRUE;
+			result = 1;
 			i386_atomic_clearbits_l(&ptes[ptei(pve->pv_va)],
 			    (opte & clearbits));
 			pmap_tlb_shootpage(pve->pv_pmap, pve->pv_va);
@@ -2298,9 +2282,9 @@ pmap_enter_86(struct pmap *pmap, vaddr_t va, paddr_t pa,
 	pt_entry_t *ptes, opte, npte;
 	struct vm_page *ptp;
 	struct pv_entry *pve, *opve = NULL;
-	boolean_t wired = (flags & PMAP_WIRED) != 0;
-	boolean_t nocache = (pa & PMAP_NOCACHE) != 0;
-	boolean_t wc = (pa & PMAP_WC) != 0;
+	int wired = (flags & PMAP_WIRED) != 0;
+	int nocache = (pa & PMAP_NOCACHE) != 0;
+	int wc = (pa & PMAP_WC) != 0;
 	struct vm_page *pg = NULL;
 	int error, wired_count, resident_count, ptp_count;
 
@@ -2471,7 +2455,7 @@ enter_now:
 		npte |= PG_PVLIST;
 		if (pg->pg_flags & PG_PMAP_WC) {
 			KASSERT(nocache == 0);
-			wc = TRUE;
+			wc = 1;
 		}
 		pmap_sync_flags_pte_86(pg, npte);
 	}
@@ -2486,7 +2470,7 @@ enter_now:
 
 	if (pmap_valid_entry(opte)) {
 		if (nocache && (opte & PG_N) == 0)
-			wbinvd(); /* XXX clflush before we enter? */
+			wbinvd_on_all_cpus(); /* XXX clflush before we enter? */
 		pmap_tlb_shootpage(pmap, va);
 	}
 
@@ -2640,7 +2624,7 @@ pmap_growkernel_86(vaddr_t maxkvaddr)
 
 	for (/*null*/ ; nkpde < needed_kpde ; nkpde++) {
 
-		if (uvm.page_init_done == FALSE) {
+		if (uvm.page_init_done == 0) {
 
 			/*
 			 * we're growing the kernel pmap early (from
@@ -2648,7 +2632,7 @@ pmap_growkernel_86(vaddr_t maxkvaddr)
 			 * handled a little differently.
 			 */
 
-			if (uvm_page_physget(&ptaddr) == FALSE)
+			if (uvm_page_physget(&ptaddr) == 0)
 				panic("pmap_growkernel: out of memory");
 			pmap_zero_phys_86(ptaddr);
 
@@ -2662,7 +2646,7 @@ pmap_growkernel_86(vaddr_t maxkvaddr)
 
 		/*
 		 * THIS *MUST* BE CODED SO AS TO WORK IN THE
-		 * pmap_initialized == FALSE CASE!  WE MAY BE
+		 * pmap_initialized == 0 CASE!  WE MAY BE
 		 * INVOKED WHILE pmap_init() IS RUNNING!
 		 */
 
@@ -2900,26 +2884,26 @@ u_int32_t	(*pmap_pte_setbits_p)(vaddr_t, u_int32_t, u_int32_t) =
     pmap_pte_setbits_86;
 u_int32_t	(*pmap_pte_bits_p)(vaddr_t) = pmap_pte_bits_86;
 paddr_t		(*pmap_pte_paddr_p)(vaddr_t) = pmap_pte_paddr_86;
-boolean_t	(*pmap_clear_attrs_p)(struct vm_page *, int) =
+int		(*pmap_clear_attrs_p)(struct vm_page *, int) =
     pmap_clear_attrs_86;
 int		(*pmap_enter_p)(pmap_t, vaddr_t, paddr_t, vm_prot_t, int) =
     pmap_enter_86;
 void		(*pmap_enter_special_p)(vaddr_t, paddr_t, vm_prot_t,
     u_int32_t) = pmap_enter_special_86;
-boolean_t	(*pmap_extract_p)(pmap_t, vaddr_t, paddr_t *) =
+int		(*pmap_extract_p)(pmap_t, vaddr_t, paddr_t *) =
     pmap_extract_86;
 vaddr_t		(*pmap_growkernel_p)(vaddr_t) = pmap_growkernel_86;
 void		(*pmap_page_remove_p)(struct vm_page *) = pmap_page_remove_86;
 void		(*pmap_do_remove_p)(struct pmap *, vaddr_t, vaddr_t, int) =
     pmap_do_remove_86;
-boolean_t	 (*pmap_test_attrs_p)(struct vm_page *, int) =
+int		 (*pmap_test_attrs_p)(struct vm_page *, int) =
     pmap_test_attrs_86;
 void		(*pmap_unwire_p)(struct pmap *, vaddr_t) = pmap_unwire_86;
 void		(*pmap_write_protect_p)(struct pmap *, vaddr_t, vaddr_t,
     vm_prot_t) = pmap_write_protect_86;
 void		(*pmap_pinit_pd_p)(pmap_t) = pmap_pinit_pd_86;
 void		(*pmap_zero_phys_p)(paddr_t) = pmap_zero_phys_86;
-boolean_t	(*pmap_zero_page_uncached_p)(paddr_t) =
+int		(*pmap_zero_page_uncached_p)(paddr_t) =
     pmap_zero_page_uncached_86;
 void		(*pmap_copy_page_p)(struct vm_page *, struct vm_page *) =
     pmap_copy_page_86;

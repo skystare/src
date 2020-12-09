@@ -1,4 +1,4 @@
-/*	$OpenBSD: interface.c,v 1.82 2018/03/11 13:16:49 claudio Exp $ */
+/*	$OpenBSD: interface.c,v 1.84 2020/11/02 00:30:56 dlg Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -633,6 +633,9 @@ if_to_ctl(struct iface *iface)
 	ictl.auth_type = iface->auth_type;
 	ictl.auth_keyid = iface->auth_keyid;
 
+	memcpy(ictl.dependon, iface->dependon, sizeof(ictl.dependon));
+	ictl.depend_ok = iface->depend_ok;
+
 	gettimeofday(&now, NULL);
 	if (evtimer_pending(&iface->hello_timer, &tv)) {
 		timersub(&tv, &now, &res);
@@ -663,7 +666,7 @@ int
 if_set_recvif(int fd, int enable)
 {
 	if (setsockopt(fd, IPPROTO_IP, IP_RECVIF, &enable,
-	    sizeof(enable)) < 0) {
+	    sizeof(enable)) == -1) {
 		log_warn("if_set_recvif: error setting IP_RECVIF");
 		return (-1);
 	}
@@ -734,7 +737,7 @@ if_join_group(struct iface *iface, struct in_addr *addr)
 		mreq.imr_interface.s_addr = iface->addr.s_addr;
 
 		if (setsockopt(iface->fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-		    (void *)&mreq, sizeof(mreq)) < 0) {
+		    (void *)&mreq, sizeof(mreq)) == -1) {
 			log_warn("if_join_group: error IP_ADD_MEMBERSHIP, "
 			    "interface %s address %s", iface->name,
 			    inet_ntoa(*addr));
@@ -782,7 +785,7 @@ if_leave_group(struct iface *iface, struct in_addr *addr)
 		mreq.imr_interface.s_addr = iface->addr.s_addr;
 
 		if (setsockopt(iface->fd, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-		    (void *)&mreq, sizeof(mreq)) < 0) {
+		    (void *)&mreq, sizeof(mreq)) == -1) {
 			log_warn("if_leave_group: error IP_DROP_MEMBERSHIP, "
 			    "interface %s address %s", iface->name,
 			    inet_ntoa(*addr));
@@ -809,7 +812,7 @@ if_set_mcast(struct iface *iface)
 	case IF_TYPE_POINTOPOINT:
 	case IF_TYPE_BROADCAST:
 		if (setsockopt(iface->fd, IPPROTO_IP, IP_MULTICAST_IF,
-		    &iface->addr.s_addr, sizeof(iface->addr.s_addr)) < 0) {
+		    &iface->addr.s_addr, sizeof(iface->addr.s_addr)) == -1) {
 			log_warn("if_set_mcast: error setting "
 			    "IP_MULTICAST_IF, interface %s", iface->name);
 			return (-1);
@@ -834,7 +837,7 @@ if_set_mcast_loop(int fd)
 	u_int8_t	loop = 0;
 
 	if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP,
-	    (char *)&loop, sizeof(loop)) < 0) {
+	    (char *)&loop, sizeof(loop)) == -1) {
 		log_warn("if_set_mcast_loop: error setting IP_MULTICAST_LOOP");
 		return (-1);
 	}
@@ -847,7 +850,7 @@ if_set_ip_hdrincl(int fd)
 {
 	int	hincl = 1;
 
-	if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &hincl, sizeof(hincl)) < 0) {
+	if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &hincl, sizeof(hincl)) == -1) {
 		log_warn("if_set_ip_hdrincl: error setting IP_HDRINCL");
 		return (-1);
 	}

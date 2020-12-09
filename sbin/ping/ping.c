@@ -1,4 +1,4 @@
-/*	$OpenBSD: ping.c,v 1.228 2018/07/21 07:27:54 claudio Exp $	*/
+/*	$OpenBSD: ping.c,v 1.242 2020/10/21 11:11:58 florian Exp $	*/
 
 /*
  * Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
@@ -150,7 +150,7 @@ int options;
 /*			0x0200 */
 #define	F_HDRINCL	0x0400
 #define	F_TTL		0x0800
-/*			0x1000 */
+#define	F_TOS		0x1000
 #define	F_AUD_RECV	0x2000
 #define	F_AUD_MISS	0x4000
 
@@ -178,7 +178,7 @@ u_char *outpack = outpackhdr+sizeof(struct ip);
 char BSPACE = '\b';		/* characters written for flood */
 char DOT = '.';
 char *hostname;
-int ident;			/* process id to identify our packets */
+int ident;			/* random number to identify our packets */
 int v6flag;			/* are we ping6? */
 
 /* counters */
@@ -258,11 +258,17 @@ main(int argc, char *argv[])
 	char *e, *target, hbuf[NI_MAXHOST], *source = NULL;
 	char rspace[3 + 4 * NROUTES + 1];	/* record route space */
 	const char *errstr;
-	double intval;
+	double fraction, integral, seconds;
 	uid_t ouid, uid;
 	gid_t gid;
 	u_int rtableid = 0;
 	extern char *__progname;
+
+	/* Cannot pledge due to special setsockopt()s below */
+	if (unveil("/", "r") == -1)
+		err(1, "unveil");
+	if (unveil(NULL, NULL) == -1)
+		err(1, "unveil");
 
 	if (strcmp("ping6", __progname) == 0) {
 		v6flag = 1;
@@ -283,15 +289,15 @@ main(int argc, char *argv[])
 		uid = getuid();
 		gid = getgid();
 	}
-	if (setgroups(1, &gid) ||
+	if (ouid && (setgroups(1, &gid) ||
 	    setresgid(gid, gid, gid) ||
-	    setresuid(uid, uid, uid))
+	    setresuid(uid, uid, uid)))
 		err(1, "unable to revoke privs");
 
 	preload = 0;
 	datap = &outpack[ECHOLEN + ECHOTMLEN];
 	while ((ch = getopt(argc, argv, v6flag ?
-	    "c:dEefHh:I:i:Ll:mNnp:qS:s:V:vw:" :
+	    "c:DdEefHh:I:i:Ll:mNnp:qS:s:T:V:vw:" :
 	    "DEI:LRS:c:defHi:l:np:qs:T:t:V:vw:")) != -1) {
 		switch(ch) {
 		case 'c':
@@ -332,21 +338,20 @@ main(int argc, char *argv[])
 		case 'S':	/* deprecated */
 			source = optarg;
 			break;
-		case 'i':		/* wait between sending packets */
-			intval = strtod(optarg, &e);
-			if (*optarg == '\0' || *e != '\0')
-				errx(1, "illegal timing interval %s", optarg);
-			if (intval < 1 && ouid)
-				errx(1, "only root may use interval < 1s");
-			interval.tv_sec = (time_t)intval;
-			interval.tv_usec =
-			    (long)((intval - interval.tv_sec) * 1000000);
-			if (interval.tv_sec < 0)
-				errx(1, "illegal timing interval %s", optarg);
-			/* less than 1/Hz does not make sense */
-			if (interval.tv_sec == 0 && interval.tv_usec < 10000) {
-				warnx("too small interval, raised to 0.01");
-				interval.tv_usec = 10000;
+		case 'i':		/* interval between packets */
+			seconds = strtod(optarg, &e);
+			if (*optarg == '\0' || *e != '\0' || seconds < 0.0)
+				errx(1, "interval is invalid: %s", optarg);
+			fraction = modf(seconds, &integral);
+			if (integral > UINT_MAX)
+				errx(1, "interval is too large: %s", optarg);
+			interval.tv_sec = integral;
+			interval.tv_usec = fraction * 1000000.0;
+			if (!timerisset(&interval))
+				errx(1, "interval is too small: %s", optarg);
+			if (interval.tv_sec < 1 && ouid != 0) {
+				errx(1, "only root may use an interval smaller"
+				    " than one second");
 			}
 			options |= F_INTERVAL;
 			break;
@@ -386,6 +391,7 @@ main(int argc, char *argv[])
 #ifndef SMALL
 		case 'T':
 			options |= F_HDRINCL;
+			options |= F_TOS;
 			errno = 0;
 			errstr = NULL;
 			if (map_tos(optarg, &tos))
@@ -428,6 +434,11 @@ main(int argc, char *argv[])
 		}
 	}
 
+	if (ouid == 0 && (setgroups(1, &gid) ||
+	    setresgid(gid, gid, gid) ||
+	    setresuid(uid, uid, uid)))
+		err(1, "unable to revoke privs");
+
 	argc -= optind;
 	argv += optind;
 
@@ -449,14 +460,10 @@ main(int argc, char *argv[])
 
 	switch (res->ai_family) {
 	case AF_INET:
-		if (res->ai_addrlen != sizeof(dst4))
-			errx(1, "size of sockaddr mismatch");
 		dst = (struct sockaddr *)&dst4;
 		from = (struct sockaddr *)&from4;
 		break;
 	case AF_INET6:
-		if (res->ai_addrlen != sizeof(dst6))
-			errx(1, "size of sockaddr mismatch");
 		dst = (struct sockaddr *)&dst6;
 		from = (struct sockaddr *)&from6;
 		break;
@@ -488,17 +495,15 @@ main(int argc, char *argv[])
 		hints.ai_family = dst->sa_family;
 		if ((error = getaddrinfo(source, NULL, &hints, &res)))
 			errx(1, "%s: %s", source, gai_strerror(error));
-		if (res->ai_addrlen != dst->sa_len)
-			errx(1, "size of sockaddr mismatch");
 		memcpy(from, res->ai_addr, res->ai_addrlen);
 		freeaddrinfo(res);
 
 		if (!v6flag && IN_MULTICAST(ntohl(dst4.sin_addr.s_addr))) {
 			if (setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF,
-			    &from4.sin_addr, sizeof(from4.sin_addr)) < 0)
+			    &from4.sin_addr, sizeof(from4.sin_addr)) == -1)
 				err(1, "setsockopt IP_MULTICAST_IF");
 		} else {
-			if (bind(s, from, from->sa_len) < 0)
+			if (bind(s, from, from->sa_len) == -1)
 				err(1, "bind");
 		}
 	} else if (options & F_VERBOSE) {
@@ -509,7 +514,7 @@ main(int argc, char *argv[])
 		int dummy;
 		socklen_t len = dst->sa_len;
 
-		if ((dummy = socket(dst->sa_family, SOCK_DGRAM, 0)) < 0)
+		if ((dummy = socket(dst->sa_family, SOCK_DGRAM, 0)) == -1)
 			err(1, "UDP socket");
 
 		memcpy(from, dst, dst->sa_len);
@@ -517,17 +522,17 @@ main(int argc, char *argv[])
 			from6.sin6_port = ntohs(DUMMY_PORT);
 			if (pktinfo &&
 			    setsockopt(dummy, IPPROTO_IPV6, IPV6_PKTINFO,
-			    (void *)pktinfo, sizeof(*pktinfo)))
+			    pktinfo, sizeof(*pktinfo)))
 				err(1, "UDP setsockopt(IPV6_PKTINFO)");
 
 			if (hoplimit != -1 &&
 			    setsockopt(dummy, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
-			    (void *)&hoplimit, sizeof(hoplimit)))
+			    &hoplimit, sizeof(hoplimit)))
 				err(1, "UDP setsockopt(IPV6_UNICAST_HOPS)");
 
 			if (hoplimit != -1 &&
 			    setsockopt(dummy, IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
-			    (void *)&hoplimit, sizeof(hoplimit)))
+			    &hoplimit, sizeof(hoplimit)))
 				err(1, "UDP setsockopt(IPV6_MULTICAST_HOPS)");
 		} else {
 			u_char loop = 0;
@@ -536,23 +541,23 @@ main(int argc, char *argv[])
 
 			if ((moptions & MULTICAST_NOLOOP) && setsockopt(dummy,
 			    IPPROTO_IP, IP_MULTICAST_LOOP, &loop,
-			    sizeof(loop)) < 0)
+			    sizeof(loop)) == -1)
 				err(1, "setsockopt IP_MULTICAST_LOOP");
 			if ((moptions & MULTICAST_TTL) && setsockopt(dummy,
 			    IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
-			    sizeof(ttl)) < 0)
+			    sizeof(ttl)) == -1)
 				err(1, "setsockopt IP_MULTICAST_TTL");
 		}
 
 		if (rtableid > 0 &&
 		    setsockopt(dummy, SOL_SOCKET, SO_RTABLE, &rtableid,
-		    sizeof(rtableid)) < 0)
+		    sizeof(rtableid)) == -1)
 			err(1, "setsockopt(SO_RTABLE)");
 
-		if (connect(dummy, from, len) < 0)
+		if (connect(dummy, from, len) == -1)
 			err(1, "UDP connect");
 
-		if (getsockname(dummy, from, &len) < 0)
+		if (getsockname(dummy, from, &len) == -1)
 			err(1, "getsockname");
 
 		close(dummy);
@@ -593,10 +598,10 @@ main(int argc, char *argv[])
 	 * size of both the send and receive buffers...
 	 */
 	maxsizelen = sizeof maxsize;
-	if (getsockopt(s, SOL_SOCKET, SO_SNDBUF, &maxsize, &maxsizelen) < 0)
+	if (getsockopt(s, SOL_SOCKET, SO_SNDBUF, &maxsize, &maxsizelen) == -1)
 		err(1, "getsockopt");
 	if (maxsize < packlen &&
-	    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &packlen, sizeof(maxsize)) < 0)
+	    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &packlen, sizeof(maxsize)) == -1)
 		err(1, "setsockopt");
 
 	/*
@@ -606,7 +611,7 @@ main(int argc, char *argv[])
 	 * /etc/ethers.
 	 */
 	while (setsockopt(s, SOL_SOCKET, SO_RCVBUF,
-	    (void*)&bufspace, sizeof(bufspace)) < 0) {
+	    &bufspace, sizeof(bufspace)) == -1) {
 		if ((bufspace -= 1024) <= 0)
 			err(1, "Cannot set the receive buffer size");
 	}
@@ -625,13 +630,13 @@ main(int argc, char *argv[])
 			int opton = 1;
 
 			if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVHOPOPTS,
-			    &opton, (socklen_t)sizeof(opton)))
+			    &opton, sizeof(opton)))
 				err(1, "setsockopt(IPV6_RECVHOPOPTS)");
 			if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVDSTOPTS,
-			    &opton, (socklen_t)sizeof(opton)))
+			    &opton, sizeof(opton)))
 				err(1, "setsockopt(IPV6_RECVDSTOPTS)");
-			if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVRTHDR, &opton,
-			    sizeof(opton)))
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVRTHDR,
+			    &opton, sizeof(opton)))
 				err(1, "setsockopt(IPV6_RECVRTHDR)");
 			ICMP6_FILTER_SETPASSALL(&filt);
 		} else {
@@ -640,20 +645,21 @@ main(int argc, char *argv[])
 		}
 
 		if ((moptions & MULTICAST_NOLOOP) &&
-		    setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop,
-		    sizeof(loop)) < 0)
+		    setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_LOOP,
+		    &loop, sizeof(loop)) == -1)
 			err(1, "setsockopt IPV6_MULTICAST_LOOP");
 
 		optval = IPV6_DEFHLIM;
-		if (IN6_IS_ADDR_MULTICAST(&dst6.sin6_addr))
+		if (IN6_IS_ADDR_MULTICAST(&dst6.sin6_addr)) {
 			if (setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
-			    &optval, (socklen_t)sizeof(optval)) == -1)
+			    &optval, sizeof(optval)) == -1)
 				err(1, "IPV6_MULTICAST_HOPS");
+		}
 		if (mflag != 1) {
 			optval = mflag > 1 ? 0 : 1;
 
 			if (setsockopt(s, IPPROTO_IPV6, IPV6_USE_MIN_MTU,
-			    &optval, (socklen_t)sizeof(optval)) == -1)
+			    &optval, sizeof(optval)) == -1)
 				err(1, "setsockopt(IPV6_USE_MIN_MTU)");
 		} else {
 			optval = 1;
@@ -662,8 +668,8 @@ main(int argc, char *argv[])
 				err(1, "setsockopt(IPV6_RECVPATHMTU)");
 		}
 
-		if (setsockopt(s, IPPROTO_ICMPV6, ICMP6_FILTER, &filt,
-		    (socklen_t)sizeof(filt)) < 0)
+		if (setsockopt(s, IPPROTO_ICMPV6, ICMP6_FILTER,
+		    &filt, sizeof(filt)) == -1)
 			err(1, "setsockopt(ICMP6_FILTER)");
 
 		if (hoplimit != -1) {
@@ -679,13 +685,27 @@ main(int argc, char *argv[])
 			*(int *)(CMSG_DATA(scmsg)) = hoplimit;
 		}
 
+		if (options & F_TOS) {
+			optval = tos;
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_TCLASS,
+			    &optval, sizeof(optval)) == -1)
+				err(1, "setsockopt(IPV6_TCLASS)");
+		}
+
+		if (df) {
+			optval = 1;
+			if (setsockopt(s, IPPROTO_IPV6, IPV6_DONTFRAG,
+			    &optval, sizeof(optval)) == -1)
+				err(1, "setsockopt(IPV6_DONTFRAG)");
+		}
+
 		optval = 1;
-		if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO, &optval,
-		    (socklen_t)sizeof(optval)) < 0)
-			warn("setsockopt(IPV6_RECVPKTINFO)"); /* XXX err? */
-		if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &optval,
-		    (socklen_t)sizeof(optval)) < 0)
-			warn("setsockopt(IPV6_RECVHOPLIMIT)"); /* XXX err? */
+		if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+		    &optval, sizeof(optval)) == -1)
+			err(1, "setsockopt(IPV6_RECVPKTINFO)");
+		if (setsockopt(s, IPPROTO_IPV6, IPV6_RECVHOPLIMIT,
+		    &optval, sizeof(optval)) == -1)
+			err(1, "setsockopt(IPV6_RECVHOPLIMIT)");
 	} else {
 		u_char loop = 0;
 
@@ -703,8 +723,9 @@ main(int argc, char *argv[])
 		if (options & F_HDRINCL) {
 			struct ip *ip = (struct ip *)outpackhdr;
 
-			setsockopt(s, IPPROTO_IP, IP_HDRINCL, &optval,
-			    sizeof(optval));
+			if (setsockopt(s, IPPROTO_IP, IP_HDRINCL,
+			    &optval, sizeof(optval)) == -1)
+				err(1, "setsockopt(IP_HDRINCL)");
 			ip->ip_v = IPVERSION;
 			ip->ip_hl = sizeof(struct ip) >> 2;
 			ip->ip_tos = tos;
@@ -728,18 +749,18 @@ main(int argc, char *argv[])
 			rspace[IPOPT_OPTVAL] = IPOPT_RR;
 			rspace[IPOPT_OLEN] = sizeof(rspace)-1;
 			rspace[IPOPT_OFFSET] = IPOPT_MINOFF;
-			if (setsockopt(s, IPPROTO_IP, IP_OPTIONS, rspace,
-			    sizeof(rspace)) < 0)
+			if (setsockopt(s, IPPROTO_IP, IP_OPTIONS,
+			    rspace, sizeof(rspace)) == -1)
 				err(1, "record route");
 		}
 
 		if ((moptions & MULTICAST_NOLOOP) &&
-		    setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, &loop,
-		    sizeof(loop)) < 0)
+		    setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP,
+		    &loop, sizeof(loop)) == -1)
 			err(1, "setsockopt IP_MULTICAST_LOOP");
 		if ((moptions & MULTICAST_TTL) &&
-		    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
-		    sizeof(ttl)) < 0)
+		    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL,
+		    &ttl, sizeof(ttl)) == -1)
 			err(1, "setsockopt IP_MULTICAST_TTL");
 	}
 
@@ -764,6 +785,55 @@ main(int argc, char *argv[])
 	smsgiov.iov_base = (caddr_t)outpack;
 	smsghdr.msg_iov = &smsgiov;
 	smsghdr.msg_iovlen = 1;
+
+	/* Drain our socket. */
+	(void)signal(SIGALRM, onsignal);
+	memset(&itimer, 0, sizeof(itimer));
+	itimer.it_value.tv_sec = 1; /* make sure we don't get stuck */
+	(void)setitimer(ITIMER_REAL, &itimer, NULL);
+	for (;;) {
+		struct msghdr		m;
+		union {
+			struct cmsghdr hdr;
+			u_char buf[CMSG_SPACE(1024)];
+		}			cmsgbuf;
+		struct iovec		iov[1];
+		struct pollfd		pfd;
+		struct sockaddr_in	peer4;
+		struct sockaddr_in6	peer6;
+		ssize_t			cc;
+
+		if (seenalrm)
+			break;
+
+		pfd.fd = s;
+		pfd.events = POLLIN;
+
+		if (poll(&pfd, 1, 0) <= 0)
+			break;
+
+		if (v6flag) {
+			m.msg_name = &peer6;
+			m.msg_namelen = sizeof(peer6);
+		} else {
+			m.msg_name = &peer4;
+			m.msg_namelen = sizeof(peer4);
+		}
+		memset(&iov, 0, sizeof(iov));
+		iov[0].iov_base = (caddr_t)packet;
+		iov[0].iov_len = packlen;
+
+		m.msg_iov = iov;
+		m.msg_iovlen = 1;
+		m.msg_control = (caddr_t)&cmsgbuf.buf;
+		m.msg_controllen = sizeof(cmsgbuf.buf);
+
+		cc = recvmsg(s, &m, 0);
+		if (cc == -1 && errno != EINTR)
+			break;
+	}
+	memset(&itimer, 0, sizeof(itimer));
+	(void)setitimer(ITIMER_REAL, &itimer, NULL);
 
 	while (preload--)		/* Fire off them quickies. */
 		pinger(s);
@@ -859,7 +929,7 @@ main(int argc, char *argv[])
 		m.msg_controllen = sizeof(cmsgbuf.buf);
 
 		cc = recvmsg(s, &m, 0);
-		if (cc < 0) {
+		if (cc == -1) {
 			if (errno != EINTR) {
 				warn("recvmsg");
 				sleep(1);
@@ -1022,7 +1092,7 @@ retransmit(int s)
 /*
  * pinger --
  *	Compose and transmit an ICMP ECHO REQUEST packet.  The IP packet
- * will be added on by the kernel.  The ID field is our UNIX process ID,
+ * will be added on by the kernel.  The ID field is a random number,
  * and the sequence number is an ascending integer.  The first 8 bytes
  * of the data portion are used to hold a UNIX "timeval" struct in VAX
  * byte-order, to compute the round-trip time.
@@ -1054,7 +1124,7 @@ pinger(int s)
 		icp->icmp_code = 0;
 		icp->icmp_cksum = 0;
 		icp->icmp_seq = seq;
-		icp->icmp_id = ident;			/* ID */
+		icp->icmp_id = ident;
 	}
 	CLR(ntohs(seq) % mx_dup_ck);
 
@@ -1100,8 +1170,8 @@ pinger(int s)
 
 	i = sendmsg(s, &smsghdr, 0);
 
-	if (i < 0 || i != cc) {
-		if (i < 0)
+	if (i == -1 || i != cc) {
+		if (i == -1)
 			warn("sendmsg");
 		printf("ping: wrote %s %d chars, ret=%d\n", hostname, cc, i);
 	}
@@ -2164,13 +2234,14 @@ usage(void)
 {
 	if (v6flag) {
 		fprintf(stderr,
-		    "usage: ping6 [-dEefHLmnqv] [-c count] [-h hoplimit] "
-		    "[-I sourceaddr]\n\t[-i wait] [-l preload] [-p pattern] "
-		    "[-s packetsize] [-V rtable]\n\t[-w maxwait] host\n");
+		    "usage: ping6 [-DdEefHLmnqv] [-c count] [-h hoplimit] "
+		    "[-I sourceaddr]\n\t[-i interval] [-l preload] "
+		    "[-p pattern] [-s packetsize] [-T toskeyword]\n"
+		    "\t[-V rtable] [-w maxwait] host\n");
 	} else {
 		fprintf(stderr,
-		    "usage: ping [-DdEefHLnqRv] [-c count] [-I ifaddr]"
-		    " [-i wait]\n\t[-l preload] [-p pattern] [-s packetsize]"
+		    "usage: ping [-DdEefHLnqRv] [-c count] [-I sourceaddr] "
+		    "[-i interval]\n\t[-l preload] [-p pattern] [-s packetsize]"
 #ifndef	SMALL
 		    " [-T toskeyword]"
 #endif	/* SMALL */

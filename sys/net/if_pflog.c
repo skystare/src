@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_pflog.c,v 1.81 2018/01/09 15:24:24 bluhm Exp $	*/
+/*	$OpenBSD: if_pflog.c,v 1.91 2020/08/28 12:01:48 mvs Exp $	*/
 /*
  * The authors of this code are John Ioannidis (ji@tla.org),
  * Angelos D. Keromytis (kermit@csd.uch.gr) and
@@ -48,7 +48,9 @@
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_types.h>
+#if NBPFILTER > 0
 #include <net/bpf.h>
+#endif
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -81,24 +83,17 @@ int	pflogioctl(struct ifnet *, u_long, caddr_t);
 void	pflogstart(struct ifnet *);
 int	pflog_clone_create(struct if_clone *, int);
 int	pflog_clone_destroy(struct ifnet *);
-void	pflog_bpfcopy(const void *, void *, size_t);
+void	pflog_mtap(caddr_t, struct pfloghdr *, struct mbuf *);
 
 struct if_clone	pflog_cloner =
     IF_CLONE_INITIALIZER("pflog", pflog_clone_create, pflog_clone_destroy);
 
 int		  npflogifs = 0;
 struct ifnet	**pflogifs = NULL;	/* for fast access */
-struct mbuf	 *pflog_mhdr = NULL, *pflog_mptr = NULL;
 
 void
 pflogattach(int npflog)
 {
-	if (pflog_mhdr == NULL)
-		if ((pflog_mhdr = m_get(M_DONTWAIT, MT_HEADER)) == NULL)
-			panic("pflogattach: no mbuf");
-	if (pflog_mptr == NULL)
-		if ((pflog_mptr = m_get(M_DONTWAIT, MT_DATA)) == NULL)
-			panic("pflogattach: no mbuf");
 	if_clone_attach(&pflog_cloner);
 }
 
@@ -124,8 +119,7 @@ pflogifs_resize(size_t n)
 		else
 			p[i] = NULL;
 
-	if (pflogifs)
-		free(pflogifs, M_DEVBUF, 0);
+	free(pflogifs, M_DEVBUF, npflogifs * sizeof(*pflogifs));
 	pflogifs = p;
 	npflogifs = n;
 	return (0);
@@ -148,7 +142,6 @@ pflog_clone_create(struct if_clone *ifc, int unit)
 	ifp->if_start = pflogstart;
 	ifp->if_xflags = IFXF_CLONED;
 	ifp->if_type = IFT_PFLOG;
-	IFQ_SET_MAXLEN(&ifp->if_snd, IFQ_MAXLEN);
 	ifp->if_hdrlen = PFLOG_HDRLEN;
 	if_attach(ifp);
 	if_alloc_sadl(ifp);
@@ -183,7 +176,7 @@ pflog_clone_destroy(struct ifnet *ifp)
 	NET_UNLOCK();
 
 	if_detach(ifp);
-	free(pflogif, M_DEVBUF, 0);
+	free(pflogif, M_DEVBUF, sizeof(*pflogif));
 	return (0);
 }
 
@@ -193,7 +186,7 @@ pflog_clone_destroy(struct ifnet *ifp)
 void
 pflogstart(struct ifnet *ifp)
 {
-	IFQ_PURGE(&ifp->if_snd);
+	ifq_purge(&ifp->if_snd);
 }
 
 int
@@ -227,6 +220,7 @@ pflog_packet(struct pf_pdesc *pd, u_int8_t reason, struct pf_rule *rm,
 {
 #if NBPFILTER > 0
 	struct ifnet *ifn;
+	caddr_t if_bpf;
 	struct pfloghdr hdr;
 
 	if (rm == NULL || pd == NULL || pd->kif == NULL || pd->m == NULL)
@@ -234,8 +228,13 @@ pflog_packet(struct pf_pdesc *pd, u_int8_t reason, struct pf_rule *rm,
 	if (trigger == NULL)
 		trigger = rm;
 
-	if (trigger->logif >= npflogifs || (ifn = pflogifs[trigger->logif]) ==
-	    NULL || !ifn->if_bpf)
+	if (trigger->logif >= npflogifs)
+		return (0);
+	ifn = pflogifs[trigger->logif];
+	if (ifn == NULL)
+		return (0);
+	if_bpf = ifn->if_bpf;
+	if (!if_bpf)
 		return (0);
 
 	bzero(&hdr, sizeof(hdr));
@@ -260,15 +259,15 @@ pflog_packet(struct pf_pdesc *pd, u_int8_t reason, struct pf_rule *rm,
 		hdr.uid = pd->lookup.uid;
 		hdr.pid = pd->lookup.pid;
 	} else {
-		hdr.uid = UID_MAX;
+		hdr.uid = -1;
 		hdr.pid = NO_PID;
 	}
 	hdr.rule_uid = rm->cuid;
 	hdr.rule_pid = rm->cpid;
 	hdr.dir = pd->dir;
 
-	PF_ACPY(&hdr.saddr, &pd->nsaddr, pd->naf);
-	PF_ACPY(&hdr.daddr, &pd->ndaddr, pd->naf);
+	pf_addrcpy(&hdr.saddr, &pd->nsaddr, pd->naf);
+	pf_addrcpy(&hdr.daddr, &pd->ndaddr, pd->naf);
 	hdr.af = pd->af;
 	hdr.naf = pd->naf;
 	hdr.sport = pd->nsport;
@@ -277,68 +276,43 @@ pflog_packet(struct pf_pdesc *pd, u_int8_t reason, struct pf_rule *rm,
 	ifn->if_opackets++;
 	ifn->if_obytes += pd->m->m_pkthdr.len;
 
-	bpf_mtap_hdr(ifn->if_bpf, (caddr_t)&hdr, PFLOG_HDRLEN, pd->m,
-	    BPF_DIRECTION_OUT, pflog_bpfcopy);
+	pflog_mtap(if_bpf, &hdr, pd->m);
 #endif
 
 	return (0);
 }
 
 void
-pflog_bpfcopy(const void *src_arg, void *dst_arg, size_t len)
+pflog_mtap(caddr_t if_bpf, struct pfloghdr *pfloghdr, struct mbuf *m)
 {
-	struct mbuf		*m, *mp, *mhdr, *mptr;
-	struct pfloghdr		*pfloghdr;
-	u_int			 count;
-	u_char			*dst, *mdst;
-	int			 afto, hlen, mlen, off;
+	struct mbuf		 mhdr;
+	struct m_hdr		 mptr;
+	struct mbuf		*mp;
+	u_char			*mdst;
+	int			 afto, hlen, off;
 
 	struct pf_pdesc		 pd;
 	struct pf_addr		 osaddr, odaddr;
 	u_int16_t		 osport = 0, odport = 0;
 	u_int8_t		 proto = 0;
 
-	m = (struct mbuf *)src_arg;
-	dst = dst_arg;
-
-	mhdr = pflog_mhdr;
-	mptr = pflog_mptr;
-
-	if (m == NULL)
-		panic("pflog_bpfcopy got no mbuf");
-
-	/* first mbuf holds struct pfloghdr */
-	pfloghdr = mtod(m, struct pfloghdr *);
 	afto = pfloghdr->af != pfloghdr->naf;
-	count = min(m->m_len, len);
-	bcopy(pfloghdr, dst, count);
-	pfloghdr = (struct pfloghdr *)dst;
-	dst += count;
-	len -= count;
-	m = m->m_next;
-
-	if (len <= 0)
-		return;
-
-	/* second mbuf is pkthdr */
-	if (m == NULL)
-		panic("no second mbuf");
 
 	/*
 	 * temporary mbuf will hold an ip/ip6 header and 8 bytes
 	 * of the protocol header
 	 */
-	m_inithdr(mhdr);
-	mhdr->m_len = 0;	/* XXX not done in m_inithdr() */
+	m_inithdr(&mhdr);
+	mhdr.m_len = 0;	/* XXX not done in m_inithdr() */
 
 #ifdef INET6
 	/* offset for a new header */
 	if (afto && pfloghdr->af == AF_INET)
-		mhdr->m_data += sizeof(struct ip6_hdr) -
+		mhdr.m_data += sizeof(struct ip6_hdr) -
 		    sizeof(struct ip);
 #endif /* INET6 */
 
-	mdst = mtod(mhdr, char *);
+	mdst = mtod(&mhdr, char *);
 	switch (pfloghdr->af) {
 	case AF_INET: {
 		struct ip	*h;
@@ -379,18 +353,18 @@ pflog_bpfcopy(const void *src_arg, void *dst_arg, size_t len)
 		hlen += 8;
 	}
 
-	mhdr->m_len += hlen;
-	mhdr->m_pkthdr.len = mhdr->m_len;
+	mhdr.m_len = hlen;
+	mhdr.m_pkthdr.len = hlen;
 
 	/* create a chain mhdr -> mptr, mptr->m_data = (m->m_data+hlen) */
 	mp = m_getptr(m, hlen, &off);
 	if (mp != NULL) {
-		bcopy(mp, mptr, sizeof(*mptr));
-		mptr->m_data += off;
-		mptr->m_len -= off;
-		mptr->m_flags &= ~M_PKTHDR;
-		mhdr->m_next = mptr;
-		mhdr->m_pkthdr.len += m->m_pkthdr.len - hlen;
+		mptr.mh_flags = 0;
+		mptr.mh_data = mp->m_data + off;
+		mptr.mh_len = mp->m_len - off;
+		mptr.mh_next = mp->m_next;
+
+		mhdr.m_next = (struct mbuf *)&mptr;
 	}
 
 	/*
@@ -398,12 +372,12 @@ pflog_bpfcopy(const void *src_arg, void *dst_arg, size_t len)
 	 * counting the packet here again.
 	 */
 	if (pf_setup_pdesc(&pd, pfloghdr->af, pfloghdr->dir, NULL,
-	    mhdr, NULL) != PF_PASS)
+	    &mhdr, NULL) != PF_PASS)
 		goto copy;
 	pd.naf = pfloghdr->naf;
 
-	PF_ACPY(&osaddr, pd.src, pd.af);
-	PF_ACPY(&odaddr, pd.dst, pd.af);
+	pf_addrcpy(&osaddr, pd.src, pd.af);
+	pf_addrcpy(&odaddr, pd.dst, pd.af);
 	if (pd.sport)
 		osport = *pd.sport;
 	if (pd.dport)
@@ -417,17 +391,16 @@ pflog_bpfcopy(const void *src_arg, void *dst_arg, size_t len)
 		    &pd.hdr, M_NOWAIT);
 #ifdef INET6
 		if (afto) {
-			PF_ACPY(&pd.nsaddr, &pfloghdr->saddr, pd.naf);
-			PF_ACPY(&pd.ndaddr, &pfloghdr->daddr, pd.naf);
+			pf_addrcpy(&pd.nsaddr, &pfloghdr->saddr, pd.naf);
+			pf_addrcpy(&pd.ndaddr, &pfloghdr->daddr, pd.naf);
 		}
 #endif /* INET6 */
-		PF_ACPY(&pfloghdr->saddr, &osaddr, pd.af);
-		PF_ACPY(&pfloghdr->daddr, &odaddr, pd.af);
+		pf_addrcpy(&pfloghdr->saddr, &osaddr, pd.af);
+		pf_addrcpy(&pfloghdr->daddr, &odaddr, pd.af);
 		pfloghdr->sport = osport;
 		pfloghdr->dport = odport;
 	}
 
-	pd.tot_len = min(pd.tot_len, len);
 	pd.tot_len -= pd.m->m_data - pd.m->m_pktdat;
 
 #ifdef INET6
@@ -436,10 +409,11 @@ pflog_bpfcopy(const void *src_arg, void *dst_arg, size_t len)
 #endif /* INET6 */
 
 	m = pd.m;
+	KASSERT(m == &mhdr);
  copy:
-	mlen = min(m->m_pkthdr.len, len);
-	m_copydata(m, 0, mlen, dst);
-	len -= mlen;
-	if (len > 0)
-		bzero(dst + mlen, len);
+#if NBPFILTER > 0
+	bpf_mtap_hdr(if_bpf, pfloghdr, sizeof(*pfloghdr), m,
+	    BPF_DIRECTION_OUT);
+#endif
+	return;
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: namei.h,v 1.38 2018/08/13 23:11:44 deraadt Exp $	*/
+/*	$OpenBSD: namei.h,v 1.45 2020/03/19 13:55:20 anton Exp $	*/
 /*	$NetBSD: namei.h,v 1.11 1996/02/09 18:25:20 christos Exp $	*/
 
 /*
@@ -39,6 +39,8 @@
 #include <sys/tree.h>
 #include <sys/uio.h>
 
+struct unveil;
+
 /*
  * Encapsulation of namei parameters.
  */
@@ -76,10 +78,11 @@ struct nameidata {
 	struct vnode **ni_tvp;		/* traversed vnodes */
 	size_t ni_tvpend;		/* end of traversed vnode list */
 	size_t ni_tvpsize;		/* size of traversed vnode list */
+	int ni_unveil_eacces;		/* indicates unveil flag mismatch */
 
 	/*
 	 * Lookup parameters: this structure describes the subset of
-	 * information from the nameidata structure that is passed
+	 * information from the nameidat satructure that is passed
 	 * through the VOP interface.
 	 */
 	struct componentname {
@@ -94,6 +97,8 @@ struct nameidata {
 		 * Shared between lookup and commit routines.
 		 */
 		char	*cn_pnbuf;	/* pathname buffer */
+		char	*cn_rpbuf;	/* realpath buffer */
+		size_t	cn_rpi;		/* realpath index */
 		char	*cn_nameptr;	/* pointer to looked up name */
 		long	cn_namelen;	/* length of looked up component */
 		long	cn_consume;	/* chars to consume in lookup() */
@@ -142,6 +147,7 @@ struct nameidata {
 #define MAKEENTRY	0x004000      /* entry is to be added to name cache */
 #define ISLASTCN	0x008000      /* this is last component of pathname */
 #define ISSYMLINK	0x010000      /* symlink needs interpretation */
+#define REALPATH	0x020000      /* save pathname buffer for realpath */
 #define	REQUIREDIR	0x080000      /* must be a directory */
 #define STRIPSLASHES    0x100000      /* strip trailing slashes */
 #define PDIRUNLOCK	0x200000      /* vfs_lookup() unlocked parent dir */
@@ -199,6 +205,15 @@ int cache_revlookup(struct vnode *, struct vnode **, char **, char *);
 void nchinit(void);
 struct mount;
 void cache_purgevfs(struct mount *);
+
+int unveil_add(struct proc *, struct nameidata *, const char *);
+void unveil_removevnode(struct vnode *);
+void unveil_free_traversed_vnodes(struct nameidata *);
+ssize_t unveil_find_cover(struct vnode *, struct proc *);
+struct unveil *unveil_lookup(struct vnode *, struct process *, ssize_t *);
+void unveil_start_relative(struct proc *, struct nameidata *, struct vnode *);
+void unveil_check_component(struct proc *, struct nameidata *, struct vnode *);
+int unveil_check_final(struct proc *, struct nameidata *);
 
 extern struct pool namei_pool;
 

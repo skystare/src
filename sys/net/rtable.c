@@ -1,4 +1,4 @@
-/*	$OpenBSD: rtable.c,v 1.64 2018/09/09 10:07:38 henning Exp $ */
+/*	$OpenBSD: rtable.c,v 1.72 2020/11/07 09:51:40 denis Exp $ */
 
 /*
  * Copyright (c) 2014-2016 Martin Pieuchot
@@ -83,7 +83,7 @@ void		   rtmap_dtor(void *, void *);
 
 struct srp_gc	   rtmap_gc = SRP_GC_INITIALIZER(rtmap_dtor, NULL);
 
-void		   rtable_init_backend(unsigned int);
+void		   rtable_init_backend(void);
 void		  *rtable_alloc(unsigned int, unsigned int, unsigned int);
 void		  *rtable_get(unsigned int, sa_family_t);
 
@@ -153,7 +153,6 @@ void
 rtable_init(void)
 {
 	struct domain	*dp;
-	unsigned int	 keylen = 0;
 	int		 i;
 
 	KASSERT(sizeof(struct rtmap) == sizeof(struct dommp));
@@ -171,11 +170,8 @@ rtable_init(void)
 			continue;
 
 		af2idx[dp->dom_family] = af2idx_max++;
-		if (dp->dom_rtkeylen > keylen)
-			keylen = dp->dom_rtkeylen;
-
 	}
-	rtable_init_backend(keylen);
+	rtable_init_backend();
 
 	/*
 	 * Allocate AF-to-id table now that we now how many AFs this
@@ -358,7 +354,7 @@ void	rtable_mpath_insert(struct art_node *, struct rtentry *);
 struct srpl_rc rt_rc = SRPL_RC_INITIALIZER(rtentry_ref, rtentry_unref, NULL);
 
 void
-rtable_init_backend(unsigned int keylen)
+rtable_init_backend(void)
 {
 	art_init();
 }
@@ -367,6 +363,44 @@ void *
 rtable_alloc(unsigned int rtableid, unsigned int alen, unsigned int off)
 {
 	return (art_alloc(rtableid, alen, off));
+}
+
+int
+rtable_setsource(unsigned int rtableid, int af, struct sockaddr *src)
+{
+	struct art_root		*ar;
+
+	if ((ar = rtable_get(rtableid, af)) == NULL)
+		return (EAFNOSUPPORT);
+
+	ar->source = src;
+
+	return (0);
+}
+
+struct sockaddr *
+rtable_getsource(unsigned int rtableid, int af)
+{
+	struct art_root		*ar;
+
+	ar = rtable_get(rtableid, af);
+	if (ar == NULL)
+		return (NULL);
+
+	return (ar->source);
+}
+
+void
+rtable_clearsource(unsigned int rtableid, struct sockaddr *src)
+{
+	struct sockaddr	*addr;
+
+	addr = rtable_getsource(rtableid, src->sa_family);
+	if (addr && (addr->sa_len == src->sa_len)) {
+		if (memcmp(src, addr, addr->sa_len) == 0) {
+			rtable_setsource(rtableid, src->sa_family, NULL);
+		}
+	}
 }
 
 struct rtentry *
@@ -618,6 +652,8 @@ rtable_delete(unsigned int rtableid, struct sockaddr *dst,
 
 	addr = satoaddr(ar, dst);
 	plen = rtable_satoplen(dst->sa_family, mask);
+	if (plen == -1)
+		return (EINVAL);
 
 	rtref(rt); /* guarantee rtfree won't do anything under ar_lock */
 	rw_enter_write(&ar->ar_lock);
@@ -666,6 +702,7 @@ leave:
 struct rtable_walk_cookie {
 	int		(*rwc_func)(struct rtentry *, void *, unsigned int);
 	void		 *rwc_arg;
+	struct rtentry	**rwc_prt;
 	unsigned int	  rwc_rid;
 };
 
@@ -681,8 +718,13 @@ rtable_walk_helper(struct art_node *an, void *xrwc)
 	int				 error = 0;
 
 	SRPL_FOREACH(rt, &sr, &an->an_rtlist, rt_next) {
-		if ((error = (*rwc->rwc_func)(rt, rwc->rwc_arg, rwc->rwc_rid)))
+		error = (*rwc->rwc_func)(rt, rwc->rwc_arg, rwc->rwc_rid);
+		if (error != 0)
 			break;
+	}
+	if (rwc->rwc_prt != NULL && rt != NULL) {
+		rtref(rt);
+		*rwc->rwc_prt = rt;
 	}
 	SRPL_LEAVE(&sr);
 
@@ -690,7 +732,7 @@ rtable_walk_helper(struct art_node *an, void *xrwc)
 }
 
 int
-rtable_walk(unsigned int rtableid, sa_family_t af,
+rtable_walk(unsigned int rtableid, sa_family_t af, struct rtentry **prt,
     int (*func)(struct rtentry *, void *, unsigned int), void *arg)
 {
 	struct art_root			*ar;
@@ -703,10 +745,10 @@ rtable_walk(unsigned int rtableid, sa_family_t af,
 
 	rwc.rwc_func = func;
 	rwc.rwc_arg = arg;
+	rwc.rwc_prt = prt;
 	rwc.rwc_rid = rtableid;
 
-	while ((error = art_walk(ar, rtable_walk_helper, &rwc)) == EAGAIN)
-		continue;
+	error = art_walk(ar, rtable_walk_helper, &rwc);
 
 	return (error);
 }
@@ -733,13 +775,12 @@ rtable_mpath_capable(unsigned int rtableid, sa_family_t af)
 
 int
 rtable_mpath_reprio(unsigned int rtableid, struct sockaddr *dst,
-    struct sockaddr *mask, uint8_t prio, struct rtentry *rt)
+    int plen, uint8_t prio, struct rtentry *rt)
 {
 	struct art_root			*ar;
 	struct art_node			*an;
 	struct srp_ref			 sr;
 	uint8_t				*addr;
-	int				 plen;
 	int				 error = 0;
 
 	ar = rtable_get(rtableid, dst->sa_family);
@@ -747,7 +788,6 @@ rtable_mpath_reprio(unsigned int rtableid, struct sockaddr *dst,
 		return (EAFNOSUPPORT);
 
 	addr = satoaddr(ar, dst);
-	plen = rtable_satoplen(dst->sa_family, mask);
 
 	rw_enter_write(&ar->ar_lock);
 	an = art_lookup(ar, addr, plen, &sr);
@@ -888,60 +928,49 @@ rtable_satoplen(sa_family_t af, struct sockaddr *mask)
 	if (ap > ep)
 		return (-1);
 
+	/* Trim trailing zeroes. */
+	while (ap < ep && ep[-1] == 0)
+		ep--;
+
 	if (ap == ep)
 		return (0);
 
 	/* "Beauty" adapted from sbin/route/show.c ... */
 	while (ap < ep) {
-		switch (*ap) {
+		switch (*ap++) {
 		case 0xff:
 			plen += 8;
-			ap++;
 			break;
 		case 0xfe:
 			plen += 7;
-			ap++;
 			goto out;
 		case 0xfc:
 			plen += 6;
-			ap++;
 			goto out;
 		case 0xf8:
 			plen += 5;
-			ap++;
 			goto out;
 		case 0xf0:
 			plen += 4;
-			ap++;
 			goto out;
 		case 0xe0:
 			plen += 3;
-			ap++;
 			goto out;
 		case 0xc0:
 			plen += 2;
-			ap++;
 			goto out;
 		case 0x80:
 			plen += 1;
-			ap++;
-			goto out;
-		case 0x00:
 			goto out;
 		default:
 			/* Non contiguous mask. */
 			return (-1);
 		}
-
 	}
 
 out:
-#ifdef DIAGNOSTIC
-	for (; ap < ep; ap++) {
-		if (*ap != 0x00)
-			return (-1);
-	}
-#endif /* DIAGNOSTIC */
+	if (plen > dp->dom_maxplen || ap != ep)
+		return -1;
 
 	return (plen);
 }

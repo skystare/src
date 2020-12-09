@@ -1,4 +1,4 @@
-/*	$OpenBSD: if.h,v 1.195 2018/09/12 09:20:34 krw Exp $	*/
+/*	$OpenBSD: if.h,v 1.204 2020/09/30 19:22:51 mvs Exp $	*/
 /*	$NetBSD: if.h,v 1.23 1996/05/07 02:40:27 thorpej Exp $	*/
 
 /*
@@ -129,6 +129,8 @@ struct	if_data {
 #define IFQ_MINPRIO	0
 #define IFQ_MAXPRIO	IFQ_NQUEUES - 1
 #define IFQ_DEFPRIO	3
+#define IFQ_PRIO2TOS(_p) ((_p) << 5)
+#define IFQ_TOS2PRIO(_t) ((_t) >> 5)
 
 /*
  * Values for if_link_state.
@@ -227,6 +229,7 @@ struct if_status_description {
 #define	IFXF_WOL		0x10	/* [N] wake on lan enabled */
 #define	IFXF_AUTOCONF6		0x20	/* [N] v6 autoconf enabled */
 #define IFXF_INET6_NOSOII	0x40	/* [N] don't do RFC 7217 */
+#define	IFXF_AUTOCONF4		0x80	/* [N] v4 autoconf (aka dhcp) enabled */
 
 #define	IFXF_CANTCHANGE \
 	(IFXF_MPSAFE|IFXF_CLONED)
@@ -320,6 +323,27 @@ struct if_announcemsghdr {
 #define IFAN_ARRIVAL	0	/* interface arrival */
 #define IFAN_DEPARTURE	1	/* interface departure */
 
+/* message format used to pass 80211 interface info */
+struct if_ieee80211_data {
+	uint8_t		ifie_channel;	/* IEEE80211_CHAN_MAX  == 255 */
+	uint8_t		ifie_nwid_len;
+	uint32_t	ifie_flags;	/* ieee80211com.ic_flags */
+	uint32_t	ifie_xflags;	/* ieee80211com.ic xflags */
+	uint8_t		ifie_nwid[32];	/* IEEE80211_NWID_LEN */
+	uint8_t		ifie_addr[6];	/* IEEE80211_ADDR_LEN */
+};
+
+struct if_ieee80211_msghdr {
+	uint16_t	ifim_msglen;
+	uint8_t		ifim_version;
+	uint8_t		ifim_type;
+	uint16_t	ifim_hdrlen;
+	uint16_t	ifim_index;
+	uint16_t	ifim_tableid;
+
+	struct if_ieee80211_data	ifim_ifie;
+};
+
 /* message format used to pass interface name to index mappings */
 struct if_nameindex_msg {
 	unsigned int	if_index;
@@ -396,7 +420,18 @@ struct	ifreq {
 #define	ifr_data	ifr_ifru.ifru_data	/* for use by interface */
 #define ifr_index	ifr_ifru.ifru_index	/* interface index */
 #define ifr_llprio	ifr_ifru.ifru_metric	/* link layer priority */
+#define ifr_hdrprio	ifr_ifru.ifru_metric	/* header prio field config */
+#define ifr_pwe3	ifr_ifru.ifru_metric	/* PWE3 type */
 };
+
+#define IF_HDRPRIO_MIN		IFQ_MINPRIO
+#define IF_HDRPRIO_MAX		IFQ_MAXPRIO
+#define IF_HDRPRIO_PACKET	-1	/* use mbuf prio */
+#define IF_HDRPRIO_PAYLOAD	-2	/* copy payload prio */
+#define IF_HDRPRIO_OUTER	-3	/* use outer prio */
+
+#define IF_PWE3_ETHERNET	1	/* ethernet or ethernet tagged */
+#define IF_PWE3_IP		2	/* IP layer 2 */
 
 struct ifaliasreq {
 	char	ifra_name[IFNAMSIZ];		/* if name, e.g. "en0" */
@@ -468,6 +503,20 @@ struct if_parent {
 	char		ifp_parent[IFNAMSIZ];
 };
 
+/* SIOCGIFSFFPAGE */
+
+#define IFSFF_ADDR_EEPROM	0xa0
+#define IFSFF_ADDR_DDM		0xa2
+
+#define IFSFF_DATA_LEN		256
+
+struct if_sffpage {
+	char		 sff_ifname[IFNAMSIZ];		/* u -> k */
+	uint8_t		 sff_addr;			/* u -> k */
+	uint8_t		 sff_page;			/* u -> k */
+	uint8_t		 sff_data[IFSFF_DATA_LEN];	/* k -> u */
+};
+
 #include <net/if_arp.h>
 
 #ifdef _KERNEL
@@ -481,7 +530,6 @@ void	if_attach(struct ifnet *);
 void	if_attach_queues(struct ifnet *, unsigned int);
 void	if_attach_iqueues(struct ifnet *, unsigned int);
 void	if_attach_ifq(struct ifnet *, const struct ifq_ops *, void *);
-void	if_attachtail(struct ifnet *);
 void	if_attachhead(struct ifnet *);
 void	if_deactivate(struct ifnet *);
 void	if_detach(struct ifnet *);

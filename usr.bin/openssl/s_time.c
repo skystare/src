@@ -1,4 +1,4 @@
-/* $OpenBSD: s_time.c,v 1.31 2018/08/28 14:30:48 cheloha Exp $ */
+/* $OpenBSD: s_time.c,v 1.34 2019/07/14 03:30:46 guenther Exp $ */
 /* Copyright (C) 1995-1998 Eric Young (eay@cryptsoft.com)
  * All rights reserved.
  *
@@ -92,6 +92,7 @@ extern int verify_depth;
 static void s_time_usage(void);
 static int run_test(SSL *);
 static int benchmark(int);
+static void print_tally_mark(SSL *);
 
 static SSL_CTX *tm_ctx = NULL;
 static const SSL_METHOD *s_time_meth = NULL;
@@ -114,7 +115,7 @@ struct {
 	char *www_path;
 } s_time_config;
 
-struct option s_time_options[] = {
+static const struct option s_time_options[] = {
 	{
 		.name = "bugs",
 		.desc = "Enable workarounds for known SSL/TLS bugs",
@@ -376,7 +377,7 @@ run_test(SSL *scon)
 	if (s_time_config.www_path != NULL) {
 		retval = snprintf(buf, sizeof buf,
 		    "GET %s HTTP/1.0\r\n\r\n", s_time_config.www_path);
-		if (retval == -1 || retval >= sizeof buf) {
+		if (retval < 0 || retval >= sizeof buf) {
 			fprintf(stderr, "URL too long\n");
 			return 0;
 		}
@@ -393,6 +394,24 @@ run_test(SSL *scon)
 	return 1;
 }
 
+static void
+print_tally_mark(SSL *scon)
+{
+	int ver;
+
+	if (SSL_session_reused(scon))
+		ver = 'r';
+	else {
+		ver = SSL_version(scon);
+		if (ver == TLS1_VERSION)
+			ver = 't';
+		else
+			ver = '*';
+	}
+	fputc(ver, stdout);
+	fflush(stdout);
+}
+
 static int
 benchmark(int reuse_session)
 {
@@ -400,7 +419,6 @@ benchmark(int reuse_session)
 	int nConn = 0;
 	SSL *scon = NULL;
 	int ret = 1;
-	int ver;
 
 	if (reuse_session) {
 		/* Get an SSL object so we can reuse the session id */
@@ -429,18 +447,7 @@ benchmark(int reuse_session)
 		if (!run_test(scon))
 			goto end;
 		nConn += 1;
-		if (SSL_session_reused(scon))
-			ver = 'r';
-		else {
-			ver = SSL_version(scon);
-			if (ver == TLS1_VERSION)
-				ver = 't';
-			else
-				ver = '*';
-		}
-		fputc(ver, stdout);
-		fflush(stdout);
-
+		print_tally_mark(scon);
 		if (!reuse_session) {
 			SSL_free(scon);
 			scon = NULL;

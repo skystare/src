@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.27 2015/11/16 00:16:39 mmcc Exp $	*/
+/*	$OpenBSD: util.c,v 1.31 2020/12/03 08:58:52 mvs Exp $	*/
 
 /*
  * Copyright (c) 1990, 1991, 1993, 1994, 1995, 1996, 1997
@@ -118,39 +118,37 @@ ts_print(const struct bpf_timeval *tvp)
 	int s;
 #define TSBUFLEN 32
 	static char buf[TSBUFLEN];
-	static struct bpf_timeval last;
-	struct timeval diff;
+	static struct timeval last;
+	struct timeval diff, cur;
 	time_t t;
 
 	if (Iflag && device)
-		(void)printf("%s ", device);
+		printf("%s ", device);
 	switch(tflag){
 	case 0:
 		break;
 	case -1:
 		/* Unix timeval style */
-		(void)printf("%u.%06u ",
-		    (u_int32_t)tvp->tv_sec, (u_int32_t)tvp->tv_usec);
+		printf("%u.%06u ", tvp->tv_sec, tvp->tv_usec);
 		break;
 	case -2:
-		t=tvp->tv_sec;
+		t = tvp->tv_sec;
 		strftime(buf, TSBUFLEN, "%b %d %T", priv_localtime(&t));
-		printf("%s.%06u ", buf, (u_int32_t)tvp->tv_usec);
+		printf("%s.%06u ", buf, tvp->tv_usec);
 		break;
-	case -3:
-	case -4:
-		/* time since first/last frame */
-		timersub(tvp, &last, &diff);
-		(void)printf("%u.%06u ",
-		    (u_int32_t)diff.tv_sec, (u_int32_t)diff.tv_usec);
-		if (tflag == -3 || (last.tv_sec == 0 && last.tv_usec == 0))
-			last = *tvp;
+	case -3: /* last frame time delta  */
+	case -4: /* first frame time delta  */
+		cur.tv_sec = tvp->tv_sec;
+		cur.tv_usec = tvp->tv_usec;
+		timersub(&cur, &last, &diff);
+		printf("%lld.%06ld ", diff.tv_sec, diff.tv_usec);
+		if (!timerisset(&last) || tflag == -3)
+			last = cur;
 		break;
 	default:
-		/* Default */
 		s = (tvp->tv_sec + thiszone) % 86400;
-		(void)printf("%02d:%02d:%02d.%06u ",
-		    s / 3600, (s % 3600) / 60, s % 60, (u_int32_t)tvp->tv_usec);
+		printf("%02d:%02d:%02d.%06u ",
+		    s / 3600, (s % 3600) / 60, s % 60, tvp->tv_usec);
 		break;
 	}
 }
@@ -169,12 +167,12 @@ relts_print(int secs)
 	int *s = seconds;
 
 	if (secs <= 0) {
-		(void)printf("0s");
+		printf("0s");
 		return;
 	}
 	while (secs > 0) {
 		if (secs >= *s) {
-			(void)printf("%d%s", secs / *s, *l);
+			printf("%d%s", secs / *s, *l);
 			secs -= (secs / *s) * *s;
 		}
 		s++;
@@ -268,10 +266,10 @@ read_infile(char *fname)
 	char		*cp;
 
 	fd = open(fname, O_RDONLY);
-	if (fd < 0)
+	if (fd == -1)
 		error("can't open %s: %s", fname, pcap_strerror(errno));
 
-	if (fstat(fd, &buf) < 0)
+	if (fstat(fd, &buf) == -1)
 		error("can't stat %s: %s", fname, pcap_strerror(errno));
 
 	if (buf.st_size >= SSIZE_MAX)
@@ -305,13 +303,11 @@ safeputs(const char *s)
 void
 safeputchar(int c)
 {
-	unsigned char ch;
-
-	ch = (unsigned char)(c & 0xff);
+	c &= 0xff;
 	if (c < 0x80 && isprint(c))
-		printf("%c", c & 0xff);
+		putchar(c);
 	else
-		printf("\\%03o", c & 0xff);
+		printf("\\%03o", c);
 }
 
 /*

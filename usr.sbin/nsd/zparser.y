@@ -298,25 +298,57 @@ rel_dname:	label
 
 wire_dname:	wire_abs_dname
     |	wire_rel_dname
+    {
+	    /* terminate in root label and copy the origin in there */
+	    if(parser->origin && domain_dname(parser->origin)) {
+		    $$.len = $1.len + domain_dname(parser->origin)->name_size;
+		    if ($$.len > MAXDOMAINLEN)
+			    zc_error("domain name exceeds %d character limit",
+				     MAXDOMAINLEN);
+		    $$.str = (char *) region_alloc(parser->rr_region, $$.len);
+		    memmove($$.str, $1.str, $1.len);
+		    memmove($$.str + $1.len, dname_name(domain_dname(parser->origin)),
+			domain_dname(parser->origin)->name_size);
+	    } else {
+		    $$.len = $1.len + 1;
+		    if ($$.len > MAXDOMAINLEN)
+			    zc_error("domain name exceeds %d character limit",
+				     MAXDOMAINLEN);
+		    $$.str = (char *) region_alloc(parser->rr_region, $$.len);
+		    memmove($$.str, $1.str, $1.len);
+		    $$.str[ $1.len ] = 0;
+	    }
+    }
     ;
 
 wire_abs_dname:	'.'
     {
-	    char *result = (char *) region_alloc(parser->rr_region, 2);
+	    char *result = (char *) region_alloc(parser->rr_region, 1);
 	    result[0] = 0;
-	    result[1] = '\0';
 	    $$.str = result;
 	    $$.len = 1;
     }
+    |	'@'
+    {
+	    if(parser->origin && domain_dname(parser->origin)) {
+		    $$.len = domain_dname(parser->origin)->name_size;
+		    $$.str = (char *) region_alloc(parser->rr_region, $$.len);
+		    memmove($$.str, dname_name(domain_dname(parser->origin)), $$.len);
+	    } else {
+		    $$.len = 1;
+		    $$.str = (char *) region_alloc(parser->rr_region, $$.len);
+		    $$.str[0] = 0;
+	    }
+    }
     |	wire_rel_dname '.'
     {
-	    char *result = (char *) region_alloc(parser->rr_region,
-						 $1.len + 2);
-	    memcpy(result, $1.str, $1.len);
-	    result[$1.len] = 0;
-	    result[$1.len+1] = '\0';
-	    $$.str = result;
 	    $$.len = $1.len + 1;
+	    if ($$.len > MAXDOMAINLEN)
+		    zc_error("domain name exceeds %d character limit",
+			     MAXDOMAINLEN);
+	    $$.str = (char *) region_alloc(parser->rr_region, $$.len);
+	    memcpy($$.str, $1.str, $1.len);
+	    $$.str[$1.len] = 0;
     }
     ;
 
@@ -330,7 +362,7 @@ wire_label:	STR
 
 	    /* make label anyway */
 	    result[0] = $1.len;
-	    memcpy(result+1, $1.str, $1.len);
+	    memmove(result+1, $1.str, $1.len);
 
 	    $$.str = result;
 	    $$.len = $1.len + 1;
@@ -340,16 +372,13 @@ wire_label:	STR
 wire_rel_dname:	wire_label
     |	wire_rel_dname '.' wire_label
     {
-	    if ($1.len + $3.len - 3 > MAXDOMAINLEN)
+	    $$.len = $1.len + $3.len;
+	    if ($$.len > MAXDOMAINLEN)
 		    zc_error("domain name exceeds %d character limit",
 			     MAXDOMAINLEN);
-
-	    /* make dname anyway */
-	    $$.len = $1.len + $3.len;
-	    $$.str = (char *) region_alloc(parser->rr_region, $$.len + 1);
-	    memcpy($$.str, $1.str, $1.len);
-	    memcpy($$.str + $1.len, $3.str, $3.len);
-	    $$.str[$$.len] = '\0';
+	    $$.str = (char *) region_alloc(parser->rr_region, $$.len);
+	    memmove($$.str, $1.str, $1.len);
+	    memmove($$.str + $1.len, $3.str, $3.len);
     }
     ;
 
@@ -604,7 +633,7 @@ type_and_rdata:
     |	T_DLV sp rdata_dlv { if (dlv_warn) { dlv_warn = 0; zc_warning_prev_line("DLV is experimental"); } }
     |	T_DLV sp rdata_unknown { if (dlv_warn) { dlv_warn = 0; zc_warning_prev_line("DLV is experimental"); } $$ = $1; parse_unknown_rdata($1, $3); }
     |	T_SSHFP sp rdata_sshfp
-    |	T_SSHFP sp rdata_unknown { $$ = $1; parse_unknown_rdata($1, $3); }
+    |	T_SSHFP sp rdata_unknown { $$ = $1; parse_unknown_rdata($1, $3); check_sshfp(); }
     |	T_RRSIG sp rdata_rrsig
     |	T_RRSIG sp rdata_unknown { $$ = $1; parse_unknown_rdata($1, $3); }
     |	T_NSEC sp rdata_nsec
@@ -877,6 +906,7 @@ rdata_sshfp:	STR sp STR sp str_sp_seq trail
 	    zadd_rdata_wireformat(zparser_conv_byte(parser->region, $1.str)); /* alg */
 	    zadd_rdata_wireformat(zparser_conv_byte(parser->region, $3.str)); /* fp type */
 	    zadd_rdata_wireformat(zparser_conv_hex(parser->region, $5.str, $5.len)); /* hash */
+	    check_sshfp();
     }
     ;
 
@@ -983,11 +1013,17 @@ rdata_ipsec_base: STR sp STR sp STR sp dotted_str
 			/* convert and insert the dname */
 			if(strlen($7.str) == 0)
 				zc_error_prev_line("IPSECKEY must specify gateway name");
-			if(!(name = dname_parse(parser->region, $7.str)))
+			if(!(name = dname_parse(parser->region, $7.str))) {
 				zc_error_prev_line("IPSECKEY bad gateway dname %s", $7.str);
+				break;
+			}
 			if($7.str[strlen($7.str)-1] != '.') {
 				if(parser->origin == error_domain) {
 		    			zc_error("cannot concatenate origin to domain name, because origin failed to parse");
+					break;
+				} else if(name->name_size + domain_dname(parser->origin)->name_size - 1 > MAXDOMAINLEN) {
+					zc_error("ipsec gateway name exceeds %d character limit",
+						MAXDOMAINLEN);
 					break;
 				}
 				name = dname_concatenate(parser->rr_region, name, 
@@ -1126,7 +1162,6 @@ zparser_create(region_type *region, region_type *rr_region, namedb_type *db)
 	result->current_zone = NULL;
 	result->origin = NULL;
 	result->prev_dname = NULL;
-	result->default_apex = NULL;
 
 	result->temporary_rdatas = (rdata_atom_type *) region_alloc_array(
 		result->region, MAXRDATALEN, sizeof(rdata_atom_type));
@@ -1150,7 +1185,6 @@ zparser_init(const char *filename, uint32_t ttl, uint16_t klass,
 	parser->current_zone = NULL;
 	parser->origin = domain_table_insert(parser->db->domains, origin);
 	parser->prev_dname = parser->origin;
-	parser->default_apex = parser->origin;
 	parser->error_occurred = 0;
 	parser->errors = 0;
 	parser->line = 1;

@@ -1,4 +1,4 @@
-/*	$OpenBSD: mta_session.c,v 1.110 2018/09/08 10:05:07 eric Exp $	*/
+/*	$OpenBSD: mta_session.c,v 1.137 2020/06/09 06:35:17 semarie Exp $	*/
 
 /*
  * Copyright (c) 2008 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
@@ -103,6 +104,9 @@ struct mta_session {
 	struct mta_relay	*relay;
 	struct mta_route	*route;
 	char			*helo;
+	char			*mxname;
+
+	char			*username;
 
 	int			 flags;
 
@@ -127,6 +131,7 @@ struct mta_session {
 	struct mta_task		*task;
 	struct mta_envelope	*currevp;
 	FILE			*datafp;
+	size_t			 datalen;
 
 	size_t			 failures;
 
@@ -148,8 +153,10 @@ static void mta_send(struct mta_session *, char *, ...);
 static ssize_t mta_queue_data(struct mta_session *);
 static void mta_response(struct mta_session *, char *);
 static const char * mta_strstate(int);
-static void mta_start_tls(struct mta_session *);
-static int mta_verify_certificate(struct mta_session *);
+static void mta_cert_init(struct mta_session *);
+static void mta_cert_init_cb(void *, int, const char *, const void *, size_t);
+static void mta_cert_verify(struct mta_session *);
+static void mta_cert_verify_cb(void *, int);
 static void mta_tls_verified(struct mta_session *);
 static struct mta_session *mta_tree_pop(struct tree *, uint64_t);
 static const char * dsn_strret(enum dsn_ret);
@@ -160,13 +167,46 @@ void mta_hoststat_reschedule(const char *);
 void mta_hoststat_cache(const char *, uint64_t);
 void mta_hoststat_uncache(const char *, uint64_t);
 
+
+static void mta_filter_begin(struct mta_session *);
+static void mta_filter_end(struct mta_session *);
+static void mta_connected(struct mta_session *);
+static void mta_disconnected(struct mta_session *);
+
+static void mta_report_link_connect(struct mta_session *, const char *, int,
+    const struct sockaddr_storage *,
+    const struct sockaddr_storage *);
+static void mta_report_link_greeting(struct mta_session *, const char *);
+static void mta_report_link_identify(struct mta_session *, const char *, const char *);
+static void mta_report_link_tls(struct mta_session *, const char *);
+static void mta_report_link_disconnect(struct mta_session *);
+static void mta_report_link_auth(struct mta_session *, const char *, const char *);
+static void mta_report_tx_reset(struct mta_session *, uint32_t);
+static void mta_report_tx_begin(struct mta_session *, uint32_t);
+static void mta_report_tx_mail(struct mta_session *, uint32_t, const char *, int);
+static void mta_report_tx_rcpt(struct mta_session *, uint32_t, const char *, int);
+static void mta_report_tx_envelope(struct mta_session *, uint32_t, uint64_t);
+static void mta_report_tx_data(struct mta_session *, uint32_t, int);
+static void mta_report_tx_commit(struct mta_session *, uint32_t, size_t);
+static void mta_report_tx_rollback(struct mta_session *, uint32_t);
+static void mta_report_protocol_client(struct mta_session *, const char *);
+static void mta_report_protocol_server(struct mta_session *, const char *);
+#if 0
+static void mta_report_filter_response(struct mta_session *, int, int, const char *);
+#endif
+static void mta_report_timeout(struct mta_session *);
+
+
 static struct tree wait_helo;
 static struct tree wait_ptr;
 static struct tree wait_fd;
-static struct tree wait_ssl_init;
-static struct tree wait_ssl_verify;
+static struct tree wait_tls_init;
+static struct tree wait_tls_verify;
 
 static struct runq *hangon;
+
+#define	SESSION_FILTERED(s) \
+	((s)->relay->dispatcher->u.remote.filtername)
 
 static void
 mta_session_init(void)
@@ -177,15 +217,15 @@ mta_session_init(void)
 		tree_init(&wait_helo);
 		tree_init(&wait_ptr);
 		tree_init(&wait_fd);
-		tree_init(&wait_ssl_init);
-		tree_init(&wait_ssl_verify);
+		tree_init(&wait_tls_init);
+		tree_init(&wait_tls_verify);
 		runq_init(&hangon, mta_on_timeout);
 		init = 1;
 	}
 }
 
 void
-mta_session(struct mta_relay *relay, struct mta_route *route)
+mta_session(struct mta_relay *relay, struct mta_route *route, const char *mxname)
 {
 	struct mta_session	*s;
 	struct timeval		 tv;
@@ -196,30 +236,30 @@ mta_session(struct mta_relay *relay, struct mta_route *route)
 	s->id = generate_uid();
 	s->relay = relay;
 	s->route = route;
+	s->mxname = xstrdup(mxname);
+
+	mta_filter_begin(s);
 
 	if (relay->flags & RELAY_LMTP)
 		s->flags |= MTA_LMTP;
 	switch (relay->tls) {
-		case RELAY_TLS_SMTPS:
-			s->flags |= MTA_FORCE_SMTPS;
-			s->flags |= MTA_WANT_SECURE;
-			break;
-		case RELAY_TLS_STARTTLS:
-			s->flags |= MTA_FORCE_TLS;
-			s->flags |= MTA_WANT_SECURE;
-			break;
-		case RELAY_TLS_OPPORTUNISTIC:
-			/* do not force anything, try tls then smtp */
-			break;
-		case RELAY_TLS_NO:
-			s->flags |= MTA_FORCE_PLAIN;
-			break;
-		default:
-			fatalx("bad value for relay->tls: %d", relay->tls);
+	case RELAY_TLS_SMTPS:
+		s->flags |= MTA_FORCE_SMTPS;
+		s->flags |= MTA_WANT_SECURE;
+		break;
+	case RELAY_TLS_STARTTLS:
+		s->flags |= MTA_FORCE_TLS;
+		s->flags |= MTA_WANT_SECURE;
+		break;
+	case RELAY_TLS_OPPORTUNISTIC:
+		/* do not force anything, try tls then smtp */
+		break;
+	case RELAY_TLS_NO:
+		s->flags |= MTA_FORCE_PLAIN;
+		break;
+	default:
+		fatalx("bad value for relay->tls: %d", relay->tls);
 	}
-
-	if (relay->flags & RELAY_BACKUP)
-		s->flags &= ~MTA_FORCE_PLAIN;
 
 	log_debug("debug: mta: %p: spawned for relay %s", s,
 	    mta_relay_to_text(relay));
@@ -241,13 +281,10 @@ mta_session(struct mta_relay *relay, struct mta_route *route)
 void
 mta_session_imsg(struct mproc *p, struct imsg *imsg)
 {
-	struct ca_vrfy_resp_msg	*resp_ca_vrfy;
-	struct ca_cert_resp_msg	*resp_ca_cert;
 	struct mta_session	*s;
 	struct msg		 m;
 	uint64_t		 reqid;
 	const char		*name;
-	void			*ssl;
 	int			 status;
 	struct stat		 sb;
 	
@@ -297,61 +334,6 @@ mta_session_imsg(struct mproc *p, struct imsg *imsg)
 			fatal("mta: fdopen");
 
 		mta_enter_state(s, MTA_MAIL);
-		return;
-
-	case IMSG_MTA_TLS_INIT:
-		resp_ca_cert = imsg->data;
-		s = mta_tree_pop(&wait_ssl_init, resp_ca_cert->reqid);
-		if (s == NULL)
-			return;
-
-		if (resp_ca_cert->status == CA_FAIL) {
-			if (s->relay->pki_name) {
-				log_info("%016"PRIx64" mta "
-				    "closing reason=ca-failure",
-				    s->id);
-				mta_free(s);
-				return;
-			}
-			else {
-				ssl = ssl_mta_init(NULL, NULL, 0, env->sc_tls_ciphers);
-				if (ssl == NULL)
-					fatal("mta: ssl_mta_init");
-				io_start_tls(s->io, ssl);
-				return;
-			}
-		}
-
-		resp_ca_cert = xmemdup(imsg->data, sizeof *resp_ca_cert);
-		resp_ca_cert->cert = xstrdup((char *)imsg->data +
-		    sizeof *resp_ca_cert);
-		ssl = ssl_mta_init(resp_ca_cert->name,
-		    resp_ca_cert->cert, resp_ca_cert->cert_len, env->sc_tls_ciphers);
-		if (ssl == NULL)
-			fatal("mta: ssl_mta_init");
-		io_start_tls(s->io, ssl);
-
-		freezero(resp_ca_cert->cert, resp_ca_cert->cert_len);
-		free(resp_ca_cert);
-		return;
-
-	case IMSG_MTA_TLS_VERIFY:
-		resp_ca_vrfy = imsg->data;
-		s = mta_tree_pop(&wait_ssl_verify, resp_ca_vrfy->reqid);
-		if (s == NULL)
-			return;
-
-		if (resp_ca_vrfy->status == CA_OK)
-			s->flags |= MTA_TLS_VERIFIED;
-		else if (s->relay->flags & RELAY_TLS_VERIFY) {
-			errno = 0;
-			mta_error(s, "SSL certificate check failed");
-			mta_free(s);
-			return;
-		}
-
-		mta_tls_verified(s);
-		io_resume(s->io, IO_IN);
 		return;
 
 	case IMSG_MTA_LOOKUP_HELO:
@@ -406,12 +388,14 @@ mta_free(struct mta_session *s)
 
 	log_debug("debug: mta: %p: session done", s);
 
+	mta_disconnected(s);
+
 	if (s->ready)
 		s->relay->nconn_ready -= 1;
 
 	if (s->flags & MTA_HANGON) {
 		log_debug("debug: mta: %p: cancelling hangon timer", s);
-		runq_cancel(hangon, NULL, s);
+		runq_cancel(hangon, s);
 	}
 
 	if (s->io)
@@ -419,12 +403,16 @@ mta_free(struct mta_session *s)
 
 	if (s->task)
 		fatalx("current task should have been deleted already");
-	if (s->datafp)
+	if (s->datafp) {
 		fclose(s->datafp);
+		s->datalen = 0;
+	}
 	free(s->helo);
 
 	relay = s->relay;
 	route = s->route;
+	free(s->username);
+	free(s->mxname);
 	free(s);
 	stat_decrement("mta.session", 1);
 	mta_route_collect(relay, route);
@@ -585,8 +573,9 @@ mta_enter_state(struct mta_session *s, int newstate)
 	char			 ibuf[LINE_MAX];
 	char			 obuf[LINE_MAX];
 	int			 offset;
+	const char     		*srs_sender;
 
-    again:
+again:
 	oldstate = s->state;
 
 	log_trace(TRACE_MTA, "mta: %p: %s -> %s", s,
@@ -608,16 +597,19 @@ mta_enter_state(struct mta_session *s, int newstate)
 	case MTA_EHLO:
 		s->ext = 0;
 		mta_send(s, "EHLO %s", s->helo);
+		mta_report_link_identify(s, "EHLO", s->helo);
 		break;
 
 	case MTA_HELO:
 		s->ext = 0;
 		mta_send(s, "HELO %s", s->helo);
+		mta_report_link_identify(s, "HELO", s->helo);
 		break;
 
 	case MTA_LHLO:
 		s->ext = 0;
 		mta_send(s, "LHLO %s", s->helo);
+		mta_report_link_identify(s, "LHLO", s->helo);
 		break;
 
 	case MTA_STARTTLS:
@@ -668,6 +660,14 @@ mta_enter_state(struct mta_session *s, int newstate)
 		break;
 
 	case MTA_AUTH_PLAIN:
+		memset(ibuf, 0, sizeof ibuf);
+		if (base64_decode(s->relay->secret, (unsigned char *)ibuf,
+				  sizeof(ibuf)-1) == -1) {
+			log_debug("debug: mta: %p: credentials too large on session", s);
+			mta_error(s, "Credentials too large");
+			break;
+		}
+		s->username = xstrdup(ibuf+1);
 		mta_send(s, "AUTH PLAIN %s", s->relay->secret);
 		break;
 
@@ -683,6 +683,7 @@ mta_enter_state(struct mta_session *s, int newstate)
 			mta_error(s, "Credentials too large");
 			break;
 		}
+		s->username = xstrdup(ibuf+1);
 
 		memset(obuf, 0, sizeof obuf);
 		base64_encode((unsigned char *)ibuf + 1, strlen(ibuf + 1), obuf, sizeof obuf);
@@ -759,7 +760,7 @@ mta_enter_state(struct mta_session *s, int newstate)
 			    (long long)(s->relay->limits->sessdelay_keepalive -
 			    s->hangon));
 			s->flags |= MTA_HANGON;
-			runq_schedule(hangon, time(NULL) + 1, NULL, s);
+			runq_schedule(hangon, 1, s);
 			break;
 		}
 
@@ -784,6 +785,25 @@ mta_enter_state(struct mta_session *s, int newstate)
 		s->hangon = 0;
 		s->msgtried++;
 		envid_sz = strlen(e->dsn_envid);
+
+		/* SRS-encode if requested for the relay action, AND we're not
+		 * bouncing, AND we have an RCPT which means we are forwarded,
+		 * AND the RCPT has a '@' just for sanity check (will always).
+		 */
+		if (env->sc_srs_key != NULL &&
+		    s->relay->srs &&
+		    strchr(s->task->sender, '@') &&
+		    e->rcpt &&
+		    strchr(e->rcpt, '@')) {
+			/* encode and replace task sender with new SRS-sender */
+			srs_sender = srs_encode(s->task->sender,
+			    strchr(e->rcpt, '@') + 1);
+			if (srs_sender) {
+				free(s->task->sender);
+				s->task->sender = xstrdup(srs_sender);
+			}
+		}
+
 		if (s->ext & MTA_EXT_DSN) {
 			mta_send(s, "MAIL FROM:<%s>%s%s%s%s",
 			    s->task->sender,
@@ -805,11 +825,12 @@ mta_enter_state(struct mta_session *s, int newstate)
 			    e->dest,
 			    e->dsn_notify ? " NOTIFY=" : "",
 			    e->dsn_notify ? dsn_strnotify(e->dsn_notify) : "",
-			    e->dsn_orcpt ? " ORCPT=" : "",
+			    e->dsn_orcpt ? " ORCPT=rfc822;" : "",
 			    e->dsn_orcpt ? e->dsn_orcpt : "");
 		} else
 			mta_send(s, "RCPT TO:<%s>", e->dest);
 
+		mta_report_tx_envelope(s, s->task->msgid, e->id);
 		s->rcptcount++;
 		break;
 
@@ -850,6 +871,7 @@ mta_enter_state(struct mta_session *s, int newstate)
 		if (s->datafp) {
 			fclose(s->datafp);
 			s->datafp = NULL;
+			s->datalen = 0;
 		}
 		mta_send(s, "RSET");
 		break;
@@ -874,6 +896,7 @@ mta_response(struct mta_session *s, char *line)
 	struct sockaddr_storage	 ss;
 	struct sockaddr		*sa;
 	const char		*domain;
+	char			*pbuf;
 	socklen_t		 sa_len;
 	char			 buf[LINE_MAX];
 	int			 delivery;
@@ -886,6 +909,16 @@ mta_response(struct mta_session *s, char *line)
 			s->flags |= MTA_FREE;
 			return;
 		}
+
+		pbuf = "";
+		if (strlen(line) > 4) {
+			(void)strlcpy(buf, line + 4, sizeof buf);
+			if ((pbuf = strchr(buf, ' ')))
+				*pbuf = '\0';
+			pbuf = valid_domainpart(buf) ? buf : "";
+		}
+		mta_report_link_greeting(s, pbuf);
+
 		if (s->flags & MTA_LMTP)
 			mta_enter_state(s, MTA_LHLO);
 		else
@@ -940,21 +973,24 @@ mta_response(struct mta_session *s, char *line)
 			return;
 		}
 
-		mta_start_tls(s);
+		mta_cert_init(s);
 		break;
 
 	case MTA_AUTH_PLAIN:
 		if (line[0] != '2') {
 			mta_error(s, "AUTH rejected: %s", line);
+			mta_report_link_auth(s, s->username, "fail");
 			s->flags |= MTA_FREE;
 			return;
 		}
+		mta_report_link_auth(s, s->username, "pass");
 		mta_enter_state(s, MTA_READY);
 		break;
 
 	case MTA_AUTH_LOGIN:
 		if (strncmp(line, "334 ", 4) != 0) {
 			mta_error(s, "AUTH rejected: %s", line);
+			mta_report_link_auth(s, s->username, "fail");
 			s->flags |= MTA_FREE;
 			return;
 		}
@@ -964,6 +1000,7 @@ mta_response(struct mta_session *s, char *line)
 	case MTA_AUTH_LOGIN_USER:
 		if (strncmp(line, "334 ", 4) != 0) {
 			mta_error(s, "AUTH rejected: %s", line);
+			mta_report_link_auth(s, s->username, "fail");
 			s->flags |= MTA_FREE;
 			return;
 		}
@@ -973,9 +1010,11 @@ mta_response(struct mta_session *s, char *line)
 	case MTA_AUTH_LOGIN_PASS:
 		if (line[0] != '2') {
 			mta_error(s, "AUTH rejected: %s", line);
+			mta_report_link_auth(s, s->username, "fail");
 			s->flags |= MTA_FREE;
 			return;
 		}
+		mta_report_link_auth(s, s->username, "pass");
 		mta_enter_state(s, MTA_READY);
 		break;
 
@@ -985,10 +1024,13 @@ mta_response(struct mta_session *s, char *line)
 				delivery = IMSG_MTA_DELIVERY_PERMFAIL;
 			else
 				delivery = IMSG_MTA_DELIVERY_TEMPFAIL;
+
 			mta_flush_task(s, delivery, line, 0, 0);
 			mta_enter_state(s, MTA_RSET);
 			return;
 		}
+		mta_report_tx_begin(s, s->task->msgid);
+		mta_report_tx_mail(s, s->task->msgid, s->task->sender, 1);
 		mta_enter_state(s, MTA_RCPT);
 		break;
 
@@ -1012,6 +1054,8 @@ mta_response(struct mta_session *s, char *line)
 				mta_hoststat_reschedule(domain);
 		}
 		else {
+			mta_report_tx_rollback(s, s->task->msgid);
+			mta_report_tx_reset(s, s->task->msgid);
 			if (line[0] == '5')
 				delivery = IMSG_MTA_DELIVERY_PERMFAIL;
 			else
@@ -1034,7 +1078,7 @@ mta_response(struct mta_session *s, char *line)
 			 */
 			sa_len = sizeof(ss);
 			sa = (struct sockaddr *)&ss;
-			if (getsockname(io_fileno(s->io), sa, &sa_len) < 0)
+			if (getsockname(io_fileno(s->io), sa, &sa_len) == -1)
 				mta_delivery_log(e, NULL, buf, delivery, line);
 			else
 				mta_delivery_log(e, sa_to_text(sa),
@@ -1063,6 +1107,21 @@ mta_response(struct mta_session *s, char *line)
 			}
 		}
 
+		switch (line[0]) {
+		case '2':
+			mta_report_tx_rcpt(s,
+			    s->task->msgid, e->dest, 1);
+			break;
+		case '4':
+			mta_report_tx_rcpt(s,
+			    s->task->msgid, e->dest, -1);
+			break;
+		case '5':
+			mta_report_tx_rcpt(s,
+			    s->task->msgid, e->dest, 0);
+			break;
+		}
+
 		if (s->currevp == NULL)
 			mta_enter_state(s, MTA_DATA);
 		else
@@ -1071,13 +1130,19 @@ mta_response(struct mta_session *s, char *line)
 
 	case MTA_DATA:
 		if (line[0] == '2' || line[0] == '3') {
+			mta_report_tx_data(s, s->task->msgid, 1);
 			mta_enter_state(s, MTA_BODY);
 			break;
 		}
+
 		if (line[0] == '5')
 			delivery = IMSG_MTA_DELIVERY_PERMFAIL;
 		else
 			delivery = IMSG_MTA_DELIVERY_TEMPFAIL;
+		mta_report_tx_data(s, s->task->msgid,
+		    delivery == IMSG_MTA_DELIVERY_TEMPFAIL ? -1 : 0);
+		mta_report_tx_rollback(s, s->task->msgid);
+		mta_report_tx_reset(s, s->task->msgid);
 		mta_flush_task(s, delivery, line, 0, 0);
 		mta_enter_state(s, MTA_RSET);
 		break;
@@ -1093,6 +1158,14 @@ mta_response(struct mta_session *s, char *line)
 			delivery = IMSG_MTA_DELIVERY_PERMFAIL;
 		else
 			delivery = IMSG_MTA_DELIVERY_TEMPFAIL;
+		if (delivery != IMSG_MTA_DELIVERY_OK) {
+			mta_report_tx_rollback(s, s->task->msgid);
+			mta_report_tx_reset(s, s->task->msgid);
+		}
+		else {
+			mta_report_tx_commit(s, s->task->msgid, s->datalen);
+			mta_report_tx_reset(s, s->task->msgid);
+		}
 		mta_flush_task(s, delivery, line, (s->flags & MTA_LMTP) ? 1 : 0, 0);
 		if (s->task) {
 			s->rcptcount--;
@@ -1104,9 +1177,8 @@ mta_response(struct mta_session *s, char *line)
 				    (long long int)s->relay->limits->sessdelay_transaction);
 				s->hangon = s->relay->limits->sessdelay_transaction -1;
 				s->flags |= MTA_HANGON;
-				runq_schedule(hangon, time(NULL)
-				    + s->relay->limits->sessdelay_transaction,
-				    NULL, s);
+				runq_schedule(hangon,
+				    s->relay->limits->sessdelay_transaction, s);
 			}
 			else
 				mta_enter_state(s, MTA_READY);
@@ -1115,14 +1187,18 @@ mta_response(struct mta_session *s, char *line)
 
 	case MTA_RSET:
 		s->rcptcount = 0;
+
+		if (s->task) {
+			mta_report_tx_rollback(s, s->task->msgid);
+			mta_report_tx_reset(s, s->task->msgid);
+		}
 		if (s->relay->limits->sessdelay_transaction) {
 			log_debug("debug: mta: waiting for %llds after reset",
 			    (long long int)s->relay->limits->sessdelay_transaction);
 			s->hangon = s->relay->limits->sessdelay_transaction -1;
 			s->flags |= MTA_HANGON;
-			runq_schedule(hangon, time(NULL)
-			    + s->relay->limits->sessdelay_transaction,
-			    NULL, s);
+			runq_schedule(hangon,
+			    s->relay->limits->sessdelay_transaction, s);
 		}
 		else
 			mta_enter_state(s, MTA_READY);
@@ -1148,11 +1224,11 @@ mta_io(struct io *io, int evt, void *arg)
 	switch (evt) {
 
 	case IO_CONNECTED:
-		log_info("%016"PRIx64" mta connected", s->id);
+		mta_connected(s);
 
 		if (s->use_smtps) {
 			io_set_write(io);
-			mta_start_tls(s);
+			mta_cert_init(s);
 		}
 		else {
 			mta_enter_state(s, MTA_BANNER);
@@ -1161,16 +1237,14 @@ mta_io(struct io *io, int evt, void *arg)
 		break;
 
 	case IO_TLSREADY:
-		log_info("%016"PRIx64" mta starttls ciphers=%s",
-		    s->id, ssl_to_text(io_ssl(s->io)));
+		log_info("%016"PRIx64" mta tls ciphers=%s",
+		    s->id, ssl_to_text(io_tls(s->io)));
 		s->flags |= MTA_TLS;
 
-		if (mta_verify_certificate(s)) {
-			io_pause(s->io, IO_IN);
-			break;
-		}
+		mta_report_link_tls(s,
+		    ssl_to_text(io_tls(s->io)));
 
-		mta_tls_verified(s);
+		mta_cert_verify(s);
 		break;
 
 	case IO_DATAIN:
@@ -1184,7 +1258,12 @@ mta_io(struct io *io, int evt, void *arg)
 			return;
 		}
 
+		/* Strip trailing '\r' */
+		if (len && line[len - 1] == '\r')
+			line[--len] = '\0';
+
 		log_trace(TRACE_MTA, "mta: %p: <<< %s", s, line);
+		mta_report_protocol_server(s, line);
 
 		if ((error = parse_smtp_response(line, len, &msg, &cont))) {
 			mta_error(s, "Bad response: %s", error);
@@ -1220,14 +1299,13 @@ mta_io(struct io *io, int evt, void *arg)
 		if (cont) {
 			if (s->replybuf[0] == '\0')
 				(void)strlcat(s->replybuf, line, sizeof s->replybuf);
-			else {
-				line = line + 4;
-				if (isdigit((int)*line) && *(line + 1) == '.' &&
-				    isdigit((int)*line+2) && *(line + 3) == '.' &&
-				    isdigit((int)*line+4) && isspace((int)*(line + 5)))
-					(void)strlcat(s->replybuf, line+5, sizeof s->replybuf);
-				else
-					(void)strlcat(s->replybuf, line, sizeof s->replybuf);
+			else if (len > 4) {
+				p = line + 4;
+				if (isdigit((unsigned char)p[0]) && p[1] == '.' &&
+				    isdigit((unsigned char)p[2]) && p[3] == '.' &&
+				    isdigit((unsigned char)p[4]) && isspace((unsigned char)p[5]))
+					p += 5;
+				(void)strlcat(s->replybuf, p, sizeof s->replybuf);
 			}
 			goto nextline;
 		}
@@ -1235,17 +1313,17 @@ mta_io(struct io *io, int evt, void *arg)
 		/* last line of a reply, check if we're on a continuation to parse out status and ESC.
 		 * if we overflow reply buffer or are not on continuation, log entire last line.
 		 */
-		if (s->replybuf[0] != '\0') {
+		if (s->replybuf[0] == '\0')
+			(void)strlcat(s->replybuf, line, sizeof s->replybuf);
+		else if (len > 4) {
 			p = line + 4;
-			if (isdigit((int)*p) && *(p + 1) == '.' &&
-			    isdigit((int)*p+2) && *(p + 3) == '.' &&
-			    isdigit((int)*p+4) && isspace((int)*(p + 5)))
+			if (isdigit((unsigned char)p[0]) && p[1] == '.' &&
+			    isdigit((unsigned char)p[2]) && p[3] == '.' &&
+			    isdigit((unsigned char)p[4]) && isspace((unsigned char)p[5]))
 				p += 5;
 			if (strlcat(s->replybuf, p, sizeof s->replybuf) >= sizeof s->replybuf)
 				(void)strlcpy(s->replybuf, line, sizeof s->replybuf);
 		}
-		else
-			(void)strlcpy(s->replybuf, line, sizeof s->replybuf);
 
 		if (s->state == MTA_QUIT) {
 			log_info("%016"PRIx64" mta disconnected reason=quit messages=%zu",
@@ -1291,6 +1369,7 @@ mta_io(struct io *io, int evt, void *arg)
 	case IO_TIMEOUT:
 		log_debug("debug: mta: %p: connection timeout", s);
 		mta_error(s, "Connection timeout");
+		mta_report_timeout(s);
 		if (!s->ready)
 			mta_connect(s);
 		else
@@ -1298,40 +1377,20 @@ mta_io(struct io *io, int evt, void *arg)
 		break;
 
 	case IO_ERROR:
-		log_debug("debug: mta: %p: IO error: %s", s, io_error(io));
-		if (!s->ready) {
-			mta_error(s, "IO Error: %s", io_error(io));
-			mta_connect(s);
-			break;
-		}
-		else if (!(s->flags & (MTA_FORCE_TLS|MTA_FORCE_SMTPS|MTA_FORCE_ANYSSL))) {
-			/* error in non-strict SSL negotiation, downgrade to plain */
-			if (s->flags & MTA_TLS) {
-				log_info("smtp-out: Error on session %016"PRIx64
-				    ": opportunistic TLS failed, "
-				    "downgrading to plain", s->id);
-				s->flags &= ~MTA_TLS;
-				s->flags |= MTA_DOWNGRADE_PLAIN;
-				mta_connect(s);
-				break;
-			}
-		}
-		mta_error(s, "IO Error: %s", io_error(io));
-		mta_free(s);
-		break;
-
 	case IO_TLSERROR:
-		log_debug("debug: mta: %p: TLS IO error: %s", s, io_error(io));
-		if (!(s->flags & (MTA_FORCE_TLS|MTA_FORCE_SMTPS|MTA_FORCE_ANYSSL))) {
+		log_debug("debug: mta: %p: IO error: %s", s, io_error(io));
+
+		if (s->state == MTA_STARTTLS && s->use_smtp_tls) {
 			/* error in non-strict SSL negotiation, downgrade to plain */
-			log_info("smtp-out: TLS Error on session %016"PRIx64
-			    ": TLS failed, "
+			log_info("smtp-out: Error on session %016"PRIx64
+			    ": opportunistic TLS failed, "
 			    "downgrading to plain", s->id);
 			s->flags &= ~MTA_TLS;
 			s->flags |= MTA_DOWNGRADE_PLAIN;
 			mta_connect(s);
 			break;
 		}
+
 		mta_error(s, "IO Error: %s", io_error(io));
 		mta_free(s);
 		break;
@@ -1365,6 +1424,13 @@ mta_send(struct mta_session *s, char *fmt, ...)
 
 	log_trace(TRACE_MTA, "mta: %p: >>> %s", s, p);
 
+	if (strncasecmp(p, "AUTH PLAIN ", 11) == 0)
+		mta_report_protocol_client(s, "AUTH PLAIN ********");
+	else if (s->state == MTA_AUTH_LOGIN_USER || s->state == MTA_AUTH_LOGIN_PASS)
+		mta_report_protocol_client(s, "********");
+	else
+		mta_report_protocol_client(s, p);
+
 	io_xprintf(s->io, "%s\r\n", p);
 
 	free(p);
@@ -1387,7 +1453,7 @@ mta_queue_data(struct mta_session *s)
 			break;
 		if (ln[len - 1] == '\n')
 			ln[len - 1] = '\0';
-		io_xprintf(s->io, "%s%s\r\n", *ln == '.' ? "." : "", ln);
+		s->datalen += io_xprintf(s->io, "%s%s\r\n", *ln == '.' ? "." : "", ln);
 	}
 
 	free(ln);
@@ -1439,7 +1505,7 @@ mta_flush_task(struct mta_session *s, int delivery, const char *error, size_t co
 		 */
 		sa = (struct sockaddr *)&ss;
 		sa_len = sizeof(ss);
-		if (getsockname(io_fileno(s->io), sa, &sa_len) < 0)
+		if (getsockname(io_fileno(s->io), sa, &sa_len) == -1)
 			mta_delivery_log(e, NULL, relay, delivery, error);
 		else
 			mta_delivery_log(e, sa_to_text(sa),
@@ -1512,150 +1578,138 @@ mta_error(struct mta_session *s, const char *fmt, ...)
 }
 
 static void
-mta_start_tls(struct mta_session *s)
+mta_cert_init(struct mta_session *s)
 {
-	struct ca_cert_req_msg	req_ca_cert;
-	const char	       *certname;
+	const char *name;
+	int fallback;
 
 	if (s->relay->pki_name) {
-		certname = s->relay->pki_name;
-		req_ca_cert.fallback = 0;
-	}
-	else {
-		certname = s->helo;
-		req_ca_cert.fallback = 1;
-	}
-
-	req_ca_cert.reqid = s->id;
-	(void)strlcpy(req_ca_cert.name, certname, sizeof req_ca_cert.name);
-	m_compose(p_lka, IMSG_MTA_TLS_INIT, 0, 0, -1,
-	    &req_ca_cert, sizeof(req_ca_cert));
-	tree_xset(&wait_ssl_init, s->id, s);
-	s->flags |= MTA_WAIT;
-	return;
-}
-
-static int
-mta_verify_certificate(struct mta_session *s)
-{
-#define MAX_CERTS	16
-#define MAX_CERT_LEN	(MAX_IMSGSIZE - (IMSG_HEADER_SIZE + sizeof(req_ca_vrfy)))
-	struct ca_vrfy_req_msg	req_ca_vrfy;
-	struct iovec		iov[2];
-	X509		       *x;
-	STACK_OF(X509)	       *xchain;
-	const char	       *name;
-	unsigned char	       *cert_der[MAX_CERTS];
-	int			cert_len[MAX_CERTS];
-	int			i, cert_count, res;
-
-	res = 0;
-	memset(cert_der, 0, sizeof(cert_der));
-	memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
-
-	/* Send the client certificate */
-	if (s->relay->ca_name) {
-		name = s->relay->ca_name;
-		req_ca_vrfy.fallback = 0;
+		name = s->relay->pki_name;
+		fallback = 0;
 	}
 	else {
 		name = s->helo;
-		req_ca_vrfy.fallback = 1;
+		fallback = 1;
 	}
-	if (strlcpy(req_ca_vrfy.name, name, sizeof req_ca_vrfy.name)
-	    >= sizeof req_ca_vrfy.name)
-		return 0;
 
-	x = SSL_get_peer_certificate(io_ssl(s->io));
-	if (x == NULL)
-		return 0;
-	xchain = SSL_get_peer_cert_chain(io_ssl(s->io));
+	if (cert_init(name, fallback, mta_cert_init_cb, s)) {
+		tree_xset(&wait_tls_init, s->id, s);
+		s->flags |= MTA_WAIT;
+	}
+}
+
+static void
+mta_cert_init_cb(void *arg, int status, const char *name, const void *cert,
+    size_t cert_len)
+{
+	struct mta_session *s = arg;
+	void *ssl;
+	char *xname = NULL, *xcert = NULL;
+	union {
+		struct in_addr in4;
+		struct in6_addr in6;
+	} addrbuf;
+
+	if (s->flags & MTA_WAIT)
+		mta_tree_pop(&wait_tls_init, s->id);
+
+	if (status == CA_FAIL && s->relay->pki_name) {
+		log_info("%016"PRIx64" mta closing reason=ca-failure", s->id);
+		mta_free(s);
+		return;
+	}
+
+	if (name)
+		xname = xstrdup(name);
+	if (cert)
+		xcert = xmemdup(cert, cert_len);
+	ssl = ssl_mta_init(xname, xcert, cert_len, env->sc_tls_ciphers);
+	free(xname);
+	free(xcert);
+	if (ssl == NULL)
+		fatal("mta: ssl_mta_init");
 
 	/*
-	 * Client provided a certificate and possibly a certificate chain.
-	 * SMTP can't verify because it does not have the information that
-	 * it needs, instead it will pass the certificate and chain to the
-	 * lookup process and wait for a reply.
-	 *
+	 * RFC4366 (SNI): Literal IPv4 and IPv6 addresses are not
+	 * permitted in "HostName".
 	 */
-
-	cert_len[0] = i2d_X509(x, &cert_der[0]);
-	X509_free(x);
-
-	if (cert_len[0] < 0) {
-		log_warnx("warn: failed to encode certificate");
-		goto end;
-	}
-	log_debug("debug: certificate 0: len=%d", cert_len[0]);
-	if (cert_len[0] > (int)MAX_CERT_LEN) {
-		log_warnx("warn: certificate too long");
-		goto end;
-	}
-
-	if (xchain) {
-		cert_count = sk_X509_num(xchain);
-		log_debug("debug: certificate chain len: %d", cert_count);
-		if (cert_count >= MAX_CERTS) {
-			log_warnx("warn: certificate chain too long");
-			goto end;
-		}
-	}
-	else
-		cert_count = 0;
-
-	for (i = 0; i < cert_count; ++i) {
-		x = sk_X509_value(xchain, i);
-		cert_len[i+1] = i2d_X509(x, &cert_der[i+1]);
-		if (cert_len[i+1] < 0) {
-			log_warnx("warn: failed to encode certificate");
-			goto end;
-		}
-		log_debug("debug: certificate %i: len=%d", i+1, cert_len[i+1]);
-		if (cert_len[i+1] > (int)MAX_CERT_LEN) {
-			log_warnx("warn: certificate too long");
-			goto end;
+	if (s->relay->domain->as_host == 1) {
+		if (inet_pton(AF_INET, s->relay->domain->name, &addrbuf) != 1 &&
+		    inet_pton(AF_INET6, s->relay->domain->name, &addrbuf) != 1) {
+			log_debug("%016"PRIx64" mta tls setting SNI name=%s",
+			    s->id, s->relay->domain->name);
+			if (SSL_set_tlsext_host_name(ssl, s->relay->domain->name) == 0)
+				log_warnx("%016"PRIx64" mta tls setting SNI failed",
+				   s->id);
 		}
 	}
 
-	tree_xset(&wait_ssl_verify, s->id, s);
-	s->flags |= MTA_WAIT;
+	io_start_tls(s->io, ssl);
+}
 
-	/* Send the client certificate */
-	req_ca_vrfy.reqid = s->id;
-	req_ca_vrfy.cert_len = cert_len[0];
-	req_ca_vrfy.n_chain = cert_count;
-	iov[0].iov_base = &req_ca_vrfy;
-	iov[0].iov_len = sizeof(req_ca_vrfy);
-	iov[1].iov_base = cert_der[0];
-	iov[1].iov_len = cert_len[0];
-	m_composev(p_lka, IMSG_MTA_TLS_VERIFY_CERT, 0, 0, -1,
-	    iov, nitems(iov));
+static void
+mta_cert_verify(struct mta_session *s)
+{
+	const char *name;
+	int fallback;
 
-	memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
-	req_ca_vrfy.reqid = s->id;
-
-	/* Send the chain, one cert at a time */
-	for (i = 0; i < cert_count; ++i) {
-		req_ca_vrfy.cert_len = cert_len[i+1];
-		iov[1].iov_base = cert_der[i+1];
-		iov[1].iov_len  = cert_len[i+1];
-		m_composev(p_lka, IMSG_MTA_TLS_VERIFY_CHAIN, 0, 0, -1,
-		    iov, nitems(iov));
+	if (s->relay->ca_name) {
+		name = s->relay->ca_name;
+		fallback = 0;
+	}
+	else {
+		name = s->helo;
+		fallback = 1;
 	}
 
-	/* Tell lookup process that it can start verifying, we're done */
-	memset(&req_ca_vrfy, 0, sizeof req_ca_vrfy);
-	req_ca_vrfy.reqid = s->id;
-	m_compose(p_lka, IMSG_MTA_TLS_VERIFY, 0, 0, -1,
-	    &req_ca_vrfy, sizeof req_ca_vrfy);
+	if (cert_verify(io_tls(s->io), name, fallback, mta_cert_verify_cb, s)) {
+		tree_xset(&wait_tls_verify, s->id, s);
+		io_pause(s->io, IO_IN);
+		s->flags |= MTA_WAIT;
+	}
+}
 
-	res = 1;
+static void
+mta_cert_verify_cb(void *arg, int status)
+{
+	struct mta_session *s = arg;
+	int match, resume = 0;
+	X509 *cert;
 
-    end:
-	for (i = 0; i < MAX_CERTS; ++i)
-		free(cert_der[i]);
+	if (s->flags & MTA_WAIT) {
+		mta_tree_pop(&wait_tls_verify, s->id);
+		resume = 1;
+	}
 
-	return res;
+	if (status == CERT_OK) {
+		cert = SSL_get_peer_certificate(io_tls(s->io));
+		if (!cert)
+			status = CERT_NOCERT;
+		else {
+			match = 0;
+			(void)ssl_check_name(cert, s->mxname, &match);
+			X509_free(cert);
+			if (!match) {
+				log_info("%016"PRIx64" mta "
+				    "ssl_check_name: no match for '%s' in cert",
+				    s->id, s->mxname);
+				status = CERT_INVALID;
+			}
+		}
+	}
+
+	if (status == CERT_OK)
+		s->flags |= MTA_TLS_VERIFIED;
+	else if (s->relay->flags & RELAY_TLS_VERIFY) {
+		errno = 0;
+		mta_error(s, "SSL certificate check failed");
+		mta_free(s);
+		return;
+	}
+
+	mta_tls_verified(s);
+	if (resume)
+		io_resume(s->io, IO_IN);
 }
 
 static void
@@ -1663,12 +1717,12 @@ mta_tls_verified(struct mta_session *s)
 {
 	X509 *x;
 
-	x = SSL_get_peer_certificate(io_ssl(s->io));
+	x = SSL_get_peer_certificate(io_tls(s->io));
 	if (x) {
-		log_info("smtp-out: Server certificate verification %s "
-		    "on session %016"PRIx64,
-		    (s->flags & MTA_TLS_VERIFIED) ? "succeeded" : "failed",
-		    s->id);
+	  log_info("%016"PRIx64" mta "
+		   "server-cert-check result=\"%s\"",
+		   s->id,
+		   (s->flags & MTA_TLS_VERIFIED) ? "success" : "failure");
 		X509_free(x);
 	}
 
@@ -1748,4 +1802,226 @@ mta_strstate(int state)
 	default:
 		return "MTA_???";
 	}
+}
+
+static void
+mta_filter_begin(struct mta_session *s)
+{
+	if (!SESSION_FILTERED(s))
+		return;
+
+	m_create(p_lka, IMSG_FILTER_SMTP_BEGIN, 0, 0, -1);
+	m_add_id(p_lka, s->id);
+	m_add_string(p_lka, s->relay->dispatcher->u.remote.filtername);
+	m_close(p_lka);
+}
+
+static void
+mta_filter_end(struct mta_session *s)
+{
+	if (!SESSION_FILTERED(s))
+		return;
+
+	m_create(p_lka, IMSG_FILTER_SMTP_END, 0, 0, -1);
+	m_add_id(p_lka, s->id);
+	m_close(p_lka);
+}
+
+static void
+mta_connected(struct mta_session *s)
+{
+	struct sockaddr_storage sa_src;
+	struct sockaddr_storage sa_dest;
+	int sa_len;
+
+	log_info("%016"PRIx64" mta connected", s->id);
+
+	sa_len = sizeof sa_src;
+	if (getsockname(io_fileno(s->io),
+	    (struct sockaddr *)&sa_src, &sa_len) == -1)
+		bzero(&sa_src, sizeof sa_src);
+	sa_len = sizeof sa_dest;
+	if (getpeername(io_fileno(s->io),
+	    (struct sockaddr *)&sa_dest, &sa_len) == -1)
+		bzero(&sa_dest, sizeof sa_dest);
+
+	mta_report_link_connect(s,
+	    s->route->dst->ptrname, 1,
+	    &sa_src,
+	    &sa_dest);
+}
+
+static void
+mta_disconnected(struct mta_session *s)
+{
+	mta_report_link_disconnect(s);
+	mta_filter_end(s);
+}
+
+
+static void
+mta_report_link_connect(struct mta_session *s, const char *rdns, int fcrdns,
+    const struct sockaddr_storage *ss_src,
+    const struct sockaddr_storage *ss_dest)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_link_connect("smtp-out", s->id, rdns, fcrdns, ss_src, ss_dest);
+}
+
+static void
+mta_report_link_greeting(struct mta_session *s,
+    const char *domain)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_link_greeting("smtp-out", s->id, domain);
+}
+
+static void
+mta_report_link_identify(struct mta_session *s, const char *method, const char *identity)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_link_identify("smtp-out", s->id, method, identity);
+}
+
+static void
+mta_report_link_tls(struct mta_session *s, const char *ssl)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_link_tls("smtp-out", s->id, ssl);
+}
+
+static void
+mta_report_link_disconnect(struct mta_session *s)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_link_disconnect("smtp-out", s->id);
+}
+
+static void
+mta_report_link_auth(struct mta_session *s, const char *user, const char *result)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_link_auth("smtp-out", s->id, user, result);
+}
+
+static void
+mta_report_tx_reset(struct mta_session *s, uint32_t msgid)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_reset("smtp-out", s->id, msgid);
+}
+
+static void
+mta_report_tx_begin(struct mta_session *s, uint32_t msgid)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_begin("smtp-out", s->id, msgid);
+}
+
+static void
+mta_report_tx_mail(struct mta_session *s, uint32_t msgid, const char *address, int ok)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_mail("smtp-out", s->id, msgid, address, ok);
+}
+
+static void
+mta_report_tx_rcpt(struct mta_session *s, uint32_t msgid, const char *address, int ok)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_rcpt("smtp-out", s->id, msgid, address, ok);
+}
+
+static void
+mta_report_tx_envelope(struct mta_session *s, uint32_t msgid, uint64_t evpid)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_envelope("smtp-out", s->id, msgid, evpid);
+}
+
+static void
+mta_report_tx_data(struct mta_session *s, uint32_t msgid, int ok)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_data("smtp-out", s->id, msgid, ok);
+}
+
+static void
+mta_report_tx_commit(struct mta_session *s, uint32_t msgid, size_t msgsz)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_commit("smtp-out", s->id, msgid, msgsz);
+}
+
+static void
+mta_report_tx_rollback(struct mta_session *s, uint32_t msgid)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_tx_rollback("smtp-out", s->id, msgid);
+}
+
+static void
+mta_report_protocol_client(struct mta_session *s, const char *command)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_protocol_client("smtp-out", s->id, command);
+}
+
+static void
+mta_report_protocol_server(struct mta_session *s, const char *response)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_protocol_server("smtp-out", s->id, response);
+}
+
+#if 0
+static void
+mta_report_filter_response(struct mta_session *s, int phase, int response, const char *param)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_filter_response("smtp-out", s->id, phase, response, param);
+}
+#endif
+
+static void
+mta_report_timeout(struct mta_session *s)
+{
+	if (! SESSION_FILTERED(s))
+		return;
+
+	report_smtp_timeout("smtp-out", s->id);
 }

@@ -1,4 +1,4 @@
-/*	$OpenBSD: syslogd.c,v 1.256 2018/08/31 19:06:08 bluhm Exp $	*/
+/*	$OpenBSD: syslogd.c,v 1.264 2020/09/14 20:36:01 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2014-2017 Alexander Bluhm <bluhm@genua.de>
@@ -215,8 +215,6 @@ char	*TypeNames[] = {
 SIMPLEQ_HEAD(filed_list, filed) Files;
 struct	filed consfile;
 
-int	nunix;			/* Number of Unix domain sockets requested */
-char	**path_unix;		/* Paths to Unix domain sockets */
 int	Debug;			/* debug flag */
 int	Foreground;		/* run in foreground, instead of daemonizing */
 char	LocalHostName[HOST_NAME_MAX+1];	/* our hostname */
@@ -233,7 +231,6 @@ int	NoDNS = 0;		/* when true, refrain from doing DNS lookups */
 int	ZuluTime = 0;		/* display date and time in UTC ISO format */
 int	IncludeHostname = 0;	/* include RFC 3164 hostnames when forwarding */
 int	Family = PF_UNSPEC;	/* protocol family, may disable IPv4 or IPv6 */
-char	*path_ctlsock = NULL;	/* Path to control socket */
 
 struct	tls *server_ctx;
 struct	tls_config *client_config, *server_config;
@@ -355,8 +352,9 @@ void	address_alloc(const char *, const char *, char ***, char ***, int *);
 int	socket_bind(const char *, const char *, const char *, int,
     int *, int *);
 int	unix_socket(char *, int, mode_t);
-void	double_sockbuf(int, int);
+void	double_sockbuf(int, int, int);
 void	set_sockbuf(int);
+void	set_keepalive(int);
 void	tailify_replytext(char *, int);
 
 int
@@ -372,7 +370,8 @@ main(int argc, char *argv[])
 	int		 ch, i;
 	int		 lockpipe[2] = { -1, -1}, pair[2], nullfd, fd;
 	int		 fd_ctlsock, fd_klog, fd_sendsys, *fd_bind, *fd_listen;
-	int		*fd_tls, *fd_unix, nbind, nlisten, ntls;
+	int		*fd_tls, *fd_unix, nunix, nbind, nlisten, ntls;
+	char		**path_unix, *path_ctlsock;
 	char		**bind_host, **bind_port, **listen_host, **listen_port;
 	char		*tls_hostport, **tls_host, **tls_port;
 
@@ -386,6 +385,7 @@ main(int argc, char *argv[])
 		err(1, "malloc %s", _PATH_LOG);
 	path_unix[0] = _PATH_LOG;
 	nunix = 1;
+	path_ctlsock = NULL;
 
 	bind_host = listen_host = tls_host = NULL;
 	bind_port = listen_port = tls_port = NULL;
@@ -557,15 +557,19 @@ main(int argc, char *argv[])
 				log_warnx("log socket %s failed", path_unix[i]);
 			continue;
 		}
-		double_sockbuf(fd_unix[i], SO_RCVBUF);
+		double_sockbuf(fd_unix[i], SO_RCVBUF, 0);
 	}
 
 	if (socketpair(AF_UNIX, SOCK_DGRAM, PF_UNSPEC, pair) == -1) {
 		log_warn("socketpair sendsyslog");
 		fd_sendsys = -1;
 	} else {
-		double_sockbuf(pair[0], SO_RCVBUF);
-		double_sockbuf(pair[1], SO_SNDBUF);
+		/*
+		 * Avoid to lose messages from sendsyslog(2).  A larger
+		 * 1 MB socket buffer compensates bursts.
+		 */
+		double_sockbuf(pair[0], SO_RCVBUF, 1<<20);
+		double_sockbuf(pair[1], SO_SNDBUF, 1<<20);
 		fd_sendsys = pair[0];
 	}
 
@@ -850,20 +854,6 @@ main(int argc, char *argv[])
 			event_add(ev_udp, NULL);
 		if (fd_udp6 != -1)
 			event_add(ev_udp6, NULL);
-	} else {
-		/*
-		 * If generic UDP file descriptors are used neither
-		 * for receiving nor for sending, close them.  Then
-		 * there is no useless *.514 in netstat.
-		 */
-		if (fd_udp != -1 && !send_udp) {
-			close(fd_udp);
-			fd_udp = -1;
-		}
-		if (fd_udp6 != -1 && !send_udp6) {
-			close(fd_udp6);
-			fd_udp6 = -1;
-		}
 	}
 	for (i = 0; i < nbind; i++)
 		if (fd_bind[i] != -1)
@@ -880,7 +870,7 @@ main(int argc, char *argv[])
 
 	signal_add(ev_hup, NULL);
 	signal_add(ev_term, NULL);
-	if (Debug) {
+	if (Debug || Foreground) {
 		signal_add(ev_int, NULL);
 		signal_add(ev_quit, NULL);
 	} else {
@@ -989,9 +979,11 @@ socket_bind(const char *proto, const char *host, const char *port,
 			continue;
 		}
 		if (!shutread && res->ai_protocol == IPPROTO_UDP)
-			double_sockbuf(*fdp, SO_RCVBUF);
-		else if (res->ai_protocol == IPPROTO_TCP)
+			double_sockbuf(*fdp, SO_RCVBUF, 0);
+		else if (res->ai_protocol == IPPROTO_TCP) {
 			set_sockbuf(*fdp);
+			set_keepalive(*fdp);
+		}
 		reuseaddr = 1;
 		if (setsockopt(*fdp, SOL_SOCKET, SO_REUSEADDR, &reuseaddr,
 		    sizeof(reuseaddr)) == -1) {
@@ -1036,7 +1028,7 @@ klog_readcb(int fd, short event, void *arg)
 	if (n > 0) {
 		linebuf[n] = '\0';
 		printsys(linebuf);
-	} else if (n < 0 && errno != EINTR) {
+	} else if (n == -1 && errno != EINTR) {
 		log_warn("read klog");
 		event_del(ev);
 	}
@@ -1059,7 +1051,7 @@ udp_readcb(int fd, short event, void *arg)
 		cvthname((struct sockaddr *)&sa, resolve, sizeof(resolve));
 		log_debug("cvthname res: %s", resolve);
 		printline(resolve, linebuf);
-	} else if (n < 0 && errno != EINTR && errno != EWOULDBLOCK)
+	} else if (n == -1 && errno != EINTR && errno != EWOULDBLOCK)
 		log_warn("recvfrom udp");
 }
 
@@ -1076,7 +1068,7 @@ unix_readcb(int fd, short event, void *arg)
 	if (n > 0) {
 		linebuf[n] = '\0';
 		printline(LocalHostName, linebuf);
-	} else if (n < 0 && errno != EINTR && errno != EWOULDBLOCK)
+	} else if (n == -1 && errno != EINTR && errno != EWOULDBLOCK)
 		log_warn("recvfrom unix");
 }
 
@@ -1176,7 +1168,7 @@ acceptcb(int lfd, short event, void *arg, int usetls)
 	}
 	p->p_ctx = NULL;
 	if (usetls) {
-		if (tls_accept_socket(server_ctx, &p->p_ctx, fd) < 0) {
+		if (tls_accept_socket(server_ctx, &p->p_ctx, fd) == -1) {
 			log_warnx("tls_accept_socket \"%s\": %s",
 			    peername, tls_error(server_ctx));
 			bufferevent_free(p->p_bufev);
@@ -1635,9 +1627,14 @@ printsys(char *msg)
 	int c, pri, flags;
 	char *lp, *p, *q, line[LOG_MAXLINE + 1];
 	size_t prilen;
+	int l;
 
-	(void)snprintf(line, sizeof line, "%s: ", _PATH_UNIX);
-	lp = line + strlen(line);
+	l = snprintf(line, sizeof(line), "%s: ", _PATH_UNIX);
+	if (l < 0 || l >= sizeof(line)) {
+		line[0] = '\0';
+		l = 0;
+	}
+	lp = line + l;
 	for (p = msg; *p != '\0'; ) {
 		flags = SYNC_FILE | ADDDATE;	/* fsync file after write */
 		pri = DEFSPRI;
@@ -1662,11 +1659,15 @@ void
 vlogmsg(int pri, const char *proc, const char *fmt, va_list ap)
 {
 	char	msg[ERRBUFSIZE];
-	size_t	l;
+	int	l;
 
 	l = snprintf(msg, sizeof(msg), "%s[%d]: ", proc, getpid());
-	if (l < sizeof(msg))
-		vsnprintf(msg + l, sizeof(msg) - l, fmt, ap);
+	if (l < 0 || l >= sizeof(msg))
+		l = 0;
+	l = vsnprintf(msg + l, sizeof(msg) - l, fmt, ap);
+	if (l < 0)
+		strlcpy(msg, fmt, sizeof(msg));
+
 	if (!Started) {
 		fprintf(stderr, "%s\n", msg);
 		init_dropped++;
@@ -1796,7 +1797,8 @@ logline(int pri, int flags, char *from, char *msg)
 		msglen--;
 	}
 	for (i = 0; i < NAME_MAX; i++) {
-		if (!isalnum((unsigned char)msg[i]) && msg[i] != '-')
+		if (!isalnum((unsigned char)msg[i]) &&
+		    msg[i] != '-' && msg[i] != '.' && msg[i] != '_')
 			break;
 		prog[i] = msg[i];
 	}
@@ -1903,8 +1905,12 @@ fprintlog(struct filed *f, int flags, char *msg)
 		l = snprintf(greetings, sizeof(greetings),
 		    "\r\n\7Message from syslogd@%s at %.24s ...\r\n",
 		    f->f_prevhost, ctime(&now.tv_sec));
-		if (l < 0 || (size_t)l >= sizeof(greetings))
-			l = strlen(greetings);
+		if (l < 0)
+			l = strlcpy(greetings,
+			    "\r\n\7Message from syslogd ...\r\n",
+			    sizeof(greetings));
+		if (l >= sizeof(greetings))
+			l = sizeof(greetings) - 1;
 		v->iov_base = greetings;
 		v->iov_len = l;
 		v++;
@@ -1948,8 +1954,11 @@ fprintlog(struct filed *f, int flags, char *msg)
 	} else if (f->f_prevcount > 1) {
 		l = snprintf(repbuf, sizeof(repbuf),
 		    "last message repeated %d times", f->f_prevcount);
-		if (l < 0 || (size_t)l >= sizeof(repbuf))
-			l = strlen(repbuf);
+		if (l < 0)
+			l = strlcpy(repbuf, "last message repeated",
+			    sizeof(repbuf));
+		if (l >= sizeof(repbuf))
+			l = sizeof(repbuf) - 1;
 		v->iov_base = repbuf;
 		v->iov_len = l;
 	} else {
@@ -1973,8 +1982,12 @@ fprintlog(struct filed *f, int flags, char *msg)
 		    IncludeHostname ? LocalHostName : "",
 		    IncludeHostname ? " " : "",
 		    (char *)iov[4].iov_base);
-		if (l < 0 || (size_t)l > MINIMUM(MAX_UDPMSG, sizeof(line)))
-			l = MINIMUM(MAX_UDPMSG, sizeof(line));
+		if (l < 0)
+			l = strlcpy(line, iov[4].iov_base, sizeof(line));
+		if (l >= sizeof(line))
+			l = sizeof(line) - 1;
+		if (l >= MAX_UDPMSG + 1)
+			l = MAX_UDPMSG;
 		if (sendto(f->f_file, line, l, 0,
 		    (struct sockaddr *)&f->f_un.f_forw.f_addr,
 		    f->f_un.f_forw.f_addr.ss_len) != l) {
@@ -2058,7 +2071,7 @@ fprintlog(struct filed *f, int flags, char *msg)
 		}
 		retryonce = 0;
 	again:
-		if (writev(f->f_file, iov, 6) < 0) {
+		if (writev(f->f_file, iov, 6) == -1) {
 			int e = errno;
 
 			/* allow to recover from file system full */
@@ -2144,9 +2157,11 @@ fprintlog(struct filed *f, int flags, char *msg)
 
 	case F_MEMBUF:
 		log_debug("%s", "");
-		snprintf(line, sizeof(line), "%.32s %s %s",
+		l = snprintf(line, sizeof(line), "%.32s %s %s",
 		    (char *)iov[0].iov_base, (char *)iov[2].iov_base,
 		    (char *)iov[4].iov_base);
+		if (l < 0)
+			l = strlcpy(line, iov[4].iov_base, sizeof(line));
 		if (ringbuf_append_line(f->f_un.f_mb.f_rb, line) == 1)
 			f->f_un.f_mb.f_overflow = 1;
 		if (f->f_un.f_mb.f_attached)
@@ -2390,6 +2405,7 @@ init(void)
 	s = 0;
 	strlcpy(progblock, "*", sizeof(progblock));
 	strlcpy(hostblock, "*", sizeof(hostblock));
+	send_udp = send_udp6 = 0;
 	while (getline(&cline, &s, cf) != -1) {
 		/*
 		 * check for end-of-section, comments, strip off trailing
@@ -2481,6 +2497,22 @@ init(void)
 
 	Initialized = 1;
 	dropped_warn(&init_dropped, "during initialization");
+
+	if (SecureMode) {
+		/*
+		 * If generic UDP file descriptors are used neither
+		 * for receiving nor for sending, close them.  Then
+		 * there is no useless *.514 in netstat.
+		 */
+		if (fd_udp != -1 && !send_udp) {
+			close(fd_udp);
+			fd_udp = -1;
+		}
+		if (fd_udp6 != -1 && !send_udp6) {
+			close(fd_udp6);
+			fd_udp6 = -1;
+		}
+	}
 
 	if (Debug) {
 		SIMPLEQ_FOREACH(f, &Files, f_next) {
@@ -2678,20 +2710,24 @@ cfline(char *line, char *progblock, char *hostblock)
 		}
 		if (proto == NULL)
 			proto = "udp";
-		ipproto = proto;
 		if (strcmp(proto, "udp") == 0) {
 			if (fd_udp == -1)
 				proto = "udp6";
 			if (fd_udp6 == -1)
 				proto = "udp4";
-			ipproto = proto;
+		}
+		ipproto = proto;
+		if (strcmp(proto, "udp") == 0) {
+			send_udp = send_udp6 = 1;
 		} else if (strcmp(proto, "udp4") == 0) {
+			send_udp = 1;
 			if (fd_udp == -1) {
 				log_warnx("no udp4 \"%s\"",
 				    f->f_un.f_forw.f_loghost);
 				break;
 			}
 		} else if (strcmp(proto, "udp6") == 0) {
+			send_udp6 = 1;
 			if (fd_udp6 == -1) {
 				log_warnx("no udp6 \"%s\"",
 				    f->f_un.f_forw.f_loghost);
@@ -2735,11 +2771,9 @@ cfline(char *line, char *progblock, char *hostblock)
 		if (strncmp(proto, "udp", 3) == 0) {
 			switch (f->f_un.f_forw.f_addr.ss_family) {
 			case AF_INET:
-				send_udp = 1;
 				f->f_file = fd_udp;
 				break;
 			case AF_INET6:
-				send_udp6 = 1;
 				f->f_file = fd_udp6;
 				break;
 			}
@@ -3034,8 +3068,12 @@ unix_socket(char *path, int type, mode_t mode)
 	return (fd);
 }
 
+/*
+ * Increase socket buffer size in small steps to get partial success
+ * if we hit a kernel limit.  Allow an optional final step.
+ */
 void
-double_sockbuf(int fd, int optname)
+double_sockbuf(int fd, int optname, int bigsize)
 {
 	socklen_t len;
 	int i, newsize, oldsize = 0;
@@ -3045,12 +3083,18 @@ double_sockbuf(int fd, int optname)
 		log_warn("getsockopt bufsize");
 	len = sizeof(newsize);
 	newsize =  LOG_MAXLINE + 128;  /* data + control */
-	/* allow 8 full length messages */
+	/* allow 8 full length messages, that is 66560 bytes */
 	for (i = 0; i < 4; i++, newsize *= 2) {
 		if (newsize <= oldsize)
 			continue;
 		if (setsockopt(fd, SOL_SOCKET, optname, &newsize, len) == -1)
 			log_warn("setsockopt bufsize %d", newsize);
+		else
+			oldsize = newsize;
+	}
+	if (bigsize && bigsize > oldsize) {
+		if (setsockopt(fd, SOL_SOCKET, optname, &bigsize, len) == -1)
+			log_warn("setsockopt bufsize %d", bigsize);
 	}
 }
 
@@ -3063,6 +3107,15 @@ set_sockbuf(int fd)
 		log_warn("setsockopt sndbufsize %d", size);
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) == -1)
 		log_warn("setsockopt rcvbufsize %d", size);
+}
+
+void
+set_keepalive(int fd)
+{
+	int val = 1;
+
+	if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val)) == -1)
+		log_warn("setsockopt keepalive %d", val);
 }
 
 void

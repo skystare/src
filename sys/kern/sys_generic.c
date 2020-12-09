@@ -1,4 +1,4 @@
-/*	$OpenBSD: sys_generic.c,v 1.122 2018/08/20 16:00:22 mpi Exp $	*/
+/*	$OpenBSD: sys_generic.c,v 1.132 2020/10/02 15:45:22 deraadt Exp $	*/
 /*	$NetBSD: sys_generic.c,v 1.24 1996/03/29 00:25:32 cgd Exp $	*/
 
 /*
@@ -52,6 +52,7 @@
 #include <sys/uio.h>
 #include <sys/kernel.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/malloc.h>
 #include <sys/poll.h>
 #ifdef KTRACE
@@ -69,9 +70,10 @@ int selscan(struct proc *, fd_set *, fd_set *, int, int, register_t *);
 void pollscan(struct proc *, struct pollfd *, u_int, register_t *);
 int pollout(struct pollfd *, struct pollfd *, u_int);
 int dopselect(struct proc *, int, fd_set *, fd_set *, fd_set *,
-    const struct timespec *, const sigset_t *, register_t *);
-int doppoll(struct proc *, struct pollfd *, u_int, const struct timespec *,
+    struct timespec *, const sigset_t *, register_t *);
+int doppoll(struct proc *, struct pollfd *, u_int, struct timespec *,
     const sigset_t *, register_t *);
+void doselwakeup(struct selinfo *);
 
 int
 iovec_copyin(const struct iovec *uiov, struct iovec **iovp, struct iovec *aiov,
@@ -365,8 +367,11 @@ dofilewritev(struct proc *p, int fd, struct uio *uio, int flags,
 		if (uio->uio_resid != cnt && (error == ERESTART ||
 		    error == EINTR || error == EWOULDBLOCK))
 			error = 0;
-		if (error == EPIPE)
+		if (error == EPIPE) {
+			KERNEL_LOCK();
 			ptsignal(p, SIGPIPE, STHREAD);
+			KERNEL_UNLOCK();
+		}
 	}
 	cnt -= uio->uio_resid;
 
@@ -471,42 +476,18 @@ sys_ioctl(struct proc *p, void *v, register_t *retval)
 
 	case FIONBIO:
 		if ((tmp = *(int *)data) != 0)
-			fp->f_flag |= FNONBLOCK;
+			atomic_setbits_int(&fp->f_flag, FNONBLOCK);
 		else
-			fp->f_flag &= ~FNONBLOCK;
+			atomic_clearbits_int(&fp->f_flag, FNONBLOCK);
 		error = (*fp->f_ops->fo_ioctl)(fp, FIONBIO, (caddr_t)&tmp, p);
 		break;
 
 	case FIOASYNC:
 		if ((tmp = *(int *)data) != 0)
-			fp->f_flag |= FASYNC;
+			atomic_setbits_int(&fp->f_flag, FASYNC);
 		else
-			fp->f_flag &= ~FASYNC;
+			atomic_clearbits_int(&fp->f_flag, FASYNC);
 		error = (*fp->f_ops->fo_ioctl)(fp, FIOASYNC, (caddr_t)&tmp, p);
-		break;
-
-	case FIOSETOWN:
-		tmp = *(int *)data;
-
-		if (fp->f_type == DTYPE_SOCKET || fp->f_type == DTYPE_PIPE) {
-			/* nothing */
-		} else if (tmp <= 0) {
-			tmp = -tmp;
-		} else {
-			struct process *pr = prfind(tmp);
-			if (pr == NULL) {
-				error = ESRCH;
-				break;
-			}
-			tmp = pr->ps_pgrp->pg_id;
-		}
-		error = (*fp->f_ops->fo_ioctl)
-		    (fp, TIOCSPGRP, (caddr_t)&tmp, p);
-		break;
-
-	case FIOGETOWN:
-		error = (*fp->f_ops->fo_ioctl)(fp, TIOCGPGRP, data, p);
-		*(int *)data = -*(int *)data;
 		break;
 
 	default:
@@ -548,12 +529,12 @@ sys_select(struct proc *p, void *v, register_t *retval)
 		struct timeval tv;
 		if ((error = copyin(SCARG(uap, tv), &tv, sizeof tv)) != 0)
 			return (error);
-		if ((error = itimerfix(&tv)) != 0)
-			return (error);
 #ifdef KTRACE
 		if (KTRPOINT(p, KTR_STRUCT))
 			ktrreltimeval(p, &tv);
 #endif
+		if (tv.tv_sec < 0 || !timerisvalid(&tv))
+			return (EINVAL);
 		TIMEVAL_TO_TIMESPEC(&tv, &ts);
 		tsp = &ts;
 	}
@@ -581,12 +562,12 @@ sys_pselect(struct proc *p, void *v, register_t *retval)
 	if (SCARG(uap, ts) != NULL) {
 		if ((error = copyin(SCARG(uap, ts), &ts, sizeof ts)) != 0)
 			return (error);
-		if ((error = timespecfix(&ts)) != 0)
-			return (error);
 #ifdef KTRACE
 		if (KTRPOINT(p, KTR_STRUCT))
 			ktrreltimespec(p, &ts);
 #endif
+		if (ts.tv_sec < 0 || !timespecisvalid(&ts))
+			return (EINVAL);
 		tsp = &ts;
 	}
 	if (SCARG(uap, mask) != NULL) {
@@ -601,12 +582,13 @@ sys_pselect(struct proc *p, void *v, register_t *retval)
 
 int
 dopselect(struct proc *p, int nd, fd_set *in, fd_set *ou, fd_set *ex,
-    const struct timespec *tsp, const sigset_t *sigmask, register_t *retval)
+    struct timespec *timeout, const sigset_t *sigmask, register_t *retval)
 {
 	fd_mask bits[6];
 	fd_set *pibits[3], *pobits[3];
-	struct timespec ats, rts, tts;
-	int s, ncoll, error = 0, timo;
+	struct timespec elapsed, start, stop;
+	uint64_t nsecs;
+	int s, ncoll, error = 0;
 	u_int ni;
 
 	if (nd < 0)
@@ -651,15 +633,6 @@ dopselect(struct proc *p, int nd, fd_set *in, fd_set *ou, fd_set *ex,
 	}
 #endif
 
-	if (tsp) {
-		getnanouptime(&rts);
-		timespecadd(tsp, &rts, &ats);
-	} else {
-		ats.tv_sec = 0;
-		ats.tv_nsec = 0;
-	}
-	timo = 0;
-
 	if (sigmask)
 		dosigsuspend(p, *sigmask &~ sigcantmask);
 
@@ -669,24 +642,30 @@ retry:
 	error = selscan(p, pibits[0], pobits[0], nd, ni, retval);
 	if (error || *retval)
 		goto done;
-	if (tsp) {
-		getnanouptime(&rts);
-		if (timespeccmp(&rts, &ats, >=))
-			goto done;
-		timespecsub(&ats, &rts, &tts);
-		timo = tts.tv_sec > 24 * 60 * 60 ?
-			24 * 60 * 60 * hz : tstohz(&tts);
-	}
-	s = splhigh();
-	if ((p->p_flag & P_SELECT) == 0 || nselcoll != ncoll) {
+	if (timeout == NULL || timespecisset(timeout)) {
+		if (timeout != NULL) {
+			getnanouptime(&start);
+			nsecs = MIN(TIMESPEC_TO_NSEC(timeout), MAXTSLP);
+		} else
+			nsecs = INFSLP;
+		s = splhigh();
+		if ((p->p_flag & P_SELECT) == 0 || nselcoll != ncoll) {
+			splx(s);
+			goto retry;
+		}
+		atomic_clearbits_int(&p->p_flag, P_SELECT);
+		error = tsleep_nsec(&selwait, PSOCK | PCATCH, "select", nsecs);
 		splx(s);
-		goto retry;
+		if (timeout != NULL) {
+			getnanouptime(&stop);
+			timespecsub(&stop, &start, &elapsed);
+			timespecsub(timeout, &elapsed, timeout);
+			if (timeout->tv_sec < 0)
+				timespecclear(timeout);
+		}
+		if (error == 0 || error == EWOULDBLOCK)
+			goto retry;
 	}
-	atomic_clearbits_int(&p->p_flag, P_SELECT);
-	error = tsleep(&selwait, PSOCK | PCATCH, "select", timo);
-	splx(s);
-	if (error == 0)
-		goto retry;
 done:
 	atomic_clearbits_int(&p->p_flag, P_SELECT);
 	/* select is not restarted after signals... */
@@ -775,6 +754,8 @@ selrecord(struct proc *selector, struct selinfo *sip)
 	struct proc *p;
 	pid_t mytid;
 
+	KERNEL_ASSERT_LOCKED();
+
 	mytid = selector->p_tid;
 	if (sip->si_seltid == mytid)
 		return;
@@ -791,10 +772,19 @@ selrecord(struct proc *selector, struct selinfo *sip)
 void
 selwakeup(struct selinfo *sip)
 {
-	struct proc *p;
-	int s;
-
+	KERNEL_LOCK();
 	KNOTE(&sip->si_note, NOTE_SUBMIT);
+	doselwakeup(sip);
+	KERNEL_UNLOCK();
+}
+
+void
+doselwakeup(struct selinfo *sip)
+{
+	struct proc *p;
+
+	KERNEL_ASSERT_LOCKED();
+
 	if (sip->si_seltid == 0)
 		return;
 	if (sip->si_flags & SI_COLL) {
@@ -805,15 +795,10 @@ selwakeup(struct selinfo *sip)
 	p = tfind(sip->si_seltid);
 	sip->si_seltid = 0;
 	if (p != NULL) {
-		SCHED_LOCK(s);
-		if (p->p_wchan == (caddr_t)&selwait) {
-			if (p->p_stat == SSLEEP)
-				setrunnable(p);
-			else
-				unsleep(p);
+		if (wakeup_proc(p, &selwait)) {
+			/* nothing else to do */
 		} else if (p->p_flag & P_SELECT)
 			atomic_clearbits_int(&p->p_flag, P_SELECT);
-		SCHED_UNLOCK(s);
 	}
 }
 
@@ -908,12 +893,12 @@ sys_ppoll(struct proc *p, void *v, register_t *retval)
 	if (SCARG(uap, ts) != NULL) {
 		if ((error = copyin(SCARG(uap, ts), &ts, sizeof ts)) != 0)
 			return (error);
-		if ((error = timespecfix(&ts)) != 0)
-			return (error);
 #ifdef KTRACE
 		if (KTRPOINT(p, KTR_STRUCT))
 			ktrreltimespec(p, &ts);
 #endif
+		if (ts.tv_sec < 0 || !timespecisvalid(&ts))
+			return (EINVAL);
 		tsp = &ts;
 	}
 
@@ -929,15 +914,16 @@ sys_ppoll(struct proc *p, void *v, register_t *retval)
 
 int
 doppoll(struct proc *p, struct pollfd *fds, u_int nfds,
-    const struct timespec *tsp, const sigset_t *sigmask, register_t *retval)
+    struct timespec *timeout, const sigset_t *sigmask, register_t *retval)
 {
 	size_t sz;
 	struct pollfd pfds[4], *pl = pfds;
-	struct timespec ats, rts, tts;
-	int timo, ncoll, i, s, error;
+	struct timespec elapsed, start, stop;
+	uint64_t nsecs;
+	int ncoll, i, s, error;
 
 	/* Standards say no more than MAX_OPEN; this is possibly better. */
-	if (nfds > min((int)p->p_rlimit[RLIMIT_NOFILE].rlim_cur, maxfiles))
+	if (nfds > min((int)lim_cur(RLIMIT_NOFILE), maxfiles))
 		return (EINVAL);
 
 	/* optimize for the default case, of a small nfds value */
@@ -958,15 +944,6 @@ doppoll(struct proc *p, struct pollfd *fds, u_int nfds,
 		pl[i].revents = 0;
 	}
 
-	if (tsp != NULL) {
-		getnanouptime(&rts);
-		timespecadd(tsp, &rts, &ats);
-	} else {
-		ats.tv_sec = 0;
-		ats.tv_nsec = 0;
-	}
-	timo = 0;
-
 	if (sigmask)
 		dosigsuspend(p, *sigmask &~ sigcantmask);
 
@@ -976,24 +953,30 @@ retry:
 	pollscan(p, pl, nfds, retval);
 	if (*retval)
 		goto done;
-	if (tsp != NULL) {
-		getnanouptime(&rts);
-		if (timespeccmp(&rts, &ats, >=))
-			goto done;
-		timespecsub(&ats, &rts, &tts);
-		timo = tts.tv_sec > 24 * 60 * 60 ?
-			24 * 60 * 60 * hz : tstohz(&tts);
-	}
-	s = splhigh();
-	if ((p->p_flag & P_SELECT) == 0 || nselcoll != ncoll) {
+	if (timeout == NULL || timespecisset(timeout)) {
+		if (timeout != NULL) {
+			getnanouptime(&start);
+			nsecs = MIN(TIMESPEC_TO_NSEC(timeout), MAXTSLP);
+		} else
+			nsecs = INFSLP;
+		s = splhigh();
+		if ((p->p_flag & P_SELECT) == 0 || nselcoll != ncoll) {
+			splx(s);
+			goto retry;
+		}
+		atomic_clearbits_int(&p->p_flag, P_SELECT);
+		error = tsleep_nsec(&selwait, PSOCK | PCATCH, "poll", nsecs);
 		splx(s);
-		goto retry;
+		if (timeout != NULL) {
+			getnanouptime(&stop);
+			timespecsub(&stop, &start, &elapsed);
+			timespecsub(timeout, &elapsed, timeout);
+			if (timeout->tv_sec < 0)
+				timespecclear(timeout);
+		}
+		if (error == 0 || error == EWOULDBLOCK)
+			goto retry;
 	}
-	atomic_clearbits_int(&p->p_flag, P_SELECT);
-	error = tsleep(&selwait, PSOCK | PCATCH, "poll", timo);
-	splx(s);
-	if (error == 0)
-		goto retry;
 
 done:
 	atomic_clearbits_int(&p->p_flag, P_SELECT);
@@ -1034,6 +1017,7 @@ sys_utrace(struct proc *curp, void *v, register_t *retval)
 		syscallarg(const void *) addr;
 		syscallarg(size_t) len;
 	} */ *uap = v;
+
 	return (ktruser(curp, SCARG(uap, label), SCARG(uap, addr),
 	    SCARG(uap, len)));
 #else

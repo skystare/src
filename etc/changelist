@@ -1,4 +1,4 @@
-#	$OpenBSD: changelist,v 1.122 2018/07/23 11:57:17 florian Exp $
+#	$OpenBSD: changelist,v 1.127 2020/09/13 10:03:46 ajacoutot Exp $
 #
 # List of files which the security script backs up and checks
 # for modifications.
@@ -60,6 +60,7 @@
 /etc/ldpd.conf
 /etc/locate.rc
 /etc/login.conf
+/etc/login_ldap.conf
 /etc/mail.rc
 /etc/mail/aliases
 /etc/mail/smtpd.conf
@@ -109,6 +110,11 @@
 /etc/resolv.conf.tail
 /etc/ripd.conf
 /etc/rpc
+/etc/rpki/afrinic.tal
+/etc/rpki/apnic.tal
+/etc/rpki/arin.tal
+/etc/rpki/lacnic.tal
+/etc/rpki/ripe.tal
 /etc/sasyncd.conf
 /etc/sensorsd.conf
 /etc/services
@@ -135,6 +141,7 @@
 /etc/switchd.conf
 /etc/sysmerge.ignore
 /etc/ttys
+/etc/unwind.conf
 /etc/usermgmt.conf
 /etc/vm.conf
 /etc/weekly
@@ -154,7 +161,10 @@
 /var/cron/cron.allow
 /var/cron/cron.deny
 /var/cron/tabs/root
+/var/db/unwind.key
 +/var/nsd/etc/nsd.conf
 /var/unbound/etc/unbound.conf
 /var/yp/Makefile.main
 /var/yp/Makefile.yp
+/.cshrc
+/.profile

@@ -1,4 +1,4 @@
-/*	$OpenBSD: savecore.c,v 1.57 2016/09/01 14:12:07 tedu Exp $	*/
+/*	$OpenBSD: savecore.c,v 1.62 2019/06/28 13:32:46 deraadt Exp $	*/
 /*	$NetBSD: savecore.c,v 1.26 1996/03/18 21:16:05 leo Exp $	*/
 
 /*-
@@ -133,7 +133,7 @@ main(int argc, char *argv[])
 	/* Increase our data size to the max if we can. */
 	if (getrlimit(RLIMIT_DATA, &rl) == 0) {
 		rl.rlim_cur = rl.rlim_max;
-		if (setrlimit(RLIMIT_DATA, &rl) < 0)
+		if (setrlimit(RLIMIT_DATA, &rl) == -1)
 			syslog(LOG_WARNING, "can't set rlimit data size: %m");
 	}
 
@@ -171,12 +171,24 @@ main(int argc, char *argv[])
 	(void)time(&now);
 	kmem_setup();
 
-	if (pledge("stdio rpath wpath cpath", NULL) == -1) {
-		syslog(LOG_ERR, "pledge: %m");
-		exit(1);
-	}
-
-	if (clear) {
+	if (!clear) {
+		if (unveil(dirn, "rwc") == -1) {
+			syslog(LOG_ERR, "unveil: %m");
+			exit(1);
+		}
+		if (unveil(kernel ? kernel : _PATH_UNIX, "r") == -1) {
+			syslog(LOG_ERR, "unveil: %m");
+			exit(1);
+		}
+		if (unveil(rawname(ddname), "r") == -1) {
+			syslog(LOG_ERR, "unveil: %m");
+			exit(1);
+		}
+		if (pledge("stdio rpath wpath cpath", NULL) == -1) {
+			syslog(LOG_ERR, "pledge: %m");
+			exit(1);
+		}
+	} else {
 		clear_dump();
 		return (0);
 	}
@@ -367,6 +379,11 @@ dump_exists(void)
 void
 clear_dump(void)
 {
+	if (pledge("stdio", NULL) == -1) {
+		syslog(LOG_ERR, "pledge: %m");
+		exit(1);
+	}
+
 	if (kvm_dump_inval(kd_dump) == -1)
 		syslog(LOG_ERR, "%s: kvm_clear_dump: %s", ddname,
 			kvm_geterr(kd_dump));
@@ -521,7 +538,7 @@ err2:			syslog(LOG_WARNING,
 			exit(1);
 		}
 	}
-	if (nr < 0) {
+	if (nr == -1) {
 		syslog(LOG_ERR, "%s: %s",
 		    kernel ? kernel : _PATH_UNIX, strerror(errno));
 		syslog(LOG_WARNING,
@@ -567,7 +584,7 @@ find_dev(dev_t dev, int type)
 		}
 	}
 	closedir(dfd);
-	syslog(LOG_ERR, "can't find device %d/%d", major(dev), minor(dev));
+	syslog(LOG_ERR, "can't find device %u/%u", major(dev), minor(dev));
 	exit(1);
 }
 
@@ -622,12 +639,12 @@ check_space(void)
 	int fd;
 
 	tkernel = kernel ? kernel : _PATH_UNIX;
-	if (stat(tkernel, &st) < 0) {
+	if (stat(tkernel, &st) == -1) {
 		syslog(LOG_ERR, "%s: %m", tkernel);
 		exit(1);
 	}
 	kernelsize = st.st_blocks * S_BLKSIZE;
-	if ((fd = open(dirn, O_RDONLY, 0)) < 0 || fstatfs(fd, &fsbuf) < 0) {
+	if ((fd = open(dirn, O_RDONLY, 0)) == -1 || fstatfs(fd, &fsbuf) == -1) {
 		syslog(LOG_ERR, "%s: %m", dirn);
 		exit(1);
 	}

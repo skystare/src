@@ -1,4 +1,4 @@
-/*	$OpenBSD: smtpd.c,v 1.303 2018/09/04 13:04:42 gilles Exp $	*/
+/*	$OpenBSD: smtpd.c,v 1.335 2020/09/23 19:11:50 martijn Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -34,6 +34,7 @@
 #include <event.h>
 #include <fcntl.h>
 #include <fts.h>
+#include <grp.h>
 #include <imsg.h>
 #include <inttypes.h>
 #include <login_cap.h>
@@ -80,18 +81,22 @@ static struct mproc *setup_peer(enum smtp_proc_type, pid_t, int);
 static int imsg_wait(struct imsgbuf *, struct imsg *, int);
 
 static void	offline_scan(int, short, void *);
-static int	offline_add(char *);
+static int	offline_add(char *, uid_t, gid_t);
 static void	offline_done(void);
-static int	offline_enqueue(char *);
+static int	offline_enqueue(char *, uid_t, gid_t);
 
 static void	purge_task(void);
 static int	parent_auth_user(const char *, const char *);
 static void	load_pki_tree(void);
 static void	load_pki_keys(void);
 
+static void	fork_filter_processes(void);
+static void	fork_filter_process(const char *, const char *, const char *, const char *, const char *, uint32_t);
+
 enum child_type {
 	CHILD_DAEMON,
 	CHILD_MDA,
+	CHILD_PROCESSOR,
 	CHILD_ENQUEUE_OFFLINE,
 };
 
@@ -107,6 +112,8 @@ struct child {
 
 struct offline {
 	TAILQ_ENTRY(offline)	 entry;
+	uid_t			 uid;
+	gid_t			 gid;
 	char			*path;
 };
 
@@ -151,11 +158,12 @@ static void
 parent_imsg(struct mproc *p, struct imsg *imsg)
 {
 	struct forward_req	*fwreq;
+	struct filter_proc	*processor;
 	struct deliver		 deliver;
 	struct child		*c;
 	struct msg		 m;
 	const void		*data;
-	const char		*username, *password, *cause;
+	const char		*username, *password, *cause, *procname;
 	uint64_t		 reqid;
 	size_t			 sz;
 	void			*i;
@@ -247,6 +255,17 @@ parent_imsg(struct mproc *p, struct imsg *imsg)
 		m_get_int(&m, &v);
 		m_end(&m);
 		profiling = v;
+		return;
+
+	case IMSG_LKA_PROCESSOR_ERRFD:
+		m_msg(&m, imsg);
+		m_get_string(&m, &procname);
+		m_end(&m);
+
+		processor = dict_xget(env->sc_filter_processes_dict, procname);
+		m_create(p_lka, IMSG_LKA_PROCESSOR_ERRFD, 0, 0, processor->errfd);
+		m_add_string(p_lka, procname);
+		m_close(p_lka);
 		return;
 	}
 
@@ -382,6 +401,14 @@ parent_sig_handler(int sig, short event, void *p)
 				goto skip;
 
 			switch (child->type) {
+			case CHILD_PROCESSOR:
+				if (fail) {
+					log_warnx("warn: lost processor: %s %s",
+					    child->title, cause);
+					parent_shutdown();
+				}
+				break;
+
 			case CHILD_DAEMON:
 				if (fail)
 					log_warnx("warn: lost child: %s %s",
@@ -517,9 +544,7 @@ main(int argc, char *argv[])
 				tracing |= TRACE_IO;
 			else if (!strcmp(optarg, "smtp"))
 				tracing |= TRACE_SMTP;
-			else if (!strcmp(optarg, "mfa") ||
-			    !strcmp(optarg, "filter") ||
-			    !strcmp(optarg, "filters"))
+			else if (!strcmp(optarg, "filters"))
 				tracing |= TRACE_FILTERS;
 			else if (!strcmp(optarg, "mta") ||
 			    !strcmp(optarg, "transfer"))
@@ -816,8 +841,11 @@ start_child(int save_argc, char **save_argv, char *rexec)
 		return p;
 	}
 
-	if (dup2(sp[0], 3) == -1)
-		fatal("%s: dup2", rexec);
+	if (sp[0] != 3) {
+		if (dup2(sp[0], 3) == -1)
+			fatal("%s: dup2", rexec);
+	} else if (fcntl(sp[0], F_SETFD, 0) == -1)
+		fatal("%s: fcntl", rexec);
 
 	if (closefrom(4) == -1)
 		fatal("%s: closefrom", rexec);
@@ -1053,10 +1081,12 @@ smtpd(void) {
 	offline_timeout.tv_usec = 0;
 	evtimer_add(&offline_ev, &offline_timeout);
 
+	fork_filter_processes();
+
 	purge_task();
 
-	if (pledge("stdio rpath wpath cpath fattr flock tmppath "
-	    "getpw sendfd proc exec id inet unix", NULL) == -1)
+	if (pledge("stdio rpath wpath cpath fattr tmppath "
+	    "getpw sendfd proc exec id inet chown unix", NULL) == -1)
 		err(1, "pledge");
 
 	event_dispatch();
@@ -1151,7 +1181,7 @@ fork_proc_backend(const char *key, const char *conf, const char *procname)
 	if (pid == 0) {
 		/* child process */
 		dup2(sp[0], STDIN_FILENO);
-		if (closefrom(STDERR_FILENO + 1) < 0)
+		if (closefrom(STDERR_FILENO + 1) == -1)
 			exit(1);
 
 		if (procname == NULL)
@@ -1229,6 +1259,142 @@ purge_task(void)
 }
 
 static void
+fork_filter_processes(void)
+{
+	const char	*name;
+	void		*iter;
+	const char	*fn;
+	struct filter_config *fc;
+	struct filter_config *fcs;
+	struct filter_proc *fp;
+	size_t		 i;
+
+	/* For each filter chain, assign the registered subsystem to subfilters */
+	iter = NULL;
+	while (dict_iter(env->sc_filters_dict, &iter, (const char **)&fn, (void **)&fc)) {
+		if (fc->chain) {
+			for (i = 0; i < fc->chain_size; ++i) {
+				fcs = dict_xget(env->sc_filters_dict, fc->chain[i]);
+				fcs->filter_subsystem |= fc->filter_subsystem;
+			}
+		}
+	}
+
+	/* For each filter, assign the registered subsystem to underlying proc */
+	iter = NULL;
+	while (dict_iter(env->sc_filters_dict, &iter, (const char **)&fn, (void **)&fc)) {
+		if (fc->proc) {
+			fp = dict_xget(env->sc_filter_processes_dict, fc->proc);
+			fp->filter_subsystem |= fc->filter_subsystem;
+		}
+	}
+
+	iter = NULL;
+	while (dict_iter(env->sc_filter_processes_dict, &iter, &name, (void **)&fp))
+		fork_filter_process(name, fp->command, fp->user, fp->group, fp->chroot, fp->filter_subsystem);
+}
+
+static void
+fork_filter_process(const char *name, const char *command, const char *user, const char *group, const char *chroot_path, uint32_t subsystems)
+{
+	pid_t		 pid;
+	struct filter_proc	*processor;
+	char		 buf;
+	int		 sp[2], errfd[2];
+	struct passwd	*pw;
+	struct group	*gr;
+	char		 exec[_POSIX_ARG_MAX];
+	int		 execr;
+
+	if (user == NULL)
+		user = SMTPD_USER;
+	if ((pw = getpwnam(user)) == NULL)
+		err(1, "getpwnam");
+
+	if (group) {
+		if ((gr = getgrnam(group)) == NULL)
+			err(1, "getgrnam");
+	}
+	else {
+		if ((gr = getgrgid(pw->pw_gid)) == NULL)
+			err(1, "getgrgid");
+	}
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, sp) == -1)
+		err(1, "socketpair");
+	if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, errfd) == -1)
+		err(1, "socketpair");
+
+	if ((pid = fork()) == -1)
+		err(1, "fork");
+
+	/* parent passes the child fd over to lka */
+	if (pid > 0) {
+		processor = dict_xget(env->sc_filter_processes_dict, name);
+		processor->errfd = errfd[1];
+		child_add(pid, CHILD_PROCESSOR, name);
+		close(sp[0]);
+		close(errfd[0]);
+		m_create(p_lka, IMSG_LKA_PROCESSOR_FORK, 0, 0, sp[1]);
+		m_add_string(p_lka, name);
+		m_add_u32(p_lka, (uint32_t)subsystems);
+		m_close(p_lka);
+		return;
+	}
+
+	close(sp[1]);
+	close(errfd[1]);
+	dup2(sp[0], STDIN_FILENO);
+	dup2(sp[0], STDOUT_FILENO);
+	dup2(errfd[0], STDERR_FILENO);
+
+	if (chroot_path) {
+		if (chroot(chroot_path) != 0 || chdir("/") != 0)
+			err(1, "chroot: %s", chroot_path);
+	}
+
+	if (setgroups(1, &gr->gr_gid) ||
+	    setresgid(gr->gr_gid, gr->gr_gid, gr->gr_gid) ||
+	    setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid))
+		err(1, "fork_filter_process: cannot drop privileges");
+
+	if (closefrom(STDERR_FILENO + 1) == -1)
+		err(1, "closefrom");
+	if (setsid() == -1)
+		err(1, "setsid");
+	if (signal(SIGPIPE, SIG_DFL) == SIG_ERR ||
+	    signal(SIGINT, SIG_DFL) == SIG_ERR ||
+	    signal(SIGTERM, SIG_DFL) == SIG_ERR ||
+	    signal(SIGCHLD, SIG_DFL) == SIG_ERR ||
+	    signal(SIGHUP, SIG_DFL) == SIG_ERR)
+		err(1, "signal");
+
+	if (command[0] == '/')
+		execr = snprintf(exec, sizeof(exec), "exec %s", command);
+	else
+		execr = snprintf(exec, sizeof(exec), "exec %s/%s", 
+		    PATH_LIBEXEC, command);
+	if (execr >= (int) sizeof(exec))
+		errx(1, "%s: exec path too long", name);
+
+	/*
+	 * Wait for lka to acknowledge that it received the fd.
+	 * This prevents a race condition between the filter sending an error
+	 * message, and exiting and lka not being able to log it because of
+	 * SIGCHLD.
+	 * (Ab)use read to determine if the fd is installed; since stderr is
+	 * never going to be read from we can shutdown(2) the write-end in lka.
+	 */
+	if (read(STDERR_FILENO, &buf, 1) != 0)
+		errx(1, "lka didn't properly close write end of error socket");
+	if (system(exec) == -1)
+		err(1, NULL);
+
+	/* there's no successful exit from a processor */
+	_exit(1);
+}
+
+static void
 forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 {
 	char		 ebuf[128], sfn[32];
@@ -1243,6 +1409,8 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 	const char	*pw_dir;
 
 	dsp = dict_xget(env->sc_dispatchers, deliver->dispatcher);
+	if (dsp->type != DISPATCHER_LOCAL)
+		fatalx("non-local dispatcher called from forkmda()");
 
 	log_debug("debug: smtpd: forking mda for session %016"PRIx64
 	    ": %s as %s", id, deliver->userinfo.username,
@@ -1280,7 +1448,7 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 		pw_dir = deliver->userinfo.directory;
 	}
 
-	if (pw_uid == 0 && !dsp->u.local.requires_root) {
+	if (pw_uid == 0 && !dsp->u.local.is_mbox) {
 		(void)snprintf(ebuf, sizeof ebuf, "not allowed to deliver to: %s",
 		    deliver->userinfo.username);
 		m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
@@ -1292,7 +1460,7 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 		return;
 	}
 
-	if (pipe(pipefd) < 0) {
+	if (pipe(pipefd) == -1) {
 		(void)snprintf(ebuf, sizeof ebuf, "pipe: %s", strerror(errno));
 		m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
 		m_add_id(p_pony, id);
@@ -1306,7 +1474,7 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 	/* prepare file which captures stdout and stderr */
 	(void)strlcpy(sfn, "/tmp/smtpd.out.XXXXXXXXXXX", sizeof(sfn));
 	allout = mkstemp(sfn);
-	if (allout < 0) {
+	if (allout == -1) {
 		(void)snprintf(ebuf, sizeof ebuf, "mkstemp: %s", strerror(errno));
 		m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
 		m_add_id(p_pony, id);
@@ -1321,7 +1489,7 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 	unlink(sfn);
 
 	pid = fork();
-	if (pid < 0) {
+	if (pid == -1) {
 		(void)snprintf(ebuf, sizeof ebuf, "fork: %s", strerror(errno));
 		m_create(p_pony, IMSG_MDA_DONE, 0, 0, -1);
 		m_add_id(p_pony, id);
@@ -1346,19 +1514,24 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 		m_close(p);
 		return;
 	}
-	if (chdir(pw_dir) < 0 && chdir("/") < 0)
+
+	/* mbox helper, create mailbox before privdrop if it doesn't exist */
+	if (dsp->u.local.is_mbox)
+		mda_mbox_init(deliver);
+
+	if (chdir(pw_dir) == -1 && chdir("/") == -1)
 		err(1, "chdir");
 	if (setgroups(1, &pw_gid) ||
 	    setresgid(pw_gid, pw_gid, pw_gid) ||
 	    setresuid(pw_uid, pw_uid, pw_uid))
 		err(1, "forkmda: cannot drop privileges");
-	if (dup2(pipefd[0], STDIN_FILENO) < 0 ||
-	    dup2(allout, STDOUT_FILENO) < 0 ||
-	    dup2(allout, STDERR_FILENO) < 0)
+	if (dup2(pipefd[0], STDIN_FILENO) == -1 ||
+	    dup2(allout, STDOUT_FILENO) == -1 ||
+	    dup2(allout, STDERR_FILENO) == -1)
 		err(1, "forkmda: dup2");
-	if (closefrom(STDERR_FILENO + 1) < 0)
+	if (closefrom(STDERR_FILENO + 1) == -1)
 		err(1, "closefrom");
-	if (setsid() < 0)
+	if (setsid() == -1)
 		err(1, "setsid");
 	if (signal(SIGPIPE, SIG_DFL) == SIG_ERR ||
 	    signal(SIGINT, SIG_DFL) == SIG_ERR ||
@@ -1370,7 +1543,12 @@ forkmda(struct mproc *p, uint64_t id, struct deliver *deliver)
 	/* avoid hangs by setting 5m timeout */
 	alarm(300);
 
-	mda_unpriv(dsp, deliver, pw_name, pw_dir);
+	if (dsp->u.local.is_mbox &&
+	    dsp->u.local.mda_wrapper == NULL &&
+	    deliver->mda_exec[0] == '\0')
+		mda_mbox(deliver);
+	else
+		mda_unpriv(dsp, deliver, pw_name, pw_dir);
 }
 
 static void
@@ -1411,7 +1589,8 @@ offline_scan(int fd, short ev, void *arg)
 			continue;
 		}
 
-		if (offline_add(e->fts_name)) {
+		if (offline_add(e->fts_name, e->fts_statp->st_uid,
+		    e->fts_statp->st_gid)) {
 			log_warnx("warn: smtpd: "
 			    "could not add offline message %s", e->fts_name);
 			continue;
@@ -1431,7 +1610,7 @@ offline_scan(int fd, short ev, void *arg)
 }
 
 static int
-offline_enqueue(char *name)
+offline_enqueue(char *name, uid_t uid, gid_t gid)
 {
 	char		*path;
 	struct stat	 sb;
@@ -1494,6 +1673,18 @@ offline_enqueue(char *name)
 			_exit(1);
 		}
 
+		if (sb.st_uid != uid) {
+			log_warnx("warn: smtpd: file %s has bad uid %d",
+			    path, sb.st_uid);
+			_exit(1);
+		}
+
+		if (sb.st_gid != gid) {
+			log_warnx("warn: smtpd: file %s has bad gid %d",
+			    path, sb.st_gid);
+			_exit(1);
+		}
+
 		pw = getpwuid(sb.st_uid);
 		if (pw == NULL) {
 			log_warnx("warn: smtpd: getpwuid for uid %d failed",
@@ -1550,17 +1741,19 @@ offline_enqueue(char *name)
 }
 
 static int
-offline_add(char *path)
+offline_add(char *path, uid_t uid, gid_t gid)
 {
 	struct offline	*q;
 
 	if (offline_running < OFFLINE_QUEUEMAX)
 		/* skip queue */
-		return offline_enqueue(path);
+		return offline_enqueue(path, uid, gid);
 
 	q = malloc(sizeof(*q) + strlen(path) + 1);
 	if (q == NULL)
 		return (-1);
+	q->uid = uid;
+	q->gid = gid;
 	q->path = (char *)q + sizeof(*q);
 	memmove(q->path, path, strlen(path) + 1);
 	TAILQ_INSERT_TAIL(&offline_q, q, entry);
@@ -1579,7 +1772,7 @@ offline_done(void)
 		if ((q = TAILQ_FIRST(&offline_q)) == NULL)
 			break; /* all done */
 		TAILQ_REMOVE(&offline_q, q, entry);
-		offline_enqueue(q->path);
+		offline_enqueue(q->path, q->uid, q->gid);
 		free(q);
 	}
 }
@@ -1597,7 +1790,7 @@ parent_forward_open(char *username, char *directory, uid_t uid, gid_t gid)
 		return -1;
 	}
 
-	if (stat(directory, &sb) < 0) {
+	if (stat(directory, &sb) == -1) {
 		log_warn("warn: smtpd: parent_forward_open: %s", directory);
 		return -1;
 	}
@@ -1725,6 +1918,8 @@ proc_title(enum smtp_proc_type proc)
 		return "klondike";
 	case PROC_CLIENT:
 		return "client";
+	case PROC_PROCESSOR:
+		return "processor";
 	}
 	return "unknown";
 }
@@ -1805,6 +2000,11 @@ imsg_to_str(int type)
 	CASE(IMSG_GETADDRINFO);
 	CASE(IMSG_GETADDRINFO_END);
 	CASE(IMSG_GETNAMEINFO);
+	CASE(IMSG_RES_QUERY);
+
+	CASE(IMSG_CERT_INIT);
+	CASE(IMSG_CERT_CERTIFICATE);
+	CASE(IMSG_CERT_VERIFY);
 
 	CASE(IMSG_SETUP_KEY);
 	CASE(IMSG_SETUP_PEER);
@@ -1869,10 +2069,6 @@ imsg_to_str(int type)
 	CASE(IMSG_MTA_LOOKUP_SMARTHOST);
 	CASE(IMSG_MTA_OPEN_MESSAGE);
 	CASE(IMSG_MTA_SCHEDULE);
-	CASE(IMSG_MTA_TLS_INIT);
-	CASE(IMSG_MTA_TLS_VERIFY_CERT);
-	CASE(IMSG_MTA_TLS_VERIFY_CHAIN);
-	CASE(IMSG_MTA_TLS_VERIFY);
 
 	CASE(IMSG_SCHED_ENVELOPE_BOUNCE);
 	CASE(IMSG_SCHED_ENVELOPE_DELIVER);
@@ -1889,10 +2085,6 @@ imsg_to_str(int type)
 	CASE(IMSG_SMTP_CHECK_SENDER);
 	CASE(IMSG_SMTP_EXPAND_RCPT);
 	CASE(IMSG_SMTP_LOOKUP_HELO);
-	CASE(IMSG_SMTP_TLS_INIT);
-	CASE(IMSG_SMTP_TLS_VERIFY_CERT);
-	CASE(IMSG_SMTP_TLS_VERIFY_CHAIN);
-	CASE(IMSG_SMTP_TLS_VERIFY);
 
 	CASE(IMSG_SMTP_REQ_CONNECT);
 	CASE(IMSG_SMTP_REQ_HELO);
@@ -1905,8 +2097,34 @@ imsg_to_str(int type)
 	CASE(IMSG_SMTP_EVENT_ROLLBACK);
 	CASE(IMSG_SMTP_EVENT_DISCONNECT);
 
-	CASE(IMSG_CA_PRIVENC);
-	CASE(IMSG_CA_PRIVDEC);
+	CASE(IMSG_LKA_PROCESSOR_FORK);
+	CASE(IMSG_LKA_PROCESSOR_ERRFD);
+
+	CASE(IMSG_REPORT_SMTP_LINK_CONNECT);
+	CASE(IMSG_REPORT_SMTP_LINK_DISCONNECT);
+	CASE(IMSG_REPORT_SMTP_LINK_TLS);
+	CASE(IMSG_REPORT_SMTP_LINK_GREETING);
+	CASE(IMSG_REPORT_SMTP_LINK_IDENTIFY);
+	CASE(IMSG_REPORT_SMTP_LINK_AUTH);
+
+	CASE(IMSG_REPORT_SMTP_TX_RESET);
+	CASE(IMSG_REPORT_SMTP_TX_BEGIN);
+	CASE(IMSG_REPORT_SMTP_TX_ENVELOPE);
+	CASE(IMSG_REPORT_SMTP_TX_COMMIT);
+	CASE(IMSG_REPORT_SMTP_TX_ROLLBACK);
+
+	CASE(IMSG_REPORT_SMTP_PROTOCOL_CLIENT);
+	CASE(IMSG_REPORT_SMTP_PROTOCOL_SERVER);
+
+	CASE(IMSG_FILTER_SMTP_BEGIN);
+	CASE(IMSG_FILTER_SMTP_END);
+	CASE(IMSG_FILTER_SMTP_PROTOCOL);
+	CASE(IMSG_FILTER_SMTP_DATA_BEGIN);
+	CASE(IMSG_FILTER_SMTP_DATA_END);
+
+	CASE(IMSG_CA_RSA_PRIVENC);
+	CASE(IMSG_CA_RSA_PRIVDEC);
+	CASE(IMSG_CA_ECDSA_SIGN);
 	default:
 		(void)snprintf(buf, sizeof(buf), "IMSG_??? (%d)", type);
 

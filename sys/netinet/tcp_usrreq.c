@@ -1,4 +1,4 @@
-/*	$OpenBSD: tcp_usrreq.c,v 1.169 2018/06/11 07:40:26 bluhm Exp $	*/
+/*	$OpenBSD: tcp_usrreq.c,v 1.178 2020/11/16 06:44:38 gnezdo Exp $	*/
 /*	$NetBSD: tcp_usrreq.c,v 1.20 1996/02/13 23:44:16 christos Exp $	*/
 
 /*
@@ -110,7 +110,25 @@ u_int	tcp_sendspace = TCP_SENDSPACE;
 u_int	tcp_recvspace = TCP_RECVSPACE;
 u_int	tcp_autorcvbuf_inc = 16 * 1024;
 
-int *tcpctl_vars[TCPCTL_MAXID] = TCPCTL_VARS;
+static int pr_slowhz = PR_SLOWHZ;
+const struct sysctl_bounded_args tcpctl_vars[] = {
+	{ TCPCTL_SLOWHZ, &pr_slowhz, 1, 0 },
+	{ TCPCTL_RFC1323, &tcp_do_rfc1323, 0, 1 },
+	{ TCPCTL_KEEPINITTIME, &tcptv_keep_init, 1, 3 * TCPTV_KEEP_INIT },
+	{ TCPCTL_KEEPIDLE, &tcp_keepidle, 1, 5 * TCPTV_KEEP_IDLE },
+	{ TCPCTL_KEEPINTVL, &tcp_keepintvl, 1, 3 * TCPTV_KEEPINTVL },
+	{ TCPCTL_SACK, &tcp_do_sack, 0, 1 },
+	{ TCPCTL_MSSDFLT, &tcp_mssdflt, TCP_MSS, 65535 },
+	{ TCPCTL_RSTPPSLIMIT, &tcp_rst_ppslim, 1, 1000 * 1000 },
+	{ TCPCTL_ACK_ON_PUSH, &tcp_ack_on_push, 0, 1 },
+#ifdef TCP_ECN
+	{ TCPCTL_ECN, &tcp_do_ecn, 0, 1 },
+#endif
+	{ TCPCTL_SYN_CACHE_LIMIT, &tcp_syn_cache_limit, 1, 1000 * 1000 },
+	{ TCPCTL_SYN_BUCKET_LIMIT, &tcp_syn_bucket_limit, 1, INT_MAX },
+	{ TCPCTL_RFC3390, &tcp_do_rfc3390, 0, 2 },
+	{ TCPCTL_ALWAYS_KEEPALIVE, &tcp_always_keepalive, 0, 1 },
+};
 
 struct	inpcbtable tcbtable;
 
@@ -145,9 +163,8 @@ tcp_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 	soassertlocked(so);
 
 	if (control && control->m_len) {
-		m_freem(control);
-		m_freem(m);
-		return (EINVAL);
+		error = EINVAL;
+		goto release;
 	}
 
 	inp = sotoinpcb(so);
@@ -160,18 +177,12 @@ tcp_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 		error = so->so_error;
 		if (error == 0)
 			error = EINVAL;
-		/*
-		 * The following corrects an mbuf leak under rare
-		 * circumstances
-		 */
-		if (req == PRU_SEND || req == PRU_SENDOOB)
-			m_freem(m);
-		return (error);
+		goto release;
 	}
 	tp = intotcpcb(inp);
 	/* tp might get 0 when using socket splicing */
 	if (tp == NULL)
-		return (0);
+		goto release;
 	if (so->so_options & SO_DEBUG) {
 		otp = tp;
 		ostate = tp->t_state;
@@ -340,7 +351,7 @@ tcp_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 
 	case PRU_SENSE:
 		((struct stat *) m)->st_blksize = so->so_snd.sb_hiwat;
-		return (0);
+		break;
 
 	case PRU_RCVOOB:
 		if ((so->so_oobmark == 0 &&
@@ -404,6 +415,13 @@ tcp_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
 	}
 	if (otp)
 		tcp_trace(TA_USER, ostate, tp, otp, NULL, req, 0);
+	return (error);
+
+ release:
+	if (req != PRU_RCVD && req != PRU_RCVOOB && req != PRU_SENSE) {
+		m_freem(control);
+		m_freem(m);
+	}
 	return (error);
 }
 
@@ -945,6 +963,7 @@ tcp_sysctl_tcpstat(void *oldp, size_t *oldlenp, void *newp)
 	ASSIGN(tcps_sack_rexmit_bytes);
 	ASSIGN(tcps_sack_rcv_opts);
 	ASSIGN(tcps_sack_snd_opts);
+	ASSIGN(tcps_sack_drop_opts);
 
 #undef ASSIGN
 
@@ -980,16 +999,6 @@ tcp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (ENOTDIR);
 
 	switch (name[0]) {
-	case TCPCTL_SACK:
-		NET_LOCK();
-		error = sysctl_int(oldp, oldlenp, newp, newlen,
-		    &tcp_do_sack);
-		NET_UNLOCK();
-		return (error);
-
-	case TCPCTL_SLOWHZ:
-		return (sysctl_rdint(oldp, oldlenp, newp, PR_SLOWHZ));
-
 	case TCPCTL_BADDYNAMIC:
 		NET_LOCK();
 		error = sysctl_struct(oldp, oldlenp, newp, newlen,
@@ -1018,21 +1027,6 @@ tcp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		NET_UNLOCK();
 		return (error);
 
-	case TCPCTL_ALWAYS_KEEPALIVE:
-		NET_LOCK();
-		error = sysctl_int(oldp, oldlenp, newp, newlen,
-		    &tcp_always_keepalive);
-		NET_UNLOCK();
-		return (error);
-
-#ifdef TCP_ECN
-	case TCPCTL_ECN:
-		NET_LOCK();
-		error = sysctl_int(oldp, oldlenp, newp, newlen,
-		   &tcp_do_ecn);
-		NET_UNLOCK();
-		return (error);
-#endif
 	case TCPCTL_REASS_LIMIT:
 		NET_LOCK();
 		nval = tcp_reass_limit;
@@ -1101,14 +1095,11 @@ tcp_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp,
 		return (error);
 
 	default:
-		if (name[0] < TCPCTL_MAXID) {
-			NET_LOCK();
-			error = sysctl_int_arr(tcpctl_vars, name, namelen,
-			    oldp, oldlenp, newp, newlen);
-			NET_UNLOCK();
-			return (error);
-		}
-		return (ENOPROTOOPT);
+		NET_LOCK();
+		error = sysctl_bounded_arr(tcpctl_vars, nitems(tcpctl_vars), name,
+		     namelen, oldp, oldlenp, newp, newlen);
+		NET_UNLOCK();
+		return (error);
 	}
 	/* NOTREACHED */
 }
@@ -1143,8 +1134,9 @@ tcp_update_sndspace(struct tcpcb *tp)
 	if (sbspace(so, &so->so_snd) >= so->so_snd.sb_lowat) {
 		if (nmax < so->so_snd.sb_cc + so->so_snd.sb_lowat)
 			nmax = so->so_snd.sb_cc + so->so_snd.sb_lowat;
-		if (nmax * 2 < so->so_snd.sb_mbcnt + so->so_snd.sb_lowat)
-			nmax = (so->so_snd.sb_mbcnt+so->so_snd.sb_lowat+1) / 2;
+		/* keep in sync with sbreserve() calculation */
+		if (nmax * 8 < so->so_snd.sb_mbcnt + so->so_snd.sb_lowat)
+			nmax = (so->so_snd.sb_mbcnt+so->so_snd.sb_lowat+7) / 8;
 	}
 
 	/* round to MSS boundary */

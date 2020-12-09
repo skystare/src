@@ -1,7 +1,6 @@
-#	$OpenBSD: Makefile.inc,v 1.1 2013/01/20 23:01:44 miod Exp $
+#	$OpenBSD: Makefile.inc,v 1.3 2019/10/20 03:44:49 guenther Exp $
 
-LIBCSRCDIR=${.CURDIR}/../../lib/libc
 CFLAGS += -fpic
-CPPFLAGS += -I${LIBCSRCDIR}/arch/m88k
-
 SRCS+=	memcpy.c
+
+RELATIVE_RELOC=R_88K_BBASED_32

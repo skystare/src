@@ -1,17 +1,10 @@
-# $OpenBSD: Makefile,v 1.1 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.3 2020/08/03 14:45:24 patrick Exp $
 
 LIB=	LLVMARMUtils
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${.OBJDIR}/../include/llvm/ARM -I${LLVM_SRCS}/lib/Target/ARM
 
-.include <bsd.own.mk>
-SRCS=	ARMBaseInfo.cpp
+SRCS+=	ARMBaseInfo.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Target/ARM/Utils
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Target/ARM/Utils

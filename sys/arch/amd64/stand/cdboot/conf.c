@@ -1,4 +1,4 @@
-/*	$OpenBSD: conf.c,v 1.36 2018/07/11 14:48:40 mlarkin Exp $	*/
+/*	$OpenBSD: conf.c,v 1.46 2020/06/14 16:06:25 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2004 Tom Cosgrove
@@ -14,8 +14,8 @@
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
  *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR 
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED 
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
  * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
  * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #include <libsa.h>
 #include <lib/libsa/ufs.h>
+#include <lib/libsa/ufs2.h>
 #include <lib/libsa/cd9660.h>
 #ifdef notdef
 #include <lib/libsa/fat.h>
@@ -41,7 +42,7 @@
 #include <biosdev.h>
 #include <dev/cons.h>
 
-const char version[] = "3.40";
+const char version[] = "3.52";
 int	debug = 1;
 
 
@@ -65,7 +66,9 @@ struct fs_ops file_system[] = {
 	{ cd9660_open, cd9660_close, cd9660_read, cd9660_write, cd9660_seek,
 	  cd9660_stat, cd9660_readdir },
 	{ ufs_open,    ufs_close,    ufs_read,    ufs_write,    ufs_seek,
-	  ufs_stat,    ufs_readdir    },
+	  ufs_stat,    ufs_readdir,  ufs_fchmod },
+	{ ufs2_open,   ufs2_close,   ufs2_read,   ufs2_write,   ufs2_seek,
+	  ufs2_stat,   ufs2_readdir, ufs2_fchmod },
 #ifdef notdef
 	{ tftp_open,   tftp_close,   tftp_read,   tftp_write,   tftp_seek,
 	  tftp_stat,   tftp_readdir   },

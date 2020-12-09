@@ -1,13 +1,13 @@
-# $OpenBSD: Makefile,v 1.4 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.10 2020/08/03 14:45:25 patrick Exp $
 
 LIB=	LLVMCore
-NOPIC=
 NOPROFILE=
 
-CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/IR
+CPPFLAGS+=	-I${.OBJDIR}/../include/llvm/IR \
+		-I${LLVM_SRCS}/include/llvm/IR
 
-.include <bsd.own.mk>
-SRCS=	AsmWriter.cpp \
+SRCS+=	AbstractCallSite.cpp \
+	AsmWriter.cpp \
 	Attributes.cpp \
 	AutoUpgrade.cpp \
 	BasicBlock.cpp \
@@ -15,7 +15,7 @@ SRCS=	AsmWriter.cpp \
 	ConstantFold.cpp \
 	ConstantRange.cpp \
 	Constants.cpp \
-	Core.cpp \
+	CoreCore.cpp \
 	DIBuilder.cpp \
 	DataLayout.cpp \
 	DebugInfo.cpp \
@@ -25,6 +25,7 @@ SRCS=	AsmWriter.cpp \
 	DiagnosticInfo.cpp \
 	DiagnosticPrinter.cpp \
 	Dominators.cpp \
+	FPEnv.cpp \
 	Function.cpp \
 	GVMaterializer.cpp \
 	Globals.cpp \
@@ -45,9 +46,13 @@ SRCS=	AsmWriter.cpp \
 	Operator.cpp \
 	OptBisect.cpp \
 	Pass.cpp \
+	PassInstrumentation.cpp \
 	PassManager.cpp \
 	PassRegistry.cpp \
+	PassTimingInfo.cpp \
 	ProfileSummary.cpp \
+	RemarkStreamer.cpp \
+	SafepointIRVerifier.cpp \
 	Statepoint.cpp \
 	Type.cpp \
 	TypeFinder.cpp \
@@ -55,20 +60,11 @@ SRCS=	AsmWriter.cpp \
 	User.cpp \
 	Value.cpp \
 	ValueSymbolTable.cpp \
-	ValueTypes.cpp \
 	Verifier.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/IR
+CoreCore.cpp:
+	ln -s ${LLVM_SRCS}/lib/IR/Core.cpp $@
 
-Attributes.o: AttributesCompatFunc.inc
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/IR
 
-AttributesCompatFunc.inc: AttributesCompatFunc.td
-	${.OBJDIR}/../llvm-tblgen/llvm-tblgen -gen-attrs \
-		-I${LLVM_SRCS}/include/llvm/IR -I${LLVM_SRCS}/lib/Target \
-		-I${LLVM_SRCS}/include \
-		-o ${.TARGET} ${.ALLSRC}
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+CLEANFILES+= CoreCore.cpp

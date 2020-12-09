@@ -1,4 +1,4 @@
-/*	$OpenBSD: ucom.c,v 1.67 2018/02/19 08:59:52 mpi Exp $ */
+/*	$OpenBSD: ucom.c,v 1.71 2020/07/31 10:49:33 mglocker Exp $ */
 /*	$NetBSD: ucom.c,v 1.49 2003/01/01 00:10:25 thorpej Exp $	*/
 
 /*
@@ -217,12 +217,10 @@ ucom_detach(struct device *self, int flags)
 		 sc, flags, tp, sc->sc_bulkin_no, sc->sc_bulkout_no));
 
 	if (sc->sc_bulkin_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_bulkin_pipe);
 		usbd_close_pipe(sc->sc_bulkin_pipe);
 		sc->sc_bulkin_pipe = NULL;
 	}
 	if (sc->sc_bulkout_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_bulkout_pipe);
 		usbd_close_pipe(sc->sc_bulkout_pipe);
 		sc->sc_bulkout_pipe = NULL;
 	}
@@ -291,7 +289,8 @@ ucom_shutdown(struct ucom_softc *sc)
 	 */
 	if (ISSET(tp->t_cflag, HUPCL)) {
 		ucom_dtr(sc, 0);
-		(void)tsleep(sc, TTIPRI, ttclos, hz);
+		ucom_rts(sc, 0);
+		tsleep_nsec(sc, TTIPRI, ttclos, SEC_TO_NSEC(1));
 	}
 }
 
@@ -460,6 +459,9 @@ ucom_do_open(dev_t dev, int flag, int mode, struct proc *p)
 		 * unless explicitly requested to deassert it.
 		 */
 		ucom_dtr(sc, 1);
+		/* When not using CRTSCTS, RTS follows DTR. */
+		if (!ISSET(t.c_cflag, CRTSCTS))
+			ucom_rts(sc, 1);
 
 		/* XXX CLR(sc->sc_rx_flags, RX_ANY_BLOCK);*/
 		ucom_hwiflow(sc);
@@ -493,7 +495,7 @@ ucom_do_open(dev_t dev, int flag, int mode, struct proc *p)
 			    !ISSET(tp->t_state, TS_CARR_ON))) {
 				SET(tp->t_state, TS_WOPEN);
 				error = ttysleep(tp, &tp->t_rawq,
-				    TTIPRI | PCATCH, ttopen, 0);
+				    TTIPRI | PCATCH, ttopen);
 
 				if (usbd_is_dying(sc->sc_uparent)) {
 					splx(s);
@@ -817,13 +819,9 @@ ucom_dtr(struct ucom_softc *sc, int onoff)
 {
 	DPRINTF(("ucom_dtr: onoff=%d\n", onoff));
 
-	if (sc->sc_methods->ucom_set != NULL) {
+	if (sc->sc_methods->ucom_set != NULL)
 		sc->sc_methods->ucom_set(sc->sc_parent, sc->sc_portno,
 		    UCOM_SET_DTR, onoff);
-		/* When not using CRTSCTS, RTS follows DTR. */
-		if (!(sc->sc_swflags & TIOCFLAG_CRTSCTS))
-			ucom_rts(sc, onoff);
-	}
 }
 
 void
@@ -896,6 +894,16 @@ ucomparam(struct tty *tp, struct termios *t)
 	tp->t_ispeed = 0;
 	tp->t_ospeed = t->c_ospeed;
 	tp->t_cflag = t->c_cflag;
+
+	/*
+	 * When not using CRTSCTS, RTS follows DTR.
+	 * This assumes that the ucom_param() call will enable these signals
+	 * for real.
+	 */
+	if (!ISSET(t->c_cflag, CRTSCTS))
+		sc->sc_mcr = UMCR_DTR | UMCR_RTS;
+	else
+		sc->sc_mcr = UMCR_DTR;
 
 	if (sc->sc_methods->ucom_param != NULL) {
 		error = sc->sc_methods->ucom_param(sc->sc_parent, sc->sc_portno,
@@ -1186,12 +1194,10 @@ ucom_cleanup(struct ucom_softc *sc)
 
 	ucom_shutdown(sc);
 	if (sc->sc_bulkin_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_bulkin_pipe);
 		usbd_close_pipe(sc->sc_bulkin_pipe);
 		sc->sc_bulkin_pipe = NULL;
 	}
 	if (sc->sc_bulkout_pipe != NULL) {
-		usbd_abort_pipe(sc->sc_bulkout_pipe);
 		usbd_close_pipe(sc->sc_bulkout_pipe);
 		sc->sc_bulkout_pipe = NULL;
 	}

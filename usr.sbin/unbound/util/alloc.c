@@ -126,10 +126,40 @@ alloc_init(struct alloc_cache* alloc, struct alloc_cache* super,
 	}
 }
 
+/** free the special list */
+static void
+alloc_clear_special_list(struct alloc_cache* alloc)
+{
+	alloc_special_type* p, *np;
+	/* free */
+	p = alloc->quar;
+	while(p) {
+		np = alloc_special_next(p);
+		/* deinit special type */
+		lock_rw_destroy(&p->entry.lock);
+		free(p);
+		p = np;
+	}
+}
+
+void
+alloc_clear_special(struct alloc_cache* alloc)
+{
+	if(!alloc->super) {
+		lock_quick_lock(&alloc->lock);
+	}
+	alloc_clear_special_list(alloc);
+	alloc->quar = 0;
+	alloc->num_quar = 0;
+	if(!alloc->super) {
+		lock_quick_unlock(&alloc->lock);
+	}
+}
+
 void 
 alloc_clear(struct alloc_cache* alloc)
 {
-	alloc_special_type* p, *np;
+	alloc_special_type* p;
 	struct regional* r, *nr;
 	if(!alloc)
 		return;
@@ -147,15 +177,7 @@ alloc_clear(struct alloc_cache* alloc)
 		alloc->super->num_quar += alloc->num_quar;
 		lock_quick_unlock(&alloc->super->lock);
 	} else {
-		/* free */
-		p = alloc->quar;
-		while(p) {
-			np = alloc_special_next(p);
-			/* deinit special type */
-			lock_rw_destroy(&p->entry.lock);
-			free(p);
-			p = np;
-		}
+		alloc_clear_special_list(alloc);
 	}
 	alloc->quar = 0;
 	alloc->num_quar = 0;
@@ -354,6 +376,7 @@ void *unbound_stat_malloc(size_t size)
 {
 	void* res;
 	if(size == 0) size = 1;
+	log_assert(size <= SIZE_MAX-16);
 	res = malloc(size+16);
 	if(!res) return NULL;
 	unbound_mem_alloc += size;
@@ -376,6 +399,7 @@ void *unbound_stat_calloc(size_t nmemb, size_t size)
 	if(nmemb != 0 && INT_MAX/nmemb < size)
 		return NULL; /* integer overflow check */
 	s = (nmemb*size==0)?(size_t)1:nmemb*size;
+	log_assert(s <= SIZE_MAX-16);
 	res = calloc(1, s+16);
 	if(!res) return NULL;
 	log_info("stat %p=calloc(%u, %u)", res+16, (unsigned)nmemb, (unsigned)size);
@@ -425,6 +449,7 @@ void *unbound_stat_realloc(void *ptr, size_t size)
 		/* nothing changes */
 		return ptr;
 	}
+	log_assert(size <= SIZE_MAX-16);
 	res = malloc(size+16);
 	if(!res) return NULL;
 	unbound_mem_alloc += size;
@@ -499,7 +524,9 @@ void *unbound_stat_malloc_lite(size_t size, const char* file, int line,
         const char* func)
 {
 	/*  [prefix .. len .. actual data .. suffix] */
-	void* res = malloc(size+lite_pad*2+sizeof(size_t));
+	void* res;
+	log_assert(size <= SIZE_MAX-(lite_pad*2+sizeof(size_t)));
+	res = malloc(size+lite_pad*2+sizeof(size_t));
 	if(!res) return NULL;
 	memmove(res, lite_pre, lite_pad);
 	memmove(res+lite_pad, &size, sizeof(size_t));
@@ -516,6 +543,7 @@ void *unbound_stat_calloc_lite(size_t nmemb, size_t size, const char* file,
 	if(nmemb != 0 && INT_MAX/nmemb < size)
 		return NULL; /* integer overflow check */
 	req = nmemb * size;
+	log_assert(req <= SIZE_MAX-(lite_pad*2+sizeof(size_t)));
 	res = malloc(req+lite_pad*2+sizeof(size_t));
 	if(!res) return NULL;
 	memmove(res, lite_pre, lite_pad);

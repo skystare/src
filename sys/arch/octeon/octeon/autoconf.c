@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.13 2018/01/27 22:55:23 naddy Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.16 2019/07/12 03:03:48 visa Exp $	*/
 /*
  * Copyright (c) 2009 Miodrag Vallat.
  *
@@ -23,14 +23,16 @@
 
 #include <machine/autoconf.h>
 
+#define DUID_SIZE	8
+
 extern void dumpconf(void);
-void parse_uboot_root(void);
+int parseduid(const char *, u_char *);
 
 int	cold = 1;
 struct device *bootdv = NULL;
 char    bootdev[16];
+char uboot_rootdev[64];
 enum devclass bootdev_class = DV_DULL;
-extern char uboot_rootdev[];
 
 void
 cpu_configure(void)
@@ -51,7 +53,7 @@ struct devmap {
 	enum devclass	 class;
 };
 
-struct devmap *
+enum devclass
 findtype(void)
 {
 	static struct devmap devmap[] = {
@@ -59,52 +61,82 @@ findtype(void)
 		{ "sd", DV_DISK },
 		{ "octcf", DV_DISK },
 		{ "amdcf", DV_DISK },
-		{ "cnmac", DV_IFNET },
-		{ NULL, DV_DULL }
+		{ NULL, DV_IFNET }
 	};
 	struct devmap *dp = &devmap[0];
 
 	if (strlen(bootdev) < 2)
-		return dp;
+		return DV_DISK;
 
 	while (dp->dev) {
 		if (strncmp(bootdev, dp->dev, strlen(dp->dev)) == 0)
 			break;
 		dp++;
 	}
-
-	if (dp->dev == NULL)
-		printf("%s is not a valid rootdev\n", bootdev);
-
-	return dp;
+	return dp->class;
 }
 
 void
-parse_uboot_root(void)
+parse_uboot_root(const char *p)
 {
-	struct devmap *dp;
-	char *p;
+	const char *base;
 	size_t len;
 
 	/*
-	 * Turn the U-Boot root device (rootdev=/dev/octcf0) into a boot device.
+	 * Turn the U-Boot root device (/dev/octcf0) into a boot device.
 	 */
-	p = strrchr(uboot_rootdev, '/');
-	if (p == NULL) {
-		p = strchr(uboot_rootdev, '=');
-		if (p == NULL)
-			return;
+
+	if (strlen(uboot_rootdev) != 0)
+		return;
+
+	/* Get device basename. */
+	base = strrchr(p, '/');
+	if (base != NULL)
+		p = base + 1;
+
+	if (parseduid(p, bootduid) == 0) {
+		strlcpy(uboot_rootdev, p, sizeof(uboot_rootdev));
+		bootdev_class = DV_DISK;
+		return;
 	}
-	p++;
 
 	len = strlen(p);
 	if (len <= 2 || len >= sizeof bootdev - 1)
 		return;
 
 	strlcpy(bootdev, p, sizeof(bootdev));
+	strlcpy(uboot_rootdev, p, sizeof(uboot_rootdev));
+	bootdev_class = findtype();
+}
 
-	dp = findtype();
-	bootdev_class = dp->class;
+static unsigned int
+parsehex(int c)
+{
+	if (c >= 'a')
+		return c - 'a' + 10;
+	else
+		return c - '0';
+}
+
+int
+parseduid(const char *str, u_char *duid)
+{
+	int i;
+
+	for (i = 0; i < DUID_SIZE * 2; i++) {
+		if (!(str[i] >= '0' && str[i] <= '9') &&
+		    !(str[i] >= 'a' && str[i] <= 'f'))
+			return -1;
+	}
+	if (str[DUID_SIZE * 2] != '\0')
+		return -1;
+
+	for (i = 0; i < DUID_SIZE; i++) {
+		duid[i] = parsehex(str[i * 2]) * 0x10 +
+		    parsehex(str[i * 2 + 1]);
+	}
+
+	return 0;
 }
 
 void

@@ -1,6 +1,6 @@
-/*	$OpenBSD: mdoc_markdown.c,v 1.26 2018/08/17 20:31:52 schwarze Exp $ */
+/* $OpenBSD: mdoc_markdown.c,v 1.35 2020/04/03 11:34:19 schwarze Exp $ */
 /*
- * Copyright (c) 2017, 2018 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2017, 2018, 2020 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -13,12 +13,15 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ * Markdown formatter for mdoc(7) used by mandoc(1).
  */
 #include <sys/types.h>
 
 #include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "mandoc_aux.h"
@@ -28,16 +31,16 @@
 #include "main.h"
 
 struct	md_act {
-	int		(*cond)(struct roff_node *n);
-	int		(*pre)(struct roff_node *n);
-	void		(*post)(struct roff_node *n);
+	int		(*cond)(struct roff_node *);
+	int		(*pre)(struct roff_node *);
+	void		(*post)(struct roff_node *);
 	const char	 *prefix; /* pre-node string constant */
 	const char	 *suffix; /* post-node string constant */
 };
 
 static	void	 md_nodelist(struct roff_node *);
 static	void	 md_node(struct roff_node *);
-static	const char *md_stack(char c);
+static	const char *md_stack(char);
 static	void	 md_preword(void);
 static	void	 md_rawword(const char *);
 static	void	 md_word(const char *);
@@ -48,6 +51,7 @@ static	void	 md_uri(const char *);
 static	int	 md_cond_head(struct roff_node *);
 static	int	 md_cond_body(struct roff_node *);
 
+static	int	 md_pre_abort(struct roff_node *);
 static	int	 md_pre_raw(struct roff_node *);
 static	int	 md_pre_word(struct roff_node *);
 static	int	 md_pre_skip(struct roff_node *);
@@ -138,7 +142,7 @@ static	const struct md_act md_acts[MDOC_MAX - MDOC_Dd] = {
 	{ md_cond_head, md_pre_Nd, NULL, NULL, NULL }, /* Nd */
 	{ NULL, md_pre_Nm, md_post_Nm, "**", "**" }, /* Nm */
 	{ md_cond_body, md_pre_word, md_post_word, "[", "]" }, /* Op */
-	{ NULL, md_pre_Fd, md_post_raw, "*", "*" }, /* Ot */
+	{ NULL, md_pre_abort, NULL, NULL, NULL }, /* Ot */
 	{ NULL, md_pre_raw, md_post_raw, "*", "*" }, /* Pa */
 	{ NULL, NULL, NULL, NULL, NULL }, /* Rv */
 	{ NULL, NULL, NULL, NULL, NULL }, /* St */
@@ -211,7 +215,7 @@ static	const struct md_act md_acts[MDOC_MAX - MDOC_Dd] = {
 	{ NULL, md_pre_raw, md_post_raw, "*", "*" }, /* Fr */
 	{ NULL, NULL, NULL, NULL, NULL }, /* Ud */
 	{ NULL, NULL, md_post_Lb, NULL, NULL }, /* Lb */
-	{ NULL, md_pre_Pp, NULL, NULL, NULL }, /* Lp */
+	{ NULL, md_pre_abort, NULL, NULL, NULL }, /* Lp */
 	{ NULL, md_pre_Lk, NULL, NULL, NULL }, /* Lk */
 	{ NULL, md_pre_Mt, NULL, NULL, NULL }, /* Mt */
 	{ md_cond_body, md_pre_word, md_post_word, "{", "}" }, /* Brq */
@@ -224,6 +228,7 @@ static	const struct md_act md_acts[MDOC_MAX - MDOC_Dd] = {
 	{ NULL, NULL, md_post_pc, NULL, NULL }, /* %Q */
 	{ NULL, md_pre_Lk, md_post_pc, NULL, NULL }, /* %U */
 	{ NULL, NULL, NULL, NULL, NULL }, /* Ta */
+	{ NULL, md_pre_skip, NULL, NULL, NULL }, /* Tg */
 };
 static const struct md_act *md_act(enum roff_tok);
 
@@ -259,21 +264,21 @@ md_act(enum roff_tok tok)
 }
 
 void
-markdown_mdoc(void *arg, const struct roff_man *mdoc)
+markdown_mdoc(void *arg, const struct roff_meta *mdoc)
 {
 	outflags = MD_Sm;
-	md_word(mdoc->meta.title);
-	if (mdoc->meta.msec != NULL) {
+	md_word(mdoc->title);
+	if (mdoc->msec != NULL) {
 		outflags &= ~MD_spc;
 		md_word("(");
-		md_word(mdoc->meta.msec);
+		md_word(mdoc->msec);
 		md_word(")");
 	}
 	md_word("-");
-	md_word(mdoc->meta.vol);
-	if (mdoc->meta.arch != NULL) {
+	md_word(mdoc->vol);
+	if (mdoc->arch != NULL) {
 		md_word("(");
-		md_word(mdoc->meta.arch);
+		md_word(mdoc->arch);
 		md_word(")");
 	}
 	outflags |= MD_sp;
@@ -281,9 +286,9 @@ markdown_mdoc(void *arg, const struct roff_man *mdoc)
 	md_nodelist(mdoc->first->child);
 
 	outflags |= MD_sp;
-	md_word(mdoc->meta.os);
+	md_word(mdoc->os);
 	md_word("-");
-	md_word(mdoc->meta.date);
+	md_word(mdoc->date);
 	putchar('\n');
 }
 
@@ -307,7 +312,9 @@ md_node(struct roff_node *n)
 
 	if (outflags & MD_nonl)
 		outflags &= ~(MD_nl | MD_sp);
-	else if (outflags & MD_spc && n->flags & NODE_LINE)
+	else if (outflags & MD_spc &&
+	     n->flags & NODE_LINE &&
+	     !roff_node_transparent(n))
 		outflags |= MD_nl;
 
 	act = NULL;
@@ -587,6 +594,9 @@ md_word(const char *s)
 			case ESCAPE_SPECIAL:
 				uc = mchars_spec2cp(seq, sz);
 				break;
+			case ESCAPE_UNDEF:
+				uc = *seq;
+				break;
 			case ESCAPE_DEVICE:
 				md_rawword("markdown");
 				continue;
@@ -600,6 +610,7 @@ md_word(const char *s)
 				nextfont = "***";
 				break;
 			case ESCAPE_FONT:
+			case ESCAPE_FONTCW:
 			case ESCAPE_FONTROMAN:
 				nextfont = "";
 				break;
@@ -722,6 +733,12 @@ md_cond_body(struct roff_node *n)
 }
 
 static int
+md_pre_abort(struct roff_node *n)
+{
+	abort();
+}
+
+static int
 md_pre_raw(struct roff_node *n)
 {
 	const char	*prefix;
@@ -774,14 +791,17 @@ md_post_word(struct roff_node *n)
 static void
 md_post_pc(struct roff_node *n)
 {
+	struct roff_node *nn;
+
 	md_post_raw(n);
 	if (n->parent->tok != MDOC_Rs)
 		return;
-	if (n->next != NULL) {
+
+	if ((nn = roff_node_next(n)) != NULL) {
 		md_word(",");
-		if (n->prev != NULL &&
-		    n->prev->tok == n->tok &&
-		    n->next->tok == n->tok)
+		if (nn->tok == n->tok &&
+		    (nn = roff_node_prev(n)) != NULL &&
+		    nn->tok == n->tok)
 			md_word("and");
 	} else {
 		md_word(".");
@@ -798,10 +818,13 @@ md_pre_skip(struct roff_node *n)
 static void
 md_pre_syn(struct roff_node *n)
 {
-	if (n->prev == NULL || ! (n->flags & NODE_SYNPRETTY))
+	struct roff_node *np;
+
+	if ((n->flags & NODE_SYNPRETTY) == 0 ||
+	    (np = roff_node_prev(n)) == NULL)
 		return;
 
-	if (n->prev->tok == n->tok &&
+	if (np->tok == n->tok &&
 	    n->tok != MDOC_Ft &&
 	    n->tok != MDOC_Fo &&
 	    n->tok != MDOC_Fn) {
@@ -809,7 +832,7 @@ md_pre_syn(struct roff_node *n)
 		return;
 	}
 
-	switch (n->prev->tok) {
+	switch (np->tok) {
 	case MDOC_Fd:
 	case MDOC_Fn:
 	case MDOC_Fo:
@@ -1040,7 +1063,9 @@ md_pre_Fa(struct roff_node *n)
 static void
 md_post_Fa(struct roff_node *n)
 {
-	if (n->next != NULL && n->next->tok == MDOC_Fa)
+	struct roff_node *nn;
+
+	if ((nn = roff_node_next(n)) != NULL && nn->tok == MDOC_Fa)
 		md_word(",");
 }
 
@@ -1062,9 +1087,11 @@ md_post_Fd(struct roff_node *n)
 static void
 md_post_Fl(struct roff_node *n)
 {
+	struct roff_node *nn;
+
 	md_post_raw(n);
-	if (n->child == NULL && n->next != NULL &&
-	    n->next->type != ROFFT_TEXT && !(n->next->flags & NODE_LINE))
+	if (n->child == NULL && (nn = roff_node_next(n)) != NULL &&
+	    nn->type != ROFFT_TEXT && (nn->flags & NODE_LINE) == 0)
 		outflags &= ~MD_spc;
 }
 
@@ -1278,7 +1305,7 @@ md_post_It(struct roff_node *n)
 		while ((n = n->prev) != NULL && n->type != ROFFT_HEAD)
 			i++;
 
-		/* 
+		/*
 		 * If a width was specified for this column,
 		 * subtract what printed, and
 		 * add the same spacing as in mdoc_term.c.

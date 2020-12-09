@@ -1,4 +1,4 @@
-/*	$OpenBSD: scsiconf.c,v 1.196 2017/09/08 05:36:53 deraadt Exp $	*/
+/*	$OpenBSD: scsiconf.c,v 1.237 2020/11/19 13:45:15 krw Exp $	*/
 /*	$NetBSD: scsiconf.c,v 1.57 1996/05/02 01:09:01 neil Exp $	*/
 
 /*
@@ -59,34 +59,41 @@
 #include <sys/atomic.h>
 
 #include <scsi/scsi_all.h>
+#include <scsi/scsi_debug.h>
 #include <scsi/scsiconf.h>
 
+int	scsibusmatch(struct device *, void *, void *);
+void	scsibusattach(struct device *, struct device *, void *);
+int	scsibusactivate(struct device *, int);
+int	scsibusdetach(struct device *, int);
+int	scsibussubmatch(struct device *, void *, void *);
+int	scsibussubprint(void *, const char *);
 #if NBIO > 0
 #include <sys/ioctl.h>
 #include <sys/scsiio.h>
 #include <dev/biovar.h>
-#endif
+int	scsibusbioctl(struct device *, u_long, caddr_t);
+#endif /* NBIO > 0 */
 
-/*
- * Declarations
- */
-int	scsi_probedev(struct scsibus_softc *, int, int);
+void	scsi_get_target_luns(struct scsi_link *, struct scsi_lun_array *);
+void	scsi_add_link(struct scsi_link *);
+void	scsi_remove_link(struct scsi_link *);
+void	scsi_print_link(struct scsi_link *);
+int	scsi_probe_link(struct scsibus_softc *, int, int, int);
+int	scsi_activate_link(struct scsi_link *, int);
+int	scsi_detach_link(struct scsi_link *, int);
+int	scsi_detach_bus(struct scsibus_softc *, int);
 
 void	scsi_devid(struct scsi_link *);
 int	scsi_devid_pg80(struct scsi_link *);
 int	scsi_devid_pg83(struct scsi_link *);
 int	scsi_devid_wwn(struct scsi_link *);
 
-int	scsibusmatch(struct device *, void *, void *);
-void	scsibusattach(struct device *, struct device *, void *);
-int	scsibusactivate(struct device *, int);
-int	scsibusdetach(struct device *, int);
+int	scsi_activate_bus(struct scsibus_softc *, int);
+int	scsi_activate_target(struct scsibus_softc *, int, int);
+int	scsi_activate_lun(struct scsibus_softc *, int, int, int);
 
-int	scsibussubmatch(struct device *, void *, void *);
-
-#if NBIO > 0
-int	scsibus_bioctl(struct device *, u_long, caddr_t);
-#endif
+int	scsi_autoconf = SCSI_AUTOCONF;
 
 struct cfattach scsibus_ca = {
 	sizeof(struct scsibus_softc), scsibusmatch, scsibusattach,
@@ -96,505 +103,6 @@ struct cfattach scsibus_ca = {
 struct cfdriver scsibus_cd = {
 	NULL, "scsibus", DV_DULL
 };
-
-#ifdef SCSIDEBUG
-u_int32_t scsidebug_buses = SCSIDEBUG_BUSES;
-u_int32_t scsidebug_targets = SCSIDEBUG_TARGETS;
-u_int32_t scsidebug_luns = SCSIDEBUG_LUNS;
-int scsidebug_level = SCSIDEBUG_LEVEL;
-#endif
-
-int scsi_autoconf = SCSI_AUTOCONF;
-
-int scsibusprint(void *, const char *);
-void scsibus_printlink(struct scsi_link *);
-
-int scsi_activate_bus(struct scsibus_softc *, int);
-int scsi_activate_target(struct scsibus_softc *, int, int);
-int scsi_activate_lun(struct scsibus_softc *, int, int, int);
-
-const u_int8_t version_to_spc [] = {
-	0, /* 0x00: The device does not claim conformance to any standard. */
-	1, /* 0x01: (Obsolete) SCSI-1 in olden times. */
-	2, /* 0x02: (Obsolete) SCSI-2 in olden times. */
-	3, /* 0x03: The device complies to ANSI INCITS 301-1997 (SPC-3). */
-	2, /* 0x04: The device complies to ANSI INCITS 351-2001 (SPC-2). */
-	3, /* 0x05: The device complies to ANSI INCITS 408-2005 (SPC-3). */
-	4, /* 0x06: The device complies to SPC-4. */
-	0, /* 0x07: RESERVED. */
-};
-
-int
-scsiprint(void *aux, const char *pnp)
-{
-	/* only "scsibus"es can attach to "scsi"s; easy. */
-	if (pnp)
-		printf("scsibus at %s", pnp);
-
-	return (UNCONF);
-}
-
-int
-scsibusmatch(struct device *parent, void *match, void *aux)
-{
-	return (1);
-}
-
-/*
- * The routine called by the adapter boards to get all their
- * devices configured in.
- */
-void
-scsibusattach(struct device *parent, struct device *self, void *aux)
-{
-	struct scsibus_softc		*sb = (struct scsibus_softc *)self;
-	struct scsibus_attach_args	*saa = aux;
-	struct scsi_link		*sc_link_proto = saa->saa_sc_link;
-
-	if (!cold)
-		scsi_autoconf = 0;
-
-	sc_link_proto->bus = sb;
-	sc_link_proto->scsibus = sb->sc_dev.dv_unit;
-	sb->adapter_link = sc_link_proto;
-	if (sb->adapter_link->adapter_buswidth == 0)
-		sb->adapter_link->adapter_buswidth = 8;
-	sb->sc_buswidth = sb->adapter_link->adapter_buswidth;
-	if (sb->adapter_link->luns == 0)
-		sb->adapter_link->luns = 8;
-
-	printf(": %d targets", sb->sc_buswidth);
-	if (sb->adapter_link->adapter_target < sb->sc_buswidth)
-		printf(", initiator %d", sb->adapter_link->adapter_target);
-	if (sb->adapter_link->port_wwn != 0x0 &&
-	    sb->adapter_link->node_wwn != 0x0) {
-		printf(", WWPN %016llx, WWNN %016llx",
-		    sb->adapter_link->port_wwn, sb->adapter_link->node_wwn);
-	}
-	printf("\n");
-
-	/* Initialize shared data. */
-	scsi_init();
-
-	SLIST_INIT(&sb->sc_link_list);
-
-#if NBIO > 0
-	if (bio_register(&sb->sc_dev, scsibus_bioctl) != 0)
-		printf("%s: unable to register bio\n", sb->sc_dev.dv_xname);
-#endif
-
-	scsi_probe_bus(sb);
-}
-
-int
-scsibusactivate(struct device *dev, int act)
-{
-	struct scsibus_softc *sb = (struct scsibus_softc *)dev;
-
-	return scsi_activate(sb, -1, -1, act);
-}
-
-int
-scsi_activate(struct scsibus_softc *sb, int target, int lun, int act)
-{
-	if (target == -1 && lun == -1)
-		return scsi_activate_bus(sb, act);
-
-	if (target == -1)
-		return 0;
-
-	if (lun == -1)
-		return scsi_activate_target(sb, target, act);
-
-	return scsi_activate_lun(sb, target, lun, act);
-}
-
-int
-scsi_activate_bus(struct scsibus_softc *sb, int act)
-{
-	int target, rv = 0, r;
-
-	for (target = 0; target < sb->sc_buswidth; target++) {
-		r = scsi_activate_target(sb, target, act);
-		if (r)
-			rv = r;
-	}
-	return (rv);
-}
-
-int
-scsi_activate_target(struct scsibus_softc *sb, int target, int act)
-{
-	int lun, rv = 0, r;
-
-	for (lun = 0; lun < sb->adapter_link->luns; lun++) {
-		r = scsi_activate_lun(sb, target, lun, act);
-		if (r)
-			rv = r;
-	}
-	return (rv);
-}
-
-int
-scsi_activate_lun(struct scsibus_softc *sb, int target, int lun, int act)
-{
-	struct scsi_link *link;
-	struct device *dev;
-	int rv = 0;
-
-	link = scsi_get_link(sb, target, lun);
-	if (link == NULL)
-		return (0);
-
-	dev = link->device_softc;
-	switch (act) {
-	case DVACT_DEACTIVATE:
-		atomic_setbits_int(&link->state, SDEV_S_DYING);
-		config_deactivate(dev);
-		break;
-	default:
-		rv = config_suspend(dev, act);
-		break;
-	}
-	return (rv);
-}
-
-int
-scsibusdetach(struct device *dev, int type)
-{
-	struct scsibus_softc		*sb = (struct scsibus_softc *)dev;
-	int				error;
-
-#if NBIO > 0
-	bio_unregister(&sb->sc_dev);
-#endif
-
-	error = scsi_detach_bus(sb, type);
-	if (error != 0)
-		return (error);
-
-	KASSERT(SLIST_EMPTY(&sb->sc_link_list));
-
-	return (0);
-}
-
-int
-scsibussubmatch(struct device *parent, void *match, void *aux)
-{
-	struct cfdata			*cf = match;
-	struct scsi_attach_args		*sa = aux;
-	struct scsi_link		*link = sa->sa_sc_link;
-
-	if (cf->cf_loc[0] != -1 && cf->cf_loc[0] != link->target)
-		return (0);
-	if (cf->cf_loc[1] != -1 && cf->cf_loc[1] != link->lun)
-		return (0);
-
-	return ((*cf->cf_attach->ca_match)(parent, match, aux));
-}
-
-#if NBIO > 0
-int
-scsibus_bioctl(struct device *dev, u_long cmd, caddr_t addr)
-{
-	struct scsibus_softc		*sb = (struct scsibus_softc *)dev;
-	struct sbioc_device		*sdev;
-
-	switch (cmd) {
-	case SBIOCPROBE:
-		sdev = (struct sbioc_device *)addr;
-		return (scsi_probe(sb, sdev->sd_target, sdev->sd_lun));
-
-	case SBIOCDETACH:
-		sdev = (struct sbioc_device *)addr;
-		return (scsi_detach(sb, sdev->sd_target, sdev->sd_lun, 0));
-
-	default:
-		return (ENOTTY);
-	}
-}
-#endif
-
-int
-scsi_probe_bus(struct scsibus_softc *sb)
-{
-	struct scsi_link *alink = sb->adapter_link;
-	int i;
-
-	for (i = 0; i < alink->adapter_buswidth; i++)
-		scsi_probe_target(sb, i);
-
-	return (0);
-}
-
-int
-scsi_probe_target(struct scsibus_softc *sb, int target)
-{
-	struct scsi_link *alink = sb->adapter_link;
-	struct scsi_link *link;
-	struct scsi_report_luns_data *report;
-	int i, nluns, lun;
-
-	if (scsi_probe_lun(sb, target, 0) == EINVAL)
-		return (EINVAL);
-
-	link = scsi_get_link(sb, target, 0);
-	if (link == NULL)
-		return (ENXIO);
-
-	if ((link->flags & (SDEV_UMASS | SDEV_ATAPI)) == 0 &&
-	    SCSISPC(link->inqdata.version) > 2) {
-		report = dma_alloc(sizeof(*report), PR_WAITOK);
-		if (report == NULL)
-			goto dumbscan;
-
-		if (scsi_report_luns(link, REPORT_NORMAL, report,
-		    sizeof(*report), scsi_autoconf | SCSI_SILENT |
-		    SCSI_IGNORE_ILLEGAL_REQUEST | SCSI_IGNORE_NOT_READY |
-		    SCSI_IGNORE_MEDIA_CHANGE, 10000) != 0) {
-			dma_free(report, sizeof(*report));
-			goto dumbscan;
-		}
-
-		/*
-		 * XXX In theory we should check if data is full, which
-		 * would indicate it needs to be enlarged and REPORT
-		 * LUNS tried again. Solaris tries up to 3 times with
-		 * larger sizes for data.
-		 */
-		nluns = _4btol(report->length) / RPL_LUNDATA_SIZE;
-		for (i = 0; i < nluns; i++) {
-			if (report->luns[i].lundata[0] != 0)
-				continue;
-			lun = report->luns[i].lundata[RPL_LUNDATA_T0LUN];
-			if (lun == 0)
-				continue;
-
-			/* Probe the provided LUN. Don't check LUN 0. */
-			scsi_remove_link(sb, link);
-			scsi_probe_lun(sb, target, lun);
-			scsi_add_link(sb, link);
-		}
-
-		dma_free(report, sizeof(*report));
-		return (0);
-	}
-
-dumbscan:
-	for (i = 1; i < alink->luns; i++) {
-		if (scsi_probe_lun(sb, target, i) == EINVAL)
-			break;
-	}
-
-	return (0);
-}
-
-int
-scsi_probe(struct scsibus_softc *sb, int target, int lun)
-{
-	if (target == -1 && lun == -1)
-		return (scsi_probe_bus(sb));
-
-	/* specific lun and wildcard target is bad */
-	if (target == -1)
-		return (EINVAL);
-
-	if (lun == -1)
-		return (scsi_probe_target(sb, target));
-
-	return (scsi_probe_lun(sb, target, lun));
-}
-
-int
-scsi_probe_lun(struct scsibus_softc *sb, int target, int lun)
-{
-	struct scsi_link *alink = sb->adapter_link;
-
-	if (target < 0 || target >= alink->adapter_buswidth ||
-	    target == alink->adapter_target ||
-	    lun < 0 || lun >= alink->luns)
-		return (ENXIO);
-
-	return (scsi_probedev(sb, target, lun));
-}
-
-int
-scsi_detach_bus(struct scsibus_softc *sb, int flags)
-{
-	struct scsi_link *alink = sb->adapter_link;
-	int i, err, rv = 0;
-
-	for (i = 0; i < alink->adapter_buswidth; i++) {
-		err = scsi_detach_target(sb, i, flags);
-		if (err != 0 && err != ENXIO)
-			rv = err;
-	}
-
-	return (rv);
-}
-
-int
-scsi_detach(struct scsibus_softc *sb, int target, int lun, int flags)
-{
-	if (target == -1 && lun == -1)
-		return (scsi_detach_bus(sb, flags));
-
-	/* specific lun and wildcard target is bad */
-	if (target == -1)
-		return (EINVAL);
-
-	if (lun == -1)
-		return (scsi_detach_target(sb, target, flags));
-
-	return (scsi_detach_lun(sb, target, lun, flags));
-}
-
-int
-scsi_detach_target(struct scsibus_softc *sb, int target, int flags)
-{
-	struct scsi_link *alink = sb->adapter_link;
-	int i, err, rv = 0;
-
-	if (target < 0 || target >= alink->adapter_buswidth ||
-	    target == alink->adapter_target)
-		return (ENXIO);
-
-	for (i = 0; i < alink->luns; i++) { /* nicer backwards? */
-		if (scsi_get_link(sb, target, i) == NULL)
-			continue;
-
-		err = scsi_detach_lun(sb, target, i, flags);
-		if (err != 0 && err != ENXIO)
-			rv = err;
-	}
-
-	return (rv);
-}
-
-int
-scsi_detach_lun(struct scsibus_softc *sb, int target, int lun, int flags)
-{
-	struct scsi_link *alink = sb->adapter_link;
-	struct scsi_link *link;
-	int rv;
-
-	if (target < 0 || target >= alink->adapter_buswidth ||
-	    target == alink->adapter_target ||
-	    lun < 0 || lun >= alink->luns)
-		return (ENXIO);
-
-	link = scsi_get_link(sb, target, lun);
-	if (link == NULL)
-		return (ENXIO);
-
-	if (((flags & DETACH_FORCE) == 0) && (link->flags & SDEV_OPEN))
-		return (EBUSY);
-
-	/* detaching a device from scsibus is a five step process... */
-
-	/* 1. wake up processes sleeping for an xs */
-	scsi_link_shutdown(link);
-
-	/* 2. detach the device */
-	rv = config_detach(link->device_softc, flags);
-
-	if (rv != 0)
-		return (rv);
-
-	/* 3. if its using the openings io allocator, clean it up */
-	if (ISSET(link->flags, SDEV_OWN_IOPL)) {
-		scsi_iopool_destroy(link->pool);
-		free(link->pool, M_DEVBUF, sizeof(*link->pool));
-	}
-
-	/* 4. free up its state in the adapter */
-	if (alink->adapter->dev_free != NULL)
-		alink->adapter->dev_free(link);
-
-	/* 5. free up its state in the midlayer */
-	if (link->id != NULL)
-		devid_free(link->id);
-	scsi_remove_link(sb, link);
-	free(link, M_DEVBUF, sizeof(*link));
-
-	return (0);
-}
-
-struct scsi_link *
-scsi_get_link(struct scsibus_softc *sb, int target, int lun)
-{
-	struct scsi_link *link;
-
-	SLIST_FOREACH(link, &sb->sc_link_list, bus_list)
-		if (link->target == target && link->lun == lun)
-			return (link);
-
-	return (NULL);
-}
-
-void
-scsi_add_link(struct scsibus_softc *sb, struct scsi_link *link)
-{
-	SLIST_INSERT_HEAD(&sb->sc_link_list, link, bus_list);
-}
-
-void
-scsi_remove_link(struct scsibus_softc *sb, struct scsi_link *link)
-{
-	SLIST_REMOVE(&sb->sc_link_list, link, scsi_link, bus_list);
-}
-
-void
-scsi_strvis(u_char *dst, u_char *src, int len)
-{
-	u_char				last;
-
-	/* Trim leading and trailing whitespace and NULs. */
-	while (len > 0 && (src[0] == ' ' || src[0] == '\t' || src[0] == '\n' ||
-	    src[0] == '\0' || src[0] == 0xff))
-		++src, --len;
-	while (len > 0 && (src[len-1] == ' ' || src[len-1] == '\t' ||
-	    src[len-1] == '\n' || src[len-1] == '\0' || src[len-1] == 0xff))
-		--len;
-
-	last = 0xff;
-	while (len > 0) {
-		switch (*src) {
-		case ' ':
-		case '\t':
-		case '\n':
-		case '\0':
-		case 0xff:
-			/* collapse whitespace and NULs to a single space */
-			if (last != ' ')
-				*dst++ = ' ';
-			last = ' ';
-			break;
-		case '\\':
-			/* quote characters */
-			*dst++ = '\\';
-			*dst++ = '\\';
-			last = '\\';
-			break;
-		default:
-			if (*src < 0x20 || *src >= 0x80) {
-				/* non-printable characters */
-				*dst++ = '\\';
-				*dst++ = ((*src & 0300) >> 6) + '0';
-				*dst++ = ((*src & 0070) >> 3) + '0';
-				*dst++ = ((*src & 0007) >> 0) + '0';
-			} else {
-				/* normal characters */
-				*dst++ = *src;
-			}
-			last = *src;
-			break;
-		}
-		++src, --len;
-	}
-
-	*dst++ = 0;
-}
 
 struct scsi_quirk_inquiry_pattern {
 	struct scsi_inquiry_pattern	pattern;
@@ -628,14 +136,14 @@ const struct scsi_quirk_inquiry_pattern scsi_quirk_patterns[] = {
 	 "QUANTUM ", "ELS85S          ", ""},	  SDEV_AUTOSAVE},
 	{{T_DIRECT, T_REMOV,
 	 "iomega", "jaz 1GB",		 ""},	  SDEV_NOTAGS},
-        {{T_DIRECT, T_FIXED,
-         "MICROP", "4421-07",		 ""},     SDEV_NOTAGS},
-        {{T_DIRECT, T_FIXED,
-         "SEAGATE", "ST150176LW",        "0002"}, SDEV_NOTAGS},
-        {{T_DIRECT, T_FIXED,
-         "HP", "C3725S",		 ""},     SDEV_NOTAGS},
-        {{T_DIRECT, T_FIXED,
-         "IBM", "DCAS",			 ""},     SDEV_NOTAGS},
+	{{T_DIRECT, T_FIXED,
+	 "MICROP", "4421-07",		 ""},     SDEV_NOTAGS},
+	{{T_DIRECT, T_FIXED,
+	 "SEAGATE", "ST150176LW",        "0002"}, SDEV_NOTAGS},
+	{{T_DIRECT, T_FIXED,
+	 "HP", "C3725S",		 ""},     SDEV_NOTAGS},
+	{{T_DIRECT, T_FIXED,
+	 "IBM", "DCAS",			 ""},     SDEV_NOTAGS},
 
 	{{T_SEQUENTIAL, T_REMOV,
 	 "SONY    ", "SDT-5000        ", "3."},   SDEV_NOSYNC|SDEV_NOWIDE},
@@ -647,134 +155,870 @@ const struct scsi_quirk_inquiry_pattern scsi_quirk_patterns[] = {
 	 "WangDAT ", "Model 3200      ", "02.2"}, SDEV_NOSYNC|SDEV_NOWIDE},
 
 	/* ATAPI device quirks */
-        {{T_CDROM, T_REMOV,
-         "CR-2801TE", "", "1.07"},              ADEV_NOSENSE},
-        {{T_CDROM, T_REMOV,
-         "CREATIVECD3630E", "", "AC101"},       ADEV_NOSENSE},
-        {{T_CDROM, T_REMOV,
-         "FX320S", "", "q01"},                  ADEV_NOSENSE},
-        {{T_CDROM, T_REMOV,
-         "GCD-R580B", "", "1.00"},              ADEV_LITTLETOC},
-        {{T_CDROM, T_REMOV,
-         "MATSHITA CR-574", "", "1.02"},        ADEV_NOCAPACITY},
-        {{T_CDROM, T_REMOV,
-         "MATSHITA CR-574", "", "1.06"},        ADEV_NOCAPACITY},
-        {{T_CDROM, T_REMOV,
-         "Memorex CRW-2642", "", "1.0g"},       ADEV_NOSENSE},
-        {{T_CDROM, T_REMOV,
-         "SANYO CRD-256P", "", "1.02"},         ADEV_NOCAPACITY},
-        {{T_CDROM, T_REMOV,
-         "SANYO CRD-254P", "", "1.02"},         ADEV_NOCAPACITY},
-        {{T_CDROM, T_REMOV,
-         "SANYO CRD-S54P", "", "1.08"},         ADEV_NOCAPACITY},
-        {{T_CDROM, T_REMOV,
-         "CD-ROM  CDR-S1", "", "1.70"},         ADEV_NOCAPACITY}, /* Sanyo */
-        {{T_CDROM, T_REMOV,
-         "CD-ROM  CDR-N16", "", "1.25"},        ADEV_NOCAPACITY}, /* Sanyo */
-        {{T_CDROM, T_REMOV,
-         "UJDCD8730", "", "1.14"},              ADEV_NODOORLOCK}, /* Acer */
+	{{T_CDROM, T_REMOV,
+	 "CR-2801TE", "", "1.07"},              ADEV_NOSENSE},
+	{{T_CDROM, T_REMOV,
+	 "CREATIVECD3630E", "", "AC101"},       ADEV_NOSENSE},
+	{{T_CDROM, T_REMOV,
+	 "FX320S", "", "q01"},                  ADEV_NOSENSE},
+	{{T_CDROM, T_REMOV,
+	 "GCD-R580B", "", "1.00"},              ADEV_LITTLETOC},
+	{{T_CDROM, T_REMOV,
+	 "MATSHITA CR-574", "", "1.02"},        ADEV_NOCAPACITY},
+	{{T_CDROM, T_REMOV,
+	 "MATSHITA CR-574", "", "1.06"},        ADEV_NOCAPACITY},
+	{{T_CDROM, T_REMOV,
+	 "Memorex CRW-2642", "", "1.0g"},       ADEV_NOSENSE},
+	{{T_CDROM, T_REMOV,
+	 "SANYO CRD-256P", "", "1.02"},         ADEV_NOCAPACITY},
+	{{T_CDROM, T_REMOV,
+	 "SANYO CRD-254P", "", "1.02"},         ADEV_NOCAPACITY},
+	{{T_CDROM, T_REMOV,
+	 "SANYO CRD-S54P", "", "1.08"},         ADEV_NOCAPACITY},
+	{{T_CDROM, T_REMOV,
+	 "CD-ROM  CDR-S1", "", "1.70"},         ADEV_NOCAPACITY}, /* Sanyo */
+	{{T_CDROM, T_REMOV,
+	 "CD-ROM  CDR-N16", "", "1.25"},        ADEV_NOCAPACITY}, /* Sanyo */
+	{{T_CDROM, T_REMOV,
+	 "UJDCD8730", "", "1.14"},              ADEV_NODOORLOCK}, /* Acer */
 };
 
+int
+scsiprint(void *aux, const char *pnp)
+{
+	/* Only "scsibus"es can attach to "scsi"s. */
+	if (pnp)
+		printf("scsibus at %s", pnp);
+
+	return UNCONF;
+}
+
+int
+scsibusmatch(struct device *parent, void *match, void *aux)
+{
+	return 1;
+}
+
+/*
+ * The routine called by the adapter boards to get all their
+ * devices configured in.
+ */
+void
+scsibusattach(struct device *parent, struct device *self, void *aux)
+{
+	struct scsibus_softc		*sb = (struct scsibus_softc *)self;
+	struct scsibus_attach_args	*saa = aux;
+
+	if (!cold)
+		scsi_autoconf = 0;
+
+	SLIST_INIT(&sb->sc_link_list);
+	sb->sb_adapter_softc = saa->saa_adapter_softc;
+	sb->sb_adapter = saa->saa_adapter;
+	sb->sb_pool = saa->saa_pool;
+	sb->sb_quirks = saa->saa_quirks;
+	sb->sb_flags = saa->saa_flags;
+	sb->sb_openings = saa->saa_openings;
+	sb->sb_adapter_buswidth = saa->saa_adapter_buswidth;
+	sb->sb_adapter_target = saa->saa_adapter_target;
+	sb->sb_luns = saa->saa_luns;
+
+	if (sb->sb_adapter_buswidth == 0)
+		sb->sb_adapter_buswidth = 8;
+	if (sb->sb_luns == 0)
+		sb->sb_luns = 8;
+
+	printf(": %d targets", sb->sb_adapter_buswidth);
+	if (sb->sb_adapter_target < sb->sb_adapter_buswidth)
+		printf(", initiator %d", sb->sb_adapter_target);
+	if (saa->saa_wwpn != 0x0 && saa->saa_wwnn != 0x0) {
+		printf(", WWPN %016llx, WWNN %016llx", saa->saa_wwpn,
+		    saa->saa_wwnn);
+	}
+	printf("\n");
+
+	/* Initialize shared data. */
+	scsi_init();
+
+	SLIST_INIT(&sb->sc_link_list);
+
+#if NBIO > 0
+	if (bio_register(&sb->sc_dev, scsibusbioctl) != 0)
+		printf("%s: unable to register bio\n", sb->sc_dev.dv_xname);
+#endif /* NBIO > 0 */
+
+	scsi_probe_bus(sb);
+}
+
+int
+scsibusactivate(struct device *dev, int act)
+{
+	struct scsibus_softc *sb = (struct scsibus_softc *)dev;
+
+	return scsi_activate_bus(sb, act);
+}
+
+int
+scsibusdetach(struct device *dev, int type)
+{
+	struct scsibus_softc		*sb = (struct scsibus_softc *)dev;
+	int				 error;
+
+#if NBIO > 0
+	bio_unregister(&sb->sc_dev);
+#endif /* NBIO > 0 */
+
+	error = scsi_detach_bus(sb, type);
+	if (error != 0)
+		return error;
+
+	KASSERT(SLIST_EMPTY(&sb->sc_link_list));
+
+	return 0;
+}
+
+int
+scsibussubmatch(struct device *parent, void *match, void *aux)
+{
+	struct cfdata			*cf = match;
+	struct scsi_attach_args		*sa = aux;
+	struct scsi_link		*link = sa->sa_sc_link;
+
+	if (cf->cf_loc[0] != -1 && cf->cf_loc[0] != link->target)
+		return 0;
+	if (cf->cf_loc[1] != -1 && cf->cf_loc[1] != link->lun)
+		return 0;
+
+	return (*cf->cf_attach->ca_match)(parent, match, aux);
+}
+
+/*
+ * Print out autoconfiguration information for a subdevice.
+ *
+ * This is a slight abuse of 'standard' autoconfiguration semantics,
+ * because 'print' functions don't normally print the colon and
+ * device information.  However, in this case that's better than
+ * either printing redundant information before the attach message,
+ * or having the device driver call a special function to print out
+ * the standard device information.
+ */
+int
+scsibussubprint(void *aux, const char *pnp)
+{
+	struct scsi_attach_args		*sa = aux;
+
+	if (pnp != NULL)
+		printf("%s", pnp);
+
+	scsi_print_link(sa->sa_sc_link);
+
+	return UNCONF;
+}
+
+#if NBIO > 0
+int
+scsibusbioctl(struct device *dev, u_long cmd, caddr_t addr)
+{
+	struct scsibus_softc		*sb = (struct scsibus_softc *)dev;
+	struct sbioc_device		*sdev;
+
+	switch (cmd) {
+	case SBIOCPROBE:
+		sdev = (struct sbioc_device *)addr;
+		return scsi_probe(sb, sdev->sd_target, sdev->sd_lun);
+
+	case SBIOCDETACH:
+		sdev = (struct sbioc_device *)addr;
+		return scsi_detach(sb, sdev->sd_target, sdev->sd_lun, 0);
+
+	default:
+		return ENOTTY;
+	}
+}
+#endif /* NBIO > 0 */
+
+int
+scsi_activate(struct scsibus_softc *sb, int target, int lun, int act)
+{
+	if (target == -1 && lun == -1)
+		return scsi_activate_bus(sb, act);
+	else if (lun == -1)
+		return scsi_activate_target(sb, target, act);
+	else
+		return scsi_activate_lun(sb, target, lun, act);
+}
+
+int
+scsi_activate_bus(struct scsibus_softc *sb, int act)
+{
+	struct scsi_link		*link;
+	int				 r, rv = 0;
+
+	/*  Activate all links on the bus. */
+	SLIST_FOREACH(link, &sb->sc_link_list, bus_list) {
+		r = scsi_activate_link(link, act);
+		if (r)
+			rv = r;
+	}
+	return rv;
+}
+
+int
+scsi_activate_target(struct scsibus_softc *sb, int target, int act)
+{
+	struct scsi_link		*link;
+	int				 r, rv = 0;
+
+	/*  Activate all links on the target. */
+	SLIST_FOREACH(link, &sb->sc_link_list, bus_list) {
+		if (link->target == target) {
+			r = scsi_activate_link(link, act);
+			if (r)
+				rv = r;
+		}
+	}
+	return rv;
+}
+
+int
+scsi_activate_lun(struct scsibus_softc *sb, int target, int lun, int act)
+{
+	struct scsi_link *link;
+
+	/*  Activate the (target, lun) link.*/
+	link = scsi_get_link(sb, target, lun);
+	if (link == NULL)
+		return 0;
+
+	return scsi_activate_link(link, act);
+}
+
+int
+scsi_activate_link(struct scsi_link *link, int act)
+{
+	struct device			*dev;
+	int				 rv = 0;
+
+	dev = link->device_softc;
+	switch (act) {
+	case DVACT_DEACTIVATE:
+		atomic_setbits_int(&link->state, SDEV_S_DYING);
+		config_deactivate(dev);
+		break;
+	default:
+		rv = config_suspend(dev, act);
+		break;
+	}
+	return rv;
+}
+
+int
+scsi_probe(struct scsibus_softc *sb, int target, int lun)
+{
+	if (target == -1 && lun == -1)
+		return scsi_probe_bus(sb);
+	else if (lun == -1)
+		return scsi_probe_target(sb, target);
+	else
+		return scsi_probe_lun(sb, target, lun);
+}
+
+int
+scsi_probe_bus(struct scsibus_softc *sb)
+{
+	int		target, r, rv = 0;
+
+	/* Probe all possible targets on bus. */
+	for (target = 0; target < sb->sb_adapter_buswidth; target++) {
+		r = scsi_probe_target(sb, target);
+		if (r != 0 && r != EINVAL)
+			rv = r;
+	}
+	return rv;
+}
+
+int
+scsi_probe_target(struct scsibus_softc *sb, int target)
+{
+	struct scsi_lun_array		 lunarray;
+	struct scsi_link		*link0;
+	int				 i, r, rv = 0;
+
+	if (target < 0 || target == sb->sb_adapter_target)
+		return EINVAL;
+
+	/* Probe all possible luns on target. */
+	scsi_probe_link(sb, target, 0, 0);
+	link0 = scsi_get_link(sb, target, 0);
+	if (link0 == NULL)
+		return EINVAL;
+	scsi_get_target_luns(link0, &lunarray);
+	for (i = 0; i < lunarray.count; i++) {
+		r = scsi_probe_link(sb, target, lunarray.luns[i],
+		    lunarray.dumbscan);
+		if (r == EINVAL && lunarray.dumbscan == 1)
+			return 0;
+		if (r != 0 && r != EINVAL)
+			rv = r;
+	}
+	return rv;
+}
+
+int
+scsi_probe_lun(struct scsibus_softc *sb, int target, int lun)
+{
+	if (target < 0 || target == sb->sb_adapter_target || lun < 0)
+		return EINVAL;
+
+	/* Probe lun on target. *NOT* a dumbscan! */
+	return scsi_probe_link(sb, target, lun, 0);
+}
+
+/*
+ * Given a target and lun, ask the device what it is, and find the correct
+ * driver table entry.
+ *
+ * Return 0 if further LUNs are possible, EINVAL if not.
+ */
+int
+scsi_probe_link(struct scsibus_softc *sb, int target, int lun, int dumbscan)
+{
+	struct scsi_attach_args			 sa;
+	const struct scsi_quirk_inquiry_pattern	*finger;
+	struct scsi_inquiry_data		*inqbuf, *usbinqbuf;
+	struct scsi_link			*link, *link0;
+	struct cfdata				*cf;
+	int					 inqbytes, priority, rslt = 0;
+	u_int16_t				 devquirks;
+
+	/* Skip this slot if it is already attached and try the next LUN. */
+	if (scsi_get_link(sb, target, lun) != NULL)
+		return 0;
+
+	link = malloc(sizeof(*link), M_DEVBUF, M_NOWAIT);
+	if (link == NULL) {
+		SC_DEBUG(link, SDEV_DB2, ("Bad LUN. can't allocate "
+		    "scsi_link.\n"));
+		return EINVAL;
+	}
+
+	link->state = 0;
+	link->target = target;
+	link->lun = lun;
+	link->openings = sb->sb_openings;
+	link->node_wwn = link->port_wwn = 0;
+	link->flags = sb->sb_flags;
+	link->quirks = sb->sb_quirks;
+	link->interpret_sense = scsi_interpret_sense;
+	link->device_softc = NULL;
+	link->bus = sb;
+	memset(&link->inqdata, 0, sizeof(link->inqdata));
+	link->id = NULL;
+	TAILQ_INIT(&link->queue);
+	link->running = 0;
+	link->pending = 0;
+	link->pool = sb->sb_pool;
+
+	SC_DEBUG(link, SDEV_DB2, ("scsi_link created.\n"));
+
+	/* Ask the adapter if this will be a valid device. */
+	if (sb->sb_adapter->dev_probe != NULL &&
+	    sb->sb_adapter->dev_probe(link) != 0) {
+		if (lun == 0) {
+			SC_DEBUG(link, SDEV_DB2, ("Bad LUN 0. dev_probe() "
+			    "failed.\n"));
+			rslt = EINVAL;
+		}
+		goto free;
+	}
+
+	/*
+	 * If we havent been given an io pool by now then fall back to
+	 * using link->openings.
+	 */
+	if (link->pool == NULL) {
+		link->pool = malloc(sizeof(*link->pool),
+		    M_DEVBUF, M_NOWAIT);
+		if (link->pool == NULL) {
+			SC_DEBUG(link, SDEV_DB2, ("Bad LUN. can't allocate "
+			    "link->pool.\n"));
+			rslt = ENOMEM;
+			goto bad;
+		}
+		scsi_iopool_init(link->pool, link,
+		    scsi_default_get, scsi_default_put);
+
+		SET(link->flags, SDEV_OWN_IOPL);
+	}
+
+	/*
+	 * Tell drivers that are paying attention to avoid sync/wide/tags until
+	 * INQUIRY data has been processed and the quirks information is
+	 * complete. Some drivers set bits in quirks before we get here, so
+	 * just add NOTAGS, NOWIDE and NOSYNC.
+	 */
+	devquirks = link->quirks;
+	SET(link->quirks, SDEV_NOSYNC | SDEV_NOWIDE | SDEV_NOTAGS);
+
+	/*
+	 * Ask the device what it is.
+	 */
+#ifdef SCSIDEBUG
+	if (((sb->sc_dev.dv_unit < 32) &&
+	    ((1U << sb->sc_dev.dv_unit) & scsidebug_buses)) &&
+	    ((target < 32) && ((1U << target) & scsidebug_targets)) &&
+	    ((lun < 32) && ((1U << lun) & scsidebug_luns)))
+		SET(link->flags, scsidebug_level);
+#endif /* SCSIDEBUG */
+
+	if (lun == 0) {
+		/* Clear any outstanding errors. */
+		scsi_test_unit_ready(link, TEST_READY_RETRIES,
+		    scsi_autoconf | SCSI_IGNORE_ILLEGAL_REQUEST |
+		    SCSI_IGNORE_NOT_READY | SCSI_IGNORE_MEDIA_CHANGE);
+	}
+
+	/* Now go ask the device all about itself. */
+	inqbuf = dma_alloc(sizeof(*inqbuf), PR_NOWAIT | PR_ZERO);
+	if (inqbuf == NULL) {
+		SC_DEBUG(link, SDEV_DB2, ("Bad LUN. can't allocate inqbuf.\n"));
+		rslt = ENOMEM;
+		goto bad;
+	}
+
+	rslt = scsi_inquire(link, inqbuf, scsi_autoconf | SCSI_SILENT);
+	if (rslt != 0) {
+		if (lun == 0) {
+			SC_DEBUG(link, SDEV_DB2, ("Bad LUN 0. inquiry rslt = "
+			    "%i\n", rslt));
+			rslt = EINVAL;
+		}
+		dma_free(inqbuf, sizeof(*inqbuf));
+		goto bad;
+	}
+	inqbytes = SID_SCSI2_HDRLEN + inqbuf->additional_length;
+	memcpy(&link->inqdata, inqbuf, inqbytes);
+	dma_free(inqbuf, sizeof(*inqbuf));
+	inqbuf = &link->inqdata;
+	if (inqbytes < offsetof(struct scsi_inquiry_data, vendor))
+		memset(inqbuf->vendor, ' ', sizeof(inqbuf->vendor));
+	if (inqbytes < offsetof(struct scsi_inquiry_data, product))
+		memset(inqbuf->product, ' ', sizeof(inqbuf->product));
+	if (inqbytes < offsetof(struct scsi_inquiry_data, revision))
+		memset(inqbuf->revision, ' ', sizeof(inqbuf->revision));
+	if (inqbytes < offsetof(struct scsi_inquiry_data, extra))
+		memset(inqbuf->extra, ' ', sizeof(inqbuf->extra));
+
+	switch (inqbuf->device & SID_QUAL) {
+	case SID_QUAL_RSVD:
+	case SID_QUAL_BAD_LU:
+	case SID_QUAL_LU_OFFLINE:
+		SC_DEBUG(link, SDEV_DB1, ("Bad LUN. SID_QUAL = 0x%02x\n",
+		    inqbuf->device & SID_QUAL));
+		goto bad;
+
+	case SID_QUAL_LU_OK:
+		break;
+
+	default:
+		SC_DEBUG(link, SDEV_DB1, ("Vendor-specific SID_QUAL = 0x%02x\n",
+		    inqbuf->device & SID_QUAL));
+		break;
+	}
+
+	if ((inqbuf->device & SID_TYPE) == T_NODEVICE) {
+		SC_DEBUG(link, SDEV_DB1,
+		    ("Bad LUN. SID_TYPE = T_NODEVICE\n"));
+		goto bad;
+	}
+
+	scsi_devid(link);
+
+	link0 = scsi_get_link(sb, target, 0);
+	if (lun == 0 || link0 == NULL)
+		;
+	else if (ISSET(link->flags, SDEV_UMASS))
+		;
+	else if (link->id != NULL && !DEVID_CMP(link0->id, link->id))
+		;
+	else if (dumbscan == 1 && memcmp(inqbuf, &link0->inqdata,
+	    sizeof(*inqbuf)) == 0) {
+		/* The device doesn't distinguish between LUNs. */
+		SC_DEBUG(link, SDEV_DB1, ("Bad LUN. IDENTIFY not supported."
+		    "\n"));
+		rslt = EINVAL;
+		goto free_devid;
+	}
+
+	link->quirks = devquirks;	/* Restore what the device wanted. */
+
+	finger = (const struct scsi_quirk_inquiry_pattern *)scsi_inqmatch(
+	    inqbuf, scsi_quirk_patterns,
+	    nitems(scsi_quirk_patterns),
+	    sizeof(scsi_quirk_patterns[0]), &priority);
+	if (priority != 0)
+		SET(link->quirks, finger->quirks);
+
+	switch (SID_ANSII_REV(inqbuf)) {
+	case SCSI_REV_0:
+	case SCSI_REV_1:
+		SET(link->quirks, SDEV_NOTAGS | SDEV_NOSYNC | SDEV_NOWIDE |
+		    SDEV_NOSYNCCACHE);
+		break;
+	case SCSI_REV_2:
+	case SCSI_REV_SPC:
+	case SCSI_REV_SPC2:
+		if (!ISSET(inqbuf->flags, SID_CmdQue))
+			SET(link->quirks, SDEV_NOTAGS);
+		if (!ISSET(inqbuf->flags, SID_Sync))
+			SET(link->quirks, SDEV_NOSYNC);
+		if (!ISSET(inqbuf->flags, SID_WBus16))
+			SET(link->quirks, SDEV_NOWIDE);
+		break;
+	case SCSI_REV_SPC3:
+	case SCSI_REV_SPC4:
+	case SCSI_REV_SPC5:
+		/* By this time SID_Sync and SID_WBus16 were obsolete. */
+		if (!ISSET(inqbuf->flags, SID_CmdQue))
+			SET(link->quirks, SDEV_NOTAGS);
+		break;
+	default:
+		break;
+	}
+
+	/*
+	 * If the device can't use tags, >1 opening may confuse it.
+	 */
+	if (ISSET(link->quirks, SDEV_NOTAGS))
+		link->openings = 1;
+
+	/*
+	 * note what BASIC type of device it is
+	 */
+	if (ISSET(inqbuf->dev_qual2, SID_REMOVABLE))
+		SET(link->flags, SDEV_REMOVABLE);
+
+	sa.sa_sc_link = link;
+
+	if ((cf = config_search(scsibussubmatch, (struct device *)sb,
+	    &sa)) == 0) {
+		scsibussubprint(&sa, sb->sc_dev.dv_xname);
+		printf(" not configured\n");
+		goto free_devid;
+	}
+
+	/*
+	 * Braindead USB devices, especially some x-in-1 media readers, try to
+	 * 'help' by pretending any LUN is actually LUN 0 until they see a
+	 * different LUN used in a command. So do an INQUIRY on LUN 1 at this
+	 * point to prevent such helpfulness before it causes confusion.
+	 */
+	if (lun == 0 && ISSET(link->flags, SDEV_UMASS) &&
+	    scsi_get_link(sb, target, 1) == NULL && sb->sb_luns > 1 &&
+	    (usbinqbuf = dma_alloc(sizeof(*usbinqbuf), M_NOWAIT)) != NULL) {
+
+		link->lun = 1;
+		scsi_inquire(link, usbinqbuf, scsi_autoconf | SCSI_SILENT);
+		link->lun = 0;
+
+		dma_free(usbinqbuf, sizeof(*usbinqbuf));
+	}
+
+	scsi_add_link(link);
+
+	/*
+	 * Generate a TEST_UNIT_READY command. This gives drivers waiting for
+	 * valid quirks data a chance to set wide/sync/tag options
+	 * appropriately. It also clears any outstanding ACA conditions that
+	 * INQUIRY may leave behind.
+	 *
+	 * Do this now so that any messages generated by config_attach() do not
+	 * have negotiation messages inserted into their midst.
+	 */
+	scsi_test_unit_ready(link, TEST_READY_RETRIES,
+	    scsi_autoconf | SCSI_IGNORE_ILLEGAL_REQUEST |
+	    SCSI_IGNORE_NOT_READY | SCSI_IGNORE_MEDIA_CHANGE);
+
+	config_attach((struct device *)sb, cf, &sa, scsibussubprint);
+
+	return 0;
+
+free_devid:
+	if (link->id)
+		devid_free(link->id);
+bad:
+	if (ISSET(link->flags, SDEV_OWN_IOPL))
+		free(link->pool, M_DEVBUF, sizeof(*link->pool));
+
+	if (sb->sb_adapter->dev_free != NULL)
+		sb->sb_adapter->dev_free(link);
+free:
+	free(link, M_DEVBUF, sizeof(*link));
+	return rslt;
+}
+
+int
+scsi_detach(struct scsibus_softc *sb, int target, int lun, int flags)
+{
+	if (target == -1 && lun == -1)
+		return scsi_detach_bus(sb, flags);
+	else if (lun == -1)
+		return scsi_detach_target(sb, target, flags);
+	else
+		return scsi_detach_lun(sb, target, lun, flags);
+}
+
+int
+scsi_detach_bus(struct scsibus_softc *sb, int flags)
+{
+	struct scsi_link	*link, *tmp;
+	int			 r, rv = 0;
+
+	/* Detach all links from bus. */
+	SLIST_FOREACH_SAFE(link, &sb->sc_link_list, bus_list, tmp) {
+		r = scsi_detach_link(link, flags);
+		if (r != 0 && r != ENXIO)
+			rv = r;
+	}
+	return rv;
+}
+
+int
+scsi_detach_target(struct scsibus_softc *sb, int target, int flags)
+{
+	struct scsi_link	*link, *tmp;
+	int			 r, rv = 0;
+
+	/* Detach all links from target. */
+	SLIST_FOREACH_SAFE(link, &sb->sc_link_list, bus_list, tmp) {
+		if (link->target == target) {
+			r = scsi_detach_link(link, flags);
+			if (r != 0 && r != ENXIO)
+				rv = r;
+		}
+	}
+	return rv;
+}
+
+int
+scsi_detach_lun(struct scsibus_softc *sb, int target, int lun, int flags)
+{
+	struct scsi_link	*link;
+
+	/* Detach (target, lun) link. */
+	link = scsi_get_link(sb, target, lun);
+	if (link == NULL)
+		return EINVAL;
+
+	return scsi_detach_link(link, flags);
+}
+
+int
+scsi_detach_link(struct scsi_link *link, int flags)
+{
+	struct scsibus_softc		*sb = link->bus;
+	int				 rv;
+
+	if (!ISSET(flags, DETACH_FORCE) && ISSET(link->flags, SDEV_OPEN))
+		return EBUSY;
+
+	/* Detaching a device from scsibus is a five step process. */
+
+	/* 1. Wake up processes sleeping for an xs. */
+	scsi_link_shutdown(link);
+
+	/* 2. Detach the device. */
+	rv = config_detach(link->device_softc, flags);
+
+	if (rv != 0)
+		return rv;
+
+	/* 3. If it's using the openings io allocator, clean that up. */
+	if (ISSET(link->flags, SDEV_OWN_IOPL)) {
+		scsi_iopool_destroy(link->pool);
+		free(link->pool, M_DEVBUF, sizeof(*link->pool));
+	}
+
+	/* 4. Free up its state in the adapter. */
+	if (sb->sb_adapter->dev_free != NULL)
+		sb->sb_adapter->dev_free(link);
+
+	/* 5. Free up its state in the midlayer. */
+	if (link->id != NULL)
+		devid_free(link->id);
+	scsi_remove_link(link);
+	free(link, M_DEVBUF, sizeof(*link));
+
+	return 0;
+}
+
+struct scsi_link *
+scsi_get_link(struct scsibus_softc *sb, int target, int lun)
+{
+	struct scsi_link *link;
+
+	SLIST_FOREACH(link, &sb->sc_link_list, bus_list) {
+		if (link->target == target && link->lun == lun)
+			return link;
+	}
+
+	return NULL;
+}
 
 void
-scsibus_printlink(struct scsi_link *link)
+scsi_add_link(struct scsi_link *link)
 {
-	char				vendor[33], product[65], revision[17];
+	SLIST_INSERT_HEAD(&link->bus->sc_link_list, link, bus_list);
+}
+
+void
+scsi_remove_link(struct scsi_link *link)
+{
+	SLIST_REMOVE(&link->bus->sc_link_list, link, scsi_link, bus_list);
+}
+
+void
+scsi_get_target_luns(struct scsi_link *link0, struct scsi_lun_array *lunarray)
+{
+	struct scsi_report_luns_data	*report;
+	int				 i, nluns, rv = 0;
+
+	/* Initialize dumbscan result. Just in case. */
+	report = NULL;
+	for (i = 0; i < link0->bus->sb_luns; i++)
+		lunarray->luns[i] = i;
+	lunarray->count = link0->bus->sb_luns;
+	lunarray->dumbscan = 1;
+
+	/*
+	 * ATAPI, USB and pre-SPC (i.e. pre-SCSI-3) devices can't ask
+	 * for a report of valid LUNs.
+	 */
+	if ((link0->flags & (SDEV_UMASS | SDEV_ATAPI)) != 0 ||
+	    SID_ANSII_REV(&link0->inqdata) < SCSI_REV_SPC)
+		goto dumbscan;
+
+	report = dma_alloc(sizeof(*report), PR_WAITOK);
+	if (report == NULL)
+		goto dumbscan;
+
+	rv = scsi_report_luns(link0, REPORT_NORMAL, report,
+	    sizeof(*report), scsi_autoconf | SCSI_SILENT |
+	    SCSI_IGNORE_ILLEGAL_REQUEST | SCSI_IGNORE_NOT_READY |
+	    SCSI_IGNORE_MEDIA_CHANGE, 10000);
+	if (rv != 0)
+		goto dumbscan;
+
+	/*
+	 * XXX In theory we should check if data is full, which
+	 * would indicate it needs to be enlarged and REPORT
+	 * LUNS tried again. Solaris tries up to 3 times with
+	 * larger sizes for data.
+	 */
+
+	/* Return the reported Type-0 LUNs. Type-0 only! */
+	lunarray->count = 0;
+	lunarray->dumbscan = 0;
+	nluns = _4btol(report->length) / RPL_LUNDATA_SIZE;
+	for (i = 0; i < nluns; i++) {
+		if (report->luns[i].lundata[0] != 0)
+			continue;
+		lunarray->luns[lunarray->count++] =
+		    report->luns[i].lundata[RPL_LUNDATA_T0LUN];
+	}
+
+dumbscan:
+	if (report != NULL)
+		dma_free(report, sizeof(*report));
+}
+
+void
+scsi_strvis(u_char *dst, u_char *src, int len)
+{
+	u_char				last;
+
+	/* Trim leading and trailing whitespace and NULs. */
+	while (len > 0 && (src[0] == ' ' || src[0] == '\t' || src[0] == '\n' ||
+	    src[0] == '\0' || src[0] == 0xff))
+		++src, --len;
+	while (len > 0 && (src[len-1] == ' ' || src[len-1] == '\t' ||
+	    src[len-1] == '\n' || src[len-1] == '\0' || src[len-1] == 0xff))
+		--len;
+
+	last = 0xff;
+	while (len > 0) {
+		switch (*src) {
+		case ' ':
+		case '\t':
+		case '\n':
+		case '\0':
+		case 0xff:
+			/* Collapse whitespace and NULs to a single space. */
+			if (last != ' ')
+				*dst++ = ' ';
+			last = ' ';
+			break;
+		case '\\':
+			/* Quote backslashes. */
+			*dst++ = '\\';
+			*dst++ = '\\';
+			last = '\\';
+			break;
+		default:
+			if (*src < 0x20 || *src >= 0x80) {
+				/* Non-printable characters to octal. */
+				*dst++ = '\\';
+				*dst++ = ((*src & 0300) >> 6) + '0';
+				*dst++ = ((*src & 0070) >> 3) + '0';
+				*dst++ = ((*src & 0007) >> 0) + '0';
+			} else {
+				/* Copy normal characters. */
+				*dst++ = *src;
+			}
+			last = *src;
+			break;
+		}
+		++src, --len;
+	}
+
+	*dst++ = 0;
+}
+
+void
+scsi_print_link(struct scsi_link *link)
+{
+	char				 visbuf[65];
 	struct scsi_inquiry_data	*inqbuf;
-	u_int8_t			type;
-	int				removable;
-	char				*dtype = NULL, *qtype = NULL;
+	u_int8_t			*id;
+	int				 i;
+
+	printf(" targ %d lun %d: ", link->target, link->lun);
 
 	inqbuf = &link->inqdata;
 
-	type = inqbuf->device & SID_TYPE;
-	removable = inqbuf->dev_qual2 & SID_REMOVABLE ? 1 : 0;
+	scsi_strvis(visbuf, inqbuf->vendor, 8);
+	printf("<%s, ", visbuf);
+	scsi_strvis(visbuf, inqbuf->product, 16);
+	printf("%s, ", visbuf);
+	scsi_strvis(visbuf, inqbuf->revision, 4);
+	printf("%s>", visbuf);
 
-	/*
-	 * Figure out basic device type and qualifier.
-	 */
-	switch (inqbuf->device & SID_QUAL) {
-	case SID_QUAL_LU_OK:
-		qtype = "";
-		break;
-
-	case SID_QUAL_LU_OFFLINE:
-		qtype = " offline";
-		break;
-
-	case SID_QUAL_RSVD:
-		panic("scsibusprint: qualifier == SID_QUAL_RSVD");
-	case SID_QUAL_BAD_LU:
-		panic("scsibusprint: qualifier == SID_QUAL_BAD_LU");
-
-	default:
-		qtype = "";
-		dtype = "vendor-unique";
-		break;
-	}
-	if (dtype == NULL) {
-		switch (type) {
-		case T_DIRECT:
-			dtype = "direct";
-			break;
-		case T_SEQUENTIAL:
-			dtype = "sequential";
-			break;
-		case T_PRINTER:
-			dtype = "printer";
-			break;
-		case T_PROCESSOR:
-			dtype = "processor";
-			break;
-		case T_CDROM:
-			dtype = "cdrom";
-			break;
-		case T_WORM:
-			dtype = "worm";
-			break;
-		case T_SCANNER:
-			dtype = "scanner";
-			break;
-		case T_OPTICAL:
-			dtype = "optical";
-			break;
-		case T_CHANGER:
-			dtype = "changer";
-			break;
-		case T_COMM:
-			dtype = "communication";
-			break;
-		case T_ENCLOSURE:
-			dtype = "enclosure services";
-			break;
-		case T_RDIRECT:
-			dtype = "simplified direct";
-			break;
-		case T_NODEVICE:
-			panic("scsibusprint: device type T_NODEVICE");
-		default:
-			dtype = "unknown";
-			break;
-		}
-	}
-
-	scsi_strvis(vendor, inqbuf->vendor, 8);
-	scsi_strvis(product, inqbuf->product, 16);
-	scsi_strvis(revision, inqbuf->revision, 4);
-
-	printf(" targ %d lun %d: <%s, %s, %s> ", link->target, link->lun,
-	    vendor, product, revision);
-	if (link->flags & SDEV_ATAPI)
-		printf("ATAPI");
+#ifdef SCSIDEBUG
+	if (ISSET(link->flags, SDEV_ATAPI))
+		printf(" ATAPI");
+	else if (SID_ANSII_REV(inqbuf) < SCSI_REV_SPC)
+		printf(" SCSI/%d", SID_ANSII_REV(inqbuf));
+	else if (SID_ANSII_REV(inqbuf) == SCSI_REV_SPC)
+		printf(" SCSI/SPC");
 	else
-		printf("SCSI%d", SCSISPC(inqbuf->version));
-	printf(" %d/%s %s%s", type, dtype, removable ? "removable" : "fixed",
-	    qtype);
+		printf(" SCSI/SPC-%d", SID_ANSII_REV(inqbuf) - 2);
+#endif /* SCSIDEBUG */
+
+	if (ISSET(link->flags, SDEV_REMOVABLE))
+		printf(" removable");
 
 	if (link->id != NULL && link->id->d_type != DEVID_NONE) {
-		u_int8_t *id = (u_int8_t *)(link->id + 1);
-		int i;
-
+		id = (u_int8_t *)(link->id + 1);
 		switch (link->id->d_type) {
 		case DEVID_NAA:
 			printf(" naa.");
@@ -813,266 +1057,21 @@ scsibus_printlink(struct scsi_link *link)
 				printf("%02x", id[i]);
 		}
 	}
-}
-
-/*
- * Print out autoconfiguration information for a subdevice.
- *
- * This is a slight abuse of 'standard' autoconfiguration semantics,
- * because 'print' functions don't normally print the colon and
- * device information.  However, in this case that's better than
- * either printing redundant information before the attach message,
- * or having the device driver call a special function to print out
- * the standard device information.
- */
-int
-scsibusprint(void *aux, const char *pnp)
-{
-	struct scsi_attach_args		*sa = aux;
-
-	if (pnp != NULL)
-		printf("%s", pnp);
-
-	scsibus_printlink(sa->sa_sc_link);
-
-	return (UNCONF);
-}
-
-/*
- * Given a target and lun, ask the device what it is, and find the correct
- * driver table entry.
- *
- * Return 0 if further LUNs are possible, EINVAL if not.
- */
-int
-scsi_probedev(struct scsibus_softc *sb, int target, int lun)
-{
-	const struct scsi_quirk_inquiry_pattern *finger;
-	struct scsi_inquiry_data *inqbuf, *usbinqbuf;
-	struct scsi_attach_args sa;
-	struct scsi_link *link, *link0;
-	struct cfdata *cf;
-	int priority, rslt = 0;
-
-	/* Skip this slot if it is already attached and try the next LUN. */
-	if (scsi_get_link(sb, target, lun) != NULL)
-		return (0);
-
-	link = malloc(sizeof(*link), M_DEVBUF, M_NOWAIT);
-	if (link == NULL)
-		return (EINVAL);
-
-	*link = *sb->adapter_link;
-	link->target = target;
-	link->lun = lun;
-	link->interpret_sense = scsi_interpret_sense;
-	link->node_wwn = link->port_wwn = 0;
-	TAILQ_INIT(&link->queue);
-
-	SC_DEBUG(link, SDEV_DB2, ("scsi_link created.\n"));
-
-	/* ask the adapter if this will be a valid device */
-	if (sb->adapter_link->adapter->dev_probe != NULL &&
-	    sb->adapter_link->adapter->dev_probe(link) != 0) {
-		if (lun == 0)
-			rslt = EINVAL;
-		goto free;
-	}
-
-	/*
-	 * If we havent been given an io pool by now then fall back to
-	 * using link->openings.
-	 */
-	if (link->pool == NULL) {
-		link->pool = malloc(sizeof(*link->pool),
-		    M_DEVBUF, M_NOWAIT);
-		if (link->pool == NULL) {
-			rslt = ENOMEM;
-			goto bad;
-		}
-		scsi_iopool_init(link->pool, link,
-		    scsi_default_get, scsi_default_put);
-
-		SET(link->flags, SDEV_OWN_IOPL);
-	}
-
-	/*
-	 * Tell drivers that are paying attention to avoid sync/wide/tags until
-	 * INQUIRY data has been processed and the quirks information is
-	 * complete. Some drivers set bits in quirks before we get here, so
-	 * just add NOTAGS, NOWIDE and NOSYNC.
-	 */
-	link->quirks |= SDEV_NOSYNC | SDEV_NOWIDE | SDEV_NOTAGS;
-
-	/*
-	 * Ask the device what it is
-	 */
 #ifdef SCSIDEBUG
-	if (((sb->sc_dev.dv_unit < 32) &&
-	     ((1U << sb->sc_dev.dv_unit) & scsidebug_buses)) &&
-	    ((target < 32) && ((1U << target) & scsidebug_targets)) &&
-	    ((lun < 32) && ((1U << lun) & scsidebug_luns)))
-		link->flags |= scsidebug_level;
+	printf("\n");
+	sc_print_addr(link);
+	printf("state %u, luns %u, openings %u\n",
+	    link->state, link->bus->sb_luns, link->openings);
+
+	sc_print_addr(link);
+	printf("flags (0x%04x) ", link->flags);
+	scsi_show_flags(link->flags, flagnames);
+	printf("\n");
+
+	sc_print_addr(link);
+	printf("quirks (0x%04x) ", link->quirks);
+	scsi_show_flags(link->quirks, quirknames);
 #endif /* SCSIDEBUG */
-
-	if (lun == 0) {
-		/* Clear any outstanding errors. */
-		scsi_test_unit_ready(link, TEST_READY_RETRIES,
-		    scsi_autoconf | SCSI_IGNORE_ILLEGAL_REQUEST |
-		    SCSI_IGNORE_NOT_READY | SCSI_IGNORE_MEDIA_CHANGE);
-	}
-
-	/* Now go ask the device all about itself. */
-	inqbuf = dma_alloc(sizeof(*inqbuf), PR_NOWAIT | PR_ZERO);
-	if (inqbuf == NULL) {
-		rslt = ENOMEM;
-		goto bad;
-	}
-
-	rslt = scsi_inquire(link, inqbuf, scsi_autoconf | SCSI_SILENT);
-	memcpy(&link->inqdata, inqbuf, sizeof(link->inqdata));
-	dma_free(inqbuf, sizeof(*inqbuf));
-
-	if (rslt != 0) {
-		SC_DEBUG(link, SDEV_DB2, ("Bad LUN. rslt = %i\n", rslt));
-		if (lun == 0)
-			rslt = EINVAL;
-		goto bad;
-	}
-	inqbuf = &link->inqdata;
-
-	switch (inqbuf->device & SID_QUAL) {
-	case SID_QUAL_RSVD:
-	case SID_QUAL_BAD_LU:
-	case SID_QUAL_LU_OFFLINE:
-		SC_DEBUG(link, SDEV_DB1, ("Bad LUN. SID_QUAL = 0x%02x\n",
-		    inqbuf->device & SID_QUAL));
-		goto bad;
-
-	case SID_QUAL_LU_OK:
-		if ((inqbuf->device & SID_TYPE) == T_NODEVICE) {
-			SC_DEBUG(link, SDEV_DB1,
-			    ("Bad LUN. SID_TYPE = T_NODEVICE\n"));
-			goto bad;
-		}
-		break;
-
-	default:
-		break;
-	}
-
-	scsi_devid(link);
-
-	link0 = scsi_get_link(sb, target, 0);
-	if (lun == 0 || link0 == NULL)
-		;
-	else if (link->flags & SDEV_UMASS)
-		;
-	else if (link->id != NULL && !DEVID_CMP(link0->id, link->id))
-		;
-	else if (memcmp(inqbuf, &link0->inqdata, sizeof(*inqbuf)) == 0) {
-		/* The device doesn't distinguish between LUNs. */
-		SC_DEBUG(link, SDEV_DB1, ("IDENTIFY not supported.\n"));
-		rslt = EINVAL;
-		goto free_devid;
-	}
-
-	finger = (const struct scsi_quirk_inquiry_pattern *)scsi_inqmatch(
-	    inqbuf, scsi_quirk_patterns,
-	    nitems(scsi_quirk_patterns),
-	    sizeof(scsi_quirk_patterns[0]), &priority);
-
-	/*
-	 * Based upon the inquiry flags we got back, and if we're
-	 * at SCSI-2 or better, remove some limiting quirks.
-	 */
-	if (SCSISPC(inqbuf->version) >= 2) {
-		if ((inqbuf->flags & SID_CmdQue) != 0)
-			link->quirks &= ~SDEV_NOTAGS;
-		if ((inqbuf->flags & SID_Sync) != 0)
-			link->quirks &= ~SDEV_NOSYNC;
-		if ((inqbuf->flags & SID_WBus16) != 0)
-			link->quirks &= ~SDEV_NOWIDE;
-	} else
-		/* Older devices do not have SYNCHRONIZE CACHE capability. */
-		link->quirks |= SDEV_NOSYNCCACHE;
-
-	/*
-	 * Now apply any quirks from the table.
-	 */
-	if (priority != 0)
-		link->quirks |= finger->quirks;
-
-	/*
-	 * If the device can't use tags, >1 opening may confuse it.
-	 */
-	if (ISSET(link->quirks, SDEV_NOTAGS))
-		link->openings = 1;
-
-	/*
-	 * note what BASIC type of device it is
-	 */
-	if ((inqbuf->dev_qual2 & SID_REMOVABLE) != 0)
-		link->flags |= SDEV_REMOVABLE;
-
-	sa.sa_sc_link = link;
-	sa.sa_inqbuf = &link->inqdata;
-
-	if ((cf = config_search(scsibussubmatch, (struct device *)sb,
-	    &sa)) == 0) {
-		scsibusprint(&sa, sb->sc_dev.dv_xname);
-		printf(" not configured\n");
-		goto free_devid;
-	}
-
-	/*
-	 * Braindead USB devices, especially some x-in-1 media readers, try to
-	 * 'help' by pretending any LUN is actually LUN 0 until they see a
-	 * different LUN used in a command. So do an INQUIRY on LUN 1 at this
-	 * point to prevent such helpfulness before it causes confusion.
-	 */
-	if (lun == 0 && (link->flags & SDEV_UMASS) &&
-	    scsi_get_link(sb, target, 1) == NULL && link->luns > 1 &&
-	    (usbinqbuf = dma_alloc(sizeof(*usbinqbuf), M_NOWAIT)) != NULL) {
-
-		link->lun = 1;
-		scsi_inquire(link, usbinqbuf, scsi_autoconf | SCSI_SILENT);
-		link->lun = 0;
-
-		dma_free(usbinqbuf, sizeof(*usbinqbuf));
-	}
-
-	scsi_add_link(sb, link);
-
-	/*
-	 * Generate a TEST_UNIT_READY command. This gives drivers waiting for
-	 * valid quirks data a chance to set wide/sync/tag options
-	 * appropriately. It also clears any outstanding ACA conditions that
-	 * INQUIRY may leave behind.
-	 *
-	 * Do this now so that any messages generated by config_attach() do not
-	 * have negotiation messages inserted into their midst.
-	 */
-	scsi_test_unit_ready(link, TEST_READY_RETRIES,
-	    scsi_autoconf | SCSI_IGNORE_ILLEGAL_REQUEST |
-	    SCSI_IGNORE_NOT_READY | SCSI_IGNORE_MEDIA_CHANGE);
-
-	config_attach((struct device *)sb, cf, &sa, scsibusprint);
-
-	return (0);
-
-free_devid:
-	if (link->id)
-		devid_free(link->id);
-bad:
-	if (ISSET(link->flags, SDEV_OWN_IOPL))
-		free(link->pool, M_DEVBUF, sizeof(*link->pool));
-
-	if (sb->adapter_link->adapter->dev_free != NULL)
-		sb->adapter_link->adapter->dev_free(link);
-free:
-	free(link, M_DEVBUF, sizeof(*link));
-	return (rslt);
 }
 
 /*
@@ -1083,20 +1082,18 @@ const void *
 scsi_inqmatch(struct scsi_inquiry_data *inqbuf, const void *_base,
     int nmatches, int matchsize, int *bestpriority)
 {
-	u_int8_t			type;
-	int				removable;
-	const void			*bestmatch;
 	const unsigned char		*base = (const unsigned char *)_base;
+	const void			*bestmatch;
+	int				 removable;
 
 	/* Include the qualifier to catch vendor-unique types. */
-	type = inqbuf->device;
-	removable = inqbuf->dev_qual2 & SID_REMOVABLE ? T_REMOV : T_FIXED;
+	removable = ISSET(inqbuf->dev_qual2, SID_REMOVABLE) ? T_REMOV : T_FIXED;
 
 	for (*bestpriority = 0, bestmatch = 0; nmatches--; base += matchsize) {
 		struct scsi_inquiry_pattern *match = (void *)base;
 		int priority, len;
 
-		if (type != match->type)
+		if (inqbuf->device != match->type)
 			continue;
 		if (removable != match->removable)
 			continue;
@@ -1115,17 +1112,31 @@ scsi_inqmatch(struct scsi_inquiry_data *inqbuf, const void *_base,
 		priority += len;
 
 #ifdef SCSIDEBUG
-		printf("scsi_inqmatch: %d/%d/%d <%s, %s, %s>\n",
-		    priority, match->type, match->removable,
+		printf("scsi_inqmatch: ");
+		if (_base == &scsi_quirk_patterns)
+			printf(" quirk ");
+		else
+			printf(" match ");
+
+		printf("priority %d. %s %s <\"%s\", \"%s\", \"%s\">", priority,
+		    devicetypenames[(match->type & SID_TYPE)],
+		    (match->removable == T_FIXED) ? "T_FIXED" : "T_REMOV",
 		    match->vendor, match->product, match->revision);
-#endif
+
+		if (_base == &scsi_quirk_patterns)
+			printf(" quirks: 0x%04x",
+			    ((struct scsi_quirk_inquiry_pattern *)match)->quirks
+			);
+
+		printf("\n");
+#endif /* SCSIDEBUG */
 		if (priority > *bestpriority) {
 			*bestpriority = priority;
 			bestmatch = base;
 		}
 	}
 
-	return (bestmatch);
+	return bestmatch;
 }
 
 void
@@ -1134,16 +1145,16 @@ scsi_devid(struct scsi_link *link)
 	struct {
 		struct scsi_vpd_hdr hdr;
 		u_int8_t list[32];
-	} __packed *pg;
-	int pg80 = 0, pg83 = 0, i;
-	size_t len;
+	} __packed			*pg;
+	size_t				 len;
+	int				 pg80 = 0, pg83 = 0, i;
 
 	if (link->id != NULL)
 		return;
 
 	pg = dma_alloc(sizeof(*pg), PR_WAITOK | PR_ZERO);
 
-	if (SCSISPC(link->inqdata.version) >= 2) {
+	if (SID_ANSII_REV(&link->inqdata) >= SCSI_REV_2) {
 		if (scsi_inquire_vpd(link, pg, sizeof(*pg), SI_PG_SUPPORTED,
 		    scsi_autoconf) != 0)
 			goto wwn;
@@ -1175,13 +1186,12 @@ done:
 int
 scsi_devid_pg83(struct scsi_link *link)
 {
-	struct scsi_vpd_hdr *hdr = NULL;
-	struct scsi_vpd_devid_hdr dhdr, chdr;
-	u_int8_t *pg = NULL, *id;
-	int type, idtype = 0;
-	u_char idflags;
-	int len, pos;
-	int rv;
+	struct scsi_vpd_devid_hdr	 dhdr, chdr;
+	struct scsi_vpd_hdr		*hdr = NULL;
+	u_int8_t			*pg = NULL, *id;
+	int				 len, pos, rv, type;
+	int				 idtype = 0;
+	u_char				 idflags;
 
 	hdr = dma_alloc(sizeof(*hdr), PR_WAITOK | PR_ZERO);
 
@@ -1264,18 +1274,17 @@ done:
 		dma_free(pg, len);
 	if (hdr)
 		dma_free(hdr, sizeof(*hdr));
-	return (rv);
+	return rv;
 }
 
 int
 scsi_devid_pg80(struct scsi_link *link)
 {
-	struct scsi_vpd_hdr *hdr = NULL;
-	u_int8_t *pg = NULL;
-	char *id;
-	size_t idlen;
-	int pglen, len;
-	int rv;
+	struct scsi_vpd_hdr		*hdr = NULL;
+	u_int8_t			*pg = NULL;
+	char				*id;
+	size_t				 idlen;
+	int				 len, pglen, rv;
 
 	hdr = dma_alloc(sizeof(*hdr), PR_WAITOK | PR_ZERO);
 
@@ -1316,7 +1325,7 @@ free:
 	dma_free(pg, pglen);
 freehdr:
 	dma_free(hdr, sizeof(*hdr));
-	return (rv);
+	return rv;
 }
 
 int
@@ -1325,22 +1334,12 @@ scsi_devid_wwn(struct scsi_link *link)
 	u_int64_t wwnn;
 
 	if (link->lun != 0 || link->node_wwn == 0)
-		return (EOPNOTSUPP);
+		return EOPNOTSUPP;
 
 	wwnn = htobe64(link->node_wwn);
 	link->id = devid_alloc(DEVID_WWN, 0, sizeof(wwnn), (u_int8_t *)&wwnn);
 
-	return (0);
-}
-
-/*
- * scsi_minphys member of struct scsi_adapter for drivers which don't
- * need any specific routine.
- */
-void
-scsi_minphys(struct buf *bp, struct scsi_link *sl)
-{
-	minphys(bp);
+	return 0;
 }
 
 struct devid *
@@ -1350,7 +1349,7 @@ devid_alloc(u_int8_t type, u_int8_t flags, u_int8_t len, u_int8_t *id)
 
 	d = malloc(sizeof(*d) + len, M_DEVBUF, M_WAITOK|M_CANFAIL);
 	if (d == NULL)
-		return (NULL);
+		return NULL;
 
 	d->d_type = type;
 	d->d_flags = flags;
@@ -1358,14 +1357,14 @@ devid_alloc(u_int8_t type, u_int8_t flags, u_int8_t len, u_int8_t *id)
 	d->d_refcount = 1;
 	memcpy(d + 1, id, len);
 
-	return (d);
+	return d;
 }
 
 struct devid *
 devid_copy(struct devid *d)
 {
 	d->d_refcount++;
-	return (d);
+	return d;
 }
 
 void

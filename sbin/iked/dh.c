@@ -1,4 +1,4 @@
-/*	$OpenBSD: dh.c,v 1.21 2017/10/27 14:26:35 patrick Exp $	*/
+/*	$OpenBSD: dh.c,v 1.24 2020/10/28 20:54:13 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2010-2014 Reyk Floeter <reyk@openbsd.org>
@@ -19,6 +19,14 @@
 #include <sys/param.h>	/* roundup */
 #include <string.h>
 
+#include <sys/queue.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <event.h>
+#include <imsg.h>
+
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <openssl/obj_mac.h>
 #include <openssl/dh.h>
 #include <openssl/ec.h>
@@ -26,8 +34,11 @@
 #include <openssl/bn.h>
 
 #include "dh.h"
+#include "iked.h"
 
 int	dh_init(struct group *);
+int	dh_getlen(struct group *);
+int	dh_secretlen(struct group *);
 
 /* MODP */
 int	modp_init(struct group *);
@@ -35,7 +46,7 @@ int	modp_getlen(struct group *);
 int	modp_create_exchange(struct group *, uint8_t *);
 int	modp_create_shared(struct group *, uint8_t *, uint8_t *);
 
-/* EC2N/ECP */
+/* ECP */
 int	ec_init(struct group *);
 int	ec_getlen(struct group *);
 int	ec_secretlen(struct group *);
@@ -83,8 +94,6 @@ const struct group_id ike_groups[] = {
 	    "FFFFFFFFFFFFFFFF",
 	    "02"
 	},
-	{ GROUP_EC2N, 3, 155, NULL, NULL, NID_ipsec3 },
-	{ GROUP_EC2N, 4, 185, NULL, NULL, NID_ipsec4 },
 	{ GROUP_MODP, 5, 1536,
 	    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
 	    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
@@ -244,9 +253,7 @@ const struct group_id ike_groups[] = {
 	{ GROUP_ECP, 28, 256, NULL, NULL, NID_brainpoolP256r1 },
 	{ GROUP_ECP, 29, 384, NULL, NULL, NID_brainpoolP384r1 },
 	{ GROUP_ECP, 30, 512, NULL, NULL, NID_brainpoolP512r1 },
-
-	/* "Private use" extensions */
-	{ GROUP_CURVE25519, 1034, CURVE25519_SIZE * 8 }
+	{ GROUP_CURVE25519, 31, CURVE25519_SIZE * 8 }
 };
 
 void
@@ -292,7 +299,6 @@ group_get(uint32_t id)
 		group->exchange = modp_create_exchange;
 		group->shared = modp_create_shared;
 		break;
-	case GROUP_EC2N:
 	case GROUP_ECP:
 		group->init = ec_init;
 		group->getlen = ec_getlen;
@@ -357,15 +363,32 @@ dh_secretlen(struct group *group)
 }
 
 int
-dh_create_exchange(struct group *group, uint8_t *buf)
+dh_create_exchange(struct group *group, struct ibuf **bufp, struct ibuf *iexchange)
 {
-	return (group->exchange(group, buf));
+	struct ibuf *buf;
+
+	*bufp = NULL;
+	buf = ibuf_new(NULL, dh_getlen(group));
+	if (buf == NULL)
+		return -1;
+	*bufp = buf;
+	return (group->exchange(group, buf->buf));
 }
 
 int
-dh_create_shared(struct group *group, uint8_t *secret, uint8_t *exchange)
+dh_create_shared(struct group *group, struct ibuf **secretp, struct ibuf *exchange)
 {
-	return (group->shared(group, secret, exchange));
+	struct ibuf *buf;
+
+	*secretp = NULL;
+	if (exchange == NULL ||
+	    (ssize_t)ibuf_size(exchange) != dh_getlen(group))
+		return -1;
+	buf = ibuf_new(NULL, dh_secretlen(group));
+	if (buf == NULL)
+		return -1;
+	*secretp = buf;
+	return (group->shared(group, buf->buf, exchange->buf));
 }
 
 int

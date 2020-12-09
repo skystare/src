@@ -1,4 +1,4 @@
-/*	$OpenBSD: autoconf.c,v 1.9 2018/02/06 20:35:21 naddy Exp $	*/
+/*	$OpenBSD: autoconf.c,v 1.11 2020/11/06 13:32:38 patrick Exp $	*/
 /*
  * Copyright (c) 2009 Miodrag Vallat.
  *
@@ -16,26 +16,23 @@
  */
 
 #include <sys/param.h>
-#include <sys/systm.h>
-#include <sys/conf.h>
 #include <sys/device.h>
+#include <sys/disklabel.h>
 #include <sys/reboot.h>
-#include <sys/socket.h>
 #include <sys/hibernate.h>
+#include <sys/systm.h>
 #include <uvm/uvm.h>
 
+#if defined(NFSCLIENT)
 #include <net/if.h>
 #include <net/if_types.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+#endif
 
 #include <machine/bootconfig.h>
 
 extern void dumpconf(void);
-void	parsepmonbp(void);
-
-struct device *bootdv = NULL;
-enum devclass bootdev_class = DV_DULL;
 
 void
 unmap_startup(void)
@@ -52,10 +49,10 @@ unmap_startup(void)
 void
 cpu_configure(void)
 {
-	(void)splhigh();
+	splhigh();
 
 	softintr_init();
-	(void)config_rootfound("mainbus", NULL);
+	config_rootfound("mainbus", NULL);
 
 	unmap_startup();
 
@@ -66,23 +63,12 @@ cpu_configure(void)
 void
 diskconf(void)
 {
-	size_t	len;
-	char	*p;
-	dev_t	tmpdev;
+#if defined(NFSCLIENT)
 	extern uint8_t *bootmac;
-
-	if (*boot_file != '\0')
-		printf("bootfile: %s\n", boot_file);
-
-	if (bootdv == NULL) {
-
-		// boot_file is of the format <device>:/bsd we want the device part
-		if ((p = strchr(boot_file, ':')) != NULL)
-			len = p - boot_file;
-		else
-			len = strlen(boot_file);
-		bootdv = parsedisk(boot_file, len, 0, &tmpdev);
-	}
+	dev_t tmpdev = NODEV;
+#endif
+	struct device *bootdv = NULL;
+	int part = 0;
 
 #if defined(NFSCLIENT)
 	if (bootmac) {
@@ -100,12 +86,7 @@ diskconf(void)
 	}
 #endif
 
-	if (bootdv != NULL)
-		printf("boot device: %s\n", bootdv->dv_xname);
-	else
-		printf("boot device: lookup %s failed \n", boot_file);
-
-	setroot(bootdv, 0, RB_USERREQ);
+	setroot(bootdv, part, RB_USERREQ);
 	dumpconf();
 
 #ifdef HIBERNATE

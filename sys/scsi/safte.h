@@ -1,4 +1,4 @@
-/*	$OpenBSD: safte.h,v 1.6 2006/01/08 06:28:42 dlg Exp $ */
+/*	$OpenBSD: safte.h,v 1.9 2020/09/12 15:54:51 krw Exp $ */
 
 /*
  * Copyright (c) 2005 David Gwynne <dlg@openbsd.org>
@@ -16,22 +16,16 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef _SCSI_SAFTE_H_
-#define _SCSI_SAFTE_H_
+#ifndef _SCSI_SAFTE_H
+#define _SCSI_SAFTE_H
 
-#define SAFTE_EXTRA_OFFSET	0x05
 /* scsi_inquiry_data.extra */
 struct safte_inq {
 	u_int8_t	uniqueid[7];
 	u_int8_t	chanid;
 	u_int8_t	ident[6];
 #define SAFTE_IDENT		"SAF-TE"
-	u_int8_t	revision[4];
-#ifdef notyet
-	u_int8_t	reserved[2];
-#endif
-} __packed;
-#define SAFTE_INQ_LEN		54
+};
 
 struct safte_readbuf_cmd {
 	u_int8_t	opcode;		/* READ_BUFFER */
@@ -174,4 +168,4 @@ struct safte_slotop {
 	u_int8_t	reserved[61];	/* zero these */
 } __packed;
 
-#endif /* _SCSI_SAFTE_H_ */
+#endif /* _SCSI_SAFTE_H */

@@ -1,4 +1,4 @@
-/*	$OpenBSD: setjmp.S,v 1.2 2017/03/08 06:28:12 drahn Exp $	*/
+/*	$OpenBSD: setjmp.S,v 1.4 2020/10/19 08:47:28 kettenis Exp $	*/
 /*-
  * Copyright (c) 2014 Andrew Turner
  * Copyright (c) 2014 The FreeBSD Foundation
@@ -35,6 +35,7 @@
 
 ENTRY(setjmp)
 
+	RETGUARD_SETUP(setjmp, x15)
 	mov	x2, x0 				/* save jmpbuf in x2 */
 	/* Store the signal mask */
 	mov	w1, #0				/* set */
@@ -60,10 +61,13 @@ ENTRY(setjmp)
 	stp	d8, d9, [x0], #16
 	stp	d10, d11, [x0], #16
 	stp	d12, d13, [x0], #16
-	stp	d14, d15, [x0]
+	stp	d14, d15, [x0], #16
+	mrs	x1, fpcr
+	str	x1, [x0]
 
 	/* Return value */
 	mov	x0, #0
+	RETGUARD_CHECK(setjmp, x15)
 	ret
 
 	.align	3
@@ -72,6 +76,8 @@ ENTRY(setjmp)
 END_STRONG(setjmp)
 
 ENTRY(longjmp)
+	RETGUARD_SYMBOL(longjmp)
+	RETGUARD_LOAD_RANDOM(longjmp, x15)
 	mov	x2, x0				/* move jmpbuf */
 	mov	x3, x1				/* final return value */
 
@@ -98,16 +104,20 @@ ENTRY(longjmp)
 	ldp	x25, x26, [x0], #16
 	ldp	x27, x28, [x0], #16
 	ldp	x29, x30, [x0], #16
+	RETGUARD_CALC_COOKIE(x15)
 
 	/* Restore the vfp registers */
 	ldp	d8, d9, [x0], #16
 	ldp	d10, d11, [x0], #16
 	ldp	d12, d13, [x0], #16
-	ldp	d14, d15, [x0]
+	ldp	d14, d15, [x0], #16
+	ldr	x1, [x0]
+	msr	fpcr, x1
 
 	/* Load the return value */
 	cmp	w3, #0
 	csinc	w0, w3, wzr, ne
+	RETGUARD_CHECK(longjmp, x15)
 	ret
 
 botch:

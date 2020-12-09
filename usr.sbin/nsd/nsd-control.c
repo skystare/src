@@ -42,8 +42,8 @@
  */
 
 #include "config.h"
+#include <stdio.h>
 #ifdef HAVE_SSL
-
 #include <sys/types.h>
 #include <unistd.h>
 #include <string.h>
@@ -62,6 +62,10 @@
 #include "util.h"
 #include "tsig.h"
 #include "options.h"
+
+static void usage(void) ATTR_NORETURN;
+static void ssl_err(const char* s) ATTR_NORETURN;
+static void ssl_path_err(const char* s, const char *path) ATTR_NORETURN;
 
 /** Give nsd-control usage, and exit (1). */
 static void
@@ -87,6 +91,7 @@ usage()
 	printf("  stats_noreset			peek at statistics\n");
 	printf("  addzone <name> <pattern>	add a new zone\n");
 	printf("  delzone <name>		remove a zone\n");
+	printf("  changezone <name> <pattern>	change zone to use pattern\n");
 	printf("  addzones			add zone list on stdin {name space pattern newline}\n");
 	printf("  delzones			remove zone list on stdin {name newline}\n");
 	printf("  write [<zone>]		write changed zonefiles to disk\n");
@@ -96,6 +101,11 @@ usage()
 	printf("  zonestatus [<zone>]		print state, serial, activity\n");
 	printf("  serverpid			get pid of server process\n");
 	printf("  verbosity <number>		change logging detail\n");
+	printf("  print_tsig [<key_name>]	print tsig with <name> the secret and algo\n");
+	printf("  update_tsig <name> <secret>	change existing tsig with <name> to a new <secret>\n");
+	printf("  add_tsig <name> <secret> [algo] add new key with the given parameters\n");
+	printf("  assoc_tsig <zone> <key_name>	associate <zone> with given tsig <key_name> name\n");
+	printf("  del_tsig <key_name>		delete tsig <key_name> from configuration\n");
 	exit(1);
 }
 
@@ -105,6 +115,22 @@ static void ssl_err(const char* s)
 	fprintf(stderr, "error: %s\n", s);
 	ERR_print_errors_fp(stderr);
 	exit(1);
+}
+
+/** exit with ssl error related to a file path */
+static void ssl_path_err(const char* s, const char *path)
+{
+	unsigned long err;
+	err = ERR_peek_error();
+	if (ERR_GET_LIB(err) == ERR_LIB_SYS &&
+		(ERR_GET_FUNC(err) == SYS_F_FOPEN ||
+		 ERR_GET_FUNC(err) == SYS_F_FREAD) ) {
+		fprintf(stderr, "error: %s\n%s: %s\n",
+			s, path, ERR_reason_error_string(err));
+		exit(1);
+	} else {
+		ssl_err(s);
+	}
 }
 
 /** setup SSL context */
@@ -124,24 +150,36 @@ setup_ctx(struct nsd_options* cfg)
 	if (cfg->zonesdir && cfg->zonesdir[0] &&
 		(s_cert[0] != '/' || c_key[0] != '/' || c_cert[0] != '/')) {
 		if(chdir(cfg->zonesdir))
-			ssl_err("could not chdir to zonesdir");
+			error("could not chdir to zonesdir: %s %s",
+				cfg->zonesdir, strerror(errno));
 	}
 
         ctx = SSL_CTX_new(SSLv23_client_method());
 	if(!ctx)
 		ssl_err("could not allocate SSL_CTX pointer");
+#if SSL_OP_NO_SSLv2 != 0
         if((SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2) & SSL_OP_NO_SSLv2)
 		!= SSL_OP_NO_SSLv2)
 		ssl_err("could not set SSL_OP_NO_SSLv2");
+#endif
         if((SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3) & SSL_OP_NO_SSLv3)
 		!= SSL_OP_NO_SSLv3)
 		ssl_err("could not set SSL_OP_NO_SSLv3");
-	if(!SSL_CTX_use_certificate_file(ctx,c_cert,SSL_FILETYPE_PEM) ||
-		!SSL_CTX_use_PrivateKey_file(ctx,c_key,SSL_FILETYPE_PEM)
-		|| !SSL_CTX_check_private_key(ctx))
-		ssl_err("Error setting up SSL_CTX client key and cert");
+#if defined(SSL_OP_NO_RENEGOTIATION)
+	/* disable client renegotiation */
+	if((SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION) &
+		SSL_OP_NO_RENEGOTIATION) != SSL_OP_NO_RENEGOTIATION)
+		ssl_err("could not set SSL_OP_NO_RENEGOTIATION");
+#endif
+	if(!SSL_CTX_use_certificate_file(ctx,c_cert,SSL_FILETYPE_PEM))
+		ssl_path_err("Error setting up SSL_CTX client cert", c_cert);
+	if(!SSL_CTX_use_PrivateKey_file(ctx,c_key,SSL_FILETYPE_PEM))
+		ssl_path_err("Error setting up SSL_CTX client key", c_key);
+	if(!SSL_CTX_check_private_key(ctx))
+		ssl_err("Error setting up SSL_CTX client key");
 	if (SSL_CTX_load_verify_locations(ctx, s_cert, NULL) != 1)
-		ssl_err("Error setting up SSL_CTX verify, server cert");
+		ssl_path_err("Error setting up SSL_CTX verify, server cert",
+			s_cert);
 	SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
 
 	return ctx;
@@ -199,6 +237,7 @@ contact_server(const char* svr, struct nsd_options* cfg, int statuscmd)
 		addrfamily = AF_LOCAL;
 		port = 0;
 #endif
+#ifdef INET6
 	} else if(strchr(svr, ':')) {
 		struct sockaddr_in6 sa;
 		addrlen = (socklen_t)sizeof(struct sockaddr_in6);
@@ -211,6 +250,7 @@ contact_server(const char* svr, struct nsd_options* cfg, int statuscmd)
 		}
 		memcpy(&addr, &sa, addrlen);
 		addrfamily = AF_INET6;
+#endif
 	} else { /* ip4 */
 		struct sockaddr_in sa;
 		addrlen = (socklen_t)sizeof(struct sockaddr_in);

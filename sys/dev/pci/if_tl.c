@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_tl.c,v 1.71 2017/07/13 17:44:36 naddy Exp $	*/
+/*	$OpenBSD: if_tl.c,v 1.74 2020/07/10 13:26:38 patrick Exp $	*/
 
 /*
  * Copyright (c) 1997, 1998
@@ -226,9 +226,9 @@
 const struct tl_products tl_prods[] = {
 	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_N100TX, TLPHY_MEDIA_NO_10_T },
 	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_N10T, TLPHY_MEDIA_10_5 },
-	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_IntNF3P, TLPHY_MEDIA_10_2 },
-	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_IntPL100TX, TLPHY_MEDIA_10_5|TLPHY_MEDIA_NO_10_T },
-	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_DPNet100TX, TLPHY_MEDIA_10_5|TLPHY_MEDIA_NO_10_T },
+	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_INTNF3P, TLPHY_MEDIA_10_2 },
+	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_INTPL100TX, TLPHY_MEDIA_10_5|TLPHY_MEDIA_NO_10_T },
+	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_DPNET100TX, TLPHY_MEDIA_10_5|TLPHY_MEDIA_NO_10_T },
 	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_DP4000, TLPHY_MEDIA_10_5|TLPHY_MEDIA_NO_10_T },
 	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_NF3P_BNC, TLPHY_MEDIA_10_2 },
 	{ PCI_VENDOR_COMPAQ, PCI_PRODUCT_COMPAQ_NF3P, TLPHY_MEDIA_10_5 },
@@ -1295,7 +1295,7 @@ tl_intr(void *xsc)
 		CMD_PUT(sc, TL_CMD_ACK | r | type);
 	}
 
-	if (!IFQ_IS_EMPTY(&ifp->if_snd))
+	if (!ifq_empty(&ifp->if_snd))
 		tl_start(ifp);
 
 	return r;
@@ -1465,7 +1465,7 @@ tl_start(struct ifnet *ifp)
 	start_tx = sc->tl_cdata.tl_tx_free;
 
 	while(sc->tl_cdata.tl_tx_free != NULL) {
-		IFQ_DEQUEUE(&ifp->if_snd, m_head);
+		m_head = ifq_dequeue(&ifp->if_snd);
 		if (m_head == NULL)
 			break;
 
@@ -1786,9 +1786,9 @@ tl_probe(struct device *parent, void *match, void *aux)
 		switch (PCI_PRODUCT(pa->pa_id)) {
 		case PCI_PRODUCT_COMPAQ_N100TX:
 		case PCI_PRODUCT_COMPAQ_N10T:
-		case PCI_PRODUCT_COMPAQ_IntNF3P:
-		case PCI_PRODUCT_COMPAQ_DPNet100TX:
-		case PCI_PRODUCT_COMPAQ_IntPL100TX:
+		case PCI_PRODUCT_COMPAQ_INTNF3P:
+		case PCI_PRODUCT_COMPAQ_DPNET100TX:
+		case PCI_PRODUCT_COMPAQ_INTPL100TX:
 		case PCI_PRODUCT_COMPAQ_DP4000:
 		case PCI_PRODUCT_COMPAQ_N10T2:
 		case PCI_PRODUCT_COMPAQ_N10_TX_UTP:
@@ -1962,7 +1962,7 @@ tl_attach(struct device *parent, struct device *self, void *aux)
 	ifp->if_ioctl = tl_ioctl;
 	ifp->if_start = tl_start;
 	ifp->if_watchdog = tl_watchdog;
-	IFQ_SET_MAXLEN(&ifp->if_snd, TL_TX_LIST_CNT - 1);
+	ifq_set_maxlen(&ifp->if_snd, TL_TX_LIST_CNT - 1);
 	bcopy(sc->sc_dev.dv_xname, ifp->if_xname, IFNAMSIZ);
 
 	ifp->if_capabilities = IFCAP_VLAN_MTU;

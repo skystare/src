@@ -1,4 +1,4 @@
-/*	$OpenBSD: dh.h,v 1.11 2017/10/27 14:26:35 patrick Exp $	*/
+/*	$OpenBSD: dh.h,v 1.13 2020/10/28 20:54:13 tobhe Exp $	*/
 
 /*
  * Copyright (c) 2010-2013 Reyk Floeter <reyk@openbsd.org>
@@ -21,9 +21,8 @@
 
 enum group_type {
 	GROUP_MODP		= 0,
-	GROUP_EC2N		= 1,
-	GROUP_ECP		= 2,
-	GROUP_CURVE25519	= 3
+	GROUP_ECP		= 1,
+	GROUP_CURVE25519	= 2
 };
 
 struct group_id {
@@ -59,9 +58,7 @@ struct group	*group_get(uint32_t);
 const struct group_id
 		*group_getid(uint32_t);
 
-int		 dh_getlen(struct group *);
-int		 dh_secretlen(struct group *);
-int		 dh_create_exchange(struct group *, uint8_t *);
-int		 dh_create_shared(struct group *, uint8_t *, uint8_t *);
+int		 dh_create_exchange(struct group *, struct ibuf **, struct ibuf *);
+int		 dh_create_shared(struct group *, struct ibuf **, struct ibuf *);
 
 #endif /* DH_GROUP_H */

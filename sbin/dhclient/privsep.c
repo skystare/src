@@ -1,4 +1,4 @@
-/*	$OpenBSD: privsep.c,v 1.71 2017/09/20 19:21:00 krw Exp $ */
+/*	$OpenBSD: privsep.c,v 1.79 2020/11/21 18:34:25 krw Exp $ */
 
 /*
  * Copyright (c) 2004 Henning Brauer <henning@openbsd.org>
@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <imsg.h>
+#include <resolv.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -46,13 +47,12 @@ dispatch_imsg(char *name, int rdomain, int ioctlfd, int routefd,
 	static int	 lastidx;
 	struct imsg	 imsg;
 	ssize_t		 n;
-	size_t		 sz;
-	int		 index, newidx, retries;
+	int		 index;
 
 	index = if_nametoindex(name);
 	if (index == 0) {
 		log_warnx("%s: unknown interface", log_procname);
-		quit = INTERNALSIG;
+		quit = TERMINATE;
 		return;
 	}
 
@@ -64,70 +64,25 @@ dispatch_imsg(char *name, int rdomain, int ioctlfd, int routefd,
 			break;
 
 		switch (imsg.hdr.type) {
-		case IMSG_DELETE_ADDRESS:
+		case IMSG_REVOKE:
 			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(struct imsg_delete_address))
-				log_warnx("%s: bad IMSG_DELETE_ADDRESS",
+			    sizeof(struct proposal))
+				log_warnx("%s: bad IMSG_REVOKE",
 				    log_procname);
 			else
-				priv_delete_address(name, ioctlfd, imsg.data);
+				priv_revoke_proposal(name, ioctlfd, imsg.data,
+				    &resolv_conf);
 			break;
 
-		case IMSG_SET_ADDRESS:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(struct imsg_set_address))
-				log_warnx("%s: bad IMSG_SET_ADDRESS",
-				    log_procname);
-			else
-				priv_set_address(name, ioctlfd, imsg.data);
-			break;
-
-		case IMSG_FLUSH_ROUTES:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(struct imsg_flush_routes))
-				log_warnx("%s: bad IMSG_FLUSH_ROUTES",
-				    log_procname);
-			else
-				priv_flush_routes(index, routefd, rdomain,
-				    imsg.data);
-			break;
-
-		case IMSG_ADD_ROUTE:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(struct imsg_add_route))
-				log_warnx("%s: bad IMSG_ADD_ROUTE",
-				    log_procname);
-			else
-				priv_add_route(name, rdomain, routefd,
-				    imsg.data);
-			break;
-
-		case IMSG_SET_MTU:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE +
-			    sizeof(struct imsg_set_mtu))
-				log_warnx("%s: bad IMSG_SET_MTU", log_procname);
-			else
-				priv_set_mtu(name, ioctlfd, imsg.data);
-			break;
-
-		case IMSG_SET_RESOLV_CONF:
-			if (imsg.hdr.len < IMSG_HEADER_SIZE)
-				log_warnx("%s: bad IMSG_SET_RESOLV_CONF",
+		case IMSG_PROPOSE:
+			if (imsg.hdr.len < IMSG_HEADER_SIZE +
+			    sizeof(struct proposal))
+				log_warnx("%s: bad IMSG_PROPOSE",
 				    log_procname);
 			else {
-				free(resolv_conf);
-				resolv_conf = NULL;
-				sz = imsg.hdr.len - IMSG_HEADER_SIZE;
-				if (sz > 0) {
-					resolv_conf = malloc(sz);
-					if (resolv_conf == NULL)
-						log_warn("%s: resolv_conf",
-						    log_procname);
-					else
-						strlcpy(resolv_conf,
-						    imsg.data, sz);
-				}
-				lastidx = 0;
+				priv_propose(name, ioctlfd, imsg.data,
+				    imsg.hdr.len - IMSG_HEADER_SIZE - sizeof(struct proposal),
+				    &resolv_conf, routefd, rdomain, index, &lastidx);
 			}
 			break;
 
@@ -135,24 +90,18 @@ dispatch_imsg(char *name, int rdomain, int ioctlfd, int routefd,
 			if (imsg.hdr.len != IMSG_HEADER_SIZE)
 				log_warnx("%s: bad IMSG_WRITE_RESOLV_CONF",
 				    log_procname);
-			else {
-				retries = 0;
-				do {
-					newidx = default_route_index(rdomain,
-					    routefd);
-					retries++;
-				} while (newidx == 0 && retries < 3);
-				if (newidx == index && newidx != lastidx)
-					priv_write_resolv_conf(resolv_conf);
-				lastidx = newidx;
-			}
+			else
+				priv_write_resolv_conf(index, routefd, rdomain,
+				    resolv_conf, &lastidx);
 			break;
 
-		case IMSG_HUP:
-			if (imsg.hdr.len != IMSG_HEADER_SIZE)
-				log_warnx("%s: bad IMSG_HUP", log_procname);
+		case IMSG_TELL_UNWIND:
+			if (imsg.hdr.len != IMSG_HEADER_SIZE +
+			    sizeof(struct unwind_info))
+				log_warnx("%s: bad IMSG_TELL_UNWIND",
+				    log_procname);
 			else
-				quit = SIGHUP;
+				priv_tell_unwind(index, routefd, rdomain, imsg.data);
 			break;
 
 		default:

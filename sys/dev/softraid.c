@@ -1,4 +1,4 @@
-/* $OpenBSD: softraid.c,v 1.392 2018/05/02 02:24:55 visa Exp $ */
+/* $OpenBSD: softraid.c,v 1.416 2020/10/15 00:13:47 krw Exp $ */
 /*
  * Copyright (c) 2007, 2008, 2009 Marco Peereboom <marco@peereboom.us>
  * Copyright (c) 2008 Chris Kuethe <ckuethe@openbsd.org>
@@ -93,10 +93,7 @@ struct cfdriver softraid_cd = {
 
 /* scsi & discipline */
 void			sr_scsi_cmd(struct scsi_xfer *);
-void			sr_minphys(struct buf *, struct scsi_link *);
 int			sr_scsi_probe(struct scsi_link *);
-void			sr_copy_internal_data(struct scsi_xfer *,
-			    void *, size_t);
 int			sr_scsi_ioctl(struct scsi_link *, u_long,
 			    caddr_t, int);
 int			sr_bio_ioctl(struct device *, u_long, caddr_t);
@@ -179,7 +176,7 @@ extern void		(*softraid_disk_attach)(struct disk *, int);
 
 /* scsi glue */
 struct scsi_adapter sr_switch = {
-	sr_scsi_cmd, sr_minphys, sr_scsi_probe, NULL, sr_scsi_ioctl
+	sr_scsi_cmd, NULL, sr_scsi_probe, NULL, sr_scsi_ioctl
 };
 
 /* native metadata format */
@@ -1470,28 +1467,29 @@ unwind:
 		for (bc1 = SLIST_FIRST(&bv1->sbv_chunks); bc1 != NULL;
 		    bc1 = bc2) {
 			bc2 = SLIST_NEXT(bc1, sbc_link);
-			free(bc1->sbc_metadata, M_DEVBUF, 0);
-			free(bc1, M_DEVBUF, 0);
+			free(bc1->sbc_metadata, M_DEVBUF,
+			    sizeof(*bc1->sbc_metadata));
+			free(bc1, M_DEVBUF, sizeof(*bc1));
 		}
-		free(bv1, M_DEVBUF, 0);
+		free(bv1, M_DEVBUF, sizeof(*bv1));
 	}
 	/* Free keydisks chunks. */
 	for (bc1 = SLIST_FIRST(&kdh); bc1 != NULL; bc1 = bc2) {
 		bc2 = SLIST_NEXT(bc1, sbc_link);
-		free(bc1->sbc_metadata, M_DEVBUF, 0);
-		free(bc1, M_DEVBUF, 0);
+		free(bc1->sbc_metadata, M_DEVBUF, sizeof(*bc1->sbc_metadata));
+		free(bc1, M_DEVBUF, sizeof(*bc1));
 	}
 	/* Free unallocated chunks. */
 	for (bc1 = SLIST_FIRST(&bch); bc1 != NULL; bc1 = bc2) {
 		bc2 = SLIST_NEXT(bc1, sbc_link);
-		free(bc1->sbc_metadata, M_DEVBUF, 0);
-		free(bc1, M_DEVBUF, 0);
+		free(bc1->sbc_metadata, M_DEVBUF, sizeof(*bc1->sbc_metadata));
+		free(bc1, M_DEVBUF, sizeof(*bc1));
 	}
 
 	while (!SLIST_EMPTY(&sdklist)) {
 		sdk = SLIST_FIRST(&sdklist);
 		SLIST_REMOVE_HEAD(&sdklist, sdk_link);
-		free(sdk, M_DEVBUF, 0);
+		free(sdk, M_DEVBUF, sizeof(*sdk));
 	}
 
 	free(devs, M_DEVBUF, BIOC_CRMAXLEN * sizeof(dev_t));
@@ -1751,7 +1749,7 @@ sr_hotplug_unregister(struct sr_discipline *sd, void *func)
 	if (mhe != NULL) {
 		SLIST_REMOVE(&sr_hotplug_callbacks, mhe,
 		    sr_hotplug_list, shl_link);
-		free(mhe, M_DEVBUF, 0);
+		free(mhe, M_DEVBUF, sizeof(*mhe));
 	}
 }
 
@@ -1802,17 +1800,18 @@ sr_attach(struct device *parent, struct device *self, void *aux)
 
 	printf("\n");
 
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.adapter = &sr_switch;
-	sc->sc_link.adapter_target = SR_MAX_LD;
-	sc->sc_link.adapter_buswidth = SR_MAX_LD;
-	sc->sc_link.luns = 1;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter = &sr_switch;
+	saa.saa_adapter_target = SDEV_NO_ADAPTER_TARGET;
+	saa.saa_adapter_buswidth = SR_MAX_LD;
+	saa.saa_luns = 1;
+	saa.saa_openings = 0;
+	saa.saa_pool = NULL;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
-
-	sc->sc_scsibus = (struct scsibus_softc *)config_found(&sc->sc_dev,
-	    &saa, scsiprint);
+	sc->sc_scsibus = (struct scsibus_softc *)config_found(&sc->sc_dev, &saa,
+	    scsiprint);
 
 	softraid_disk_attach = sr_disk_attach;
 
@@ -1885,31 +1884,6 @@ sr_error(struct sr_softc *sc, const char *fmt, ...)
 	va_end(ap);
 }
 
-void
-sr_minphys(struct buf *bp, struct scsi_link *sl)
-{
-	DNPRINTF(SR_D_MISC, "sr_minphys: %ld\n", bp->b_bcount);
-
-	/* XXX currently using SR_MAXFER = MAXPHYS */
-	if (bp->b_bcount > SR_MAXFER)
-		bp->b_bcount = SR_MAXFER;
-	minphys(bp);
-}
-
-void
-sr_copy_internal_data(struct scsi_xfer *xs, void *v, size_t size)
-{
-	size_t			copy_cnt;
-
-	DNPRINTF(SR_D_MISC, "sr_copy_internal_data xs: %p size: %zu\n",
-	    xs, size);
-
-	if (xs->datalen) {
-		copy_cnt = MIN(size, xs->datalen);
-		memcpy(xs->data, v, copy_cnt);
-	}
-}
-
 int
 sr_ccb_alloc(struct sr_discipline *sd)
 {
@@ -1953,7 +1927,8 @@ sr_ccb_free(struct sr_discipline *sd)
 	while ((ccb = TAILQ_FIRST(&sd->sd_ccb_freeq)) != NULL)
 		TAILQ_REMOVE(&sd->sd_ccb_freeq, ccb, ccb_link);
 
-	free(sd->sd_ccb, M_DEVBUF, 0);
+	free(sd->sd_ccb, M_DEVBUF, sd->sd_max_wu * sd->sd_max_ccb_per_wu *
+	    sizeof(struct sr_ccb));
 }
 
 struct sr_ccb *
@@ -2087,7 +2062,7 @@ sr_ccb_done(struct sr_ccb *ccb)
 }
 
 int
-sr_wu_alloc(struct sr_discipline *sd, int wu_size)
+sr_wu_alloc(struct sr_discipline *sd)
 {
 	struct sr_workunit	*wu;
 	int			i, no_wu;
@@ -2105,7 +2080,7 @@ sr_wu_alloc(struct sr_discipline *sd, int wu_size)
 	TAILQ_INIT(&sd->sd_wu_defq);
 
 	for (i = 0; i < no_wu; i++) {
-		wu = malloc(wu_size, M_DEVBUF, M_WAITOK | M_ZERO);
+		wu = malloc(sd->sd_wu_size, M_DEVBUF, M_WAITOK | M_ZERO);
 		TAILQ_INSERT_TAIL(&sd->sd_wu, wu, swu_next);
 		TAILQ_INIT(&wu->swu_ccb);
 		wu->swu_dis = sd;
@@ -2132,7 +2107,7 @@ sr_wu_free(struct sr_discipline *sd)
 
 	while ((wu = TAILQ_FIRST(&sd->sd_wu)) != NULL) {
 		TAILQ_REMOVE(&sd->sd_wu, wu, swu_next);
-		free(wu, M_DEVBUF, 0);
+		free(wu, M_DEVBUF, sd->sd_wu_size);
 	}
 }
 
@@ -2337,7 +2312,7 @@ void
 sr_scsi_cmd(struct scsi_xfer *xs)
 {
 	struct scsi_link	*link = xs->sc_link;
-	struct sr_softc		*sc = link->adapter_softc;
+	struct sr_softc		*sc = link->bus->sb_adapter_softc;
 	struct sr_workunit	*wu = xs->io;
 	struct sr_discipline	*sd;
 
@@ -2360,15 +2335,15 @@ sr_scsi_cmd(struct scsi_xfer *xs)
 	wu->swu_state = SR_WU_INPROGRESS;
 	wu->swu_xs = xs;
 
-	switch (xs->cmd->opcode) {
+	switch (xs->cmd.opcode) {
 	case READ_COMMAND:
-	case READ_BIG:
+	case READ_10:
 	case READ_16:
 	case WRITE_COMMAND:
-	case WRITE_BIG:
+	case WRITE_10:
 	case WRITE_16:
 		DNPRINTF(SR_D_CMD, "%s: sr_scsi_cmd: READ/WRITE %02x\n",
-		    DEVNAME(sc), xs->cmd->opcode);
+		    DEVNAME(sc), xs->cmd.opcode);
 		if (sd->sd_scsi_rw(wu))
 			goto stuffup;
 		break;
@@ -2404,7 +2379,7 @@ sr_scsi_cmd(struct scsi_xfer *xs)
 	case READ_CAPACITY:
 	case READ_CAPACITY_16:
 		DNPRINTF(SR_D_CMD, "%s: sr_scsi_cmd READ CAPACITY 0x%02x\n",
-		    DEVNAME(sc), xs->cmd->opcode);
+		    DEVNAME(sc), xs->cmd.opcode);
 		if (sd->sd_scsi_read_cap(wu))
 			goto stuffup;
 		goto complete;
@@ -2418,7 +2393,7 @@ sr_scsi_cmd(struct scsi_xfer *xs)
 
 	default:
 		DNPRINTF(SR_D_CMD, "%s: unsupported scsi command %x\n",
-		    DEVNAME(sc), xs->cmd->opcode);
+		    DEVNAME(sc), xs->cmd.opcode);
 		/* XXX might need to add generic function to handle others */
 		goto stuffup;
 	}
@@ -2439,7 +2414,7 @@ complete:
 int
 sr_scsi_probe(struct scsi_link *link)
 {
-	struct sr_softc		*sc = link->adapter_softc;
+	struct sr_softc		*sc = link->bus->sb_adapter_softc;
 	struct sr_discipline	*sd;
 
 	KASSERT(link->target < SR_MAX_LD && link->lun == 0);
@@ -2460,7 +2435,7 @@ sr_scsi_probe(struct scsi_link *link)
 int
 sr_scsi_ioctl(struct scsi_link *link, u_long cmd, caddr_t addr, int flag)
 {
-	struct sr_softc		*sc = link->adapter_softc;
+	struct sr_softc		*sc = link->bus->sb_adapter_softc;
 	struct sr_discipline	*sd;
 
 	sd = sc->sc_targets[link->target];
@@ -2856,8 +2831,6 @@ sr_hotspare(struct sr_softc *sc, dev_t dev)
 	    NOCRED, curproc)) {
 		DNPRINTF(SR_D_META, "%s: sr_hotspare ioctl failed\n",
 		    DEVNAME(sc));
-		VOP_CLOSE(vn, FREAD | FWRITE, NOCRED, curproc);
-		vput(vn);
 		goto fail;
 	}
 	if (label.d_partitions[part].p_fstype != FS_RAID) {
@@ -2966,13 +2939,14 @@ sr_hotspare(struct sr_softc *sc, dev_t dev)
 	goto done;
 
 fail:
-	free(hotspare, M_DEVBUF, 0);
+	free(hotspare, M_DEVBUF, sizeof(*hotspare));
 
 done:
 	if (sd)
-		free(sd->sd_vol.sv_chunks, M_DEVBUF, 0);
-	free(sd, M_DEVBUF, 0);
-	free(sm, M_DEVBUF, 0);
+		free(sd->sd_vol.sv_chunks, M_DEVBUF,
+		    sizeof(sd->sd_vol.sv_chunks));
+	free(sd, M_DEVBUF, sizeof(*sd));
+	free(sm, M_DEVBUF, sizeof(*sm));
 	if (open) {
 		VOP_CLOSE(vn, FREAD | FWRITE, NOCRED, curproc);
 		vput(vn);
@@ -3054,7 +3028,8 @@ sr_hotspare_rebuild(struct sr_discipline *sd)
 			splx(s);
 
 			if (busy) {
-				tsleep(sd, PRIBIO, "sr_hotspare", hz);
+				tsleep_nsec(sd, PRIBIO, "sr_hotspare",
+				    SEC_TO_NSEC(1));
 				i++;
 			}
 
@@ -3079,7 +3054,7 @@ sr_hotspare_rebuild(struct sr_discipline *sd)
 			/* Remove hotspare from available list. */
 			sc->sc_hotspare_no--;
 			SLIST_REMOVE(cl, hotspare, sr_chunk, src_link);
-			free(hotspare, M_DEVBUF, 0);
+			free(hotspare, M_DEVBUF, sizeof(*hotspare));
 
 		}
 		rw_exit_write(&sc->sc_lock);
@@ -3375,7 +3350,7 @@ sr_ioctl_createraid(struct sr_softc *sc, struct bioc_createraid *bc,
 				    &sd->sd_meta->ssdi.ssd_uuid);
 				sr_error(sc, "disk %s is currently in use; "
 				    "cannot force create", uuid);
-				free(uuid, M_DEVBUF, 0);
+				free(uuid, M_DEVBUF, 37);
 				goto unwind;
 			}
 
@@ -3428,7 +3403,7 @@ sr_ioctl_createraid(struct sr_softc *sc, struct bioc_createraid *bc,
 			    "chunk count");
 			goto unwind;
 		}
-			
+
 		/* Ensure metadata level matches requested assembly level. */
 		if (sd->sd_meta->ssdi.ssd_level != bc->bc_level) {
 			sr_error(sc, "volume level does not match metadata "
@@ -3439,7 +3414,7 @@ sr_ioctl_createraid(struct sr_softc *sc, struct bioc_createraid *bc,
 		if (sr_already_assembled(sd)) {
 			uuid = sr_uuid_format(&sd->sd_meta->ssdi.ssd_uuid);
 			sr_error(sc, "disk %s already assembled", uuid);
-			free(uuid, M_DEVBUF, 0);
+			free(uuid, M_DEVBUF, 37);
 			goto unwind;
 		}
 
@@ -3676,7 +3651,7 @@ sr_ioctl_installboot(struct sr_softc *sc, struct sr_discipline *sd,
 	struct sr_meta_opt_item *omi;
 	struct sr_meta_boot	*sbm;
 	struct disk		*dk;
-	u_int32_t		bbs, bls, secsize;
+	u_int32_t		bbs = 0, bls = 0, secsize;
 	u_char			duid[8];
 	int			rv = EINVAL;
 	int			i;
@@ -3714,11 +3689,17 @@ sr_ioctl_installboot(struct sr_softc *sc, struct sr_discipline *sd,
 		goto done;
 	}
 
-	if (bb->bb_bootblk_size > SR_BOOT_BLOCKS_SIZE * DEV_BSIZE)
+	if (bb->bb_bootblk_size > SR_BOOT_BLOCKS_SIZE * DEV_BSIZE) {
+		sr_error(sc, "boot block too large (%d > %d)",
+		    bb->bb_bootblk_size, SR_BOOT_BLOCKS_SIZE * DEV_BSIZE);
 		goto done;
+	}
 
-	if (bb->bb_bootldr_size > SR_BOOT_LOADER_SIZE * DEV_BSIZE)
+	if (bb->bb_bootldr_size > SR_BOOT_LOADER_SIZE * DEV_BSIZE) {
+		sr_error(sc, "boot loader too large (%d > %d)",
+		    bb->bb_bootldr_size, SR_BOOT_LOADER_SIZE * DEV_BSIZE);
 		goto done;
+	}
 
 	secsize = sd->sd_meta->ssdi.ssd_secsize;
 
@@ -3741,7 +3722,7 @@ sr_ioctl_installboot(struct sr_softc *sc, struct sr_discipline *sd,
 	if (omi == NULL) {
 		omi = malloc(sizeof(struct sr_meta_opt_item), M_DEVBUF,
 		    M_WAITOK | M_ZERO);
-		omi->omi_som = malloc(sizeof(struct sr_meta_crypto), M_DEVBUF,
+		omi->omi_som = malloc(sizeof(struct sr_meta_boot), M_DEVBUF,
 		    M_WAITOK | M_ZERO);
 		omi->omi_som->som_type = SR_OPT_BOOT;
 		omi->omi_som->som_length = sizeof(struct sr_meta_boot);
@@ -3777,7 +3758,7 @@ sr_ioctl_installboot(struct sr_softc *sc, struct sr_discipline *sd,
 
 		if (sr_rw(sc, chunk->src_dev_mm, bootblk, bbs,
 		    SR_BOOT_BLOCKS_OFFSET, B_WRITE)) {
-			sr_error(sc, "failed to write boot block", DEVNAME(sc));
+			sr_error(sc, "failed to write boot block");
 			goto done;
 		}
 
@@ -3805,8 +3786,8 @@ sr_ioctl_installboot(struct sr_softc *sc, struct sr_discipline *sd,
 	rv = 0;
 
 done:
-	free(bootblk, M_DEVBUF, 0);
-	free(bootldr, M_DEVBUF, 0);
+	free(bootblk, M_DEVBUF, bbs);
+	free(bootldr, M_DEVBUF, bls);
 
 	return (rv);
 }
@@ -3837,7 +3818,7 @@ sr_chunks_unwind(struct sr_softc *sc, struct sr_chunk_head *cl)
 			    curproc);
 			vput(ch_entry->src_vn);
 		}
-		free(ch_entry, M_DEVBUF, 0);
+		free(ch_entry, M_DEVBUF, sizeof(*ch_entry));
 	}
 	SLIST_INIT(cl);
 }
@@ -3861,14 +3842,14 @@ sr_discipline_free(struct sr_discipline *sd)
 	if (sd->sd_free_resources)
 		sd->sd_free_resources(sd);
 	free(sd->sd_vol.sv_chunks, M_DEVBUF, 0);
-	free(sd->sd_meta, M_DEVBUF, 0);
-	free(sd->sd_meta_foreign, M_DEVBUF, 0);
+	free(sd->sd_meta, M_DEVBUF, SR_META_SIZE * DEV_BSIZE);
+	free(sd->sd_meta_foreign, M_DEVBUF, smd[sd->sd_meta_type].smd_size);
 
 	som = &sd->sd_meta_opt;
 	for (omi = SLIST_FIRST(som); omi != NULL; omi = omi_next) {
 		omi_next = SLIST_NEXT(omi, omi_link);
 		free(omi->omi_som, M_DEVBUF, 0);
-		free(omi, M_DEVBUF, 0);
+		free(omi, M_DEVBUF, sizeof(*omi));
 	}
 
 	if (sd->sd_target != 0) {
@@ -3884,14 +3865,14 @@ sr_discipline_free(struct sr_discipline *sd)
 		TAILQ_REMOVE(&sc->sc_dis_list, sd, sd_link);
 
 	explicit_bzero(sd, sizeof *sd);
-	free(sd, M_DEVBUF, 0);
+	free(sd, M_DEVBUF, sizeof(*sd));
 }
 
 void
 sr_discipline_shutdown(struct sr_discipline *sd, int meta_save, int dying)
 {
 	struct sr_softc		*sc;
-	int			s;
+	int			ret, s;
 
 	if (!sd)
 		return;
@@ -3916,11 +3897,12 @@ sr_discipline_shutdown(struct sr_discipline *sd, int meta_save, int dying)
 
 	/* make sure there isn't a sync pending and yield */
 	wakeup(sd);
-	while (sd->sd_sync || sd->sd_must_flush)
-		if (tsleep(&sd->sd_sync, MAXPRI, "sr_down", 60 * hz) ==
-		    EWOULDBLOCK)
+	while (sd->sd_sync || sd->sd_must_flush) {
+		ret = tsleep_nsec(&sd->sd_sync, MAXPRI, "sr_down",
+		    SEC_TO_NSEC(60));
+		if (ret == EWOULDBLOCK)
 			break;
-
+	}
 	if (dying == -1) {
 		sd->sd_ready = 1;
 		splx(s);
@@ -3977,6 +3959,7 @@ sr_discipline_init(struct sr_discipline *sd, int level)
 	task_set(&sd->sd_hotspare_rebuild_task, sr_hotspare_rebuild_callback,
 	    sd);
 
+	sd->sd_wu_size = sizeof(struct sr_workunit);
 	switch (level) {
 	case 0:
 		sr_raid0_discipline_init(sd);
@@ -4012,7 +3995,7 @@ sr_raid_inquiry(struct sr_workunit *wu)
 {
 	struct sr_discipline	*sd = wu->swu_dis;
 	struct scsi_xfer	*xs = wu->swu_xs;
-	struct scsi_inquiry	*cdb = (struct scsi_inquiry *)xs->cmd;
+	struct scsi_inquiry	*cdb = (struct scsi_inquiry *)&xs->cmd;
 	struct scsi_inquiry_data inq;
 
 	DNPRINTF(SR_D_DIS, "%s: sr_raid_inquiry\n", DEVNAME(sd->sd_sc));
@@ -4026,9 +4009,9 @@ sr_raid_inquiry(struct sr_workunit *wu)
 	bzero(&inq, sizeof(inq));
 	inq.device = T_DIRECT;
 	inq.dev_qual2 = 0;
-	inq.version = 2;
-	inq.response_format = 2;
-	inq.additional_length = 32;
+	inq.version = SCSI_REV_2;
+	inq.response_format = SID_SCSI2_RESPONSE;
+	inq.additional_length = SID_SCSI2_ALEN;
 	inq.flags |= SID_CmdQue;
 	strlcpy(inq.vendor, sd->sd_meta->ssdi.ssd_vendor,
 	    sizeof(inq.vendor));
@@ -4036,7 +4019,7 @@ sr_raid_inquiry(struct sr_workunit *wu)
 	    sizeof(inq.product));
 	strlcpy(inq.revision, sd->sd_meta->ssdi.ssd_revision,
 	    sizeof(inq.revision));
-	sr_copy_internal_data(xs, &inq, sizeof(inq));
+	scsi_copy_internal_data(xs, &inq, sizeof(inq));
 
 	return (0);
 }
@@ -4057,20 +4040,20 @@ sr_raid_read_cap(struct sr_workunit *wu)
 	secsize = sd->sd_meta->ssdi.ssd_secsize;
 
 	addr = ((sd->sd_meta->ssdi.ssd_size * DEV_BSIZE) / secsize) - 1;
-	if (xs->cmd->opcode == READ_CAPACITY) {
+	if (xs->cmd.opcode == READ_CAPACITY) {
 		bzero(&rcd, sizeof(rcd));
 		if (addr > 0xffffffffllu)
 			_lto4b(0xffffffff, rcd.addr);
 		else
 			_lto4b(addr, rcd.addr);
 		_lto4b(secsize, rcd.length);
-		sr_copy_internal_data(xs, &rcd, sizeof(rcd));
+		scsi_copy_internal_data(xs, &rcd, sizeof(rcd));
 		rv = 0;
-	} else if (xs->cmd->opcode == READ_CAPACITY_16) {
+	} else if (xs->cmd.opcode == READ_CAPACITY_16) {
 		bzero(&rcd16, sizeof(rcd16));
 		_lto8b(addr, rcd16.addr);
 		_lto4b(secsize, rcd16.length);
-		sr_copy_internal_data(xs, &rcd16, sizeof(rcd16));
+		scsi_copy_internal_data(xs, &rcd16, sizeof(rcd16));
 		rv = 0;
 	}
 
@@ -4125,7 +4108,7 @@ int
 sr_raid_start_stop(struct sr_workunit *wu)
 {
 	struct scsi_xfer	*xs = wu->swu_xs;
-	struct scsi_start_stop	*ss = (struct scsi_start_stop *)xs->cmd;
+	struct scsi_start_stop	*ss = (struct scsi_start_stop *)&xs->cmd;
 
 	DNPRINTF(SR_D_DIS, "%s: sr_raid_start_stop\n",
 	    DEVNAME(wu->swu_dis->sd_sc));
@@ -4144,7 +4127,7 @@ int
 sr_raid_sync(struct sr_workunit *wu)
 {
 	struct sr_discipline	*sd = wu->swu_dis;
-	int			s, rv = 0, ios;
+	int			s, ret, rv = 0, ios;
 
 	DNPRINTF(SR_D_DIS, "%s: sr_raid_sync\n", DEVNAME(sd->sd_sc));
 
@@ -4154,7 +4137,8 @@ sr_raid_sync(struct sr_workunit *wu)
 	s = splbio();
 	sd->sd_sync = 1;
 	while (sd->sd_wu_pending > ios) {
-		if (tsleep(sd, PRIBIO, "sr_sync", 15 * hz) == EWOULDBLOCK) {
+		ret = tsleep_nsec(sd, PRIBIO, "sr_sync", SEC_TO_NSEC(15));
+		if (ret == EWOULDBLOCK) {
 			DNPRINTF(SR_D_DIS, "%s: sr_raid_sync timeout\n",
 			    DEVNAME(sd->sd_sc));
 			rv = 1;
@@ -4298,7 +4282,7 @@ sr_raid_recreate_wu(struct sr_workunit *wu)
 int
 sr_alloc_resources(struct sr_discipline *sd)
 {
-	if (sr_wu_alloc(sd, sizeof(struct sr_workunit))) {
+	if (sr_wu_alloc(sd)) {
 		sr_error(sd->sd_sc, "unable to allocate work units");
 		return (ENOMEM);
 	}
@@ -4579,7 +4563,7 @@ sr_validate_io(struct sr_workunit *wu, daddr_t *blkno, char *func)
 	int			rv = 1;
 
 	DNPRINTF(SR_D_DIS, "%s: %s 0x%02x\n", DEVNAME(sd->sd_sc), func,
-	    xs->cmd->opcode);
+	    xs->cmd.opcode);
 
 	if (sd->sd_meta->ssd_data_blkno == 0)
 		panic("invalid data blkno");
@@ -4597,11 +4581,11 @@ sr_validate_io(struct sr_workunit *wu, daddr_t *blkno, char *func)
 	}
 
 	if (xs->cmdlen == 10)
-		*blkno = _4btol(((struct scsi_rw_big *)xs->cmd)->addr);
+		*blkno = _4btol(((struct scsi_rw_10 *)&xs->cmd)->addr);
 	else if (xs->cmdlen == 16)
-		*blkno = _8btol(((struct scsi_rw_16 *)xs->cmd)->addr);
+		*blkno = _8btol(((struct scsi_rw_16 *)&xs->cmd)->addr);
 	else if (xs->cmdlen == 6)
-		*blkno = _3btol(((struct scsi_rw *)xs->cmd)->addr);
+		*blkno = _3btol(((struct scsi_rw *)&xs->cmd)->addr);
 	else {
 		printf("%s: %s: illegal cmdlen for %s\n",
 		    DEVNAME(sd->sd_sc), func, sd->sd_meta->ssd_devname);
@@ -4724,8 +4708,7 @@ sr_rebuild(struct sr_discipline *sd)
 		xs_r.datalen = sz << DEV_BSHIFT;
 		xs_r.data = buf;
 		xs_r.cmdlen = sizeof(*cr);
-		xs_r.cmd = &xs_r.cmdstore;
-		cr = (struct scsi_rw_16 *)xs_r.cmd;
+		cr = (struct scsi_rw_16 *)&xs_r.cmd;
 		cr->opcode = READ_16;
 		_lto4b(sz, cr->length);
 		_lto8b(lba, cr->addr);
@@ -4745,8 +4728,7 @@ sr_rebuild(struct sr_discipline *sd)
 		xs_w.datalen = sz << DEV_BSHIFT;
 		xs_w.data = buf;
 		xs_w.cmdlen = sizeof(*cw);
-		xs_w.cmd = &xs_w.cmdstore;
-		cw = (struct scsi_rw_16 *)xs_w.cmd;
+		cw = (struct scsi_rw_16 *)&xs_w.cmd;
 		cw->opcode = WRITE_16;
 		_lto4b(sz, cw->length);
 		_lto8b(lba, cw->addr);
@@ -4778,7 +4760,7 @@ sr_rebuild(struct sr_discipline *sd)
 		/* wait for write completion */
 		slept = 0;
 		while ((wu_w->swu_flags & SR_WUF_REBUILDIOCOMP) == 0) {
-			tsleep(wu_w, PRIBIO, "sr_rebuild", 0);
+			tsleep_nsec(wu_w, PRIBIO, "sr_rebuild", INFSLP);
 			slept = 1;
 		}
 		/* yield if we didn't sleep */

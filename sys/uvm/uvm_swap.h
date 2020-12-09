@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvm_swap.h,v 1.16 2013/11/05 06:02:45 deraadt Exp $	*/
+/*	$OpenBSD: uvm_swap.h,v 1.18 2020/09/29 11:47:41 mpi Exp $	*/
 /*	$NetBSD: uvm_swap.h,v 1.5 2000/01/11 06:57:51 chs Exp $	*/
 
 /*
@@ -13,8 +13,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
  * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
@@ -43,6 +41,7 @@ int			uvm_swap_put(int, struct vm_page **, int, int);
 int			uvm_swap_alloc(int *, boolean_t);
 void			uvm_swap_free(int, int);
 void			uvm_swap_markbad(int, int);
+int			uvm_swapisfull(void);
 void			uvm_swap_freepages(struct vm_page **, int);
 #ifdef HIBERNATE
 int			uvm_hibswap(dev_t, u_long *, u_long *);

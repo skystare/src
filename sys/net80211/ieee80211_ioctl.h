@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_ioctl.h,v 1.34 2018/09/09 20:32:55 phessler Exp $	*/
+/*	$OpenBSD: ieee80211_ioctl.h,v 1.41 2020/10/06 07:23:15 gerhard Exp $	*/
 /*	$NetBSD: ieee80211_ioctl.h,v 1.7 2004/04/30 22:51:04 dyoung Exp $	*/
 
 /*-
@@ -277,7 +277,7 @@ struct ieee80211_keyrun {
 
 #define	SIOCG80211JOINALL	_IOWR('i', 218, struct ieee80211_joinreq_all)
 #define	SIOCS80211JOIN		_IOWR('i', 255, struct ifreq)
-#define	SIOCG80211JOIN		_IOWR('i', 256, struct ifreq)
+#define	SIOCG80211JOIN		_IOWR('i', 0, struct ifreq)
 
 /* join is pointed at by ifr.ifr_data */
 struct ieee80211_join {
@@ -304,6 +304,9 @@ struct ieee80211_joinreq_all {
 #define IEEE80211_JOIN_NWKEY	0x08
 #define IEEE80211_JOIN_WPA	0x10
 #define IEEE80211_JOIN_WPAPSK	0x20
+#define IEEE80211_JOIN_8021X	0x40
+#define IEEE80211_JOIN_ANY	0x80
+#define IEEE80211_JOIN_DEL_ALL	0x100
 
 /* node and requests */
 struct ieee80211_nodereq {
@@ -350,7 +353,14 @@ struct ieee80211_nodereq {
 	uint8_t			nr_rxmcs[howmany(80,NBBY)];
 	uint16_t		nr_max_rxrate;	/* in Mb/s, 0 <= rate <= 1023 */
 	uint8_t			nr_tx_mcs_set;
+
+	/* HT / VHT */
 	uint8_t			nr_txmcs;
+
+	/* VHT */
+	uint8_t			nr_vht_ss;
+
+	u_int32_t	nr_assoc_fail;	/* association failure reasons */
 };
 
 #define IEEE80211_NODEREQ_STATE(_s)	(1 << _s)
@@ -365,10 +375,23 @@ struct ieee80211_nodereq {
 #define IEEE80211_NODEREQ_AP_BSS	0x02	/* current bss access point */
 #define IEEE80211_NODEREQ_COPY		0x04	/* add node with flags */
 #define IEEE80211_NODEREQ_HT		0x08	/* HT negotiated */
+#define IEEE80211_NODEREQ_VHT		0x10	/* VHT negotiated */
 
 #define SIOCG80211NODE		_IOWR('i', 211, struct ieee80211_nodereq)
 #define SIOCS80211NODE		 _IOW('i', 212, struct ieee80211_nodereq)
 #define SIOCS80211DELNODE	 _IOW('i', 213, struct ieee80211_nodereq)
+
+#define IEEE80211_NODEREQ_ASSOCFAIL_CHAN	0x01
+#define IEEE80211_NODEREQ_ASSOCFAIL_IBSS	0x02
+#define IEEE80211_NODEREQ_ASSOCFAIL_PRIVACY	0x04
+#define IEEE80211_NODEREQ_ASSOCFAIL_BASIC_RATE	0x08
+#define IEEE80211_NODEREQ_ASSOCFAIL_ESSID	0x10
+#define IEEE80211_NODEREQ_ASSOCFAIL_BSSID	0x20
+#define IEEE80211_NODEREQ_ASSOCFAIL_WPA_PROTO	0x40
+#define IEEE80211_NODEREQ_ASSOCFAIL_WPA_KEY	0x80
+#define IEEE80211_NODEREQ_ASSOCFAIL_BITS	\
+	"\20\1!CHAN\2!IBSS\3!PRIVACY\4!BASICRATE\5!ESSID\6!BSSID\7!WPAPROTO" \
+	"\10!WPAKEY"
 
 /* get the entire node cache */
 struct ieee80211_nodereq_all {
@@ -385,20 +408,23 @@ struct ieee80211_nodereq_all {
 #define SIOCG80211ALLNODES	_IOWR('i', 214, struct ieee80211_nodereq_all)
 
 /* net80211 specific interface flags */
-#define IEEE80211_F_HIDENWID	0x10000000	/* CONF: hidden ssid mode */
-#define IEEE80211_F_NOBRIDGE	0x20000000	/* CONF: no internal bridging */
-#define IEEE80211_F_HOSTAPMASK	0x30000000
-#define IEEE80211_F_USERSHIFT	28
-#define IEEE80211_F_USERBITS	"\20\01HIDENWID\02NOBRIDGE"
+#define IEEE80211_F_HIDENWID	0x00000001	/* CONF: hidden ssid mode */
+#define IEEE80211_F_NOBRIDGE	0x00000002	/* CONF: no internal bridging */
+#define IEEE80211_F_HOSTAPMASK	0x00000003
+#define IEEE80211_F_STAYAUTH	0x00000004	/* CONF: ignore deauth */
+#define IEEE80211_F_NOMIMO	0x00000008	/* CONF: disable MIMO */
+#define IEEE80211_F_USERBITS	"\20\01HIDENWID\02NOBRIDGE\03STAYAUTH\04NOMIMO"
 
 struct ieee80211_flags {
 	const char		*f_name;
 	u_int			f_flag;
 };
 
-#define IEEE80211_FLAGS	{						\
-	{ "hidenwid", IEEE80211_F_HIDENWID >> IEEE80211_F_USERSHIFT },	\
-	{ "nobridge", IEEE80211_F_NOBRIDGE >> IEEE80211_F_USERSHIFT }	\
+#define IEEE80211_FLAGS	{			\
+	{ "hidenwid", IEEE80211_F_HIDENWID },	\
+	{ "nobridge", IEEE80211_F_NOBRIDGE },	\
+	{ "stayauth", IEEE80211_F_STAYAUTH },	\
+	{ "nomimo", IEEE80211_F_NOMIMO }	\
 }
 
 #define SIOCG80211FLAGS		_IOWR('i', 216, struct ifreq)

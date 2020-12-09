@@ -1,4 +1,4 @@
-/*	$OpenBSD: ieee80211_node.h,v 1.77 2018/08/13 15:19:52 stsp Exp $	*/
+/*	$OpenBSD: ieee80211_node.h,v 1.87 2020/07/21 08:38:59 stsp Exp $	*/
 /*	$NetBSD: ieee80211_node.h,v 1.9 2004/04/30 22:57:32 dyoung Exp $	*/
 
 /*-
@@ -39,8 +39,9 @@
 #define	IEEE80211_TRANS_WAIT	5		/* transition wait */
 #define	IEEE80211_INACT_WAIT	5		/* inactivity timer interval */
 #define	IEEE80211_INACT_MAX	(300/IEEE80211_INACT_WAIT)
-#define	IEEE80211_CACHE_SIZE	100
+#define	IEEE80211_CACHE_SIZE	512
 #define	IEEE80211_CACHE_WAIT	30
+#define	IEEE80211_INACT_SCAN	10		/* for station mode */
 
 struct ieee80211_rateset {
 	u_int8_t		rs_nrates;
@@ -50,6 +51,73 @@ struct ieee80211_rateset {
 extern const struct ieee80211_rateset ieee80211_std_rateset_11a;
 extern const struct ieee80211_rateset ieee80211_std_rateset_11b;
 extern const struct ieee80211_rateset ieee80211_std_rateset_11g;
+
+/* Index into ieee80211_std_rateset_11n[] array. */
+#define IEEE80211_HT_RATESET_SISO	0
+#define IEEE80211_HT_RATESET_SISO_SGI	1
+#define IEEE80211_HT_RATESET_MIMO2	2
+#define IEEE80211_HT_RATESET_MIMO2_SGI	3
+#define IEEE80211_HT_RATESET_MIMO3	4
+#define IEEE80211_HT_RATESET_MIMO3_SGI	5
+#define IEEE80211_HT_RATESET_MIMO4	6
+#define IEEE80211_HT_RATESET_MIMO4_SGI	7
+#define IEEE80211_HT_NUM_RATESETS	8
+
+/* Maximum number of rates in a HT rateset. */
+#define IEEE80211_HT_RATESET_MAX_NRATES	8
+
+/* Number of MCS indices represented by struct ieee80211_ht_rateset. */
+#define IEEE80211_HT_RATESET_NUM_MCS 32
+
+struct ieee80211_ht_rateset {
+	uint32_t nrates;
+	uint32_t rates[IEEE80211_HT_RATESET_MAX_NRATES]; /* 500 kbit/s units */
+
+	/*
+	 * This bitmask can only express MCS 0 - MCS 31.
+	 * IEEE 802.11 defined 77 HT MCS in total but common hardware
+	 * implementations tend to support MCS index 0 through 31 only.
+	 */
+	uint32_t mcs_mask;
+
+	/* Range of MCS indices represented in this rateset. */
+	int min_mcs;
+	int max_mcs;
+
+	int sgi;
+};
+
+extern const struct ieee80211_ht_rateset ieee80211_std_ratesets_11n[];
+
+/* Index into ieee80211_std_rateset_11ac[] array. */
+#define IEEE80211_VHT_RATESET_SISO		0
+#define IEEE80211_VHT_RATESET_SISO_SGI		1
+#define IEEE80211_VHT_RATESET_MIMO2		2
+#define IEEE80211_VHT_RATESET_MIMO2_SGI		3
+#define IEEE80211_VHT_RATESET_SISO_40		4
+#define IEEE80211_VHT_RATESET_SISO_40_SGI	5
+#define IEEE80211_VHT_RATESET_MIMO2_40		6
+#define IEEE80211_VHT_RATESET_MIMO2_40_SGI	7
+#define IEEE80211_VHT_RATESET_SISO_80		8
+#define IEEE80211_VHT_RATESET_SISO_80_SGI	9
+#define IEEE80211_VHT_RATESET_MIMO2_80		10
+#define IEEE80211_VHT_RATESET_MIMO2_80_SGI	11
+#define IEEE80211_VHT_NUM_RATESETS		12
+
+/* Maximum number of rates in a HT rateset. */
+#define IEEE80211_VHT_RATESET_MAX_NRATES	10
+
+struct ieee80211_vht_rateset {
+	uint32_t nrates;
+	uint32_t rates[IEEE80211_VHT_RATESET_MAX_NRATES]; /* 500 kbit/s units */
+
+	/* Number of spatial streams used by rates in this rateset. */
+	int num_ss;
+
+	int sgi;
+};
+
+extern const struct ieee80211_vht_rateset ieee80211_std_ratesets_11ac[];
 
 enum ieee80211_node_state {
 	IEEE80211_STA_CACHE,	/* cached node */
@@ -104,7 +172,7 @@ enum {
 	RSNA_SUPP_INITIALIZE,		/* not expecting any messages */
 	RSNA_SUPP_PTKSTART,		/* awaiting handshake message 1 */
 	RSNA_SUPP_PTKNEGOTIATING,	/* got message 1 and derived PTK */
-	RNSA_SUPP_PTKDONE		/* got message 3 and authenticated AP */
+	RSNA_SUPP_PTKDONE		/* got message 3 and authenticated AP */
 };
 
 struct ieee80211_rxinfo {
@@ -137,6 +205,9 @@ struct ieee80211_tx_ba {
 #define IEEE80211_BA_MAX_WINSZ	64	/* corresponds to maximum ADDBA BUFSZ */
 
 	u_int8_t		ba_token;
+
+	/* Bitmap for ACK'd frames in the current BA window. */
+	uint64_t		ba_bitmap;
 };
 
 struct ieee80211_rx_ba {
@@ -155,6 +226,13 @@ struct ieee80211_rx_ba {
 	u_int16_t		ba_head;
 	struct timeout		ba_gap_to;
 #define IEEE80211_BA_GAP_TIMEOUT	300 /* msec */
+
+	/*
+	 * Counter for frames forced to wait in the reordering buffer
+	 * due to a leading gap caused by one or more missing frames.
+	 */
+	int			ba_gapwait;
+
 	/* Counter for consecutive frames which missed the BA window. */
 	int			ba_winmiss;
 	/* Sequence number of previous frame which missed the BA window. */
@@ -263,11 +341,17 @@ struct ieee80211_node {
 	uint16_t		ni_htop2;
 	uint8_t			ni_basic_mcs[howmany(128,NBBY)];
 
+	/* Timeout handlers which trigger Tx Block Ack negotiation. */
+	struct timeout		ni_addba_req_to[IEEE80211_NUM_TID];
+	int			ni_addba_req_intval[IEEE80211_NUM_TID];
+#define IEEE80211_ADDBA_REQ_INTVAL_MAX 30	/* in seconds */
+
 	/* Block Ack records */
 	struct ieee80211_tx_ba	ni_tx_ba[IEEE80211_NUM_TID];
 	struct ieee80211_rx_ba	ni_rx_ba[IEEE80211_NUM_TID];
 
 	int			ni_txmcs;	/* current MCS used for TX */
+	int			ni_vht_ss;	/* VHT # spatial streams */
 
 	/* others */
 	u_int16_t		ni_associd;	/* assoc response */
@@ -276,11 +360,21 @@ struct ieee80211_node {
 	u_int16_t		ni_qos_txseqs[IEEE80211_NUM_TID];
 	u_int16_t		ni_qos_rxseqs[IEEE80211_NUM_TID];
 	int			ni_fails;	/* failure count to associate */
+	uint32_t		ni_assoc_fail;	/* assoc failure reasons */
+#define IEEE80211_NODE_ASSOCFAIL_CHAN		0x01
+#define IEEE80211_NODE_ASSOCFAIL_IBSS		0x02
+#define IEEE80211_NODE_ASSOCFAIL_PRIVACY	0x04
+#define IEEE80211_NODE_ASSOCFAIL_BASIC_RATE	0x08
+#define IEEE80211_NODE_ASSOCFAIL_ESSID		0x10
+#define IEEE80211_NODE_ASSOCFAIL_BSSID		0x20
+#define IEEE80211_NODE_ASSOCFAIL_WPA_PROTO	0x40
+#define IEEE80211_NODE_ASSOCFAIL_WPA_KEY	0x80
+
 	int			ni_inact;	/* inactivity mark count */
 	int			ni_txrate;	/* index to ni_rates[] */
 	int			ni_state;
 
-	u_int16_t		ni_flags;	/* special-purpose state */
+	u_int32_t		ni_flags;	/* special-purpose state */
 #define IEEE80211_NODE_ERP		0x0001
 #define IEEE80211_NODE_QOS		0x0002
 #define IEEE80211_NODE_REKEY		0x0004	/* GTK rekeying in progress */
@@ -297,6 +391,10 @@ struct ieee80211_node {
 #define IEEE80211_NODE_SA_QUERY		0x0800	/* SA Query in progress */
 #define IEEE80211_NODE_SA_QUERY_FAILED	0x1000	/* last SA Query failed */
 #define IEEE80211_NODE_RSN_NEW_PTK	0x2000	/* expecting a new PTK */
+#define IEEE80211_NODE_HT_SGI20		0x4000	/* SGI on 20 MHz negotiated */ 
+#define IEEE80211_NODE_HT_SGI40		0x8000	/* SGI on 40 MHz negotiated */ 
+#define IEEE80211_NODE_VHT		0x10000	/* VHT negotiated */
+#define IEEE80211_NODE_HTCAP		0x20000	/* claims to support HT */
 
 	/* If not NULL, this function gets called when ni_refcnt hits zero. */
 	void			(*ni_unref_cb)(struct ieee80211com *,
@@ -356,13 +454,30 @@ ieee80211_unref_node(struct ieee80211_node **ni)
 
 /* 
  * Check if the peer supports HT.
- * Require at least one of the mandatory MCS.
+ * Require a HT capabilities IE and at least one of the mandatory MCS.
  * MCS 0-7 are mandatory but some APs have particular MCS disabled.
  */
 static inline int
 ieee80211_node_supports_ht(struct ieee80211_node *ni)
 {
-	return (ni->ni_rxmcs[0] & 0xff);
+	return ((ni->ni_flags & IEEE80211_NODE_HTCAP) &&
+	    ni->ni_rxmcs[0] & 0xff);
+}
+
+/* Check if the peer supports HT short guard interval (SGI) on 20 MHz. */
+static inline int
+ieee80211_node_supports_ht_sgi20(struct ieee80211_node *ni)
+{
+	return ieee80211_node_supports_ht(ni) &&
+	    (ni->ni_htcaps & IEEE80211_HTCAP_SGI20);
+}
+
+/* Check if the peer supports HT short guard interval (SGI) on 40 MHz. */
+static inline int
+ieee80211_node_supports_ht_sgi40(struct ieee80211_node *ni)
+{
+	return ieee80211_node_supports_ht(ni) &&
+	    (ni->ni_htcaps & IEEE80211_HTCAP_SGI40);
 }
 
 struct ieee80211com;
@@ -383,6 +498,7 @@ struct ieee80211_node *ieee80211_dup_bss(struct ieee80211com *,
 		const u_int8_t *);
 struct ieee80211_node *ieee80211_find_node(struct ieee80211com *,
 		const u_int8_t *);
+void ieee80211_ba_del(struct ieee80211_node *);
 struct ieee80211_node *ieee80211_find_rxnode(struct ieee80211com *,
 		const struct ieee80211_frame *);
 struct ieee80211_node *ieee80211_find_txnode(struct ieee80211com *,
@@ -393,6 +509,7 @@ struct ieee80211_node *
 		const char *, u_int8_t);
 void ieee80211_release_node(struct ieee80211com *,
 		struct ieee80211_node *);
+void ieee80211_node_cleanup(struct ieee80211com *, struct ieee80211_node *);
 void ieee80211_free_allnodes(struct ieee80211com *, int);
 void ieee80211_iterate_nodes(struct ieee80211com *,
 		ieee80211_iter_func *, void *);
@@ -405,6 +522,7 @@ int ieee80211_setup_htop(struct ieee80211_node *, const uint8_t *,
     uint8_t, int);
 int ieee80211_setup_rates(struct ieee80211com *,
 	    struct ieee80211_node *, const u_int8_t *, const u_int8_t *, int);
+void ieee80211_node_trigger_addba_req(struct ieee80211_node *, int);
 int ieee80211_iserp_sta(const struct ieee80211_node *);
 void ieee80211_count_longslotsta(void *, struct ieee80211_node *);
 void ieee80211_count_nonerpsta(void *, struct ieee80211_node *);
@@ -414,8 +532,7 @@ void ieee80211_node_join(struct ieee80211com *,
 		struct ieee80211_node *, int);
 void ieee80211_node_leave(struct ieee80211com *,
 		struct ieee80211_node *);
-int ieee80211_match_bss(struct ieee80211com *,
-		struct ieee80211_node *);
+int ieee80211_match_bss(struct ieee80211com *, struct ieee80211_node *, int);
 struct ieee80211_node *ieee80211_node_choose_bss(struct ieee80211com *, int,
 		struct ieee80211_node **);
 void ieee80211_node_join_bss(struct ieee80211com *, struct ieee80211_node *);
@@ -423,6 +540,7 @@ void ieee80211_create_ibss(struct ieee80211com* ,
 		struct ieee80211_channel *);
 void ieee80211_notify_dtim(struct ieee80211com *);
 void ieee80211_set_tim(struct ieee80211com *, int, int);
+void ieee80211_free_node(struct ieee80211com *, struct ieee80211_node *);
 
 int ieee80211_node_cmp(const struct ieee80211_node *,
 		const struct ieee80211_node *);

@@ -1,4 +1,4 @@
-/*	$OpenBSD: bounce.c,v 1.79 2018/05/31 21:06:12 gilles Exp $	*/
+/*	$OpenBSD: bounce.c,v 1.82 2020/04/24 11:34:07 eric Exp $	*/
 
 /*
  * Copyright (c) 2009 Gilles Chehade <gilles@poolp.org>
@@ -150,13 +150,13 @@ bounce_add(uint64_t evpid)
 
 	switch (evp.esc_class) {
 	case ESC_STATUS_OK:
-		key.bounce.type = B_DSN;
+		key.bounce.type = B_DELIVERED;
 		break;
 	case ESC_STATUS_TEMPFAIL:
-		key.bounce.type = B_WARNING;
+		key.bounce.type = B_DELAYED;
 		break;
 	default:
-		key.bounce.type = B_ERROR;
+		key.bounce.type = B_FAILED;
 	}
 
 	key.bounce.dsn_ret = evp.dsn_ret;
@@ -184,7 +184,7 @@ bounce_add(uint64_t evpid)
 	line = evp.errorline;
 	if (strlen(line) > 4 && (*line == '1' || *line == '6'))
 		line += 4;
-	(void)snprintf(buf, sizeof(buf), "%s@%s: %s\n", evp.dest.user,
+	(void)snprintf(buf, sizeof(buf), "%s@%s: %s", evp.dest.user,
 	    evp.dest.domain, line);
 
 	be = xmalloc(sizeof *be);
@@ -196,8 +196,7 @@ bounce_add(uint64_t evpid)
 	be->esc_class = evp.esc_class;
 	be->esc_code = evp.esc_code;
 	TAILQ_INSERT_TAIL(&msg->envelopes, be, entry);
-	buf[strcspn(buf, "\n")] = '\0';
-	log_debug("debug: bounce: adding report %16"PRIx64": %s", be->id, buf);
+	log_debug("debug: bounce: adding report %16"PRIx64": %s", be->id, be->report);
 
 	msg->timeout = time(NULL) + 1;
 	TAILQ_INSERT_TAIL(&pending, msg, entry);
@@ -311,7 +310,7 @@ bounce_send(struct bounce_session *s, const char *fmt, ...)
 
 	log_trace(TRACE_BOUNCE, "bounce: %p: >>> %s", s, p);
 
-	io_xprintf(s->io, "%s\n", p);
+	io_xprintf(s->io, "%s\r\n", p);
 
 	free(p);
 }
@@ -343,27 +342,27 @@ bounce_duration(long long int d)
 }
 
 #define NOTICE_INTRO							    \
-	"    Hi!\n\n"							    \
-	"    This is the MAILER-DAEMON, please DO NOT REPLY to this email.\n"
+	"    Hi!\r\n\r\n"						    \
+	"    This is the MAILER-DAEMON, please DO NOT REPLY to this email.\r\n"
 
 const char *notice_error =
-    "    An error has occurred while attempting to deliver a message for\n"
-    "    the following list of recipients:\n\n";
+    "    An error has occurred while attempting to deliver a message for\r\n"
+    "    the following list of recipients:\r\n\r\n";
 
 const char *notice_warning =
-    "    A message is delayed for more than %s for the following\n"
-    "    list of recipients:\n\n";
+    "    A message is delayed for more than %s for the following\r\n"
+    "    list of recipients:\r\n\r\n";
 
 const char *notice_warning2 =
-    "    Please note that this is only a temporary failure report.\n"
-    "    The message is kept in the queue for up to %s.\n"
-    "    You DO NOT NEED to re-send the message to these recipients.\n\n";
+    "    Please note that this is only a temporary failure report.\r\n"
+    "    The message is kept in the queue for up to %s.\r\n"
+    "    You DO NOT NEED to re-send the message to these recipients.\r\n\r\n";
 
 const char *notice_success =
-    "    Your message was successfully delivered to these recipients.\n\n";
+    "    Your message was successfully delivered to these recipients.\r\n\r\n";
 
 const char *notice_relay =
-    "    Your message was relayed to these recipients.\n\n";
+    "    Your message was relayed to these recipients.\r\n\r\n";
 
 static int
 bounce_next_message(struct bounce_session *s)
@@ -451,16 +450,16 @@ bounce_next(struct bounce_session *s)
 		/* Construct an appropriate notice. */
 
 		io_xprintf(s->io,
-		    "Subject: Delivery status notification: %s\n"
-		    "From: Mailer Daemon <MAILER-DAEMON@%s>\n"
-		    "To: %s\n"
-		    "Date: %s\n"
-		    "MIME-Version: 1.0\n"
+		    "Subject: Delivery status notification: %s\r\n"
+		    "From: Mailer Daemon <MAILER-DAEMON@%s>\r\n"
+		    "To: %s\r\n"
+		    "Date: %s\r\n"
+		    "MIME-Version: 1.0\r\n"
 		    "Content-Type: multipart/mixed;"
-		    "boundary=\"%16" PRIu64 "/%s\"\n"
-		    "\n"
-		    "This is a MIME-encapsulated message.\n"
-		    "\n",
+		    "boundary=\"%16" PRIu64 "/%s\"\r\n"
+		    "\r\n"
+		    "This is a MIME-encapsulated message.\r\n"
+		    "\r\n",
 		    action_str(&s->msg->bounce),
 		    s->smtpname,
 		    s->msg->to,
@@ -469,23 +468,23 @@ bounce_next(struct bounce_session *s)
 		    s->smtpname);
 
 		io_xprintf(s->io,
-		    "--%16" PRIu64 "/%s\n"
-		    "Content-Description: Notification\n"
-		    "Content-Type: text/plain; charset=us-ascii\n"
-		    "\n"
+		    "--%16" PRIu64 "/%s\r\n"
+		    "Content-Description: Notification\r\n"
+		    "Content-Type: text/plain; charset=us-ascii\r\n"
+		    "\r\n"
 		    NOTICE_INTRO
-		    "\n",
+		    "\r\n",
 		    s->boundary, s->smtpname);
 
 		switch (s->msg->bounce.type) {
-		case B_ERROR:
+		case B_FAILED:
 			io_xprint(s->io, notice_error);
 			break;
-		case B_WARNING:
+		case B_DELAYED:
 			io_xprintf(s->io, notice_warning,
 			    bounce_duration(s->msg->bounce.delay));
 			break;
-		case B_DSN:
+		case B_DELIVERED:
 			io_xprint(s->io, s->msg->bounce.mta_without_dsn ?
 			    notice_relay : notice_success);
 			break;
@@ -495,35 +494,36 @@ bounce_next(struct bounce_session *s)
 
 		TAILQ_FOREACH(evp, &s->msg->envelopes, entry) {
 			io_xprint(s->io, evp->report);
+			io_xprint(s->io, "\r\n");
 		}
-		io_xprint(s->io, "\n");
+		io_xprint(s->io, "\r\n");
 
-		if (s->msg->bounce.type == B_WARNING)
+		if (s->msg->bounce.type == B_DELAYED)
 			io_xprintf(s->io, notice_warning2,
 			    bounce_duration(s->msg->bounce.ttl));
 
 		io_xprintf(s->io,
-		    "    Below is a copy of the original message:\n"
-		    "\n");
+		    "    Below is a copy of the original message:\r\n"
+		    "\r\n");
 
 		io_xprintf(s->io,
-		    "--%16" PRIu64 "/%s\n"
-		    "Content-Description: Delivery Report\n"
-		    "Content-Type: message/delivery-status\n"
-		    "\n",
+		    "--%16" PRIu64 "/%s\r\n"
+		    "Content-Description: Delivery Report\r\n"
+		    "Content-Type: message/delivery-status\r\n"
+		    "\r\n",
 		    s->boundary, s->smtpname);
 
 		io_xprintf(s->io,
-		    "Reporting-MTA: dns; %s\n"
-		    "\n",
+		    "Reporting-MTA: dns; %s\r\n"
+		    "\r\n",
 		    s->smtpname);
 
 		TAILQ_FOREACH(evp, &s->msg->envelopes, entry) {
 			io_xprintf(s->io,
-			    "Final-Recipient: rfc822; %s@%s\n"
-			    "Action: %s\n"
-			    "Status: %s\n"
-			    "\n",
+			    "Final-Recipient: rfc822; %s@%s\r\n"
+			    "Action: %s\r\n"
+			    "Status: %s\r\n"
+			    "\r\n",
 			    evp->dest.user,
 			    evp->dest.domain,
 			    action_str(&s->msg->bounce),
@@ -538,10 +538,10 @@ bounce_next(struct bounce_session *s)
 
 	case BOUNCE_DATA_MESSAGE:
 		io_xprintf(s->io,
-		    "--%16" PRIu64 "/%s\n"
-		    "Content-Description: Message headers\n"
-		    "Content-Type: text/rfc822-headers\n"
-		    "\n",
+		    "--%16" PRIu64 "/%s\r\n"
+		    "Content-Description: Message headers\r\n"
+		    "Content-Type: text/rfc822-headers\r\n"
+		    "\r\n",
 		    s->boundary, s->smtpname);
 
 		n = io_queued(s->io);
@@ -549,20 +549,20 @@ bounce_next(struct bounce_session *s)
 			if ((len = getline(&line, &sz, s->msgfp)) == -1)
 				break;
 			if (len == 1 && line[0] == '\n' && /* end of headers */
-			    s->msg->bounce.type == B_DSN &&
+			    s->msg->bounce.type == B_DELIVERED &&
 			    s->msg->bounce.dsn_ret ==  DSN_RETHDRS) {
 				free(line);
 				fclose(s->msgfp);
 				s->msgfp = NULL;
 				io_xprintf(s->io,
-				    "\n--%16" PRIu64 "/%s--\n", s->boundary,
+				    "\r\n--%16" PRIu64 "/%s--\r\n", s->boundary,
 				    s->smtpname);
 				bounce_send(s, ".");
 				s->state = BOUNCE_DATA_END;
 				return (0);
 			}
 			line[len - 1] = '\0';
-			io_xprintf(s->io, "%s%s\n",
+			io_xprintf(s->io, "%s%s\r\n",
 			    (len == 2 && line[0] == '.') ? "." : "", line);
 		}
 		free(line);
@@ -577,7 +577,7 @@ bounce_next(struct bounce_session *s)
 		}
 
 		io_xprintf(s->io,
-		    "\n--%16" PRIu64 "/%s--\n", s->boundary, s->smtpname);
+		    "\r\n--%16" PRIu64 "/%s--\r\n", s->boundary, s->smtpname);
 
 		log_trace(TRACE_BOUNCE, "bounce: %p: >>> [... %zu bytes ...]",
 		    s, io_queued(s->io) - n);
@@ -728,6 +728,10 @@ bounce_io(struct io *io, int evt, void *arg)
 		if (line == NULL)
 			break;
 
+		/* Strip trailing '\r' */
+		if (len && line[len - 1] == '\r')
+			line[--len] = '\0';
+
 		log_trace(TRACE_BOUNCE, "bounce: %p: <<< %s", s, line);
 
 		if ((error = parse_smtp_response(line, len, &msg, &cont))) {
@@ -795,15 +799,15 @@ static const char *
 action_str(const struct delivery_bounce *b)
 {
 	switch (b->type) {
-	case B_ERROR:
-		return ("error");
-	case B_WARNING:
+	case B_FAILED:
+		return ("failed");
+	case B_DELAYED:
 		return ("delayed");
-	case B_DSN:
+	case B_DELIVERED:
 		if (b->mta_without_dsn)
 			return ("relayed");
 
-		return ("success");
+		return ("delivered");
 	default:
 		log_warn("warn: bounce: unknown bounce_type");
 		return ("");

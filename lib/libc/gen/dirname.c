@@ -1,7 +1,7 @@
-/*	$OpenBSD: dirname.c,v 1.15 2013/09/30 12:02:33 millert Exp $	*/
+/*	$OpenBSD: dirname.c,v 1.17 2020/10/20 19:30:14 naddy Exp $	*/
 
 /*
- * Copyright (c) 1997, 2004 Todd C. Miller <Todd.Miller@courtesan.com>
+ * Copyright (c) 1997, 2004 Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -24,7 +24,7 @@
 /* A slightly modified copy of this file exists in libexec/ld.so */
 
 char *
-dirname(const char *path)
+dirname(char *path)
 {
 	static char dname[PATH_MAX];
 	size_t len;

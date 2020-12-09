@@ -1,4 +1,4 @@
-/*	$OpenBSD: usb.c,v 1.120 2018/08/31 16:32:31 miko Exp $	*/
+/*	$OpenBSD: usb.c,v 1.126 2020/09/02 12:36:12 mglocker Exp $	*/
 /*	$NetBSD: usb.c,v 1.77 2003/01/01 00:10:26 thorpej Exp $	*/
 
 /*
@@ -118,7 +118,6 @@ struct proc	*usb_task_thread_proc = NULL;
 void		 usb_abort_task_thread(void *);
 struct proc	*usb_abort_task_thread_proc = NULL;
 
-void		 usb_fill_di_task(void *);
 void		 usb_fill_udc_task(void *);
 void		 usb_fill_udf_task(void *);
 
@@ -382,7 +381,7 @@ usb_wait_task(struct usbd_device *dev, struct usb_task *task)
 	s = splusb();
 	while (task->state != USB_TASK_STATE_NONE) {
 		DPRINTF(("%s: waiting for task to complete\n", __func__));
-		tsleep(task, PWAIT, "endtask", 0);
+		tsleep_nsec(task, PWAIT, "endtask", INFSLP);
 	}
 	splx(s);
 }
@@ -409,7 +408,7 @@ usb_task_thread(void *arg)
 		else if ((task = TAILQ_FIRST(&usb_generic_tasks)) != NULL)
 			TAILQ_REMOVE(&usb_generic_tasks, task, next);
 		else {
-			tsleep(&usb_run_tasks, PWAIT, "usbtsk", 0);
+			tsleep_nsec(&usb_run_tasks, PWAIT, "usbtsk", INFSLP);
 			continue;
 		}
 		/*
@@ -453,7 +452,8 @@ usb_abort_task_thread(void *arg)
 		if ((task = TAILQ_FIRST(&usb_abort_tasks)) != NULL)
 			TAILQ_REMOVE(&usb_abort_tasks, task, next);
 		else {
-			tsleep(&usb_run_abort_tasks, PWAIT, "usbatsk", 0);
+			tsleep_nsec(&usb_run_abort_tasks, PWAIT, "usbatsk",
+			    INFSLP);
 			continue;
 		}
 		/*
@@ -511,32 +511,12 @@ usbclose(dev_t dev, int flag, int mode, struct proc *p)
 }
 
 void
-usb_fill_di_task(void *arg)
-{
-	struct usb_device_info *di = (struct usb_device_info *)arg;
-	struct usb_softc *sc;
-	struct usbd_device *dev;
-
-	/* check that the bus and device are still present */
-	if (di->udi_bus >= usb_cd.cd_ndevs)
-		return;
-	sc = usb_cd.cd_devs[di->udi_bus];
-	if (sc == NULL)
-		return;
-	dev = sc->sc_bus->devices[di->udi_addr];
-	if (dev == NULL)
-		return;
-
-	usbd_fill_deviceinfo(dev, di);
-}
-
-void
 usb_fill_udc_task(void *arg)
 {
 	struct usb_device_cdesc *udc = (struct usb_device_cdesc *)arg;
 	struct usb_softc *sc;
 	struct usbd_device *dev;
-	int addr = udc->udc_addr;
+	int addr = udc->udc_addr, cdesc_len;
 	usb_config_descriptor_t *cdesc;
 
 	/* check that the bus and device are still present */
@@ -550,11 +530,11 @@ usb_fill_udc_task(void *arg)
 		return;
 
 	cdesc = usbd_get_cdesc(sc->sc_bus->devices[addr],
-	    udc->udc_config_index, 0);
+	    udc->udc_config_index, &cdesc_len);
 	if (cdesc == NULL)
 		return;
 	udc->udc_desc = *cdesc;
-	free(cdesc, M_TEMP, 0);
+	free(cdesc, M_TEMP, cdesc_len);
 }
 
 void
@@ -627,7 +607,7 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 		if (!(flag & FWRITE))
 			return (EBADF);
 
-		DPRINTF(("usbioctl: USB_REQUEST addr=%d len=%zu\n", addr, len));
+		DPRINTF(("%s: USB_REQUEST addr=%d len=%zu\n", __func__, addr, len));
 		/* Avoid requests that would damage the bus integrity. */
 		if ((ur->ucr_request.bmRequestType == UT_WRITE_DEVICE &&
 		     ur->ucr_request.bRequest == UR_SET_ADDRESS) ||
@@ -692,7 +672,6 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 	{
 		struct usb_device_info *di = (void *)data;
 		int addr = di->udi_addr;
-		struct usb_task di_task;
 		struct usbd_device *dev;
 
 		if (addr < 1 || addr >= USB_MAX_DEVICES)
@@ -702,21 +681,7 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 		if (dev == NULL)
 			return (ENXIO);
 
-		di->udi_bus = unit;
-
-		/* All devices get a driver, thanks to ugen(4).  If the
-		 * task ends without adding a driver name, there was an error.
-		 */
-		di->udi_devnames[0][0] = '\0';
-
-		usb_init_task(&di_task, usb_fill_di_task, di,
-		    USB_TASK_TYPE_GENERIC);
-		usb_add_task(sc->sc_bus->root_hub, &di_task);
-		usb_wait_task(sc->sc_bus->root_hub, &di_task);
-
-		if (di->udi_devnames[0][0] == '\0')
-			return (ENXIO);
-
+		usbd_fill_deviceinfo(dev, di);
 		break;
 	}
 
@@ -775,7 +740,7 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 		usb_config_descriptor_t *cdesc;
 		struct iovec iov;
 		struct uio uio;
-		size_t len;
+		size_t len, cdesc_len;
 
 		if (addr < 1 || addr >= USB_MAX_DEVICES)
 			return (EINVAL);
@@ -790,7 +755,7 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 		    USB_TASK_TYPE_GENERIC);
 		usb_add_task(sc->sc_bus->root_hub, &udf_task);
 		usb_wait_task(sc->sc_bus->root_hub, &udf_task);
-		len = udf->udf_size;
+		len = cdesc_len = udf->udf_size;
 		cdesc = (usb_config_descriptor_t *)udf->udf_data;
 		*udf = save_udf;
 		if (cdesc == NULL)
@@ -807,7 +772,7 @@ usbioctl(dev_t devt, u_long cmd, caddr_t data, int flag, struct proc *p)
 		uio.uio_rw = UIO_READ;
 		uio.uio_procp = p;
 		error = uiomove((void *)cdesc, len, &uio);
-		free(cdesc, M_TEMP, 0);
+		free(cdesc, M_TEMP, cdesc_len);
 		return (error);
 	}
 
@@ -917,7 +882,7 @@ usb_needs_reattach(struct usbd_device *dev)
 void
 usb_schedsoftintr(struct usbd_bus *bus)
 {
-	DPRINTFN(10,("usb_schedsoftintr: polling=%d\n", bus->use_polling));
+	DPRINTFN(10,("%s: polling=%d\n", __func__, bus->use_polling));
 
 	if (bus->use_polling) {
 		bus->methods->soft_intr(bus);

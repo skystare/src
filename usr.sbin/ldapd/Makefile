@@ -1,8 +1,8 @@
-#	$OpenBSD: Makefile,v 1.15 2017/01/20 11:55:08 benno Exp $
+#	$OpenBSD: Makefile,v 1.17 2020/09/19 09:46:04 tb Exp $
 
 PROG=		ldapd
 MAN=		ldapd.8 ldapd.conf.5
-SRCS=		ber.c log.c logmsg.c control.c \
+SRCS=		log.c logmsg.c control.c \
 		util.c ldapd.c ldape.c conn.c attributes.c namespace.c \
 		btree.c filter.c search.c parse.y \
 		auth.c modify.c index.c evbuffer_tls.c \
@@ -17,7 +17,8 @@ CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
 CFLAGS+=	-Wsign-compare
 CLEANFILES+=	y.tab.h parse.c
 
-SCHEMA_FILES=	core.schema \
+SCHEMA_FILES=	bsd.schema \
+		core.schema \
 		inetorgperson.schema \
 		nis.schema
 

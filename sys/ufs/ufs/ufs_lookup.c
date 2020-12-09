@@ -1,4 +1,4 @@
-/*	$OpenBSD: ufs_lookup.c,v 1.53 2018/09/06 11:50:54 jsg Exp $	*/
+/*	$OpenBSD: ufs_lookup.c,v 1.58 2020/10/09 08:20:46 mpi Exp $	*/
 /*	$NetBSD: ufs_lookup.c,v 1.7 1996/02/09 22:36:06 christos Exp $	*/
 
 /*
@@ -496,7 +496,7 @@ found:
 		if ((DIP(dp, mode) & ISVTX) &&
 		    cred->cr_uid != 0 &&
 		    cred->cr_uid != DIP(dp, uid) &&
-		    (vdp->v_mount->mnt_flag & MNT_NOPERM) == 0 &&
+		    !vnoperm(vdp) &&
 		    DIP(VTOI(tdp), uid) != cred->cr_uid) {
 			vput(tdp);
 			return (EPERM);
@@ -671,7 +671,9 @@ ufs_makedirentry(struct inode *ip, struct componentname *cnp,
 #endif
 	newdirp->d_ino = ip->i_number;
 	newdirp->d_namlen = cnp->cn_namelen;
-	memcpy(newdirp->d_name, cnp->cn_nameptr, cnp->cn_namelen + 1);
+	memset(newdirp->d_name + (cnp->cn_namelen & ~(DIR_ROUNDUP-1)),
+	    0, DIR_ROUNDUP);
+	memcpy(newdirp->d_name, cnp->cn_nameptr, cnp->cn_namelen);
 	if (OFSFMT(ip)) {
 		newdirp->d_type = 0;
 #		if (BYTE_ORDER == LITTLE_ENDIAN)
@@ -1119,7 +1121,7 @@ ufs_dirempty(struct inode *ip, ufsino_t parentino, struct ucred *cred)
 int
 ufs_checkpath(struct inode *source, struct inode *target, struct ucred *cred)
 {
-	struct vnode *vp;
+	struct vnode *nextvp, *vp;
 	int error, rootino, namlen;
 	struct dirtemplate dirbuf;
 
@@ -1163,12 +1165,14 @@ ufs_checkpath(struct inode *source, struct inode *target, struct ucred *cred)
 		}
 		if (dirbuf.dotdot_ino == rootino)
 			break;
-		vput(vp);
-		error = VFS_VGET(vp->v_mount, dirbuf.dotdot_ino, &vp);
+		VOP_UNLOCK(vp);
+		error = VFS_VGET(vp->v_mount, dirbuf.dotdot_ino, &nextvp);
+		vrele(vp);
 		if (error) {
 			vp = NULL;
 			break;
 		}
+		vp = nextvp;
 	}
 
 out:

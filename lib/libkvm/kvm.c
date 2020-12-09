@@ -1,4 +1,4 @@
-/*	$OpenBSD: kvm.c,v 1.65 2018/05/03 16:42:07 zhuk Exp $ */
+/*	$OpenBSD: kvm.c,v 1.67 2020/10/14 19:28:22 naddy Exp $ */
 /*	$NetBSD: kvm.c,v 1.43 1996/05/05 04:31:59 gwr Exp $	*/
 
 /*-
@@ -219,11 +219,11 @@ _kvm_open(kvm_t *kd, const char *uf, const char *mf, const char *sf,
 	if (mf == 0)
 		mf = _PATH_MEM;
 
-	if ((kd->pmfd = open(mf, flag)) < 0) {
+	if ((kd->pmfd = open(mf, flag)) == -1) {
 		_kvm_syserr(kd, kd->program, "%s", mf);
 		goto failed;
 	}
-	if (fstat(kd->pmfd, &st) < 0) {
+	if (fstat(kd->pmfd, &st) == -1) {
 		_kvm_syserr(kd, kd->program, "%s", mf);
 		goto failed;
 	}
@@ -239,12 +239,12 @@ _kvm_open(kvm_t *kd, const char *uf, const char *mf, const char *sf,
 				 "%s: not physical memory device", mf);
 			goto failed;
 		}
-		if ((kd->vmfd = open(_PATH_KMEM, flag)) < 0) {
+		if ((kd->vmfd = open(_PATH_KMEM, flag)) == -1) {
 			_kvm_syserr(kd, kd->program, "%s", _PATH_KMEM);
 			goto failed;
 		}
 		kd->alive = 1;
-		if (sf != NULL && (kd->swfd = open(sf, flag)) < 0) {
+		if (sf != NULL && (kd->swfd = open(sf, flag)) == -1) {
 			_kvm_syserr(kd, kd->program, "%s", sf);
 			goto failed;
 		}
@@ -676,12 +676,13 @@ static int
 kvm_dbopen(kvm_t *kd, const char *uf)
 {
 	char dbversion[_POSIX2_LINE_MAX], kversion[_POSIX2_LINE_MAX];
-	char dbname[PATH_MAX];
+	char dbname[PATH_MAX], ufbuf[PATH_MAX];
 	struct nlist nitem;
 	size_t dbversionlen;
 	DBT rec;
 
-	uf = basename(uf);
+	strlcpy(ufbuf, uf, sizeof(ufbuf));
+	uf = basename(ufbuf);
 
 	(void)snprintf(dbname, sizeof(dbname), "%skvm_%s.db", _PATH_VARDB, uf);
 	kd->db = dbopen(dbname, O_RDONLY, 0, DB_HASH, NULL);

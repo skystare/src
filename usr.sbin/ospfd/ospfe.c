@@ -1,4 +1,4 @@
-/*	$OpenBSD: ospfe.c,v 1.102 2018/08/29 08:43:17 remi Exp $ */
+/*	$OpenBSD: ospfe.c,v 1.107 2020/11/02 00:29:58 dlg Exp $ */
 
 /*
  * Copyright (c) 2005 Claudio Jeker <claudio@openbsd.org>
@@ -466,7 +466,7 @@ ospfe_dispatch_main(int fd, short event, void *bula)
 			TAILQ_INIT(&ctl_conns);
 			control_listen();
 			if (pledge("stdio inet mcast", NULL) == -1)
-                		fatal("pledge");
+				fatal("pledge");
 			break;
 		default:
 			log_debug("ospfe_dispatch_main: error handling imsg %d",
@@ -900,7 +900,8 @@ orig_rtr_lsa(struct area *area)
 				if (ibuf_add(buf, &rtr_link, sizeof(rtr_link)))
 					fatalx("orig_rtr_lsa: ibuf_add failed");
 			}
-			if (iface->state & IF_STA_POINTTOPOINT) {
+			if ((iface->flags & IFF_UP) &&
+			    LINK_STATE_IS_UP(iface->linkstate)) {
 				log_debug("orig_rtr_lsa: stub net, "
 				    "interface %s", iface->name);
 				bzero(&rtr_link, sizeof(rtr_link));
@@ -908,11 +909,16 @@ orig_rtr_lsa(struct area *area)
 					rtr_link.id = nbr->addr.s_addr;
 					rtr_link.data = 0xffffffff;
 				} else {
-					rtr_link.id = iface->addr.s_addr;
+					rtr_link.id = iface->addr.s_addr &
+					              iface->mask.s_addr;
 					rtr_link.data = iface->mask.s_addr;
 				}
 				rtr_link.type = LINK_TYPE_STUB_NET;
-				rtr_link.metric = htons(iface->metric);
+				if (iface->dependon[0] != '\0' &&
+				    iface->depend_ok == 0)
+					rtr_link.metric = MAX_METRIC;
+				else
+					rtr_link.metric = htons(iface->metric);
 				num_links++;
 				if (ibuf_add(buf, &rtr_link, sizeof(rtr_link)))
 					fatalx("orig_rtr_lsa: ibuf_add failed");
@@ -1051,6 +1057,8 @@ orig_rtr_lsa(struct area *area)
 		/* RFC 3137: stub router support */
 		if ((oeconf->flags & OSPFD_FLAG_STUB_ROUTER || oe_nofib) &&
 		    rtr_link.type != LINK_TYPE_STUB_NET)
+			rtr_link.metric = MAX_METRIC;
+		else if (iface->dependon[0] != '\0' && iface->depend_ok == 0)
 			rtr_link.metric = MAX_METRIC;
 		else
 			rtr_link.metric = htons(iface->metric);

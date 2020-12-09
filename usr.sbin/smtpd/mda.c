@@ -1,4 +1,4 @@
-/*	$OpenBSD: mda.c,v 1.134 2018/09/04 13:04:42 gilles Exp $	*/
+/*	$OpenBSD: mda.c,v 1.141 2019/10/03 08:50:08 gilles Exp $	*/
 
 /*
  * Copyright (c) 2008 Gilles Chehade <gilles@poolp.org>
@@ -48,6 +48,7 @@
 
 struct mda_envelope {
 	TAILQ_ENTRY(mda_envelope)	 entry;
+	uint64_t			 session_id;
 	uint64_t			 id;
 	time_t				 creation;
 	char				*sender;
@@ -55,6 +56,7 @@ struct mda_envelope {
 	char				*dest;
 	char				*user;
 	char				*dispatcher;
+	char				*mda_subaddress;
 	char				*mda_exec;
 };
 
@@ -100,7 +102,7 @@ static void mda_queue_loop(uint64_t);
 static struct mda_user *mda_user(const struct envelope *);
 static void mda_user_free(struct mda_user *);
 static const char *mda_user_to_text(const struct mda_user *);
-static struct mda_envelope *mda_envelope(const struct envelope *);
+static struct mda_envelope *mda_envelope(uint64_t, const struct envelope *);
 static void mda_envelope_free(struct mda_envelope *);
 static struct mda_session * mda_session(struct mda_user *);
 static const char *mda_sysexit_to_str(int);
@@ -185,7 +187,7 @@ mda_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 		}
 
-		e = mda_envelope(&evp);
+		e = mda_envelope(u->id, &evp);
 		TAILQ_INSERT_TAIL(&u->envelopes, e, entry);
 		u->evpcount += 1;
 		stat_increment("mda.pending", 1);
@@ -240,8 +242,6 @@ mda_imsg(struct mproc *p, struct imsg *imsg)
 			return;
 		}
 
-		n = 0;
-
 		/* start queueing delivery headers */
 		if (e->sender[0])
 			/*
@@ -269,11 +269,13 @@ mda_imsg(struct mproc *p, struct imsg *imsg)
 
 		/* request parent to fork a helper process */
 		memset(&deliver, 0, sizeof deliver);
-		text_to_mailaddr(&deliver.sender, s->evp->sender);
-		text_to_mailaddr(&deliver.rcpt, s->evp->rcpt);
-		text_to_mailaddr(&deliver.dest, s->evp->dest);
+		(void)text_to_mailaddr(&deliver.sender, s->evp->sender);
+		(void)text_to_mailaddr(&deliver.rcpt, s->evp->rcpt);
+		(void)text_to_mailaddr(&deliver.dest, s->evp->dest);
 		if (s->evp->mda_exec)
 			(void)strlcpy(deliver.mda_exec, s->evp->mda_exec, sizeof deliver.mda_exec);
+		if (s->evp->mda_subaddress)
+			(void)strlcpy(deliver.mda_subaddress, s->evp->mda_subaddress, sizeof deliver.mda_subaddress);
 		(void)strlcpy(deliver.dispatcher, s->evp->dispatcher, sizeof deliver.dispatcher);
 		deliver.userinfo = s->user->userinfo;
 
@@ -344,11 +346,8 @@ mda_imsg(struct mproc *p, struct imsg *imsg)
 			error = out[0] ? out : parent_error;
 
 		syserror = NULL;
-		if (mda_sysexit) {
+		if (mda_sysexit)
 			syserror = mda_sysexit_to_str(mda_sysexit);
-			if (syserror)
-				error = syserror;
-		}
 		
 		/* update queue entry */
 		switch (mda_status) {
@@ -356,14 +355,20 @@ mda_imsg(struct mproc *p, struct imsg *imsg)
 			mda_queue_tempfail(e->id, error,
 			    ESC_OTHER_MAIL_SYSTEM_STATUS);
 			(void)snprintf(buf, sizeof buf,
-			    "Error (%s)", error);
+			    "Error (%s%s%s)",
+				       syserror ? syserror : "",
+				       syserror ? ": " : "",
+				       error);
 			mda_log(e, "TempFail", buf);
 			break;
 		case MDA_PERMFAIL:
 			mda_queue_permfail(e->id, error,
 			    ESC_OTHER_MAIL_SYSTEM_STATUS);
 			(void)snprintf(buf, sizeof buf,
-			    "Error (%s)", error);
+			    "Error (%s%s%s)",
+				       syserror ? syserror : "",
+				       syserror ? ": " : "",
+				       error);
 			mda_log(e, "PermFail", buf);
 			break;
 		case MDA_OK:
@@ -517,7 +522,7 @@ mda_getlastline(int fd, char *dst, size_t dstsz)
 	ssize_t	 len;
 	int	 out = 0;
 	
-	if (lseek(fd, 0, SEEK_SET) < 0) {
+	if (lseek(fd, 0, SEEK_SET) == -1) {
 		log_warn("warn: mda: lseek");
 		close(fd);
 		return (-1);
@@ -537,7 +542,7 @@ mda_getlastline(int fd, char *dst, size_t dstsz)
 
 	if (out) {
 		(void)strlcpy(dst, "\"", dstsz);
-		(void)strnvis(dst + 1, ln, dstsz - 2, VIS_SAFE | VIS_CSTYLE);
+		(void)strnvis(dst + 1, ln, dstsz - 2, VIS_SAFE | VIS_CSTYLE | VIS_NL);
 		(void)strlcat(dst, "\"", dstsz);
 	}
 
@@ -668,7 +673,7 @@ mda_log(const struct mda_envelope *evp, const char *prefix, const char *status)
 
 	log_info("%016"PRIx64" mda delivery evpid=%016" PRIx64 " from=<%s> to=<%s> "
 	    "%suser=%s delay=%s result=%s stat=%s",
-	    (uint64_t)0,
+	    evp->session_id,
 	    evp->id,
 	    evp->sender ? evp->sender : "",
 	    evp->dest,
@@ -788,12 +793,13 @@ mda_user_to_text(const struct mda_user *u)
 }
 
 static struct mda_envelope *
-mda_envelope(const struct envelope *evp)
+mda_envelope(uint64_t session_id, const struct envelope *evp)
 {
 	struct mda_envelope	*e;
 	char			 buf[LINE_MAX];
 
 	e = xcalloc(1, sizeof *e);
+	e->session_id = session_id;
 	e->id = evp->id;
 	e->creation = evp->creation;
 	buf[0] = '\0';
@@ -812,6 +818,8 @@ mda_envelope(const struct envelope *evp)
 	e->dispatcher = xstrdup(evp->dispatcher);
 	if (evp->mda_exec[0])
 		e->mda_exec = xstrdup(evp->mda_exec);
+	if (evp->mda_subaddress[0])
+		e->mda_subaddress = xstrdup(evp->mda_subaddress);
 	stat_increment("mda.envelope", 1);
 	return (e);
 }

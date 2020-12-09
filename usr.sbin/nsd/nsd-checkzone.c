@@ -22,7 +22,6 @@
 #include "util.h"
 #include "zonec.h"
 
-static void error(const char *format, ...) ATTR_FORMAT(printf, 1, 2);
 struct nsd nsd;
 
 /*
@@ -35,20 +34,6 @@ usage (void)
 	fprintf(stderr, "Usage: nsd-checkzone <zone name> <zone file>\n");
 	fprintf(stderr, "Version %s. Report bugs to <%s>.\n",
 		PACKAGE_VERSION, PACKAGE_BUGREPORT);
-}
-
-/*
- * Something went wrong, give error messages and exit.
- *
- */
-static void
-error(const char *format, ...)
-{
-	va_list args;
-	va_start(args, format);
-	log_vmsg(LOG_ERR, format, args);
-	va_end(args);
-	exit(1);
 }
 
 static void
@@ -76,6 +61,10 @@ check_zone(struct nsd* nsd, const char* name, const char* fname)
 	errors = zonec_read(name, fname, zone);
 	if(errors > 0) {
 		printf("zone %s file %s has %u errors\n", name, fname, errors);
+#ifdef MEMCLEAN /* otherwise, the OS collects memory pages */
+		namedb_close(nsd->db);
+		region_destroy(nsd->options->region);
+#endif
 		exit(1);
 	}
 	printf("zone %s is ok\n", name);

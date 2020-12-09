@@ -1,7 +1,7 @@
-.\"	$OpenBSD: mg.1,v 1.107 2018/08/29 07:50:16 reyk Exp $
+.\"	$OpenBSD: mg.1,v 1.118 2019/11/08 19:54:40 solene Exp $
 .\" This file is in the public domain.
 .\"
-.Dd $Mdocdate: August 29 2018 $
+.Dd $Mdocdate: November 8 2019 $
 .Dt MG 1
 .Os
 .Sh NAME
@@ -405,6 +405,10 @@ Paragraphs are delimited by <NL><NL> or <NL><TAB> or <NL><SPACE>.
 Move cursor backwards by the specified number of words.
 .It beginning-of-buffer
 Move cursor to the top of the buffer.
+If set, keep mark's position, otherwise set at current position.
+A numeric argument
+.Va n
+will move n/10th of the way from the top.
 .It beginning-of-line
 Move cursor to the beginning of the line.
 .It blink-and-insert
@@ -413,6 +417,7 @@ matching delimiter.
 For delimiters other than
 parenthesis, brackets, and braces, the character itself
 is used as its own match.
+Can be used in the startup file with the global-set-key command.
 .It bsmap-mode
 Toggle bsmap mode, where DEL and C-h are swapped.
 .It c-mode
@@ -526,6 +531,10 @@ version string.
 Stop defining a keyboard macro.
 .It end-of-buffer
 Move cursor to the end of the buffer.
+If set, keep mark's position, otherwise set at current position.
+A numeric argument
+.Va n
+will move n/10th of the way from the end.
 .It end-of-line
 Move cursor to the end of the line.
 .It enlarge-window
@@ -679,6 +688,7 @@ Bind a key mapping in the local (topmost) mode.
 Unbind a key mapping in the local (topmost) mode.
 .It make-backup-files
 Toggle generation of backup files.
+Enabled by default.
 .It make-directory
 Prompt the user for a path or directory name which is then created.
 .It mark-paragraph
@@ -884,6 +894,10 @@ Prompt and switch to a new buffer in the current window.
 Switch to buffer in another window.
 .It toggle-read-only
 Toggle the read-only flag on the current buffer.
+.It toggle-read-only-all
+Toggle the read-only flag on all non-ephemeral buffers.
+A simple toggle that switches a global read-only flag either on
+or off.
 .It transpose-chars
 Transpose the two characters in front of and under dot,
 then move forward one character.
@@ -957,7 +971,7 @@ Specific key bindings are available in dired mode.
 dired-unmark-backward
 .It RET, e, f and C-m
 dired-find-file
-.It SPC
+.It SPC, n
 dired-next-line
 .It !
 dired-shell-command
@@ -971,8 +985,8 @@ dired-do-copy
 dired-flag-file-deletion
 .It g
 dired-revert
-.It n
-dired-next-line
+.It j
+dired-goto-file
 .It o
 dired-find-file-other-window
 .It p
@@ -1015,6 +1029,8 @@ is executed.
 .It dired-find-file-other-window
 Open the file on the current line of the dired buffer in a
 different window.
+.It dired-goto-file
+Move the cursor to a file name in the dired buffer.
 .It dired-next-line
 Move the cursor to the next line.
 .It dired-other-window
@@ -1023,7 +1039,7 @@ dired buffer in another window.
 .It dired-previous-line
 Move the cursor to the previous line.
 .It dired-revert
-Refresh the dired buffer.
+Refresh the dired buffer while retaining any flags.
 .It dired-scroll-down
 Scroll down the dired buffer.
 .It dired-scroll-up
@@ -1066,9 +1082,9 @@ auto-execute *.c c-mode
 .Ed
 .Pp
 Comments can be added to the startup files by placing
-.Dq \;
+.Sq ;\&
 or
-.Dq #
+.Sq #
 as the first character of a line.
 .Sh FILES
 .Bl -tag -width /usr/share/doc/mg/tutorial -compact

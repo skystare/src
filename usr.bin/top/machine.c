@@ -1,4 +1,4 @@
-/* $OpenBSD: machine.c,v 1.91 2018/09/13 15:23:32 millert Exp $	 */
+/* $OpenBSD: machine.c,v 1.110 2020/08/26 16:21:28 kn Exp $	 */
 
 /*-
  * Copyright (c) 1994 Thorsten Lockert <tholo@sigmasoft.com>
@@ -64,7 +64,6 @@ static char	**get_proc_args(struct kinfo_proc *);
 
 struct handle {
 	struct kinfo_proc **next_proc;	/* points to next valid proc pointer */
-	int		remaining;	/* number of pointers remaining */
 };
 
 /* what we consider to be process size: */
@@ -76,26 +75,22 @@ struct handle {
 static char header[] =
 	"  PID X        PRI NICE  SIZE   RES STATE     WAIT      TIME    CPU COMMAND";
 
-/* 0123456   -- field to fill in starts at header+6 */
+/* offsets in the header line to start alternative columns */
 #define UNAME_START 6
+#define RTABLE_START 46
 
 #define Proc_format \
 	"%5d %-8.8s %3d %4d %5s %5s %-9s %-7.7s %6s %5.2f%% %s"
 
 /* process state names for the "STATE" column of the display */
-/*
- * the extra nulls in the string "run" are for adding a slash and the
- * processor number when needed
- */
-
 char	*state_abbrev[] = {
 	"", "start", "run", "sleep", "stop", "zomb", "dead", "onproc"
 };
 
 /* these are for calculating cpu state percentages */
-static int64_t	**cp_time;
-static int64_t	**cp_old;
-static int64_t	**cp_diff;
+static struct cpustats	*cp_time;
+static struct cpustats	*cp_old;
+static struct cpustats	*cp_diff;
 
 /* these are for detailing the process states */
 int process_states[8];
@@ -110,6 +105,9 @@ int64_t *cpu_states;
 char *cpustatenames[] = {
 	"user", "nice", "sys", "spin", "intr", "idle", NULL
 };
+
+/* this is for tracking which cpus are online */
+int *cpu_online;
 
 /* these are for detailing the memory statistics */
 int memory_stats[10];
@@ -139,6 +137,7 @@ static int	pageshift;	/* log base 2 of the pagesize */
 #define pagetok(size) ((size) << pageshift)
 
 int		ncpu;
+int		ncpuonline;
 int		fscale;
 
 unsigned int	maxslp;
@@ -150,7 +149,7 @@ getfscale(void)
 	size_t size = sizeof(fscale);
 
 	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]),
-	    &fscale, &size, NULL, 0) < 0)
+	    &fscale, &size, NULL, 0) == -1)
 		return (-1);
 	return fscale;
 }
@@ -170,9 +169,23 @@ getncpu(void)
 }
 
 int
+getncpuonline(void)
+{
+	int mib[] = { CTL_HW, HW_NCPUONLINE };
+	int numcpu;
+	size_t size = sizeof(numcpu);
+
+	if (sysctl(mib, sizeof(mib) / sizeof(mib[0]),
+	    &numcpu, &size, NULL, 0) == -1)
+		return (-1);
+
+	return (numcpu);
+}
+
+int
 machine_init(struct statics *statics)
 {
-	int pagesize, cpu;
+	int pagesize;
 
 	ncpu = getncpu();
 	if (ncpu == -1)
@@ -182,24 +195,14 @@ machine_init(struct statics *statics)
 	cpu_states = calloc(ncpu, CPUSTATES * sizeof(int64_t));
 	if (cpu_states == NULL)
 		err(1, NULL);
-	cp_time = calloc(ncpu, sizeof(int64_t *));
-	cp_old  = calloc(ncpu, sizeof(int64_t *));
-	cp_diff = calloc(ncpu, sizeof(int64_t *));
+	cp_time = calloc(ncpu, sizeof(*cp_time));
+	cp_old  = calloc(ncpu, sizeof(*cp_old));
+	cp_diff = calloc(ncpu, sizeof(*cp_diff));
 	if (cp_time == NULL || cp_old == NULL || cp_diff == NULL)
 		err(1, NULL);
-	for (cpu = 0; cpu < ncpu; cpu++) {
-		cp_time[cpu] = calloc(CPUSTATES, sizeof(int64_t));
-		cp_old[cpu] = calloc(CPUSTATES, sizeof(int64_t));
-		cp_diff[cpu] = calloc(CPUSTATES, sizeof(int64_t));
-		if (cp_time[cpu] == NULL || cp_old[cpu] == NULL ||
-		    cp_diff[cpu] == NULL)
-			err(1, NULL);
-	}
-
-	pbase = NULL;
-	pref = NULL;
-	onproc = -1;
-	nproc = 0;
+	cpu_online = calloc(ncpu, sizeof(*cpu_online));
+	if (cpu_online == NULL)
+		err(1, NULL);
 
 	/*
 	 * get the page size with "getpagesize" and calculate pageshift from
@@ -224,25 +227,23 @@ machine_init(struct statics *statics)
 }
 
 char *
-format_header(char *second_field, int show_threads)
+format_header(char *second_field, char *eighth_field)
 {
-	char *field_name, *thread_field = "     TID";
-	char *ptr;
-
-	if (show_threads)
-		field_name = thread_field;
-	else
-		field_name = second_field;
+	char *second_fieldp = second_field, *eighth_fieldp = eighth_field, *ptr;
 
 	ptr = header + UNAME_START;
-	while (*field_name != '\0')
-		*ptr++ = *field_name++;
+	while (*second_fieldp != '\0')
+		*ptr++ = *second_fieldp++;
+	ptr = header + RTABLE_START;
+	while (*eighth_fieldp != '\0')
+		*ptr++ = *eighth_fieldp++;
 	return (header);
 }
 
 void
 get_system_info(struct system_info *si)
 {
+	static int cpustats_mib[] = {CTL_KERN, KERN_CPUSTATS, /*fillme*/0};
 	static int sysload_mib[] = {CTL_VM, VM_LOADAVG};
 	static int uvmexp_mib[] = {CTL_VM, VM_UVMEXP};
 	static int bcstats_mib[] = {CTL_VFS, VFS_GENERIC, VFS_BCACHESTAT};
@@ -254,35 +255,21 @@ get_system_info(struct system_info *si)
 	int i;
 	int64_t *tmpstate;
 
-	if (ncpu > 1) {
-		int cp_time_mib[] = {CTL_KERN, KERN_CPTIME2, /*fillme*/0};
-
-		size = CPUSTATES * sizeof(int64_t);
-		for (i = 0; i < ncpu; i++) {
-			cp_time_mib[2] = i;
-			tmpstate = cpu_states + (CPUSTATES * i);
-			if (sysctl(cp_time_mib, 3, cp_time[i], &size, NULL, 0) < 0)
-				warn("sysctl kern.cp_time2 failed");
-			/* convert cp_time2 counts to percentages */
-			(void) percentages(CPUSTATES, tmpstate, cp_time[i],
-			    cp_old[i], cp_diff[i]);
-		}
-	} else {
-		int cp_time_mib[] = {CTL_KERN, KERN_CPTIME};
-		long cp_time_tmp[CPUSTATES];
-
-		size = sizeof(cp_time_tmp);
-		if (sysctl(cp_time_mib, 2, cp_time_tmp, &size, NULL, 0) < 0)
-			warn("sysctl kern.cp_time failed");
-		for (i = 0; i < CPUSTATES; i++)
-			cp_time[0][i] = cp_time_tmp[i];
-		/* convert cp_time counts to percentages */
-		(void) percentages(CPUSTATES, cpu_states, cp_time[0],
-		    cp_old[0], cp_diff[0]);
+	size = sizeof(*cp_time);
+	for (i = 0; i < ncpu; i++) {
+		cpustats_mib[2] = i;
+		tmpstate = cpu_states + (CPUSTATES * i);
+		if (sysctl(cpustats_mib, 3, &cp_time[i], &size, NULL, 0) == -1)
+			warn("sysctl kern.cpustats failed");
+		/* convert cpustats counts to percentages */
+		(void) percentages(CPUSTATES, tmpstate, cp_time[i].cs_time,
+		    cp_old[i].cs_time, cp_diff[i].cs_time);
+		/* note whether the cpu is online */
+		cpu_online[i] = (cp_time[i].cs_flags & CPUSTATS_ONLINE) != 0;
 	}
 
 	size = sizeof(sysload);
-	if (sysctl(sysload_mib, 2, &sysload, &size, NULL, 0) < 0)
+	if (sysctl(sysload_mib, 2, &sysload, &size, NULL, 0) == -1)
 		warn("sysctl failed");
 	infoloadp = si->load_avg;
 	for (i = 0; i < 3; i++)
@@ -291,12 +278,12 @@ get_system_info(struct system_info *si)
 
 	/* get total -- systemwide main memory usage structure */
 	size = sizeof(uvmexp);
-	if (sysctl(uvmexp_mib, 2, &uvmexp, &size, NULL, 0) < 0) {
+	if (sysctl(uvmexp_mib, 2, &uvmexp, &size, NULL, 0) == -1) {
 		warn("sysctl failed");
 		bzero(&uvmexp, sizeof(uvmexp));
 	}
 	size = sizeof(bcstats);
-	if (sysctl(bcstats_mib, 3, &bcstats, &size, NULL, 0) < 0) {
+	if (sysctl(bcstats_mib, 3, &bcstats, &size, NULL, 0) == -1) {
 		warn("sysctl failed");
 		bzero(&bcstats, sizeof(bcstats));
 	}
@@ -317,6 +304,7 @@ get_system_info(struct system_info *si)
 
 	/* set arrays and strings */
 	si->cpustates = cpu_states;
+	si->cpuonline = cpu_online;
 	si->memory = memory_stats;
 	si->last_pid = -1;
 }
@@ -327,7 +315,8 @@ struct kinfo_proc *
 getprocs(int op, int arg, int *cnt)
 {
 	size_t size;
-	int mib[6] = {CTL_KERN, KERN_PROC, 0, 0, sizeof(struct kinfo_proc), 0};
+	int mib[6] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0,
+	    sizeof(struct kinfo_proc), 0};
 	static int maxslp_mib[] = {CTL_VM, VM_MAXSLP};
 	static struct kinfo_proc *procbase;
 	int st;
@@ -336,7 +325,7 @@ getprocs(int op, int arg, int *cnt)
 	mib[3] = arg;
 
 	size = sizeof(maxslp);
-	if (sysctl(maxslp_mib, 2, &maxslp, &size, NULL, 0) < 0) {
+	if (sysctl(maxslp_mib, 2, &maxslp, &size, NULL, 0) == -1) {
 		warn("sysctl vm.maxslp failed");
 		return (0);
 	}
@@ -421,17 +410,22 @@ cmd_matches(struct kinfo_proc *proc, char *term)
 	return 0;
 }
 
-caddr_t
+struct handle *
 get_process_info(struct system_info *si, struct process_select *sel,
     int (*compare) (const void *, const void *))
 {
 	int show_idle, show_system, show_threads, show_uid, show_pid, show_cmd;
-	int hide_uid;
+	int show_rtableid, hide_rtableid, hide_uid;
 	int total_procs, active_procs;
 	struct kinfo_proc **prefp, *pp;
-	int what = KERN_PROC_KTHREAD;
+	int what = KERN_PROC_ALL;
 
-	if (sel->threads)
+	show_system = sel->system;
+	show_threads = sel->threads;
+
+	if (show_system)
+		what = KERN_PROC_KTHREAD;
+	if (show_threads)
 		what |= KERN_PROC_SHOW_THREADS;
 
 	if ((pbase = getprocs(what, 0, &nproc)) == NULL) {
@@ -450,11 +444,11 @@ get_process_info(struct system_info *si, struct process_select *sel,
 
 	/* set up flags which define what we are going to select */
 	show_idle = sel->idle;
-	show_system = sel->system;
-	show_threads = sel->threads;
 	show_uid = sel->uid != (uid_t)-1;
 	hide_uid = sel->huid != (uid_t)-1;
 	show_pid = sel->pid != (pid_t)-1;
+	show_rtableid = sel->rtableid != -1;
+	hide_rtableid = sel->hrtableid != -1;
 	show_cmd = sel->command != NULL;
 
 	/* count up process states and get pointers to interesting procs */
@@ -464,16 +458,17 @@ get_process_info(struct system_info *si, struct process_select *sel,
 	prefp = pref;
 	for (pp = pbase; pp < &pbase[nproc]; pp++) {
 		/*
-		 *  Place pointers to each valid proc structure in pref[].
-		 *  Process slots that are actually in use have a non-zero
-		 *  status field.  Processes with P_SYSTEM set are system
-		 *  processes---these get ignored unless show_system is set.
+		 * When showing threads, we want to ignore the structure
+		 * that represents the entire process, which has TID == -1
 		 */
 		if (show_threads && pp->p_tid == -1)
 			continue;
-		if (pp->p_stat != 0 &&
-		    (show_system || (pp->p_flag & P_SYSTEM) == 0) &&
-		    (show_threads || (pp->p_flag & P_THREAD) == 0)) {
+		/*
+		 * Place pointers to each valid proc structure in pref[].
+		 * Process slots that are actually in use have a non-zero
+		 * status field.
+		 */
+		if (pp->p_stat != 0) {
 			total_procs++;
 			process_states[(unsigned char) pp->p_stat]++;
 			if ((pp->p_psflags & PS_ZOMBIE) == 0 &&
@@ -482,6 +477,8 @@ get_process_info(struct system_info *si, struct process_select *sel,
 			    (!hide_uid || pp->p_ruid != sel->huid) &&
 			    (!show_uid || pp->p_ruid == sel->uid) &&
 			    (!show_pid || pp->p_pid == sel->pid) &&
+			    (!hide_rtableid || pp->p_rtableid != sel->hrtableid) &&
+			    (!show_rtableid || pp->p_rtableid == sel->rtableid) &&
 			    (!show_cmd || cmd_matches(pp, sel->command))) {
 				*prefp++ = pp;
 				active_procs++;
@@ -489,18 +486,14 @@ get_process_info(struct system_info *si, struct process_select *sel,
 		}
 	}
 
-	/* if requested, sort the "interesting" processes */
-	if (compare != NULL)
-		qsort((char *) pref, active_procs,
-		    sizeof(struct kinfo_proc *), compare);
+	qsort((char *)pref, active_procs, sizeof(struct kinfo_proc *), compare);
 	/* remember active and total counts */
 	si->p_total = total_procs;
 	si->p_active = pref_len = active_procs;
 
 	/* pass back a handle */
 	handle.next_proc = pref;
-	handle.remaining = active_procs;
-	return ((caddr_t) & handle);
+	return &handle;
 }
 
 char fmt[MAX_COLS];	/* static area where result is built */
@@ -544,45 +537,49 @@ format_comm(struct kinfo_proc *kp)
 	return (buf);
 }
 
-char *
-format_next_process(caddr_t hndl, const char *(*get_userid)(uid_t), pid_t *pid,
-    int show_threads)
+void
+skip_processes(struct handle *hndl, int n)
 {
-	char *p_wait;
+	hndl->next_proc += n;
+}
+
+char *
+format_next_process(struct handle *hndl, const char *(*get_userid)(uid_t, int),
+    int rtable, pid_t *pid)
+{
 	struct kinfo_proc *pp;
-	struct handle *hp;
 	int cputime;
 	double pct;
-	char buf[16];
+	char second_buf[16], eighth_buf[8];
 
 	/* find and remember the next proc structure */
-	hp = (struct handle *) hndl;
-	pp = *(hp->next_proc++);
-	hp->remaining--;
+	pp = *(hndl->next_proc++);
 
 	cputime = pp->p_rtime_sec + ((pp->p_rtime_usec + 500000) / 1000000);
 
 	/* calculate the base for cpu percentages */
 	pct = (double)pp->p_pctcpu / fscale;
 
-	if (pp->p_wmesg[0])
-		p_wait = pp->p_wmesg;
+	if (get_userid == NULL)
+		snprintf(second_buf, sizeof(second_buf), "%8d", pp->p_tid);
 	else
-		p_wait = "-";
+		strlcpy(second_buf, (*get_userid)(pp->p_ruid, 0),
+		    sizeof(second_buf));
 
-	if (show_threads)
-		snprintf(buf, sizeof(buf), "%8d", pp->p_tid);
+	if (rtable)
+		snprintf(eighth_buf, sizeof(eighth_buf), "%7d", pp->p_rtableid);
 	else
-		snprintf(buf, sizeof(buf), "%s", (*get_userid)(pp->p_ruid));
+		strlcpy(eighth_buf, pp->p_wmesg[0] ? pp->p_wmesg : "-",
+		    sizeof(eighth_buf));
 
 	/* format this entry */
-	snprintf(fmt, sizeof(fmt), Proc_format, pp->p_pid, buf,
+	snprintf(fmt, sizeof(fmt), Proc_format, pp->p_pid, second_buf,
 	    pp->p_priority - PZERO, pp->p_nice - NZERO,
 	    format_k(pagetok(PROCSIZE(pp))),
 	    format_k(pagetok(pp->p_vm_rssize)),
 	    (pp->p_stat == SSLEEP && pp->p_slptime > maxslp) ?
 	    "idle" : state_abbr(pp),
-	    p_wait, format_time(cputime), 100.0 * pct,
+	    eighth_buf, format_time(cputime), 100.0 * pct,
 	    printable(format_comm(pp)));
 
 	*pid = pp->p_pid;
@@ -600,6 +597,8 @@ static unsigned char sorted_state[] =
 	3,			/* stop			 */
 	1			/* zombie		 */
 };
+
+extern int rev_order;
 
 /*
  *  proc_compares - comparison functions for "qsort"
@@ -630,18 +629,25 @@ static unsigned char sorted_state[] =
 #define ORDERKEY_CMD \
 	if ((result = strcmp(p1->p_comm, p2->p_comm)) == 0)
 
+/* remove one level of indirection and set sort order */
+#define SETORDER do { \
+		if (rev_order) { \
+			p1 = *(struct kinfo_proc **) v2; \
+			p2 = *(struct kinfo_proc **) v1; \
+		} else { \
+			p1 = *(struct kinfo_proc **) v1; \
+			p2 = *(struct kinfo_proc **) v2; \
+		} \
+	} while (0)
+
 /* compare_cpu - the comparison function for sorting by cpu percentage */
 static int
 compare_cpu(const void *v1, const void *v2)
 {
-	struct proc **pp1 = (struct proc **) v1;
-	struct proc **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_PCTCPU
 	ORDERKEY_CPUTIME
@@ -657,14 +663,10 @@ compare_cpu(const void *v1, const void *v2)
 static int
 compare_size(const void *v1, const void *v2)
 {
-	struct proc **pp1 = (struct proc **) v1;
-	struct proc **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_MEM
 	ORDERKEY_RSSIZE
@@ -680,14 +682,10 @@ compare_size(const void *v1, const void *v2)
 static int
 compare_res(const void *v1, const void *v2)
 {
-	struct proc **pp1 = (struct proc **) v1;
-	struct proc **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_RSSIZE
 	ORDERKEY_MEM
@@ -703,14 +701,10 @@ compare_res(const void *v1, const void *v2)
 static int
 compare_time(const void *v1, const void *v2)
 {
-	struct proc **pp1 = (struct proc **) v1;
-	struct proc **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_CPUTIME
 	ORDERKEY_PCTCPU
@@ -726,14 +720,10 @@ compare_time(const void *v1, const void *v2)
 static int
 compare_prio(const void *v1, const void *v2)
 {
-	struct proc   **pp1 = (struct proc **) v1;
-	struct proc   **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_PRIO
 	ORDERKEY_PCTCPU
@@ -748,14 +738,10 @@ compare_prio(const void *v1, const void *v2)
 static int
 compare_pid(const void *v1, const void *v2)
 {
-	struct proc **pp1 = (struct proc **) v1;
-	struct proc **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_PID
 	ORDERKEY_PCTCPU
@@ -771,14 +757,10 @@ compare_pid(const void *v1, const void *v2)
 static int
 compare_cmd(const void *v1, const void *v2)
 {
-	struct proc **pp1 = (struct proc **) v1;
-	struct proc **pp2 = (struct proc **) v2;
 	struct kinfo_proc *p1, *p2;
 	int result;
 
-	/* remove one level of indirection */
-	p1 = *(struct kinfo_proc **) pp1;
-	p2 = *(struct kinfo_proc **) pp2;
+	SETORDER;
 
 	ORDERKEY_CMD
 	ORDERKEY_PCTCPU

@@ -1,4 +1,4 @@
-/* $OpenBSD: softraidvar.h,v 1.167 2017/06/12 16:39:51 jsing Exp $ */
+/* $OpenBSD: softraidvar.h,v 1.171 2020/07/22 13:16:04 krw Exp $ */
 /*
  * Copyright (c) 2006 Marco Peereboom <marco@peereboom.us>
  * Copyright (c) 2008 Chris Kuethe <ckuethe@openbsd.org>
@@ -313,7 +313,6 @@ SLIST_HEAD(sr_boot_volume_head, sr_boot_volume);
 /* #define SR_DEBUG */
 #ifdef SR_DEBUG
 extern u_int32_t		sr_debug;
-#define DPRINTF(x...)		do { if (sr_debug) printf(x); } while(0)
 #define DNPRINTF(n,x...)	do { if (sr_debug & n) printf(x); } while(0)
 #define	SR_D_CMD		0x0001
 #define	SR_D_INTR		0x0002
@@ -326,11 +325,9 @@ extern u_int32_t		sr_debug;
 #define	SR_D_STATE		0x0100
 #define	SR_D_REBUILD		0x0200
 #else
-#define DPRINTF(x...)
 #define DNPRINTF(n,x...)
 #endif
 
-#define	SR_MAXFER		MAXPHYS
 #define	SR_MAX_LD		256
 #define	SR_MAX_CMDS		16
 #define	SR_MAX_STATES		7
@@ -497,6 +494,7 @@ struct sr_volume {
 
 struct sr_discipline {
 	struct sr_softc		*sd_sc;		/* link back to sr softc */
+	size_t			sd_wu_size;	/* alloc and free size */
 	u_int8_t		sd_type;	/* type of discipline */
 #define	SR_MD_RAID0		0
 #define	SR_MD_RAID1		1
@@ -627,7 +625,6 @@ struct sr_softc {
 	struct ksensordev	sc_sensordev;
 	struct sensor_task	*sc_sensor_task;
 
-	struct scsi_link	sc_link;	/* scsi prototype link */
 	struct scsibus_softc	*sc_scsibus;
 
 	/* The target lookup has to be cheap since it happens for each I/O. */
@@ -650,7 +647,7 @@ void			sr_ccb_put(struct sr_ccb *);
 struct sr_ccb		*sr_ccb_rw(struct sr_discipline *, int, daddr_t,
 			    long, u_int8_t *, int, int);
 void			sr_ccb_done(struct sr_ccb *);
-int			sr_wu_alloc(struct sr_discipline *, int);
+int			sr_wu_alloc(struct sr_discipline *);
 void			sr_wu_free(struct sr_discipline *);
 void			*sr_wu_get(void *);
 void			sr_wu_put(void *, void *);

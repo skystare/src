@@ -1,4 +1,4 @@
-/*	$OpenBSD: print-udp.c,v 1.50 2018/07/10 00:38:52 dlg Exp $	*/
+/*	$OpenBSD: print-udp.c,v 1.56 2020/08/17 06:29:29 dlg Exp $	*/
 
 /*
  * Copyright (c) 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996
@@ -26,6 +26,7 @@
 
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <netinet/ip_var.h>
 #include <netinet/udp.h>
 #include <netinet/udp_var.h>
@@ -48,10 +49,6 @@
 
 #include <stdio.h>
 #include <string.h>
-
-#ifdef INET6
-#include <netinet/ip6.h>
-#endif
 
 #include "interface.h"
 #include "addrtoname.h"
@@ -118,17 +115,17 @@ vat_print(const void *hdr, u_int len, const struct udphdr *up)
 	u_int ts = *(u_short *)hdr;
 	if ((ts & 0xf060) != 0) {
 		/* probably vt */
-		(void)printf("udp/vt %u %d / %d",
-			     (u_int32_t)(ntohs(up->uh_ulen) - sizeof(*up)),
-			     ts & 0x3ff, ts >> 10);
+		printf("udp/vt %u %d / %d",
+		    (u_int32_t)(ntohs(up->uh_ulen) - sizeof(*up)),
+		    ts & 0x3ff, ts >> 10);
 	} else {
 		/* probably vat */
 		u_int i0 = ntohl(((u_int *)hdr)[0]);
 		u_int i1 = ntohl(((u_int *)hdr)[1]);
 		printf("udp/vat %u c%d %u%s",
-			(u_int32_t)(ntohs(up->uh_ulen) - sizeof(*up) - 8),
-			i0 & 0xffff,
-			i1, i0 & 0x800000? "*" : "");
+		    (u_int32_t)(ntohs(up->uh_ulen) - sizeof(*up) - 8),
+		    i0 & 0xffff,
+		    i1, i0 & 0x800000? "*" : "");
 		/* audio format */
 		if (i0 & 0x1f0000)
 			printf(" f%d", (i0 >> 16) & 0x1f);
@@ -170,13 +167,8 @@ rtp_print(const void *hdr, u_int len, const struct udphdr *up)
 		len -= 1;
 	}
 	printf(" udp/%s %d c%d %s%s %d %u",
-		ptype,
-		dlen,
-		contype,
-		(hasopt || hasext)? "+" : "",
-		hasmarker? "*" : "",
-		i0 & 0xffff,
-		i1);
+	    ptype, dlen, contype, (hasopt || hasext)? "+" : "",
+	    hasmarker? "*" : "", i0 & 0xffff, i1);
 	if (vflag) {
 		printf(" %u", i1);
 		if (hasopt) {
@@ -232,7 +224,7 @@ rtcp_print(const u_char *hdr, const u_char *ep)
 		if (len != cnt * sizeof(*rr) + sizeof(*sr) + sizeof(*rh))
 			printf(" [%d]", len);
 		if (vflag)
-		  printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
+			printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
 		if ((u_char *)(sr + 1) > ep) {
 			printf(" [|rtcp]");
 			return (ep);
@@ -250,18 +242,18 @@ rtcp_print(const u_char *hdr, const u_char *ep)
 			printf(" [%d]", len);
 		rr = (struct rtcp_rr *)(rh + 1);
 		if (vflag)
-		  printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
+			printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
 		break;
 	case RTCP_PT_SDES:
 		printf(" sdes %d", len);
 		if (vflag)
-		  printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
+			printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
 		cnt = 0;
 		break;
 	case RTCP_PT_BYE:
 		printf(" bye %d", len);
 		if (vflag)
-		  printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
+			printf(" %u", (u_int32_t)ntohl(rh->rh_ssrc));
 		cnt = 0;
 		break;
 	default:
@@ -315,14 +307,14 @@ rtcp_print(const u_char *hdr, const u_char *ep)
 #define UDPENCAP_PORT		4500		/*XXX*/
 #define GRE_PORT		4754
 #define VXLAN_PORT		4789
+#define VXLAN_GPE_PORT		4790
+#define GENEVE_PORT		6081
 #define MULTICASTDNS_PORT	5353
 #define MPLS_PORT		6635
 
-#ifdef INET6
 #define RIPNG_PORT		521		/*XXX*/
 #define DHCP6_PORT1		546		/*XXX*/
 #define DHCP6_PORT2		547		/*XXX*/
-#endif
 
 void
 udp_print(const u_char *bp, u_int length, const void *iph)
@@ -343,7 +335,6 @@ udp_print(const u_char *bp, u_int length, const void *iph)
 		ipv = ip->ip_v;
 
 		switch (ipv) {
-#ifdef INET6
 		case 6: {
 			const struct ip6_hdr *ip6 = iph;
 
@@ -356,7 +347,6 @@ udp_print(const u_char *bp, u_int length, const void *iph)
 			    sizeof(ip6->ip6_dst), cksum);
 			break;
 		}
-#endif /*INET6*/
 		case 4:
 			ipsrc = ipaddr_string(&ip->ip_src);
 			ipdst = ipaddr_string(&ip->ip_dst);
@@ -477,11 +467,17 @@ udp_print(const u_char *bp, u_int length, const void *iph)
 		case PT_VXLAN:
 			vxlan_print(cp, length);
 			break;
+		case PT_GENEVE:
+			geneve_print(cp, length);
+			break;
 		case PT_MPLS:
 			mpls_print(cp, length);
 			break;
 		case PT_TFTP:
 			tftp_print(cp, length);
+			break;
+		case PT_WIREGUARD:
+			wg_print(cp, length);
 			break;
 		}
 		return;
@@ -513,7 +509,7 @@ udp_print(const u_char *bp, u_int length, const void *iph)
 		    ((struct LAP *)cp)->type == lapDDP &&
 		    (atalk_port(sport) || atalk_port(dport))) {
 			if (vflag)
-				fputs("kip ", stdout);
+				printf("kip ");
 			atalk_print_llap(cp, length);
 			return;
 		}
@@ -566,17 +562,16 @@ udp_print(const u_char *bp, u_int length, const void *iph)
 			vqp_print(cp, length);
 		else if (ISPORT(GRE_PORT))
 			gre_print(cp, length);
-		else if (ISPORT(VXLAN_PORT))
+		else if (ISPORT(VXLAN_PORT) || ISPORT(VXLAN_GPE_PORT))
 			vxlan_print(cp, length);
+		else if (ISPORT(GENEVE_PORT))
+			geneve_print(cp, length);
 		else if (ISPORT(MPLS_PORT))
 			mpls_print(cp, length);
-#ifdef INET6
 		else if (ISPORT(RIPNG_PORT))
 			ripng_print(cp, length);
-		else if (ISPORT(DHCP6_PORT1) || ISPORT(DHCP6_PORT2)) {
-			dhcp6_print(cp, length, sport, dport);
-		}
-#endif /*INET6*/
+		else if (ISPORT(DHCP6_PORT1) || ISPORT(DHCP6_PORT2))
+			dhcp6_print(cp, length);
 		else if (ISPORT(GTP_C_PORT) || ISPORT(GTP_U_PORT) ||
 		    ISPORT(GTP_PRIME_PORT))
 			gtp_print(cp, length, sport, dport);
@@ -587,6 +582,8 @@ udp_print(const u_char *bp, u_int length, const void *iph)
 			wb_print(cp, length);
 		else if (dport == HSRP_PORT)
 			hsrp_print(cp, length);
+		else if (wg_match(cp, length))
+			wg_print(cp, length);
 		else
 			printf("udp %u", length);
 #undef ISPORT

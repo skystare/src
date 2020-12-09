@@ -1,4 +1,4 @@
-/*	$OpenBSD: locore.S,v 1.109 2018/09/12 06:12:59 guenther Exp $	*/
+/*	$OpenBSD: locore.S,v 1.122 2020/11/03 18:19:31 guenther Exp $	*/
 /*	$NetBSD: locore.S,v 1.13 2004/03/25 18:33:17 drochner Exp $	*/
 
 /*
@@ -172,7 +172,7 @@ _C_LABEL(lapic_isr):
 	.globl	_C_LABEL(ssym),_C_LABEL(esym),_C_LABEL(boothowto)
 	.globl	_C_LABEL(bootdev)
 	.globl	_C_LABEL(bootinfo), _C_LABEL(bootinfo_size), _C_LABEL(atdevbase)
-	.globl	_C_LABEL(proc0paddr),_C_LABEL(PTDpaddr)
+	.globl	_C_LABEL(proc0paddr)
 	.globl	_C_LABEL(biosbasemem)
 	.globl	_C_LABEL(bootapiver)
 	.globl	_C_LABEL(pg_nx)
@@ -198,7 +198,6 @@ _C_LABEL(atdevbase):	.quad	0	# location of start of iomem in virtual
 _C_LABEL(bootapiver):	.long	0	# /boot API version
 _C_LABEL(bootdev):	.long	0	# device we booted from
 _C_LABEL(proc0paddr):	.quad	0
-_C_LABEL(PTDpaddr):	.quad	0	# paddr of PTD, for libkvm
 #ifndef REALBASEMEM
 _C_LABEL(biosbasemem):	.long	0	# base memory reported by BIOS
 #else
@@ -214,27 +213,6 @@ _C_LABEL(pg_g_kern):	.quad	0	# 0x100 if global pages should be used
 					# in kernel mappings, 0 otherwise (for
 					# insecure CPUs)
 _C_LABEL(cpu_meltdown):	.long	0	# 1 if this CPU has Meltdown
-
-#define	_RELOC(x)	((x) - KERNBASE)
-#define	RELOC(x)	_RELOC(_C_LABEL(x))
-
-	.globl	gdt64
-
-gdt64:
-	.word	gdt64_end-gdt64_start-1
-	.quad	_RELOC(gdt64_start)
-.align 64, 0xcc
-
-gdt64_start:
-	.quad 0x0000000000000000	/* always empty */
-	.quad 0x00af9a000000ffff	/* kernel CS */
-	.quad 0x00cf92000000ffff	/* kernel DS */
-gdt64_end:
-
-/*
- * Some hackage to deal with 64bit symbols in 32 bit mode.
- * This may not be needed if things are cleaned up a little.
- */
 
 /*****************************************************************************/
 
@@ -291,8 +269,11 @@ NENTRY(lgdt)
 	pushq	%rax
 	RETGUARD_CHECK(lgdt, r11)
 	lretq
+END(lgdt)
 
+#ifdef DDB
 ENTRY(setjmp)
+	RETGUARD_SETUP(setjmp, r11)
 	/*
 	 * Only save registers that must be preserved across function
 	 * calls according to the ABI (%rbx, %rsp, %rbp, %r12-%r15)
@@ -309,22 +290,28 @@ ENTRY(setjmp)
 	movq	(%rsp),%rdx
 	movq	%rdx,56(%rax)
 	xorl	%eax,%eax
+	RETGUARD_CHECK(setjmp, r11)
 	ret
+END(setjmp)
 
 ENTRY(longjmp)
 	movq	%rdi,%rax
-	movq	(%rax),%rbx
 	movq	8(%rax),%rsp
+	movq	56(%rax),%rdx
+	movq	%rdx,(%rsp)
+	RETGUARD_SETUP(longjmp, r11)
+	movq	(%rax),%rbx
 	movq	16(%rax),%rbp
 	movq	24(%rax),%r12
 	movq	32(%rax),%r13
 	movq	40(%rax),%r14
 	movq	48(%rax),%r15
-	movq	56(%rax),%rdx
-	movq	%rdx,(%rsp)
 	xorl	%eax,%eax
 	incl	%eax
+	RETGUARD_CHECK(longjmp, r11)
 	ret
+END(longjmp)
+#endif /* DDB */
 
 /*****************************************************************************/
 
@@ -480,6 +467,8 @@ restore_saved:
 	 * interrupt trampolines.
 	 */
 	movq	PM_PDIRPA_INTEL(%rcx),%rdx
+	orq	cr3_reuse_pcid,%rax
+	orq	cr3_pcid_proc_intel,%rdx
 	movq	%rax,CPUVAR(KERN_CR3)
 	movq	%rdx,CPUVAR(USER_CR3)
 	CODEPATCH_END(CPTAG_MELTDOWN_NOP)
@@ -504,30 +493,30 @@ switch_restored:
 	popq	%rbx
 	RETGUARD_CHECK(cpu_switchto, r11)
 	ret
+END(cpu_switchto)
 
 ENTRY(cpu_idle_enter)
-	movq	_C_LABEL(cpu_idle_enter_fcn),%rax
-	cmpq	$0,%rax
-	jne	retpoline_rax
 	ret
+END(cpu_idle_enter)
 
 ENTRY(cpu_idle_leave)
-	movq	_C_LABEL(cpu_idle_leave_fcn),%rax
-	cmpq	$0,%rax
-	jne	retpoline_rax
 	ret
+END(cpu_idle_leave)
 
 /* placed here for correct static branch prediction in cpu_idle_* */
 NENTRY(retpoline_rax)
 	JMP_RETPOLINE(rax)
 
 ENTRY(cpu_idle_cycle)
+	RETGUARD_SETUP(cpu_idle_cycle, r11)
 	movq	_C_LABEL(cpu_idle_cycle_fcn),%rax
 	cmpq	$0,%rax
 	jne	retpoline_rax
 	sti
 	hlt
+	RETGUARD_CHECK(cpu_idle_cycle, r11)
 	ret
+END(cpu_idle_cycle)
 
 	.globl	_C_LABEL(panic)
 
@@ -535,6 +524,7 @@ ENTRY(cpu_idle_cycle)
 NENTRY(switch_pmcpu_set)
 	leaq	switch_active(%rip),%rdi
 	call	_C_LABEL(panic)
+END(switch_pmcpu_set)
 	/* NOTREACHED */
 
 	.section .rodata
@@ -553,9 +543,11 @@ ENTRY(savectx)
 	movq	%rbp,PCB_RBP(%rdi)
 	RETGUARD_CHECK(savectx, r11)
 	ret
+END(savectx)
 
 IDTVEC(syscall32)
 	sysret		/* go away please */
+END(Xsyscall32)
 
 /*
  * syscall insn entry.
@@ -566,7 +558,7 @@ IDTVEC(syscall32)
  * First order of business is to swap to the kernel GS.base so that
  * we can access our struct cpu_info.  After possibly mucking with
  * pagetables, we switch to our kernel stack.  Once that's in place
- * we can unblock interrupts and save the rest of the syscall frame.
+ * we can save the rest of the syscall frame and unblock interrupts.
  */
 KUTEXT_PAGE_START
  	.align	NBPG, 0xcc
@@ -577,9 +569,9 @@ XUsyscall_meltdown:
 	 * below.  For this, the Meltdown case, we use the scratch space
 	 * in cpu_info so we can switch to the kernel page tables
 	 * (thank you, Intel), at which point we'll continue at the
-	 * "movq CPUVAR(KERN_RSP),%rax" after Xsyscall below.
+	 * "SYSCALL_ENTRY" after Xsyscall below.
 	 * In case the CPU speculates past the mov to cr3, we put a
-	 * retpoline-style pause-jmp-to-pause loop.
+	 * retpoline-style pause-lfence-jmp-to-pause loop.
 	 */
 	swapgs
 	movq	%rax,CPUVAR(SCRATCH)
@@ -599,28 +591,8 @@ IDTVEC_NOALIGN(syscall_meltdown)
 IDTVEC_NOALIGN(syscall)
 	swapgs
 	movq	%rax,CPUVAR(SCRATCH)
-	movq	CPUVAR(KERN_RSP),%rax
-	xchgq	%rax,%rsp
-	movq	%rcx,TF_RCX(%rsp)
-	movq	%rcx,TF_RIP(%rsp)
-	RET_STACK_REFILL_WITH_RCX
+	SYSCALL_ENTRY			/* create trapframe */
 	sti
-
-	/*
-	 * XXX don't need this whole frame, split of the
-	 * syscall frame and trapframe is needed.
-	 * First, leave some room for the trapno, error,
-	 * ss:rsp, etc, so that all GP registers can be
-	 * saved. Then, fill in the rest.
-	 */
-	movq	$(GSEL(GUDATA_SEL, SEL_UPL)),TF_SS(%rsp)
-	movq	%rax,TF_RSP(%rsp)
-	movq	CPUVAR(SCRATCH),%rax
-	INTR_SAVE_MOST_GPRS_NO_ADJ
-	movq	%r11, TF_RFLAGS(%rsp)	/* old rflags from syscall insn */
-	movq	$(GSEL(GUCODE_SEL, SEL_UPL)), TF_CS(%rsp)
-	movq	%rax,TF_ERR(%rsp)	/* stash syscall # for SPL check */
-	INTR_CLEAR_GPRS
 
 	movq	CPUVAR(CURPROC),%r14
 	movq	%rsp,P_MD_REGS(%r14)	# save pointer to frame
@@ -660,8 +632,6 @@ IDTVEC_NOALIGN(syscall)
 .Lsyscall_restore_registers:
 	RET_STACK_REFILL_WITH_RCX
 
-	movq	TF_RDI(%rsp),%rdi
-	movq	TF_RSI(%rsp),%rsi
 	movq	TF_R8(%rsp),%r8
 	movq	TF_R9(%rsp),%r9
 	movq	TF_R10(%rsp),%r10
@@ -669,6 +639,14 @@ IDTVEC_NOALIGN(syscall)
 	movq	TF_R13(%rsp),%r13
 	movq	TF_R14(%rsp),%r14
 	movq	TF_R15(%rsp),%r15
+
+	CODEPATCH_START
+	movw	%ds,TF_R8(%rsp)
+	verw	TF_R8(%rsp)
+	CODEPATCH_END(CPTAG_MDS)
+
+	movq	TF_RDI(%rsp),%rdi
+	movq	TF_RSI(%rsp),%rsi
 	movq	TF_RBP(%rsp),%rbp
 	movq	TF_RBX(%rsp),%rbx
 
@@ -688,6 +666,7 @@ IDTVEC_NOALIGN(syscall)
 	CODEPATCH_START
 	movq	%rax,CPUVAR(SCRATCH)
 	movq	CPUVAR(USER_CR3),%rax
+	PCID_SET_REUSE_NOP
 	movq	%rax,%cr3
 Xsyscall_trampback:
 0:	pause
@@ -696,6 +675,8 @@ Xsyscall_trampback:
 	CODEPATCH_END(CPTAG_MELTDOWN_NOP)
 	swapgs
 	sysretq
+END(Xsyscall)
+END(Xsyscall_meltdown)
 KTEXT_PAGE_END
 
 KUTEXT_PAGE_START
@@ -771,6 +752,7 @@ NENTRY(proc_trampoline)
 	call	retpoline_rax
 	movq	CPUVAR(CURPROC),%r14
 	jmp	.Lsyscall_check_asts
+END(proc_trampoline)
 
 
 /*
@@ -826,8 +808,6 @@ intr_user_exit_post_ast:
 .Lintr_restore_registers:
 	RET_STACK_REFILL_WITH_RCX
 
-	movq	TF_RDI(%rsp),%rdi
-	movq	TF_RSI(%rsp),%rsi
 	movq	TF_R8(%rsp),%r8
 	movq	TF_R9(%rsp),%r9
 	movq	TF_R10(%rsp),%r10
@@ -835,6 +815,14 @@ intr_user_exit_post_ast:
 	movq	TF_R13(%rsp),%r13
 	movq	TF_R14(%rsp),%r14
 	movq	TF_R15(%rsp),%r15
+
+	CODEPATCH_START
+	movw	%ds,TF_R8(%rsp)
+	verw	TF_R8(%rsp)
+	CODEPATCH_END(CPTAG_MDS)
+
+	movq	TF_RDI(%rsp),%rdi
+	movq	TF_RSI(%rsp),%rsi
 	movq	TF_RBP(%rsp),%rbp
 	movq	TF_RBX(%rsp),%rbx
 
@@ -864,6 +852,7 @@ intr_user_exit_post_ast:
 	CODEPATCH_START
 	movq	%rax,CPUVAR(SCRATCH)
 	movq	CPUVAR(USER_CR3),%rax
+	PCID_SET_REUSE_NOP
 	movq	%rax,%cr3
 Xiretq_trampback:
 KTEXT_PAGE_END
@@ -971,6 +960,7 @@ intr_spl_lowered:
 	.asciz	"WARNING: SPL NOT LOWERED ON TRAP EXIT %x %x\n"
 	.text
 #endif /* DIAGNOSTIC */
+END(Xintr_user_exit)
 
 
 /*
@@ -1025,6 +1015,7 @@ warn_once:
 	.asciz	"WARNING: INTERRUPTS NOT BLOCKED ON INTERRUPT RETURN: 0x%x 0x%x\n"
 	.text
 #endif
+END(intr_fast_exit)
 
 /*
  * FPU/"extended CPU state" handling
@@ -1034,6 +1025,8 @@ warn_once:
  *		save current state, but retain it in the FPU
  *	void fpusavereset(sfp)
  *		save current state and reset FPU to initial/kernel state
+ *	int xsetbv_user(reg, mask)
+ *		load specifed %xcr# register, returns 0/1 if okay/it trapped
  */
 
 ENTRY(xrstor_user)
@@ -1086,6 +1079,24 @@ ENTRY(fpusavereset)
 	ret
 END(fpusavereset)
 
+ENTRY(xsetbv_user)
+	RETGUARD_SETUP(xsetbv_user, r11)
+	movl	%edi, %ecx
+	movq	%rsi, %rdx
+	movl	%esi, %eax
+	shrq	$32, %rdx
+	.globl	xsetbv_fault
+xsetbv_fault:
+	xsetbv
+	xorl	%eax, %eax
+	RETGUARD_CHECK(xsetbv_user, r11)
+	ret
+NENTRY(xsetbv_resume)
+	movl	$1, %eax
+	RETGUARD_CHECK(xsetbv_user, r11)
+	ret
+END(xsetbv_user)
+
 	.section .rodata
 	.globl	_C_LABEL(_xrstor)
 _C_LABEL(_xrstor):
@@ -1098,6 +1109,10 @@ _C_LABEL(_xsave):
 	.globl	_C_LABEL(_xsaveopt)
 _C_LABEL(_xsaveopt):
 	.byte 0x48; xsaveopt	(%rdi)		/* really xsaveopt64 */
+
+	.globl	_C_LABEL(_pcid_set_reuse)
+_C_LABEL(_pcid_set_reuse):
+	orl	$(CR3_REUSE_PCID >> 32),CPUVAR(USER_CR3 + 4)
 
 ENTRY(pagezero)
 	RETGUARD_SETUP(pagezero, r11)
@@ -1114,6 +1129,30 @@ ENTRY(pagezero)
 	sfence
 	RETGUARD_CHECK(pagezero, r11)
 	ret
+END(pagezero)
+
+/* int rdmsr_safe(u_int msr, uint64_t *data) */
+ENTRY(rdmsr_safe)
+	RETGUARD_SETUP(rdmsr_safe, r10)
+
+	movl	%edi,	%ecx	/* u_int msr */
+	.globl	rdmsr_safe_fault
+rdmsr_safe_fault:
+	rdmsr
+	salq	$32, %rdx
+	movl	%eax, %eax
+	orq	%rdx, %rax
+	movq	%rax, (%rsi)	/* *data */
+	xorq	%rax, %rax
+
+	RETGUARD_CHECK(rdmsr_safe, r10)
+	ret
+
+NENTRY(rdmsr_resume)
+	movl	$0x1, %eax
+	RETGUARD_CHECK(rdmsr_safe, r10)
+	ret
+END(rdmsr_safe)
 
 #if NXEN > 0
 	/* Hypercall page needs to be page aligned */

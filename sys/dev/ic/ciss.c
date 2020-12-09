@@ -1,4 +1,4 @@
-/*	$OpenBSD: ciss.c,v 1.75 2016/08/14 04:08:03 dlg Exp $	*/
+/*	$OpenBSD: ciss.c,v 1.89 2020/09/22 19:32:52 krw Exp $	*/
 
 /*
  * Copyright (c) 2005,2006 Michael Shalayeff
@@ -68,10 +68,9 @@ struct cfdriver ciss_cd = {
 
 void	ciss_scsi_cmd(struct scsi_xfer *xs);
 int	ciss_scsi_ioctl(struct scsi_link *, u_long, caddr_t, int);
-void	cissminphys(struct buf *bp, struct scsi_link *sl);
 
 struct scsi_adapter ciss_switch = {
-	ciss_scsi_cmd, cissminphys, NULL, NULL, ciss_scsi_ioctl
+	ciss_scsi_cmd, NULL, NULL, NULL, ciss_scsi_ioctl
 };
 
 #if NBIO > 0
@@ -354,15 +353,16 @@ ciss_attach(struct ciss_softc *sc)
 
 	sc->sc_flush = CISS_FLUSH_ENABLE;
 
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.openings = sc->maxcmd;
-	sc->sc_link.adapter = &ciss_switch;
-	sc->sc_link.luns = 1;
-	sc->sc_link.adapter_target = sc->maxunits;
-	sc->sc_link.adapter_buswidth = sc->maxunits;
-	sc->sc_link.pool = &sc->sc_iopool;
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter = &ciss_switch;
+	saa.saa_luns = 1;
+	saa.saa_adapter_target = SDEV_NO_ADAPTER_TARGET;
+	saa.saa_adapter_buswidth = sc->maxunits;
+	saa.saa_openings = sc->maxcmd;
+	saa.saa_pool = &sc->sc_iopool;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
+
 	scsibus = (struct scsibus_softc *)config_found_sm(&sc->sc_dev,
 	    &saa, scsiprint, NULL);
 
@@ -422,17 +422,6 @@ ciss_shutdown(void *v)
 	ciss_sync(sc);
 }
 
-void
-cissminphys(struct buf *bp, struct scsi_link *sl)
-{
-#if 0	/* TODO */
-#define	CISS_MAXFER	(PAGE_SIZE * (sc->maxsg + 1))
-	if (bp->b_bcount > CISS_MAXFER)
-		bp->b_bcount = CISS_MAXFER;
-#endif
-	minphys(bp);
-}
-
 /*
  * submit a command and optionally wait for completition.
  * wait arg abuses SCSI_POLL|SCSI_NOSLEEP flags to request
@@ -442,13 +431,15 @@ cissminphys(struct buf *bp, struct scsi_link *sl)
 int
 ciss_cmd(struct ciss_ccb *ccb, int flags, int wait)
 {
+	struct timespec end, now, ts;
 	struct ciss_softc *sc = ccb->ccb_sc;
 	struct ciss_cmd *cmd = &ccb->ccb_cmd;
 	struct ciss_ccb *ccb1;
 	bus_dmamap_t dmap = ccb->ccb_dmamap;
 	u_int64_t addr;
+	uint64_t nsecs;
 	u_int32_t id;
-	int i, tohz, error = 0;
+	int i, error = 0, ret;
 
 	splassert(IPL_BIO);
 
@@ -477,7 +468,7 @@ ciss_cmd(struct ciss_ccb *ccb, int flags, int wait)
 		cmd->sgin = dmap->dm_nsegs;
 
 		sgd = dmap->dm_segs;
-		CISS_DPRINTF(CISS_D_DMA, ("data=%p/%u<0x%lx/%u",
+		CISS_DPRINTF(CISS_D_DMA, ("data=%p/%zu<0x%lx/%lu",
 		    ccb->ccb_data, ccb->ccb_len, sgd->ds_addr, sgd->ds_len));
 
 		for (i = 0; i < dmap->dm_nsegs; sgd++, i++) {
@@ -488,7 +479,7 @@ ciss_cmd(struct ciss_ccb *ccb, int flags, int wait)
 			cmd->sgl[i].flags = htole32(0);
 			if (i)
 				CISS_DPRINTF(CISS_D_DMA,
-				    (",0x%lx/%u", sgd->ds_addr, sgd->ds_len));
+				    (",0x%lx/%lu", sgd->ds_addr, sgd->ds_len));
 		}
 
 		CISS_DPRINTF(CISS_D_DMA, ("> "));
@@ -518,87 +509,94 @@ ciss_cmd(struct ciss_ccb *ccb, int flags, int wait)
 	} else
 		bus_space_write_4(sc->iot, sc->ioh, CISS_INQ, ccb->ccb_cmdpa);
 
-	if (wait & SCSI_POLL) {
-		struct timeval tv;
-		int etick;
-		CISS_DPRINTF(CISS_D_CMD, ("waiting "));
+	/* If we're not waiting for completion we're done. */
+	if (!(wait & SCSI_POLL))
+		return (error);
 
-		i = ccb->ccb_xs? ccb->ccb_xs->timeout : 60000;
-		tv.tv_sec = i / 1000;
-		tv.tv_usec = (i % 1000) * 1000;
-		tohz = tvtohz(&tv);
-		if (tohz == 0)
-			tohz = 1;
-		for (i *= 100, etick = tick + tohz; i--; ) {
-			if (!(wait & SCSI_NOSLEEP)) {
-				ccb->ccb_state = CISS_CCB_POLL;
-				CISS_DPRINTF(CISS_D_CMD, ("tsleep(%d) ", tohz));
-				if (tsleep(ccb, PRIBIO + 1, "ciss_cmd",
-				    tohz) == EWOULDBLOCK) {
+	CISS_DPRINTF(CISS_D_CMD, ("waiting "));
+
+	i = ccb->ccb_xs? ccb->ccb_xs->timeout : 60000;
+
+	if (!(wait & SCSI_NOSLEEP)) {
+		NSEC_TO_TIMESPEC(MSEC_TO_NSEC(i), &ts);
+		nanouptime(&now);
+		timespecadd(&now, &ts, &end);
+
+		for (;;) {
+			ccb->ccb_state = CISS_CCB_POLL;
+			nsecs = TIMESPEC_TO_NSEC(&ts);
+			CISS_DPRINTF(CISS_D_CMD, ("tsleep_nsec(%llu) ", nsecs));
+			ret = tsleep_nsec(ccb, PRIBIO + 1, "ciss_cmd", nsecs);
+			if (ret == EWOULDBLOCK)
+				break;
+			if (ccb->ccb_state != CISS_CCB_ONQ) {
+				nanouptime(&now);
+				if (timespeccmp(&end, &now, <=))
 					break;
-				}
-				if (ccb->ccb_state != CISS_CCB_ONQ) {
-					tohz = etick - tick;
-					if (tohz <= 0)
-						break;
-					CISS_DPRINTF(CISS_D_CMD, ("T"));
-					continue;
-				}
-				ccb1 = ccb;
-			} else {
-				DELAY(10);
-
-				if (!(bus_space_read_4(sc->iot, sc->ioh,
-				    CISS_ISR) & sc->iem)) {
-					CISS_DPRINTF(CISS_D_CMD, ("N"));
-					continue;
-				}
-
-				if (sc->cfg.methods & CISS_METH_FIFO64) {
-					if (bus_space_read_4(sc->iot, sc->ioh,
-					    CISS_OUTQ64_HI) == 0xffffffff) {
-						CISS_DPRINTF(CISS_D_CMD, ("Q"));
-						continue;
-					}
-					id = bus_space_read_4(sc->iot, sc->ioh,
-					    CISS_OUTQ64_LO);
-				} else if (sc->cfg.methods &
-				    CISS_METH_FIFO64_RRO) {
-					id = bus_space_read_4(sc->iot, sc->ioh,
-					    CISS_OUTQ64_LO);
-					if (id == 0xffffffff) {
-						CISS_DPRINTF(CISS_D_CMD, ("Q"));
-						continue;
-					}
-					(void)bus_space_read_4(sc->iot,
-					    sc->ioh, CISS_OUTQ64_HI);
-				} else {
-					id = bus_space_read_4(sc->iot, sc->ioh,
-					    CISS_OUTQ);
-					if (id == 0xffffffff) {
-						CISS_DPRINTF(CISS_D_CMD, ("Q"));
-						continue;
-					}
-				}
-
-				CISS_DPRINTF(CISS_D_CMD, ("got=0x%x ", id));
-				ccb1 = sc->ccbs + (id >> 2) * sc->ccblen;
-				ccb1->ccb_cmd.id = htole32(id);
-				ccb1->ccb_cmd.id_hi = htole32(0);
+				timespecsub(&end, &now, &ts);
+				CISS_DPRINTF(CISS_D_CMD, ("T"));
+				continue;
 			}
+			ccb1 = ccb;
 
 			error = ciss_done(ccb1);
 			if (ccb1 == ccb)
 				return (error);
 		}
+	} else {
+		for (i *= 100; i--;) {
+			DELAY(10);
 
-		/* if never got a chance to be done above... */
-		ccb->ccb_err.cmd_stat = CISS_ERR_TMO;
-		error = ciss_done(ccb);
+			if (!(bus_space_read_4(sc->iot, sc->ioh,
+			    CISS_ISR) & sc->iem)) {
+				CISS_DPRINTF(CISS_D_CMD, ("N"));
+				continue;
+			}
 
-		CISS_DPRINTF(CISS_D_CMD, ("done %d:%d",
-		    ccb->ccb_err.cmd_stat, ccb->ccb_err.scsi_stat));
+			if (sc->cfg.methods & CISS_METH_FIFO64) {
+				if (bus_space_read_4(sc->iot, sc->ioh,
+				    CISS_OUTQ64_HI) == 0xffffffff) {
+					CISS_DPRINTF(CISS_D_CMD, ("Q"));
+					continue;
+				}
+				id = bus_space_read_4(sc->iot, sc->ioh,
+				    CISS_OUTQ64_LO);
+			} else if (sc->cfg.methods &
+			    CISS_METH_FIFO64_RRO) {
+				id = bus_space_read_4(sc->iot, sc->ioh,
+				    CISS_OUTQ64_LO);
+				if (id == 0xffffffff) {
+					CISS_DPRINTF(CISS_D_CMD, ("Q"));
+					continue;
+				}
+				(void)bus_space_read_4(sc->iot,
+				    sc->ioh, CISS_OUTQ64_HI);
+			} else {
+				id = bus_space_read_4(sc->iot, sc->ioh,
+				    CISS_OUTQ);
+				if (id == 0xffffffff) {
+					CISS_DPRINTF(CISS_D_CMD, ("Q"));
+					continue;
+				}
+			}
+
+			CISS_DPRINTF(CISS_D_CMD, ("got=0x%x ", id));
+			ccb1 = sc->ccbs + (id >> 2) * sc->ccblen;
+			ccb1->ccb_cmd.id = htole32(id);
+			ccb1->ccb_cmd.id_hi = htole32(0);
+
+			error = ciss_done(ccb1);
+			if (ccb1 == ccb)
+				return (error);
+		}
 	}
+
+	/* if never got a chance to be done above... */
+	ccb->ccb_err.cmd_stat = CISS_ERR_TMO;
+	error = ciss_done(ccb);
+
+	CISS_DPRINTF(CISS_D_CMD, ("done %d:%d",
+	    ccb->ccb_err.cmd_stat, ccb->ccb_err.scsi_stat));
 
 	return (error);
 }
@@ -871,7 +869,7 @@ ciss_scsi_cmd(struct scsi_xfer *xs)
 		cmd->flags |= CISS_CDB_OUT;
 	cmd->tmo = htole16(xs->timeout < 1000? 1 : xs->timeout / 1000);
 	bzero(&cmd->cdb[0], sizeof(cmd->cdb));
-	bcopy(xs->cmd, &cmd->cdb[0], CISS_MAX_CDB);
+	bcopy(&xs->cmd, &cmd->cdb[0], CISS_MAX_CDB);
 
 	lock = CISS_LOCK(sc);
 	ciss_cmd(ccb, BUS_DMA_WAITOK, xs->flags & (SCSI_POLL|SCSI_NOSLEEP));
@@ -953,7 +951,7 @@ int
 ciss_scsi_ioctl(struct scsi_link *link, u_long cmd, caddr_t addr, int flag)
 {
 #if NBIO > 0
-	return ciss_ioctl(link->adapter_softc, cmd, addr);
+	return ciss_ioctl(link->bus->sb_adapter_softc, cmd, addr);
 #else
 	return ENOTTY;
 #endif

@@ -1,7 +1,7 @@
 #! /usr/bin/perl
 
 # ex:ts=8 sw=4:
-# $OpenBSD: PkgAdd.pm,v 1.104 2018/07/10 10:37:59 espie Exp $
+# $OpenBSD: PkgAdd.pm,v 1.118 2019/12/08 10:35:17 espie Exp $
 #
 # Copyright (c) 2003-2014 Marc Espie <espie@openbsd.org>
 #
@@ -39,7 +39,7 @@ sub has_different_sig
 	if (!defined $plist->{different_sig}) {
 		my $n = OpenBSD::PackingList->from_installation($plist->pkgname)->signature;
 		my $o = $plist->signature;
-		my $r = $n->compare($o, $state->defines("SHORTENED"));
+		my $r = $n->compare($o, $state);
 		$state->print("Comparing full signature for #1 \"#2\" vs. \"#3\":",
 		    $plist->pkgname, $o->string, $n->string)
 			if $state->verbose >= 3;
@@ -101,7 +101,7 @@ sub tie_files
 		}
 		$self->{tieto} = $tied;
 		$tied->{tied} = 1;
-		$state->say("Tieing #1 to #2", $self->stringize,
+		$state->say("Tying #1 to #2", $self->stringize,
 		    $tied->stringize) if $state->verbose >= 3;
 	}
 }
@@ -112,17 +112,14 @@ our @ISA = qw(OpenBSD::AddDelete::State);
 sub handle_options
 {
 	my $state = shift;
-	$state->SUPER::handle_options('ruUzl:A:P:',
-	    '[-acinqrsUuVvxz] [-A arch] [-B pkg-destdir] [-D name[=value]]',
+	$state->SUPER::handle_options('druUzl:A:P:',
+	    '[-adcinqrsUuVvxz] [-A arch] [-B pkg-destdir] [-D name[=value]]',
 	    '[-L localbase] [-l file] [-P type] pkg-name ...');
 
 	$state->{arch} = $state->opt('A');
 
 	if ($state->opt('P')) {
-		if ($state->opt('P') eq 'cdrom') {
-			$state->{cdrom_only} = 1;
-		}
-		elsif ($state->opt('P') eq 'ftp') {
+		if ($state->opt('P') eq 'ftp') {
 			$state->{ftp_only} = 1;
 		}
 		else {
@@ -136,6 +133,10 @@ sub handle_options
 	$state->{pkglist} = $state->opt('l');
 	$state->{update} = $state->opt('u');
 	$state->{fuzzy} = $state->opt('z');
+	$state->{debug_packages} = $state->opt('d');
+	if ($state->defines('snapshot')) {
+		$state->{subst}->add('snap', 1);
+	}
 
 	if (@ARGV == 0 && !$state->{update} && !$state->{pkglist}) {
 		$state->usage("Missing pkgname");
@@ -147,6 +148,16 @@ OpenBSD::Auto::cache(cache_directory,
 		my $self = shift;
 		if (defined $ENV{PKG_CACHE}) {
 			return $ENV{PKG_CACHE};
+		} else {
+			return undef;
+		}
+	});
+
+OpenBSD::Auto::cache(debug_cache_directory,
+	sub {
+		my $self = shift;
+		if (defined $ENV{DEBUG_PKG_CACHE}) {
+			return $ENV{DEBUG_PKG_CACHE};
 		} else {
 			return undef;
 		}
@@ -201,6 +212,31 @@ OpenBSD::Auto::cache(tracker,
 	return OpenBSD::Tracker->new;
     });
 
+sub tweak_header
+{
+	my ($state, $info) = @_;
+	my $header = $state->{setheader};
+
+	if (defined $info) {
+		$header.=" ($info)";
+	}
+
+	if (!$state->progress->set_header($header)) {
+		return unless $state->verbose;
+		if (!defined $info) {
+			$header = "Adding $header";
+		}
+		if (defined $state->{lastheader} &&
+		    $header eq $state->{lastheader}) {
+			return;
+		}
+		$state->{lastheader} = $header;
+		$state->print("#1", $header);
+		$state->print("(pretending) ") if $state->{not};
+		$state->print("\n");
+	}
+}
+
 package OpenBSD::ConflictCache;
 our @ISA = (qw(OpenBSD::Cloner));
 sub new
@@ -246,24 +282,10 @@ sub setup_header
 	} else {
 		$header .= $set->print;
 	}
-	if (defined $info) {
-		$header.=" ($info)";
-	}
 
-	if (!$state->progress->set_header($header)) {
-		return unless $state->verbose;
-		if (!defined $info) {
-			$header = "Adding $header";
-		}
-		if (defined $state->{lastheader} &&
-		    $header eq $state->{lastheader}) {
-			return;
-		}
-		$state->{lastheader} = $header;
-		$state->print("#1", $header);
-		$state->print("(pretending) ") if $state->{not};
-		$state->print("\n");
-	}
+	$state->{setheader} = $header;
+
+	$state->tweak_header($info);
 }
 
 my $checked = {};
@@ -340,6 +362,9 @@ sub find_kept_handle
 	$o->{tweaked} =
 	    OpenBSD::Add::tweak_package_status($pkgname, $state);
 	$state->updater->progress_message($state, "No change in $pkgname");
+	if (defined $state->debug_cache_directory) {
+		OpenBSD::PkgAdd->may_grab_debug_for($pkgname, 1, $state);
+	}
 	delete $set->{newer}{$pkgname};
 	$n->cleanup;
 }
@@ -542,6 +567,10 @@ sub check_forward_dependencies
 		if (!$state->defines('dontmerge')) {
 			my $okay = 1;
 			for my $m (keys %$bad) {
+				if ($set->{kept}{$m}) {
+					$okay = 0;
+					next;
+				}
 				if ($set->try_merging($m, $state)) {
 					$no_merge = 0;
 				} else {
@@ -686,7 +715,7 @@ sub delete_old_packages
 		require OpenBSD::Delete;
 		try {
 			OpenBSD::Delete::delete_handle($o, $state);
-		} catchall {
+		} catch {
 			$state->errsay($_);
 			$state->fatal(partial_install(
 			    "Deinstallation of $oldname failed",
@@ -768,9 +797,8 @@ sub really_add
 		$set->setup_header($state, $handle, "extracting");
 
 		try {
-			OpenBSD::Add::perform_extraction($handle,
-			    $state);
-		} catchall {
+			OpenBSD::Add::perform_extraction($handle, $state);
+		} catch {
 			unless ($state->{interrupted}) {
 				$state->errsay($_);
 				$errors++;
@@ -799,7 +827,7 @@ sub really_add
 
 		try {
 			OpenBSD::Add::perform_installation($handle, $state);
-		} catchall {
+		} catch {
 			unless ($state->{interrupted}) {
 				$state->errsay($_);
 				$errors++;
@@ -921,10 +949,6 @@ sub process_set
 	if (newer_has_errors($set, $state)) {
 		return ();
 	}
-	if ($set->newer == 0 && $set->older_to_do == 0) {
-		$state->tracker->uptodate($set);
-		return ();
-	}
 
 	my @deps = $set->solver->solve_depends($state);
 	if ($state->verbose >= 2) {
@@ -934,6 +958,11 @@ sub process_set
 		$state->build_deptree($set, @deps);
 		$set->solver->check_for_loops($state);
 		return (@deps, $set);
+	}
+
+	if ($set->newer == 0 && $set->older_to_do == 0) {
+		$state->tracker->uptodate($set);
+		return ();
 	}
 
 	if (!$set->complete($state)) {
@@ -1023,7 +1052,59 @@ sub process_set
 	}
 	$set->cleanup;
 	$state->tracker->done($set);
+	if (defined $state->debug_cache_directory) {
+		for my $p ($set->newer_names) {
+			$self->may_grab_debug_for($p, 0, $state);
+		}
+	}
 	return ();
+}
+
+sub may_grab_debug_for
+{
+	my ($class, $orig, $kept, $state) = @_;
+	return if $orig =~ m/^debug\-/;
+	my $dbg = "debug-$orig";
+	return if $state->tracker->is_known($dbg);
+	return if OpenBSD::PackageInfo::is_installed($dbg);
+	my $d = $state->debug_cache_directory;
+	return if $kept && -f "$d/$dbg.tgz";
+	$class->grab_debug_package($d, $dbg, $state);
+}
+
+sub grab_debug_package
+{
+	my ($class, $d, $dbg, $state) = @_;
+
+	my $o = $state->locator->find($dbg);
+	return if !defined $o;
+	require OpenBSD::Temp;
+	my ($fh, $name) = OpenBSD::Temp::permanent_file($d, "debug-pkg");
+	if (!defined $fh) {
+		$state->errsay(OpenBSD::Temp->last_error);
+		return;
+	}
+	my $r = fork;
+	if (!defined $r) {
+		$state->fatal("Cannot fork: #1", $!);
+	} elsif ($r == 0) {
+		$DB::inhibit_exit = 0;
+		open(STDOUT, '>&', $fh);
+		open(STDERR, '>>', $o->{errors});
+		$o->{repository}->grab_object($o);
+	} else {
+		close($fh);
+		waitpid($r, 0);
+		my $c = $?;
+		$o->{repository}->parse_problems($o->{errors}, 1, $o);
+		if ($c == 0) {
+			rename($name, "$d/$dbg.tgz");
+		} else {
+			unlink($name);
+			$state->errsay("Grabbing debug package failed: #1",
+				$state->child_error($c));
+		}
+	}
 }
 
 sub inform_user_of_problems
@@ -1039,10 +1120,19 @@ sub inform_user_of_problems
 
 		$state->say("Couldn't find updates for #1", 
 		    join(' ', sort @cantupdate)) if @cantupdate > 0;
+		if (@cantupdate > 0) {
+			$state->{bad}++;
+		}
 	}
 	if (defined $state->{issues}) {
 		$state->say("There were some ambiguities. ".
 		    "Please run in interactive mode again.");
+	}
+	my @install = $state->tracker->cant_install_list;
+	if (@install > 0) {
+		$state->say("Couldn't install #1", 
+		    join(' ', sort @install));
+		$state->{bad}++;
 	}
 }
 

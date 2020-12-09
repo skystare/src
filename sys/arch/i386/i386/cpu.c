@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.95 2018/08/23 14:47:52 jsg Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.106 2020/11/28 18:40:01 kettenis Exp $	*/
 /* $NetBSD: cpu.c,v 1.1.2.7 2000/06/26 02:04:05 sommerfeld Exp $ */
 
 /*-
@@ -66,7 +66,6 @@
 
 #include "lapic.h"
 #include "ioapic.h"
-#include "vmm.h"
 #include "pvbus.h"
 
 #include <sys/param.h>
@@ -93,7 +92,6 @@
 #include <machine/segments.h>
 #include <machine/gdt.h>
 #include <machine/pio.h>
-#include <dev/rndvar.h>
 
 #if NLAPIC > 0
 #include <machine/apicvar.h>
@@ -133,9 +131,6 @@ void	cpu_idle_mwait_cycle(void);
 void	cpu_init_mwait(struct cpu_softc *);
 void	cpu_init_tss(struct i386tss *, void *, void *);
 void	cpu_update_nmi_cr3(vaddr_t);
-#if NVMM > 0
-void	cpu_init_vmm(struct cpu_info *ci);
-#endif /* NVMM > 0 */
 
 u_int cpu_mwait_size, cpu_mwait_states;
 
@@ -289,7 +284,7 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 	 * Allocate UPAGES contiguous pages for the idle PCB and stack.
 	 */
 
-	kstack = uvm_km_alloc(kernel_map, USPACE);
+	kstack = (vaddr_t)km_alloc(USPACE, &kv_any, &kp_dirty, &kd_nowait);
 	if (kstack == 0) {
 		if (cpunum == 0) { /* XXX */
 			panic("cpu_attach: unable to allocate idle stack for"
@@ -320,6 +315,7 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 #ifndef SMALL_KERNEL
 		cpu_ucode_apply(ci);
 #endif
+		cpu_tsx_disable(ci);
 		identifycpu(ci);
 #ifdef MTRR
 		mem_range_attach();
@@ -334,6 +330,7 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 #ifndef SMALL_KERNEL
 		cpu_ucode_apply(ci);
 #endif
+		cpu_tsx_disable(ci);
 		identifycpu(ci);
 #ifdef MTRR
 		mem_range_attach();
@@ -365,6 +362,7 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 #ifndef SMALL_KERNEL
 		cpu_ucode_apply(ci);
 #endif
+		cpu_tsx_disable(ci);
 		identifycpu(ci);
 		sched_init_cpu(ci);
 		ci->ci_next = cpu_info_list->ci_next;
@@ -386,9 +384,6 @@ cpu_attach(struct device *parent, struct device *self, void *aux)
 	}
 #endif
 
-#if NVMM > 0
-	cpu_init_vmm(ci);
-#endif /* NVMM > 0 */
 }
 
 /*
@@ -474,21 +469,26 @@ cpu_init(struct cpu_info *ci)
 }
 
 void
-cpu_init_vmm(struct cpu_info *ci)
+cpu_tsx_disable(struct cpu_info *ci)
 {
-	/*
-	 * Allocate a per-cpu VMXON region
-	 */
-	if (ci->ci_vmm_flags & CI_VMM_VMX) {
-		ci->ci_vmxon_region_pa = 0;
-		ci->ci_vmxon_region = (struct vmxon_region *)malloc(PAGE_SIZE,
-		    M_DEVBUF, M_WAITOK|M_ZERO);
-	if (!pmap_extract(pmap_kernel(), (vaddr_t)ci->ci_vmxon_region,
-	    (paddr_t *)&ci->ci_vmxon_region_pa))
-		panic("Can't locate VMXON region in phys mem\n");
+	uint64_t msr;
+	uint32_t dummy, sefflags_edx;
+
+	/* this runs before identifycpu() populates ci_feature_sefflags_edx */
+	if (cpuid_level < 0x07)
+		return;
+	CPUID_LEAF(0x7, 0, dummy, dummy, dummy, sefflags_edx);
+
+	if (strcmp(cpu_vendor, "GenuineIntel") == 0 &&
+	    (sefflags_edx & SEFF0EDX_ARCH_CAP)) {
+		msr = rdmsr(MSR_ARCH_CAPABILITIES);
+		if (msr & ARCH_CAPABILITIES_TSX_CTRL) {
+			msr = rdmsr(MSR_TSX_CTRL);
+			msr |= TSX_CTRL_RTM_DISABLE | TSX_CTRL_TSX_CPUID_CLEAR;
+			wrmsr(MSR_TSX_CTRL, msr);
+		}
 	}
 }
-
 
 void
 patinit(struct cpu_info *ci)
@@ -526,12 +526,16 @@ rdrand(void *v)
 	extern int      has_rdrand;
 	extern int      has_rdseed;
 	uint32_t r;
-	uint8_t valid;
+	uint64_t tsc = 0;
+	uint8_t valid = 0;
 	int i;
 
 	if (has_rdrand == 0 && has_rdseed == 0)
 		return;
+
 	for (i = 0; i < 4; i++) {
+		if (cpu_feature & CPUID_TSC)
+			tsc = rdtsc();
 		if (has_rdseed)
 			__asm volatile(
 			    "rdseed	%0\n\t"
@@ -542,8 +546,12 @@ rdrand(void *v)
 			    "rdrand	%0\n\t"
 			    "setc	%1\n"
 			    : "=r" (r), "=qm" (valid) );
-		if (valid)
-			enqueue_randomness(r);
+		r ^= tsc;
+		r ^= valid;		/* potential rdrand empty */
+		if (has_rdrand)
+			if (cpu_feature & CPUID_TSC)
+				r += rdtsc();	/* potential vmexit latency */
+		enqueue_randomness(r);
 	}
 
 	if (tmo)
@@ -912,3 +920,13 @@ cpu_update_nmi_cr3(vaddr_t cr3)
 	CPU_INFO_FOREACH(cii, ci)
 		ci->ci_nmi_tss->tss_cr3 = cr3;
 }
+
+#ifdef MULTIPROCESSOR
+int
+wbinvd_on_all_cpus(void)
+{
+	i386_broadcast_ipi(I386_IPI_WBINVD);
+	wbinvd();
+	return 0;
+}
+#endif

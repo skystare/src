@@ -1,4 +1,4 @@
-/*	$OpenBSD: cpu.c,v 1.24 2018/08/25 20:45:28 kettenis Exp $	*/
+/*	$OpenBSD: cpu.c,v 1.44 2020/12/04 21:18:09 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2016 Dale Rahn <drahn@dalerahn.com>
@@ -32,6 +32,7 @@
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_clock.h>
 #include <dev/ofw/ofw_regulator.h>
+#include <dev/ofw/ofw_thermal.h>
 #include <dev/ofw/fdt.h>
 
 #include <machine/cpufunc.h>
@@ -45,20 +46,35 @@
 /* CPU Identification */
 #define CPU_IMPL_ARM		0x41
 #define CPU_IMPL_CAVIUM		0x43
+#define CPU_IMPL_AMCC		0x50
 
+#define CPU_PART_CORTEX_A34	0xd02
 #define CPU_PART_CORTEX_A53	0xd03
 #define CPU_PART_CORTEX_A35	0xd04
 #define CPU_PART_CORTEX_A55	0xd05
+#define CPU_PART_CORTEX_A65	0xd06
 #define CPU_PART_CORTEX_A57	0xd07
 #define CPU_PART_CORTEX_A72	0xd08
 #define CPU_PART_CORTEX_A73	0xd09
 #define CPU_PART_CORTEX_A75	0xd0a
 #define CPU_PART_CORTEX_A76	0xd0b
+#define CPU_PART_NEOVERSE_N1	0xd0c
+#define CPU_PART_CORTEX_A77	0xd0d
+#define CPU_PART_CORTEX_A76AE	0xd0e
+#define CPU_PART_NEOVERSE_V1	0xd40
+#define CPU_PART_CORTEX_A78	0xd41
+#define CPU_PART_CORTEX_A78AE	0xd42
+#define CPU_PART_CORTEX_A65AE	0xd43
+#define CPU_PART_CORTEX_X1	0xd44
+#define CPU_PART_NEOVERSE_N2	0xd49
+#define CPU_PART_NEOVERSE_E1	0xd4a
 
 #define CPU_PART_THUNDERX_T88	0x0a1
 #define CPU_PART_THUNDERX_T81	0x0a2
 #define CPU_PART_THUNDERX_T83	0x0a3
 #define CPU_PART_THUNDERX2_T99	0x0af
+
+#define CPU_PART_X_GENE		0x000
 
 #define CPU_IMPL(midr)  (((midr) >> 24) & 0xff)
 #define CPU_PART(midr)  (((midr) >> 4) & 0xfff)
@@ -75,15 +91,27 @@ struct cpu_cores cpu_cores_none[] = {
 };
 
 struct cpu_cores cpu_cores_arm[] = {
+	{ CPU_PART_CORTEX_A34, "Cortex-A34" },
 	{ CPU_PART_CORTEX_A35, "Cortex-A35" },
 	{ CPU_PART_CORTEX_A53, "Cortex-A53" },
 	{ CPU_PART_CORTEX_A55, "Cortex-A55" },
 	{ CPU_PART_CORTEX_A57, "Cortex-A57" },
+	{ CPU_PART_CORTEX_A65, "Cortex-A65" },
+	{ CPU_PART_CORTEX_A65AE, "Cortex-A65AE" },
 	{ CPU_PART_CORTEX_A72, "Cortex-A72" },
 	{ CPU_PART_CORTEX_A73, "Cortex-A73" },
 	{ CPU_PART_CORTEX_A75, "Cortex-A75" },
 	{ CPU_PART_CORTEX_A76, "Cortex-A76" },
-	{ 0 },
+	{ CPU_PART_CORTEX_A76AE, "Cortex-A76AE" },
+	{ CPU_PART_CORTEX_A77, "Cortex-A77" },
+	{ CPU_PART_CORTEX_A78, "Cortex-A78" },
+	{ CPU_PART_CORTEX_A78AE, "Cortex-A78AE" },
+	{ CPU_PART_CORTEX_X1, "Cortex-X1" },
+	{ CPU_PART_NEOVERSE_E1, "Neoverse E1" },
+	{ CPU_PART_NEOVERSE_N1, "Neoverse N1" },
+	{ CPU_PART_NEOVERSE_N2, "Neoverse N2" },
+	{ CPU_PART_NEOVERSE_V1, "Neoverse V1" },
+	{ 0, NULL },
 };
 
 struct cpu_cores cpu_cores_cavium[] = {
@@ -91,7 +119,12 @@ struct cpu_cores cpu_cores_cavium[] = {
 	{ CPU_PART_THUNDERX_T81, "ThunderX T81" },
 	{ CPU_PART_THUNDERX_T83, "ThunderX T83" },
 	{ CPU_PART_THUNDERX2_T99, "ThunderX2 T99" },
-	{ 0 },
+	{ 0, NULL },
+};
+
+struct cpu_cores cpu_cores_amcc[] = {
+	{ CPU_PART_X_GENE, "X-Gene" },
+	{ 0, NULL },
 };
 
 /* arm cores makers */
@@ -102,7 +135,8 @@ const struct implementers {
 } cpu_implementers[] = {
 	{ CPU_IMPL_ARM,	"ARM", cpu_cores_arm },
 	{ CPU_IMPL_CAVIUM, "Cavium", cpu_cores_cavium },
-	{ 0 },
+	{ CPU_IMPL_AMCC, "Applied Micro", cpu_cores_amcc },
+	{ 0, NULL },
 };
 
 char cpu_model[64];
@@ -130,7 +164,7 @@ void
 cpu_identify(struct cpu_info *ci)
 {
 	uint64_t midr, impl, part;
-	uint64_t clidr;
+	uint64_t clidr, id;
 	uint32_t ctr, ccsidr, sets, ways, line;
 	const char *impl_name = NULL;
 	const char *part_name = NULL;
@@ -143,7 +177,7 @@ cpu_identify(struct cpu_info *ci)
 	impl = CPU_IMPL(midr);
 	part = CPU_PART(midr);
 
-	for (i = 0; cpu_implementers[i].id != 0; i++) {
+	for (i = 0; cpu_implementers[i].name; i++) {
 		if (impl == cpu_implementers[i].id) {
 			impl_name = cpu_implementers[i].name;
 			coreselecter = cpu_implementers[i].corelist;
@@ -151,7 +185,7 @@ cpu_identify(struct cpu_info *ci)
 		}
 	}
 
-	for (i = 0; coreselecter[i].id != 0; i++) {
+	for (i = 0; coreselecter[i].name; i++) {
 		if (part == coreselecter[i].id) {
 			part_name = coreselecter[i].name;
 			break;
@@ -242,16 +276,12 @@ cpu_identify(struct cpu_info *ci)
 			/* Not vulnerable. */
 			ci->ci_flush_bp = cpu_flush_bp_noop;
 			break;
-		case CPU_PART_CORTEX_A57:
-		case CPU_PART_CORTEX_A72:
-		case CPU_PART_CORTEX_A73:
-		case CPU_PART_CORTEX_A75:
 		default:
 			/*
-			 * Vulnerable; call into the firmware and hope
-			 * we're running on top of Arm Trusted
-			 * Firmware with a fix for Security Advisory
-			 * TFV 6.
+			 * Potentially vulnerable; call into the
+			 * firmware and hope we're running on top of
+			 * Arm Trusted Firmware with a fix for
+			 * Security Advisory TFV 6.
 			 */
 			ci->ci_flush_bp = cpu_flush_bp_psci;
 			break;
@@ -262,6 +292,145 @@ cpu_identify(struct cpu_info *ci)
 		ci->ci_flush_bp = cpu_flush_bp_noop;
 		break;
 	}
+
+	/*
+	 * The architecture has been updated to explicitly tell us if
+	 * we're not vulnerable.
+	 */
+
+	id = READ_SPECIALREG(id_aa64pfr0_el1);
+	if (ID_AA64PFR0_CSV2(id) >= ID_AA64PFR0_CSV2_IMPL)
+		ci->ci_flush_bp = cpu_flush_bp_noop;
+
+	/*
+	 * Print CPU features encoded in the ID registers.
+	 */
+
+	printf("\n%s: ", ci->ci_dev->dv_xname);
+
+	/*
+	 * ID_AA64ISAR0
+	 */
+	id = READ_SPECIALREG(id_aa64isar0_el1);
+	sep = "";
+
+	if (ID_AA64ISAR0_DP(id) >= ID_AA64ISAR0_DP_IMPL) {
+		printf("%sDP", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_SM4(id) >= ID_AA64ISAR0_SM4_IMPL) {
+		printf("%sSM4", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_SM3(id) >= ID_AA64ISAR0_SM3_IMPL) {
+		printf("%sSM3", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_SHA3(id) >= ID_AA64ISAR0_SHA3_IMPL) {
+		printf("%sSHA3", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_RDM(id) >= ID_AA64ISAR0_RDM_IMPL) {
+		printf("%sRDM", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_ATOMIC(id) >= ID_AA64ISAR0_ATOMIC_IMPL) {
+		printf("%sAtomic", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_CRC32(id) >= ID_AA64ISAR0_CRC32_BASE) {
+		printf("%sCRC32", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_SHA2(id) >= ID_AA64ISAR0_SHA2_BASE) {
+		printf("%sSHA2", sep);
+		sep = ",";
+	}
+	if (ID_AA64ISAR0_SHA2(id) >= ID_AA64ISAR0_SHA2_512)
+		printf("+SHA512");
+
+	if (ID_AA64ISAR0_SHA1(id) >= ID_AA64ISAR0_SHA1_BASE) {
+		printf("%sSHA1", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64ISAR0_AES(id) >= ID_AA64ISAR0_AES_BASE) {
+		printf("%sAES", sep);
+		sep = ",";
+	}
+	if (ID_AA64ISAR0_AES(id) >= ID_AA64ISAR0_AES_PMULL)
+		printf("+PMULL");
+
+	/*
+	 * ID_AA64ISAR1
+	 */
+	id = READ_SPECIALREG(id_aa64isar1_el1);
+
+	if (ID_AA64ISAR1_DPB(id) >= ID_AA64ISAR1_DPB_IMPL) {
+		printf("%sDPB", sep);
+		sep = ",";
+	}
+
+	/*
+	 * ID_AA64MMFR1
+	 *
+	 * We omit printing virtualization related fields like XNX, VH
+	 * and VMIDBits as they are not really relevant for us.
+	 */
+	id = READ_SPECIALREG(id_aa64mmfr1_el1);
+
+	if (ID_AA64MMFR1_SPECSEI(id) >= ID_AA64MMFR1_SPECSEI_IMPL) {
+		printf("%sSpecSEI", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64MMFR1_PAN(id) >= ID_AA64MMFR1_PAN_IMPL) {
+		printf("%sPAN", sep);
+		sep = ",";
+	}
+	if (ID_AA64MMFR1_PAN(id) >= ID_AA64MMFR1_PAN_ATS1E1)
+		printf("+ATS1E1");
+
+	if (ID_AA64MMFR1_LO(id) >= ID_AA64MMFR1_LO_IMPL) {
+		printf("%sLO", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64MMFR1_HPDS(id) >= ID_AA64MMFR1_HPDS_IMPL) {
+		printf("%sHPDS", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64MMFR1_HAFDBS(id) >= ID_AA64MMFR1_HAFDBS_AF) {
+		printf("%sHAF", sep);
+		sep = ",";
+	}
+	if (ID_AA64MMFR1_HAFDBS(id) >= ID_AA64MMFR1_HAFDBS_AF_DBS)
+		printf("DBS");
+
+	/*
+	 * ID_AA64PFR0
+	 */
+	id = READ_SPECIALREG(id_aa64pfr0_el1);
+
+	if (ID_AA64PFR0_CSV3(id) >= ID_AA64PFR0_CSV3_IMPL) {
+		printf("%sCSV3", sep);
+		sep = ",";
+	}
+
+	if (ID_AA64PFR0_CSV2(id) >= ID_AA64PFR0_CSV2_IMPL) {
+		printf("%sCSV2", sep);
+		sep = ",";
+	}
+	if (ID_AA64PFR0_CSV2(id) >= ID_AA64PFR0_CSV2_SCXT)
+		printf("+SCTX");
 }
 
 int	cpu_hatch_secondary(struct cpu_info *ci, int, uint64_t);
@@ -290,6 +459,7 @@ cpu_attach(struct device *parent, struct device *dev, void *aux)
 	struct fdt_attach_args *faa = aux;
 	struct cpu_info *ci;
 	uint64_t mpidr = READ_SPECIALREG(mpidr_el1);
+	uint64_t id_aa64mmfr1, sctlr;
 	uint32_t opp;
 
 	KASSERT(faa->fa_nreg > 0);
@@ -360,6 +530,14 @@ cpu_attach(struct device *parent, struct device *dev, void *aux)
 		if (OF_getproplen(ci->ci_node, "clocks") > 0) {
 			cpu_node = ci->ci_node;
 			cpu_cpuspeed = cpu_clockspeed;
+		}
+
+		/* Enable PAN. */
+		id_aa64mmfr1 = READ_SPECIALREG(id_aa64mmfr1_el1);
+		if (ID_AA64MMFR1_PAN(id_aa64mmfr1) >= ID_AA64MMFR1_PAN_IMPL) {
+			sctlr = READ_SPECIALREG(sctlr_el1);
+			sctlr &= ~SCTLR_SPAN;
+			WRITE_SPECIALREG(sctlr_el1, sctlr);
 		}
 
 		/* Initialize debug registers. */
@@ -491,6 +669,7 @@ cpu_boot_secondary(struct cpu_info *ci)
 void
 cpu_start_secondary(struct cpu_info *ci)
 {
+	uint64_t id_aa64mmfr1, sctlr;
 	uint64_t tcr;
 	int s;
 
@@ -512,6 +691,14 @@ cpu_start_secondary(struct cpu_info *ci)
 	tcr |= TCR_T0SZ(64 - USER_SPACE_BITS);
 	tcr |= TCR_A1;
 	WRITE_SPECIALREG(tcr_el1, tcr);
+
+	/* Enable PAN. */
+	id_aa64mmfr1 = READ_SPECIALREG(id_aa64mmfr1_el1);
+	if (ID_AA64MMFR1_PAN(id_aa64mmfr1) >= ID_AA64MMFR1_PAN_IMPL) {
+		sctlr = READ_SPECIALREG(sctlr_el1);
+		sctlr &= ~SCTLR_SPAN;
+		WRITE_SPECIALREG(sctlr_el1, sctlr);
+	}
 
 	/* Initialize debug registers. */
 	WRITE_SPECIALREG(mdscr_el1, DBG_MDSCR_TDCC);
@@ -584,13 +771,18 @@ void	cpu_opp_mountroot(struct device *);
 void	cpu_opp_dotask(void *);
 void	cpu_opp_setperf(int);
 
+uint32_t cpu_opp_get_cooling_level(void *, uint32_t *);
+void	cpu_opp_set_cooling_level(void *, uint32_t *, uint32_t);
+
 void
 cpu_opp_init(struct cpu_info *ci, uint32_t phandle)
 {
 	struct opp_table *ot;
+	struct cooling_device *cd;
 	int count, node, child;
+	uint32_t opp_hz, opp_microvolt;
 	uint32_t values[3];
-	int i, len;
+	int i, j, len;
 
 	LIST_FOREACH(ot, &opp_tables, ot_list) {
 		if (ot->ot_phandle == phandle) {
@@ -625,23 +817,27 @@ cpu_opp_init(struct cpu_info *ci, uint32_t phandle)
 	for (child = OF_child(node); child != 0; child = OF_peer(child)) {
 		if (OF_getproplen(child, "turbo-mode") == 0)
 			continue;
-		ot->ot_opp[count].opp_hz =
-		    OF_getpropint64(child, "opp-hz", 0);
+		opp_hz = OF_getpropint64(child, "opp-hz", 0);
 		len = OF_getpropintarray(child, "opp-microvolt",
 		    values, sizeof(values));
+		opp_microvolt = 0;
 		if (len == sizeof(uint32_t) || len == 3 * sizeof(uint32_t))
-			ot->ot_opp[count].opp_microvolt = values[0];
+			opp_microvolt = values[0];
+
+		/* Insert into the array, keeping things sorted. */
+		for (i = 0; i < count; i++) {
+			if (opp_hz < ot->ot_opp[i].opp_hz)
+				break;
+		}
+		for (j = count; j > i; j--)
+			ot->ot_opp[j] = ot->ot_opp[j - 1];
+		ot->ot_opp[i].opp_hz = opp_hz;
+		ot->ot_opp[i].opp_microvolt = opp_microvolt;
 		count++;
 	}
 
 	ot->ot_opp_hz_min = ot->ot_opp[0].opp_hz;
-	ot->ot_opp_hz_max = ot->ot_opp[0].opp_hz;
-	for (i = 1; i < ot->ot_nopp; i++) {
-		if (ot->ot_opp[i].opp_hz < ot->ot_opp_hz_min)
-			ot->ot_opp_hz_min = ot->ot_opp[i].opp_hz;
-		if (ot->ot_opp[i].opp_hz > ot->ot_opp_hz_max)
-			ot->ot_opp_hz_max = ot->ot_opp[i].opp_hz;
-	}
+	ot->ot_opp_hz_max = ot->ot_opp[count - 1].opp_hz;
 
 	if (OF_getproplen(node, "opp-shared") == 0)
 		ot->ot_master = ci;
@@ -649,7 +845,15 @@ cpu_opp_init(struct cpu_info *ci, uint32_t phandle)
 	LIST_INSERT_HEAD(&opp_tables, ot, ot_list);
 
 	ci->ci_opp_table = ot;
+	ci->ci_opp_max = ot->ot_nopp - 1;
 	ci->ci_cpu_supply = OF_getpropint(ci->ci_node, "cpu-supply", 0);
+
+	cd = malloc(sizeof(struct cooling_device), M_DEVBUF, M_ZERO | M_WAITOK);
+	cd->cd_node = ci->ci_node;
+	cd->cd_cookie = ci;
+	cd->cd_get_level = cpu_opp_get_cooling_level;
+	cd->cd_set_level = cpu_opp_set_cooling_level;
+	cooling_device_register(cd);
 
 	/*
 	 * Do addional checks at mountroot when all the clocks and
@@ -682,6 +886,9 @@ cpu_opp_mountroot(struct device *self)
 		if (ot->ot_master && ot->ot_master != ci)
 			continue;
 
+		/* PWM regulators may need to be explicitly enabled. */
+		regulator_enable(ci->ci_cpu_supply);
+
 		curr_hz = clock_get_frequency(ci->ci_node, NULL);
 		curr_microvolt = regulator_get_voltage(ci->ci_cpu_supply);
 
@@ -697,8 +904,8 @@ cpu_opp_mountroot(struct device *self)
 		}
 
 		/* Disable if regulator isn't implemented. */
-		error = ENODEV;
-		if (curr_microvolt != 0)
+		error = ci->ci_cpu_supply ? ENODEV : 0;
+		if (ci->ci_cpu_supply && curr_microvolt != 0)
 			error = regulator_set_voltage(ci->ci_cpu_supply,
 			    curr_microvolt);
 		if (error) {
@@ -730,7 +937,7 @@ cpu_opp_mountroot(struct device *self)
 		cpu_setperf = cpu_opp_setperf;
 
 		perflevel = (level > 0) ? level : 0;
-		cpu_setperf(level);
+		cpu_setperf(perflevel);
 	}
 }
 
@@ -754,7 +961,7 @@ cpu_opp_dotask(void *arg)
 		if (ot->ot_master && ot->ot_master != ci)
 			continue;
 
-		opp_idx = ci->ci_opp_idx;
+		opp_idx = MIN(ci->ci_opp_idx, ci->ci_opp_max);
 		opp_hz = ot->ot_opp[opp_idx].opp_hz;
 		opp_microvolt = ot->ot_opp[opp_idx].opp_microvolt;
 
@@ -763,8 +970,8 @@ cpu_opp_dotask(void *arg)
 
 		if (error == 0 && opp_hz < curr_hz)
 			error = clock_set_frequency(ci->ci_node, NULL, opp_hz);
-		if (error == 0 && opp_microvolt != 0 &&
-		    opp_microvolt != curr_microvolt) {
+		if (error == 0 && ci->ci_cpu_supply &&
+		    opp_microvolt != 0 && opp_microvolt != curr_microvolt) {
 			error = regulator_set_voltage(ci->ci_cpu_supply,
 			    opp_microvolt);
 		}
@@ -786,8 +993,7 @@ cpu_opp_setperf(int level)
 		struct opp_table *ot = ci->ci_opp_table;
 		uint64_t min, max;
 		uint64_t level_hz, opp_hz;
-		uint32_t opp_microvolt;
-		int opp_idx;
+		int opp_idx = -1;
 		int i;
 
 		if (ot == NULL)
@@ -803,10 +1009,15 @@ cpu_opp_setperf(int level)
 		opp_hz = min;
 		for (i = 0; i < ot->ot_nopp; i++) {
 			if (ot->ot_opp[i].opp_hz <= level_hz &&
-			    ot->ot_opp[i].opp_hz >= opp_hz) {
+			    ot->ot_opp[i].opp_hz >= opp_hz)
 				opp_hz = ot->ot_opp[i].opp_hz;
-				opp_microvolt = ot->ot_opp[i].opp_microvolt;
+		}
+
+		/* Find index of selected operating point. */
+		for (i = 0; i < ot->ot_nopp; i++) {
+			if (ot->ot_opp[i].opp_hz == opp_hz) {
 				opp_idx = i;
+				break;
 			}
 		}
 		KASSERT(opp_idx >= 0);
@@ -819,4 +1030,30 @@ cpu_opp_setperf(int level)
 	 * regulators might need process context.
 	 */
 	task_add(systq, &cpu_opp_task);
+}
+
+uint32_t
+cpu_opp_get_cooling_level(void *cookie, uint32_t *cells)
+{
+	struct cpu_info *ci = cookie;
+	struct opp_table *ot = ci->ci_opp_table;
+	
+	return ot->ot_nopp - ci->ci_opp_max - 1;
+}
+
+void
+cpu_opp_set_cooling_level(void *cookie, uint32_t *cells, uint32_t level)
+{
+	struct cpu_info *ci = cookie;
+	struct opp_table *ot = ci->ci_opp_table;
+	int opp_max;
+
+	if (level > (ot->ot_nopp - 1))
+		level = ot->ot_nopp - 1;
+
+	opp_max = (ot->ot_nopp - level - 1);
+	if (ci->ci_opp_max != opp_max) {
+		ci->ci_opp_max = opp_max;
+		task_add(systq, &cpu_opp_task);
+	}
 }

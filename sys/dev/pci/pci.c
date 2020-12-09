@@ -1,4 +1,4 @@
-/*	$OpenBSD: pci.c,v 1.112 2018/07/28 15:28:51 kettenis Exp $	*/
+/*	$OpenBSD: pci.c,v 1.119 2020/09/08 20:13:52 kettenis Exp $	*/
 /*	$NetBSD: pci.c,v 1.31 1997/06/06 23:48:04 thorpej Exp $	*/
 
 /*
@@ -53,6 +53,13 @@ void pci_suspend(struct pci_softc *);
 void pci_powerdown(struct pci_softc *);
 void pci_resume(struct pci_softc *);
 
+struct msix_vector {
+	uint32_t mv_ma;
+	uint32_t mv_mau32;
+	uint32_t mv_md;
+	uint32_t mv_vc;
+};
+
 #define NMAPREG			((PCI_MAPREG_END - PCI_MAPREG_START) / \
 				    sizeof(pcireg_t))
 struct pci_dev {
@@ -68,6 +75,8 @@ struct pci_dev {
 	pcireg_t pd_msi_ma;
 	pcireg_t pd_msi_mau32;
 	pcireg_t pd_msi_md;
+	pcireg_t pd_msix_mc;
+	struct msix_vector *pd_msix_table;
 	int pd_pmcsr_state;
 	int pd_vga_decode;
 };
@@ -271,6 +280,9 @@ pci_suspend(struct pci_softc *sc)
 			}
 			pd->pd_msi_mc = reg;
 		}
+
+		pci_suspend_msix(sc->sc_pc, pd->pd_tag, sc->sc_memt,
+		    &pd->pd_msix_mc, pd->pd_msix_table);
 	}
 }
 
@@ -354,6 +366,9 @@ pci_resume(struct pci_softc *sc)
 			pci_conf_write(sc->sc_pc, pd->pd_tag,
 			    off + PCI_MSI_MC, pd->pd_msi_mc);
 		}
+
+		pci_resume_msix(sc->sc_pc, pd->pd_tag, sc->sc_memt,
+		    pd->pd_msix_mc, pd->pd_msix_table);
 	}
 }
 
@@ -531,6 +546,8 @@ pci_probe_device(struct pci_softc *sc, pcitag_t tag,
 			return (0);
 		}
 
+		pd->pd_msix_table = pci_alloc_msix_table(sc->sc_pc, pd->pd_tag);
+
 		s = splhigh();
 		csr = pci_conf_read(pc, tag, PCI_COMMAND_STATUS_REG);
 		if (csr & (PCI_COMMAND_IO_ENABLE | PCI_COMMAND_MEM_ENABLE))
@@ -574,6 +591,7 @@ pci_detach_devices(struct pci_softc *sc, int flags)
 		return (ret);
 
 	for (pd = LIST_FIRST(&sc->sc_devs); pd != NULL; pd = next) {
+		pci_free_msix_table(sc->sc_pc, pd->pd_tag, pd->pd_msix_table);
 		next = LIST_NEXT(pd, pd_next);
 		free(pd, M_DEVBUF, sizeof *pd);
 	}
@@ -654,6 +672,38 @@ pci_get_ht_capability(pci_chipset_tag_t pc, pcitag_t tag, int capid,
 			return (1);
 		}
 		ofs = PCI_CAPLIST_NEXT(reg);
+	}
+
+	return (0);
+}
+
+int
+pci_get_ext_capability(pci_chipset_tag_t pc, pcitag_t tag, int capid,
+    int *offset, pcireg_t *value)
+{
+	pcireg_t reg;
+	unsigned int ofs;
+
+	/* Make sure this is a PCI Express device. */
+	if (pci_get_capability(pc, tag, PCI_CAP_PCIEXPRESS, NULL, NULL) == 0)
+		return (0);
+
+	/* Scan PCI Express extended capabilities. */
+	ofs = PCI_PCIE_ECAP;
+	while (ofs != 0) {
+#ifdef DIAGNOSTIC
+		if ((ofs & 3) || (ofs < PCI_PCIE_ECAP))
+			panic("pci_get_ext_capability");
+#endif
+		reg = pci_conf_read(pc, tag, ofs);
+		if (PCI_PCIE_ECAP_ID(reg) == capid) {
+			if (offset)
+				*offset = ofs;
+			if (value)
+				*value = reg;
+			return (1);
+		}
+		ofs = PCI_PCIE_ECAP_NEXT(reg);
 	}
 
 	return (0);
@@ -911,7 +961,7 @@ pci_reserve_resources(struct pci_attach_args *pa)
 			    base, size, EX_NOWAIT) &&
 			    pa->pa_memex && extent_alloc_region(pa->pa_memex,
 			    base, size, EX_NOWAIT)) {
-				printf("%d:%d:%d: mem address conflict 0x%lx/0x%lx\n",
+				printf("%d:%d:%d: rom address conflict 0x%lx/0x%lx\n",
 				    bus, dev, func, base, size);
 				pci_conf_write(pc, tag, PCI_ROM_REG, 0);
 			}
@@ -1013,10 +1063,11 @@ pci_vpd_read(pci_chipset_tag_t pc, pcitag_t tag, int offset, int count,
 	int ofs, i, j;
 
 	KASSERT(data != NULL);
-	KASSERT((offset + count) < 0x7fff);
+	if ((offset + count) >= PCI_VPD_ADDRESS_MASK)
+		return (EINVAL);
 
 	if (pci_get_capability(pc, tag, PCI_CAP_VPD, &ofs, &reg) == 0)
-		return (1);
+		return (ENXIO);
 
 	for (i = 0; i < count; offset += sizeof(*data), i++) {
 		reg &= 0x0000ffff;
@@ -1031,7 +1082,7 @@ pci_vpd_read(pci_chipset_tag_t pc, pcitag_t tag, int offset, int count,
 		j = 0;
 		do {
 			if (j++ == 20)
-				return (1);
+				return (EIO);
 			delay(4);
 			reg = pci_conf_read(pc, tag, ofs);
 		} while ((reg & PCI_VPD_OPFLAG) == 0);
@@ -1185,6 +1236,7 @@ pciioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
 		break;
 	case PCIOCGETROMLEN:
 	case PCIOCGETROM:
+	case PCIOCGETVPD:
 		break;
 	case PCIOCGETVGA:
 	case PCIOCSETVGA:
@@ -1351,6 +1403,40 @@ pciioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
 		break;
 	}
 
+	case PCIOCGETVPD: {
+		struct pci_vpd_req *pv = (struct pci_vpd_req *)data;
+		pcireg_t *data;
+		size_t len;
+		unsigned int i;
+		int s;
+
+		CTASSERT(sizeof(*data) == sizeof(*pv->pv_data));
+
+		data = mallocarray(pv->pv_count, sizeof(*data), M_TEMP,
+		    M_WAITOK|M_CANFAIL);
+		if (data == NULL) {
+			error = ENOMEM;
+			break;
+		}
+
+		s = splhigh();
+		error = pci_vpd_read(pc, tag, pv->pv_offset, pv->pv_count,
+		    data);
+		splx(s);
+
+		len = pv->pv_count * sizeof(*pv->pv_data);
+
+		if (error == 0) {
+			for (i = 0; i < pv->pv_count; i++)
+				data[i] = letoh32(data[i]);
+
+			error = copyout(data, pv->pv_data, len);
+		}
+
+		free(data, M_TEMP, len);
+		break;
+	}
+
 	case PCIOCGETVGA:
 	{
 		struct pci_vga *vga = (struct pci_vga *)data;
@@ -1401,8 +1487,8 @@ pciioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
 		while (pci_vga_proc != p && pci_vga_proc != NULL) {
 			if (vga->pv_lock == PCI_VGA_TRYLOCK)
 				return (EBUSY);
-			error = tsleep(&pci_vga_proc, PLOCK | PCATCH,
-			    "vgalk", 0);
+			error = tsleep_nsec(&pci_vga_proc, PLOCK | PCATCH,
+			    "vgalk", INFSLP);
 			if (error)
 				return (error);
 		}
@@ -1509,3 +1595,145 @@ pci_primary_vga(struct pci_attach_args *pa)
 
 	return (1);
 }
+
+#ifdef __HAVE_PCI_MSIX
+
+struct msix_vector *
+pci_alloc_msix_table(pci_chipset_tag_t pc, pcitag_t tag)
+{
+	struct msix_vector *table;
+	pcireg_t reg;
+	int tblsz;
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, NULL, &reg) == 0)
+		return NULL;
+
+	tblsz = PCI_MSIX_MC_TBLSZ(reg) + 1;
+	table = mallocarray(tblsz, sizeof(*table), M_DEVBUF, M_WAITOK);
+
+	return table;
+}
+
+void
+pci_free_msix_table(pci_chipset_tag_t pc, pcitag_t tag,
+    struct msix_vector *table)
+{
+	pcireg_t reg;
+	int tblsz;
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, NULL, &reg) == 0)
+		return;
+
+	tblsz = PCI_MSIX_MC_TBLSZ(reg) + 1;
+	free(table, M_DEVBUF, tblsz * sizeof(*table));
+}
+
+void
+pci_suspend_msix(pci_chipset_tag_t pc, pcitag_t tag,
+    bus_space_tag_t memt, pcireg_t *mc, struct msix_vector *table)
+{
+	bus_space_handle_t memh;
+	pcireg_t reg;
+	int tblsz, i;
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, NULL, &reg) == 0)
+		return;
+
+	KASSERT(table != NULL);
+
+	if (pci_msix_table_map(pc, tag, memt, &memh))
+		return;
+
+	tblsz = PCI_MSIX_MC_TBLSZ(reg) + 1;
+	for (i = 0; i < tblsz; i++) {
+		table[i].mv_ma = bus_space_read_4(memt, memh, PCI_MSIX_MA(i));
+		table[i].mv_mau32 = bus_space_read_4(memt, memh,
+		    PCI_MSIX_MAU32(i));
+		table[i].mv_md = bus_space_read_4(memt, memh, PCI_MSIX_MD(i));
+		table[i].mv_vc = bus_space_read_4(memt, memh, PCI_MSIX_VC(i));
+	}
+
+	pci_msix_table_unmap(pc, tag, memt, memh);
+	
+	*mc = reg;
+}
+
+void
+pci_resume_msix(pci_chipset_tag_t pc, pcitag_t tag,
+    bus_space_tag_t memt, pcireg_t mc, struct msix_vector *table)
+{
+	bus_space_handle_t memh;
+	pcireg_t reg;
+	int tblsz, i;
+	int off;
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, &reg) == 0)
+		return;
+
+	KASSERT(table != NULL);
+
+	if (pci_msix_table_map(pc, tag, memt, &memh))
+		return;
+
+	tblsz = PCI_MSIX_MC_TBLSZ(reg) + 1;
+	for (i = 0; i < tblsz; i++) {
+		bus_space_write_4(memt, memh, PCI_MSIX_MA(i), table[i].mv_ma);
+		bus_space_write_4(memt, memh, PCI_MSIX_MAU32(i),
+		    table[i].mv_mau32);
+		bus_space_write_4(memt, memh, PCI_MSIX_MD(i), table[i].mv_md);
+		bus_space_barrier(memt, memh, PCI_MSIX_MA(i), 16,
+		    BUS_SPACE_BARRIER_WRITE);
+		bus_space_write_4(memt, memh, PCI_MSIX_VC(i), table[i].mv_vc);
+		bus_space_barrier(memt, memh, PCI_MSIX_VC(i), 4,
+		    BUS_SPACE_BARRIER_WRITE);
+	}
+
+	pci_msix_table_unmap(pc, tag, memt, memh);
+
+	pci_conf_write(pc, tag, off, mc);
+}
+
+int
+pci_intr_msix_count(pci_chipset_tag_t pc, pcitag_t tag)
+{
+	pcireg_t reg;
+
+	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, NULL, &reg) == 0)
+		return (0);
+
+	return (PCI_MSIX_MC_TBLSZ(reg) + 1);
+}
+
+#else /* __HAVE_PCI_MSIX */
+
+struct msix_vector *
+pci_alloc_msix_table(pci_chipset_tag_t pc, pcitag_t tag)
+{
+	return NULL;
+}
+
+void
+pci_free_msix_table(pci_chipset_tag_t pc, pcitag_t tag,
+    struct msix_vector *table)
+{
+}
+
+void
+pci_suspend_msix(pci_chipset_tag_t pc, pcitag_t tag,
+    bus_space_tag_t memt, pcireg_t *mc, struct msix_vector *table)
+{
+}
+
+void
+pci_resume_msix(pci_chipset_tag_t pc, pcitag_t tag,
+    bus_space_tag_t memt, pcireg_t mc, struct msix_vector *table)
+{
+}
+
+int
+pci_intr_msix_count(pci_chipset_tag_t pc, pcitag_t tag)
+{
+	return (0);
+}
+
+#endif /* __HAVE_PCI_MSIX */

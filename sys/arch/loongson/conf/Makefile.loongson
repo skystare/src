@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile.loongson,v 1.71 2018/09/14 13:49:01 naddy Exp $
+#	$OpenBSD: Makefile.loongson,v 1.78 2020/12/01 13:40:16 visa Exp $
 
 # For instructions on building kernels consult the config(8) and options(4)
 # manual pages.
@@ -28,7 +28,9 @@ S!=	cd ../../../..; pwd
 _machdir?=	$S/arch/${_mach}
 _archdir?=	$S/arch/${_arch}
 
-INCLUDES=	-nostdinc -I$S -I${.OBJDIR} -I$S/arch
+INCLUDES=	-nostdinc -I$S -I${.OBJDIR} -I$S/arch \
+		-I$S/dev/pci/drm/include \
+		-I$S/dev/pci/drm/include/uapi
 CPPFLAGS=	${INCLUDES} ${IDENT} ${PARAM} -D_KERNEL -D__${_mach}__ -MD -MP
 CWARNFLAGS=	-Werror -Wall -Wimplicit-function-declaration \
 		-Wno-uninitialized -Wno-pointer-sign \
@@ -42,6 +44,12 @@ CMACHFLAGS+=	-fno-stack-protector
 .endif
 .if ${IDENT:M-DSMALL_KERNEL}
 SORTR=		cat
+COPTS?=		-Oz
+.endif
+.if ${COMPILER_VERSION:Mclang}
+NO_INTEGR_AS=	-no-integrated-as
+CMACHFLAGS+=	-fomit-frame-pointer
+CWARNFLAGS+=	-Wno-address-of-packed-member -Wno-constant-conversion
 .endif
 
 DEBUG?=		-g
@@ -57,7 +65,7 @@ HOSTED_C=	${HOSTCC} ${HOSTED_CFLAGS} ${HOSTED_CPPFLAGS} -c $<
 
 NORMAL_C_NOP=	${CC} ${CFLAGS} ${CPPFLAGS} -c $<
 NORMAL_C=	${CC} ${CFLAGS} ${CPPFLAGS} ${PROF} -c $<
-NORMAL_S=	${CC} ${AFLAGS} ${CPPFLAGS} -c $<
+NORMAL_S=	${CC} ${AFLAGS} ${CPPFLAGS} ${PROF} -c $<
 
 %OBJS
 
@@ -100,7 +108,7 @@ LINKFLAGS+=	-S
 assym.h: $S/kern/genassym.sh Makefile \
 	 ${_archdir}/${_arch}/genassym.cf ${_machdir}/${_mach}/genassym.cf
 	cat ${_archdir}/${_arch}/genassym.cf ${_machdir}/${_mach}/genassym.cf | \
-	    sh $S/kern/genassym.sh ${CC} ${CFLAGS} ${CPPFLAGS} -MF assym.P > assym.h.tmp
+	    sh $S/kern/genassym.sh ${CC} ${NO_INTEGR_AS} ${CFLAGS} ${CPPFLAGS} -MF assym.P > assym.h.tmp
 	sed '1s/.*/assym.h: \\/' assym.P > assym.d
 	sort -u assym.h.tmp > assym.h
 
@@ -121,7 +129,7 @@ ld.script: ${_machdir}/conf/ld.script
 	cp ${_machdir}/conf/ld.script $@
 
 gapdummy.o:
-	echo 'const char gapdummy;' > gapdummy.c
+	echo '__asm(".section .rodata,\"a\"");' > gapdummy.c
 	${CC} -c ${CFLAGS} ${CPPFLAGS} gapdummy.c -o $@
 
 makegap.sh:
@@ -143,10 +151,6 @@ clean:
 cleandir: clean
 	rm -f Makefile *.h ioconf.c options machine ${_mach} vers.c
 
-symbols.sort: ${_machdir}/${_mach}/symbols.raw
-	grep -v '^#' ${_machdir}/${_mach}/symbols.raw \
-	    | sed 's/^	//' | sort -u > symbols.sort
-
 depend obj:
 
 locore0.o: ${_machdir}/${_mach}/locore0.S assym.h
@@ -158,8 +162,7 @@ hardlink-obsd:
 	[[ ! -f /bsd ]] || cmp -s bsd /bsd || ln -f /bsd /obsd
 
 newinstall:
-	umask 077 && cp bsd /nbsd && mv /nbsd /bsd && \
-	    sha256 -h /var/db/kernel.SHA256 /bsd
+	install -F -m 700 bsd /bsd && sha256 -h /var/db/kernel.SHA256 /bsd
 
 install: update-link hardlink-obsd newinstall
 

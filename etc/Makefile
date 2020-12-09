@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.465 2018/07/24 18:15:30 jasper Exp $
+#	$OpenBSD: Makefile,v 1.480 2020/09/13 11:29:52 ajacoutot Exp $
 
 .include <bsd.own.mk>
 
@@ -39,36 +39,37 @@ kernels: ${ALL_KERNELS}
 # -rw-r--r--
 BINOWN= root
 BINGRP= wheel
-MUTABLE=acme-client.conf changelist daily etc.${MACHINE}/disktab \
+MUTABLE=changelist daily etc.${MACHINE}/disktab \
 	etc.${MACHINE}/login.conf ftpusers gettytab group ksh.kshrc locate.rc \
 	mailer.conf moduli monthly netstart newsyslog.conf ntpd.conf \
 	pf.os protocols rc rc.conf rpc services shells syslog.conf weekly
 
 # -rw-r--r--
-EXAMPLES=chio.conf dhclient.conf dhcpd.conf exports \
+EXAMPLES=acme-client.conf chio.conf dhclient.conf dhcpd.conf exports \
 	httpd.conf ifstated.conf inetd.conf man.conf mixerctl.conf \
 	mrouted.conf ntpd.conf printcap rad.conf rbootd.conf \
 	remote sensorsd.conf wsconsctl.conf
 
 # -rw-------
 EXAMPLES_600=bgpd.conf doas.conf dvmrpd.conf eigrpd.conf hostapd.conf \
-	iked.conf ipsec.conf ldapd.conf ldpd.conf ospf6d.conf ospfd.conf \
-	pf.conf radiusd.conf rc.local rc.securelevel rc.shutdown relayd.conf \
-	ripd.conf sasyncd.conf snmpd.conf vm.conf ypldap.conf
+	iked.conf ipsec.conf ldapd.conf ldpd.conf login_ldap.conf \
+	ospf6d.conf ospfd.conf pf.conf radiusd.conf rc.local \
+	rc.securelevel rc.shutdown relayd.conf ripd.conf sasyncd.conf \
+	snmpd.conf vm.conf ypldap.conf
 
 # -r-xr-xr-x
 RCDAEMONS=amd apmd bgpd bootparamd cron dhcpd dhcrelay dhcrelay6 dvmrpd \
 	eigrpd ftpd ftpproxy ftpproxy6 hostapd hotplugd httpd identd ifstated \
 	iked inetd isakmpd iscsid ldapd ldattach ldomd ldpd lockd \
 	lpd mopd mountd mrouted nfsd npppd nsd ntpd ospf6d ospfd \
-	pflogd portmap rad radiusd rarpd rbootd rebound relayd ripd route6d \
+	pflogd portmap rad radiusd rarpd rbootd relayd ripd route6d \
 	sasyncd sensorsd slowcgi slaacd smtpd sndiod snmpd spamd \
 	spamlogd sshd statd switchd syslogd tftpd tftpproxy unbound \
-	vmd watchdogd wsmoused xenodm ypbind ypldap ypserv
+	unwind vmd watchdogd wsmoused xenodm ypbind ypldap ypserv
 
 MISETS=	base${OSrev}.tgz comp${OSrev}.tgz man${OSrev}.tgz game${OSrev}.tgz
 
-all clean cleandir depend etc install:
+all clean cleandir etc install:
 
 install-mtree:
 	${INSTALL} -c -o root -g wheel -m 600 mtree/special \
@@ -153,12 +154,18 @@ distribution-etc-root-var: distrib-dirs
 		    ${DESTDIR}/etc/ppp; \
 		${INSTALL} -c -o root -g wheel -m 600 pap-secrets \
 		    ${DESTDIR}/etc/ppp
+	cd rpki; \
+		${INSTALL} -c -o root -g wheel -m 644 \
+		    afrinic.tal apnic.tal lacnic.tal ripe.tal \
+		    ${DESTDIR}/etc/rpki
 	cd examples; \
 		${INSTALL} -c -o root -g wheel -m 644 ${EXAMPLES} \
 		    ${DESTDIR}/etc/examples; \
 		${INSTALL} -c -o root -g wheel -m 600 ${EXAMPLES_600} \
 		    ${DESTDIR}/etc/examples; \
 		chgrp operator ${DESTDIR}/etc/examples/chio.conf
+		chgrp auth ${DESTDIR}/etc/examples/login_ldap.conf
+		chmod 0640 ${DESTDIR}/etc/examples/login_ldap.conf
 	cd signify; \
 		${INSTALL} -c -o root -g wheel -m 644 *.pub \
 		    ${DESTDIR}/etc/signify
@@ -178,6 +185,8 @@ distribution-etc-root-var: distrib-dirs
 	    ${DESTDIR}/var/cron/log
 	${INSTALL} -c -o root -g wheel -m 444 /dev/null \
 	    ${DESTDIR}/var/db/locate.database
+	${INSTALL} -c -o _rpki-client -g wheel -m 644 /dev/null \
+	    ${DESTDIR}/var/db/rpki-client/openbgpd
 	${INSTALL} -c -o ${BINOWN} -g wheel -m 640 /dev/null \
 	    ${DESTDIR}/var/log/authlog
 	${INSTALL} -c -o ${BINOWN} -g wheel -m 640 /dev/null \
@@ -297,8 +306,8 @@ distrib:
 
 SUBDIR+= etc.alpha etc.amd64 etc.arm64 etc.armv7
 SUBDIR+= etc.hppa etc.i386 etc.landisk etc.loongson etc.luna88k
-SUBDIR+= etc.macppc etc.octeon
-SUBDIR+= etc.sgi etc.socppc etc.sparc64
+SUBDIR+= etc.macppc etc.octeon etc.powerpc64
+SUBDIR+= etc.sgi etc.sparc64
 
 .include <bsd.subdir.mk>
 .include <bsd.prog.mk>

@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-find.c,v 1.68 2018/08/18 20:08:52 nicm Exp $ */
+/* $OpenBSD: cmd-find.c,v 1.79 2020/05/16 16:20:59 nicm Exp $ */
 
 /*
  * Copyright (c) 2015 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -76,38 +76,12 @@ static const char *cmd_find_pane_table[][2] = {
 	{ NULL, NULL }
 };
 
-/* Get session from TMUX if present. */
-static struct session *
-cmd_find_try_TMUX(struct client *c)
-{
-	struct environ_entry	*envent;
-	char			 tmp[256];
-	long long		 pid;
-	u_int			 session;
-	struct session		*s;
-
-	envent = environ_find(c->environ, "TMUX");
-	if (envent == NULL)
-		return (NULL);
-
-	if (sscanf(envent->value, "%255[^,],%lld,%d", tmp, &pid, &session) != 3)
-		return (NULL);
-	if (pid != getpid())
-		return (NULL);
-	log_debug("%s: client %p TMUX %s (session $%u)", __func__, c,
-	    envent->value, session);
-
-	s = session_find_by_id(session);
-	if (s != NULL)
-		log_debug("%s: session $%u still exists", __func__, s->id);
-	return (s);
-}
-
 /* Find pane containing client if any. */
 static struct window_pane *
 cmd_find_inside_pane(struct client *c)
 {
 	struct window_pane	*wp;
+	struct environ_entry	*envent;
 
 	if (c == NULL)
 		return (NULL);
@@ -115,6 +89,11 @@ cmd_find_inside_pane(struct client *c)
 	RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
 		if (wp->fd != -1 && strcmp(wp->tty, c->ttyname) == 0)
 			break;
+	}
+	if (wp == NULL) {
+		envent = environ_find(c->environ, "TMUX_PANE");
+		if (envent != NULL)
+			wp = window_pane_find_by_id_str(envent->value);
 	}
 	if (wp != NULL)
 		log_debug("%s: got pane %%%u (%s)", __func__, wp->id, wp->tty);
@@ -454,6 +433,7 @@ cmd_find_get_window_with_session(struct cmd_find_state *fs, const char *window)
 		if (errstr == NULL) {
 			fs->wl = winlink_find_by_index(&fs->s->windows, idx);
 			if (fs->wl != NULL) {
+				fs->idx = fs->wl->idx;
 				fs->w = fs->wl->window;
 				return (0);
 			}
@@ -608,22 +588,22 @@ cmd_find_get_pane_with_window(struct cmd_find_state *fs, const char *pane)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{up-of}") == 0) {
-		fs->wp = window_pane_find_up(fs->w->active);
+		fs->wp = window_pane_find_up(fs->current->wp);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{down-of}") == 0) {
-		fs->wp = window_pane_find_down(fs->w->active);
+		fs->wp = window_pane_find_down(fs->current->wp);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{left-of}") == 0) {
-		fs->wp = window_pane_find_left(fs->w->active);
+		fs->wp = window_pane_find_left(fs->current->wp);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
 	} else if (strcmp(pane, "{right-of}") == 0) {
-		fs->wp = window_pane_find_right(fs->w->active);
+		fs->wp = window_pane_find_right(fs->current->wp);
 		if (fs->wp == NULL)
 			return (-1);
 		return (0);
@@ -635,7 +615,7 @@ cmd_find_get_pane_with_window(struct cmd_find_state *fs, const char *pane)
 			n = strtonum(pane + 1, 1, INT_MAX, NULL);
 		else
 			n = 1;
-		wp = fs->w->active;
+		wp = fs->current->wp;
 		if (pane[0] == '+')
 			fs->wp = window_pane_next_by_number(fs->w, wp, n);
 		else
@@ -879,8 +859,6 @@ cmd_find_from_mouse(struct cmd_find_state *fs, struct mouse_event *m, int flags)
 int
 cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 {
-	struct session		*s;
-	struct winlink		*wl;
 	struct window_pane	*wp;
 
 	/* If no client, treat as from nothing. */
@@ -889,7 +867,18 @@ cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 
 	/* If this is an attached client, all done. */
 	if (c->session != NULL) {
-		cmd_find_from_session(fs, c->session, flags);
+		cmd_find_clear_state(fs, flags);
+
+		fs->wp = server_client_get_pane(c);
+		if (fs->wp == NULL) {
+			cmd_find_from_session(fs, c->session, flags);
+			return (0);
+		}
+		fs->s = c->session;
+		fs->wl = fs->s->curw;
+		fs->w = fs->wl->window;
+
+		cmd_find_log_state(__func__, fs);
 		return (0);
 	}
 	cmd_find_clear_state(fs, flags);
@@ -901,30 +890,6 @@ cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 	wp = cmd_find_inside_pane(c);
 	if (wp == NULL)
 		goto unknown_pane;
-
-	/* If we have a session in TMUX, see if it has this pane. */
-	s = cmd_find_try_TMUX(c);
-	if (s != NULL) {
-		RB_FOREACH(wl, winlinks, &s->windows) {
-			if (window_has_pane(wl->window, wp))
-				break;
-		}
-		if (wl != NULL) {
-			log_debug("%s: session $%u has pane %%%u", __func__,
-			    s->id, wp->id);
-
-			fs->s = s;
-			fs->wl = s->curw; /* use current session */
-			fs->w = fs->wl->window;
-			fs->wp = fs->w->active; /* use active pane */
-
-			cmd_find_log_state(__func__, fs);
-			return (0);
-		} else {
-			log_debug("%s: session $%u does not have pane %%%u",
-			    __func__, s->id, wp->id);
-		}
-	}
 
 	/*
 	 * Don't have a session, or it doesn't have this pane. Try all
@@ -947,17 +912,7 @@ cmd_find_from_client(struct cmd_find_state *fs, struct client *c, int flags)
 	return (0);
 
 unknown_pane:
-	/*
-	 * We're not running in a known pane, but maybe this client has TMUX
-	 * in the environment. That'd give us a session.
-	 */
-	s = cmd_find_try_TMUX(c);
-	if (s != NULL) {
-		cmd_find_from_session(fs, s, flags);
-		return (0);
-	}
-
-	/* Otherwise we need to guess. */
+	/* We can't find the pane so need to guess. */
 	return (cmd_find_from_nothing(fs, flags));
 }
 
@@ -971,7 +926,7 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 {
 	struct mouse_event	*m;
 	struct cmd_find_state	 current;
-	char			*colon, *period, *copy = NULL;
+	char			*colon, *period, *copy = NULL, tmp[256];
 	const char		*session, *window, *pane, *s;
 	int			 window_only = 0, pane_only = 0;
 
@@ -988,11 +943,27 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 		s = "session";
 	else
 		s = "unknown";
-	if (target == NULL)
-		log_debug("%s: target none, type %s", __func__, s);
+	*tmp = '\0';
+	if (flags & CMD_FIND_PREFER_UNATTACHED)
+		strlcat(tmp, "PREFER_UNATTACHED,", sizeof tmp);
+	if (flags & CMD_FIND_QUIET)
+		strlcat(tmp, "QUIET,", sizeof tmp);
+	if (flags & CMD_FIND_WINDOW_INDEX)
+		strlcat(tmp, "WINDOW_INDEX,", sizeof tmp);
+	if (flags & CMD_FIND_DEFAULT_MARKED)
+		strlcat(tmp, "DEFAULT_MARKED,", sizeof tmp);
+	if (flags & CMD_FIND_EXACT_SESSION)
+		strlcat(tmp, "EXACT_SESSION,", sizeof tmp);
+	if (flags & CMD_FIND_EXACT_WINDOW)
+		strlcat(tmp, "EXACT_WINDOW,", sizeof tmp);
+	if (flags & CMD_FIND_CANFAIL)
+		strlcat(tmp, "CANFAIL,", sizeof tmp);
+	if (*tmp != '\0')
+		tmp[strlen(tmp) - 1] = '\0';
 	else
-		log_debug("%s: target %s, type %s", __func__, target, s);
-	log_debug("%s: item %p, flags %#x", __func__, item, flags);
+		strlcat(tmp, "NONE", sizeof tmp);
+	log_debug("%s: target %s, type %s, item %p, flags %s", __func__,
+	    target == NULL ? "none" : target, s, item, tmp);
 
 	/* Clear new state. */
 	cmd_find_clear_state(fs, flags);
@@ -1001,10 +972,11 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 	if (server_check_marked() && (flags & CMD_FIND_DEFAULT_MARKED)) {
 		fs->current = &marked_pane;
 		log_debug("%s: current is marked pane", __func__);
-	} else if (cmd_find_valid_state(&item->shared->current)) {
-		fs->current = &item->shared->current;
+	} else if (cmd_find_valid_state(cmdq_get_current(item))) {
+		fs->current = cmdq_get_current(item);
 		log_debug("%s: current is from queue", __func__);
-	} else if (cmd_find_from_client(&current, item->client, flags) == 0) {
+	} else if (cmd_find_from_client(&current, cmdq_get_client(item),
+	    flags) == 0) {
 		fs->current = &current;
 		log_debug("%s: current is from client", __func__);
 	} else {
@@ -1021,16 +993,20 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 
 	/* Mouse target is a plain = or {mouse}. */
 	if (strcmp(target, "=") == 0 || strcmp(target, "{mouse}") == 0) {
-		m = &item->shared->mouse;
+		m = &cmdq_get_event(item)->m;
 		switch (type) {
 		case CMD_FIND_PANE:
 			fs->wp = cmd_mouse_pane(m, &fs->s, &fs->wl);
-			if (fs->wp != NULL)
+			if (fs->wp != NULL) {
 				fs->w = fs->wl->window;
-			break;
+				break;
+			}
+			/* FALLTHROUGH */
 		case CMD_FIND_WINDOW:
 		case CMD_FIND_SESSION:
 			fs->wl = cmd_mouse_window(m, &fs->s);
+			if (fs->wl == NULL && fs->s != NULL)
+				fs->wl = fs->s->curw;
 			if (fs->wl != NULL) {
 				fs->w = fs->wl->window;
 				fs->wp = fs->w->active;
@@ -1132,9 +1108,16 @@ cmd_find_target(struct cmd_find_state *fs, struct cmdq_item *item,
 	if (pane != NULL)
 		pane = cmd_find_map_table(cmd_find_pane_table, pane);
 
-	log_debug("%s: target %s (flags %#x): session=%s, window=%s, pane=%s",
-	    __func__, target, flags, session == NULL ? "none" : session,
-	    window == NULL ? "none" : window, pane == NULL ? "none" : pane);
+	if (session != NULL || window != NULL || pane != NULL) {
+		log_debug("%s: target %s is %s%s%s%s%s%s",
+		    __func__, target,
+		    session == NULL ? "" : "session ",
+		    session == NULL ? "" : session,
+		    window == NULL ? "" : "window ",
+		    window == NULL ? "" : window,
+		    pane == NULL ? "" : "pane ",
+		    pane == NULL ? "" : pane);
+	}
 
 	/* No pane is allowed if want an index. */
 	if (pane != NULL && (flags & CMD_FIND_WINDOW_INDEX)) {
@@ -1242,17 +1225,17 @@ found:
 
 no_session:
 	if (~flags & CMD_FIND_QUIET)
-		cmdq_error(item, "can't find session %s", session);
+		cmdq_error(item, "can't find session: %s", session);
 	goto error;
 
 no_window:
 	if (~flags & CMD_FIND_QUIET)
-		cmdq_error(item, "can't find window %s", window);
+		cmdq_error(item, "can't find window: %s", window);
 	goto error;
 
 no_pane:
 	if (~flags & CMD_FIND_QUIET)
-		cmdq_error(item, "can't find pane %s", pane);
+		cmdq_error(item, "can't find pane: %s", pane);
 	goto error;
 }
 
@@ -1260,29 +1243,31 @@ no_pane:
 static struct client *
 cmd_find_current_client(struct cmdq_item *item, int quiet)
 {
-	struct client		*c;
+	struct client		*c = NULL, *found;
 	struct session		*s;
 	struct window_pane	*wp;
 	struct cmd_find_state	 fs;
 
-	if (item->client != NULL && item->client->session != NULL)
-		return (item->client);
+	if (item != NULL)
+		c = cmdq_get_client(item);
+	if (c != NULL && c->session != NULL)
+		return (c);
 
-	c = NULL;
-	if ((wp = cmd_find_inside_pane(item->client)) != NULL) {
+	found = NULL;
+	if (c != NULL && (wp = cmd_find_inside_pane(c)) != NULL) {
 		cmd_find_clear_state(&fs, CMD_FIND_QUIET);
 		fs.w = wp->window;
 		if (cmd_find_best_session_with_window(&fs) == 0)
-			c = cmd_find_best_client(fs.s);
+			found = cmd_find_best_client(fs.s);
 	} else {
 		s = cmd_find_best_session(NULL, 0, CMD_FIND_QUIET);
 		if (s != NULL)
-			c = cmd_find_best_client(s);
+			found = cmd_find_best_client(s);
 	}
-	if (c == NULL && !quiet)
+	if (found == NULL && item != NULL && !quiet)
 		cmdq_error(item, "no current client");
-	log_debug("%s: no target, return %p", __func__, c);
-	return (c);
+	log_debug("%s: no target, return %p", __func__, found);
+	return (found);
 }
 
 /* Find the target client or report an error and return NULL. */
@@ -1322,7 +1307,7 @@ cmd_find_client(struct cmdq_item *item, const char *target, int quiet)
 
 	/* If no client found, report an error. */
 	if (c == NULL && !quiet)
-		cmdq_error(item, "can't find client %s", copy);
+		cmdq_error(item, "can't find client: %s", copy);
 
 	free(copy);
 	log_debug("%s: target %s, return %p", __func__, target, c);

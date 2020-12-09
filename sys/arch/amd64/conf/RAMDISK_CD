@@ -1,10 +1,8 @@
-#	$OpenBSD: RAMDISK_CD,v 1.173 2018/08/31 00:09:13 jmatthew Exp $
+#	$OpenBSD: RAMDISK_CD,v 1.189 2020/05/14 13:07:11 kettenis Exp $
 
 machine		amd64
 maxusers	4
 
-option		TIMEZONE=0
-option		DST=0
 option		SMALL_KERNEL
 option		NO_PROPOLICE
 option		BOOT_CONFIG
@@ -37,14 +35,19 @@ acpi0		at bios?
 #acpibat*	at acpi?
 #acpibtn*	at acpi?
 #acpicpu*	at acpi?
+acpicmos*	at acpi?
 acpiec*		at acpi?
+acpipci*	at acpi?
 acpiprt*	at acpi?
 acpimadt0	at acpi?
 #acpitz*	at acpi?
+amdgpio*	at acpi?
+aplgpio*	at acpi?
 bytgpio*	at acpi?
 sdhc*		at acpi?
 acpihve*	at acpi?
 chvgpio*        at acpi?
+glkgpio*	at acpi?
 
 mpbios0		at bios0
 
@@ -70,6 +73,7 @@ ppb*		at pci?			# PCI-PCI bridges
 pci*		at ppb?
 pci*		at pchb?
 #pcib*		at pci?			# PCI-ISA bridge
+ccp*		at pci?			# AMD Cryptographic Co-processor
 
 dwiic*		at acpi?
 dwiic*		at pci?
@@ -128,6 +132,7 @@ rsu*		at uhub?		# Realtek RTL8188SU/RTL8191SU/RTL8192SU
 uath*		at uhub?		# Atheros AR5005UG/AR5005UX
 otus*		at uhub?		# Atheros AR9001U
 athn*		at uhub?		# Atheros AR9002U
+bwfm*		at uhub?		# Broadcom FullMAC
 
 pckbc0		at isa?			# PC keyboard controller
 pckbd*		at pckbc?		# PC keyboard
@@ -189,6 +194,7 @@ sdhc*		at pci?			# SD Host Controller
 sdmmc*		at sdhc?		# SD/MMC bus
 rtsx*		at pci?			# Realtek SD Card Reader
 sdmmc*		at rtsx?		# SD/MMC bus
+bwfm*		at sdmmc?		# Broadcom FullMAC
 
 de*		at pci?			# DC21X4X-based ethernet
 fxp*		at pci?			# EtherExpress 10/100B ethernet
@@ -217,12 +223,14 @@ msk*		at mskc?		#  each port of above
 em*		at pci?			# Intel Pro/1000 ethernet
 ixgb*		at pci?			# Intel Pro/10Gb ethernet
 ix*		at pci?			# Intel 82598EB 10Gb ethernet
+myx*		at pci?			# Myricom Myri-10G 10Gb ethernet
 oce*		at pci?			# Emulex OneConnect 10Gb ethernet
 sf*		at pci?			# Adaptec AIC-6915 ethernet
 bge*		at pci?			# Broadcom BCM57xx (aka Tigon3)
 bnx*		at pci?			# Broadcom BCM5706/5708 GigE
 re*		at pci?			# Realtek 8169/8169S/8110S
 re*		at cardbus?		# Realtek 8169/8169S/8110S
+rge*		at pci?			# Realtek 8125
 stge*		at pci?			# Sundance TC9021 GigE
 hme*		at pci?			# Sun Happy Meal
 vge*		at pci?			# VIA VT612x
@@ -238,6 +246,10 @@ ale*		at pci?			# Attansic L1E Ethernet
 lii*		at pci?			# Attansic L2 Ethernet
 jme*		at pci?			# JMicron JMC250/JMC260 Ethernet
 bnxt*		at pci?			# Broadcom BCM573xx, BCM574xx
+bwfm*		at pci?			# Broadcom FullMAC
+ixl*		at pci?			# Intel Ethernet 700 Series
+mcx*		at pci?			# Mellanox ConnectX-4
+iavf*		at pci?			# Intel Ethernet Adaptive VF
 
 acx*		at pci?			# TI ACX100/ACX111 (802.11b/g)
 acx*		at cardbus?		# TI ACX100/ACX111 (802.11b/g)
@@ -256,6 +268,7 @@ iwi*		at pci?			# Intel PRO/Wireless 2200BG/2915ABG
 wpi*		at pci?			# Intel PRO/Wireless 3945ABG
 iwn*		at pci?			# Intel Wireless WiFi Link 4965AGN
 iwm*		at pci?			# Intel WiFi Link 7xxx
+iwx*		at pci?			# Intel WiFi Link 22xxx
 ral*		at pci?			# Ralink RT2500/RT2501/RT2600
 ral*		at cardbus?		# Ralink RT2500/RT2501/RT2600
 rtw*		at pci?			# Realtek 8180

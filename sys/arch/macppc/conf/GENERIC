@@ -1,4 +1,4 @@
-#	$OpenBSD: GENERIC,v 1.265 2018/08/22 15:38:46 mpi Exp $g
+#	$OpenBSD: GENERIC,v 1.271 2020/01/24 04:44:14 krw Exp $g
 #
 # For further information on compiling OpenBSD kernels, see the config(8)
 # man page.
@@ -138,8 +138,6 @@ openpic*	at macobio?	# openpic interrupt controller
 bm*		at macobio?	# BMAC ethernet
 xlights*	at macobio?	# Xserve front panel LEDs
 mc*		at macobio?	# MACE ethernet
-#esp*		at macobio? flags 0x0000ffff # 53c9x SCSI
-mesh*		at macobio? flags 0xffff # MESH SCSI
 adb*		at macobio?	# Apple Desktop Bus
 apm0		at adb?		# APM emulation
 piic0		at adb?		# PMU I2C
@@ -225,6 +223,8 @@ uslcom*	at uhub?		# Silicon Laboratories CP210x serial
 ucom*	at uslcom?
 uscom*	at uhub?		# Simple USB serial adapters
 ucom*	at uscom?
+ucrcom*	at uhub?		# Chromebook serial
+ucom*	at ucrcom?
 uark*	at uhub?		# Arkmicro ARK3116 serial
 ucom*	at uark?
 moscom*	at uhub?		# MosChip MCS7703 serial
@@ -259,11 +259,13 @@ ucom*	at ucycom?
 uslhcom* at uhidev?		# Silicon Labs CP2110 USB HID UART
 ucom*	at uslhcom?
 uhid*	at uhidev?		# USB generic HID support
+fido*	at uhidev?		# FIDO/U2F security key support
 upd*	at uhidev?		# USB Power Devices sensors
 aue*	at uhub?		# ADMtek AN986 Pegasus Ethernet
 atu*	at uhub?		# Atmel AT76c50x based 802.11b
 axe*	at uhub?		# ASIX Electronics AX88172 USB Ethernet
 axen*	at uhub?		# ASIX Electronics AX88179 USB Ethernet
+bwfm*	at uhub?		# Broadcom FullMAC
 cue*	at uhub?		# CATC USB-EL1201A based Ethernet
 kue*	at uhub?		# Kawasaki KL5KUSB101B based Ethernet
 smsc*	at uhub?		# SMSC LAN95xx Ethernet
@@ -292,7 +294,7 @@ zyd*	at uhub?		# Zydas ZD1211
 upgt*	at uhub?		# Conexant/Intersil PrismGT SoftMAC USB
 urtw*	at uhub?		# Realtek 8187
 udcf*	at uhub?		# Gude Expert mouseCLOCK
-umbg*	at uhub?		# Meinberg Funkuhren USB5131
+umbg*	at uhub?		# Meinberg Funkuhren USB5131/DCF600USB
 uthum*	at uhidev?		# TEMPerHUM sensor
 ugold*	at uhidev?		# gold TEMPer sensor
 utrh*	at uhidev?		# USBRH sensor

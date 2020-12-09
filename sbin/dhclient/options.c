@@ -1,4 +1,4 @@
-/*	$OpenBSD: options.c,v 1.113 2018/07/22 21:32:04 krw Exp $	*/
+/*	$OpenBSD: options.c,v 1.123 2020/07/07 19:48:31 krw Exp $	*/
 
 /* DHCP options parsing and reassembly. */
 
@@ -51,6 +51,7 @@
 #include <netinet/if_ether.h>
 
 #include <ctype.h>
+#include <resolv.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,8 +62,11 @@
 #include "dhcpd.h"
 #include "log.h"
 
-int parse_option_buffer(struct option_data *, unsigned char *, int);
-int expand_search_domain_name(unsigned char *, size_t, int *, unsigned char *);
+int	parse_option_buffer(struct option_data *, unsigned char *, int);
+void	pretty_print_classless_routes(unsigned char *, size_t, unsigned char *,
+    size_t);
+void	pretty_print_domain_list(unsigned char *, size_t, unsigned char *,
+    size_t);
 
 /*
  * DHCP Option names, formats and codes, from RFC1533.
@@ -79,6 +83,8 @@ int expand_search_domain_name(unsigned char *, size_t, int *, unsigned char *);
  * f - flag (true or false)
  * A - array of whatever precedes (e.g., IA means array of IP addresses)
  * C - CIDR description
+ * X - hex octets
+ * D - domain name list, comma separated list of domain names.
  */
 
 static const struct {
@@ -204,7 +210,7 @@ static const struct {
 	/* 116 */ { NULL, NULL },
 	/* 117 */ { NULL, NULL },
 	/* 118 */ { NULL, NULL },
-	/* 119 */ { "domain-search", "X" },
+	/* 119 */ { "domain-search", "D" },
 	/* 120 */ { NULL, NULL },
 	/* 121 */ { "classless-static-routes", "CIA" },
 	/* 122 */ { NULL, NULL },
@@ -356,7 +362,7 @@ code_to_name(int code)
 		return dhcp_options[code].name;
 
 	ret = snprintf(unknown, sizeof(unknown), "option-%d", code);
-	if (ret == -1 || ret >= (int)sizeof(unknown))
+	if (ret < 0 || ret >= (int)sizeof(unknown))
 		return "";
 
 	return unknown;
@@ -372,7 +378,7 @@ name_to_code(char *name)
 		if (dhcp_options[code].name == NULL) {
 			ret = snprintf(unknown, sizeof(unknown), "option-%d",
 			    code);
-			if (ret == -1 || ret >= (int)sizeof(unknown))
+			if (ret < 0 || ret >= (int)sizeof(unknown))
 				return DHO_END;
 			if (strcasecmp(unknown, name) == 0)
 				return code;
@@ -394,6 +400,38 @@ code_to_format(int code)
 		return "X";
 
 	return dhcp_options[code].format;
+}
+
+/*
+ * Some option data types cannot be appended or prepended to. For
+ * such options change ACTION_PREPEND to ACTION_SUPERSEDE and
+ * ACTION_APPEND to ACTION_DEFAULT.
+ */
+int
+code_to_action(int code, int action)
+{
+	char	*fmt;
+
+	fmt = code_to_format(code);
+	if (fmt == NULL || strpbrk(fmt, "ADtX") != NULL)
+		return action;
+
+	/*
+	 * For our protection all formats which have been excluded shall be
+	 * deemed included.
+	 */
+	switch (action) {
+	case ACTION_APPEND:
+		action = ACTION_DEFAULT;
+		break;
+	case ACTION_PREPEND:
+		action = ACTION_SUPERSEDE;
+		break;
+	default:
+		break;
+	}
+
+	return action;
 }
 
 /*
@@ -583,8 +621,8 @@ pretty_print_classless_routes(unsigned char *src, size_t srclen,
 
 	i = 0;
 	while (i < srclen) {
-		len = extract_classless_route(&src[i], srclen - i,
-		    &dest.s_addr, &netmask.s_addr, &gateway.s_addr);
+		len = extract_route(&src[i], srclen - i, &dest.s_addr,
+		    &netmask.s_addr, &gateway.s_addr);
 		if (len == 0)
 			goto bad;
 		i += len;
@@ -597,7 +635,7 @@ pretty_print_classless_routes(unsigned char *src, size_t srclen,
 		}
 
 		rslt = snprintf(bitsbuf, sizeof(bitsbuf), "/%d ", bits);
-		if (rslt == -1 || (unsigned int)rslt >= sizeof(bitsbuf))
+		if (rslt < 0 || (unsigned int)rslt >= sizeof(bitsbuf))
 			goto bad;
 
 		if (strlen(buf) > 0)
@@ -614,122 +652,62 @@ bad:
 	memset(buf, 0, buflen);
 }
 
-int
-expand_search_domain_name(unsigned char *src, size_t srclen, int *offset,
-    unsigned char *domain_search)
-{
-	char		*cursor;
-	unsigned int	 i;
-	int		 domain_name_len, label_len, pointer, pointed_len;
-
-	cursor = domain_search + strlen(domain_search);
-	domain_name_len = 0;
-
-	i = *offset;
-	while (i <= srclen) {
-		label_len = src[i];
-		if (label_len == 0) {
-			/*
-			 * A zero-length label marks the end of this
-			 * domain name.
-			 */
-			*offset = i + 1;
-			return domain_name_len;
-		} else if ((label_len & 0xC0) != 0) {
-			/* This is a pointer to another list of labels. */
-			if (i + 1 >= srclen) {
-				/* The pointer is truncated. */
-				log_warnx("%s: truncated pointer in DHCP "
-				    "Domain Search option", log_procname);
-				return -1;
-			}
-
-			pointer = ((label_len & ~(0xC0)) << 8) + src[i + 1];
-			if (pointer >= *offset) {
-				/*
-				 * The pointer must indicates a prior
-				 * occurance.
-				 */
-				log_warnx("%s: invalid forward pointer in DHCP "
-				    "Domain Search option compression",
-				    log_procname);
-				return -1;
-			}
-
-			pointed_len = expand_search_domain_name(src, srclen,
-			    &pointer, domain_search);
-			domain_name_len += pointed_len;
-
-			*offset = i + 2;
-			return domain_name_len;
-		}
-		if (i + label_len + 1 > srclen) {
-			log_warnx("%s: truncated label in DHCP Domain Search "
-			    "option", log_procname);
-			return -1;
-		}
-		/*
-		 * Update the domain name length with the length of the
-		 * current label, plus a trailing dot ('.').
-		 */
-		domain_name_len += label_len + 1;
-
-		if (strlen(domain_search) + domain_name_len >=
-		    DHCP_DOMAIN_SEARCH_LEN) {
-			log_warnx("%s: domain search list too long",
-			    log_procname);
-			return -1;
-		}
-
-		/* Copy the label found. */
-		memcpy(cursor, src + i + 1, label_len);
-		cursor[label_len] = '.';
-
-		/* Move cursor. */
-		i += label_len + 1;
-		cursor += label_len + 1;
-	}
-
-	log_warnx("%s: truncated DHCP Domain Search option", log_procname);
-
-	return -1;
-}
-
 /*
- * Must special case DHO_DOMAIN_SEARCH because it is encoded as described
- * in RFC 1035 section 4.1.4.
+ * Print string containing blank separated list of domain names
+ * as a comma separated list of double-quote delimited strings.
+ *
+ * e.g.  "eng.apple.com. marketing.apple.com."
+ *
+ * will be translated to
+ *
+ * "eng.apple.com.", "marketing.apple.com."
  */
-char *
-pretty_print_domain_search(unsigned char *src, size_t srclen)
+void
+pretty_print_domain_list(unsigned char *src, size_t srclen,
+    unsigned char *buf, size_t buflen)
 {
-	static char	 domain_search[DHCP_DOMAIN_SEARCH_LEN];
-	unsigned char	*cursor;
-	unsigned int	 offset;
-	int		 len, expanded_len, domains;
+	char	*dupnames, *hn, *inputstring;
+	int	 count;
 
-	memset(domain_search, 0, sizeof(domain_search));
+	memset(buf, 0, buflen);
 
-	/* Compute expanded length. */
-	expanded_len = len = 0;
-	domains = 0;
-	offset = 0;
-	while (offset < srclen) {
-		cursor = domain_search + strlen(domain_search);
-		if (domain_search[0] != '\0') {
-			*cursor = ' ';
-			expanded_len++;
-		}
-		len = expand_search_domain_name(src, srclen, &offset,
-		    domain_search);
-		if (len == -1)
-			return NULL;
-		domains++;
-		expanded_len += len;
-		if (domains > DHCP_DOMAIN_SEARCH_CNT)
-			return NULL;
+	/*
+	 * N.B.: option data is *NOT* guaranteed to be NUL
+	 *	 terminated. Avoid strlen(), strdup(), etc.!
+	 */
+	if (srclen >= DHCP_DOMAIN_SEARCH_LEN || src[0] == '\0')
+		return;
+
+	inputstring = malloc(srclen + 1);
+	if (inputstring == NULL)
+		fatal("domain name list");
+	memcpy(inputstring, src, srclen);
+	inputstring[srclen] = '\0';
+	dupnames = inputstring;
+
+	count = 0;
+	while ((hn = strsep(&inputstring, " \t")) != NULL) {
+		if (strlen(hn) == 0)
+			continue;
+		if (res_hnok(hn) == 0)
+			goto bad;
+		if (count > 0)
+			strlcat(buf, ", ", buflen);
+		strlcat(buf, "\"", buflen);
+		strlcat(buf, hn, buflen);
+		if (strlcat(buf, "\"", buflen) >= buflen)
+			goto bad;
+		count++;
+		if (count > DHCP_DOMAIN_SEARCH_CNT)
+			goto bad;
 	}
 
-	return domain_search;
+	free(dupnames);
+	return;
+
+bad:
+	free(dupnames);
+	memset(buf, 0, buflen);
 }
 
 /*
@@ -772,8 +750,10 @@ pretty_print_option(unsigned int code, struct option_data *option,
 	switch (code) {
 	case DHO_CLASSLESS_STATIC_ROUTES:
 	case DHO_CLASSLESS_MS_STATIC_ROUTES:
-		pretty_print_classless_routes(dp, len, optbuf,
-		    sizeof(optbuf));
+		pretty_print_classless_routes(dp, len, optbuf, sizeof(optbuf));
+		goto done;
+	case DHO_DOMAIN_SEARCH:
+		pretty_print_domain_list(dp, len, optbuf, sizeof(optbuf));
 		goto done;
 	default:
 		break;
@@ -923,13 +903,13 @@ pretty_print_option(unsigned int code, struct option_data *option,
 				    log_procname, fmtbuf[j]);
 				goto toobig;
 			}
-			if (opcount >= opleft || opcount == -1)
+			if (opcount < 0 || opcount >= opleft)
 				goto toobig;
 			opleft -= opcount;
 			op += opcount;
 			if (j + 1 < numelem && comma != ':') {
 				opcount = snprintf(op, opleft, " ");
-				if (opcount >= opleft || opcount == -1)
+				if (opcount < 0 || opcount >= opleft)
 					goto toobig;
 				opleft -= opcount;
 				op += opcount;
@@ -937,7 +917,7 @@ pretty_print_option(unsigned int code, struct option_data *option,
 		}
 		if (i + 1 < numhunk) {
 			opcount = snprintf(op, opleft, "%c", comma);
-			if (opcount >= opleft || opcount == -1)
+			if (opcount < 0 || opcount >= opleft)
 				goto toobig;
 			opleft -= opcount;
 			op += opcount;
@@ -986,4 +966,36 @@ unpack_options(struct dhcp_packet *packet)
 	}
 
 	return options;
+}
+
+void
+merge_option_data(char *fmt, struct option_data *first,
+    struct option_data *second, struct option_data *dest)
+{
+	int space = 0;
+
+	free(dest->data);
+	dest->data = NULL;
+	dest->len = first->len + second->len;
+	if (dest->len == 0)
+		return;
+
+	/*
+	 * N.B.: option data is *NOT* guaranteed to be NUL
+	 *	 terminated. Avoid strlen(), strdup(), etc.!
+	 */
+	if (fmt[0] == 'D') {
+		if (first->len > 0 && second->len > 0)
+			space = 1;
+	}
+
+	dest->len += space;
+	dest->data = malloc(dest->len);
+	if (dest->data == NULL)
+		fatal("merged option data");
+
+	memcpy(dest->data, first->data, first->len);
+	if (space == 1)
+		dest->data[first->len] = ' ';
+	memcpy(dest->data + first->len + space, second->data, second->len);
 }

@@ -1,4 +1,4 @@
-#	$OpenBSD: Makefile,v 1.93 2018/08/31 07:28:27 eric Exp $
+#	$OpenBSD: Makefile,v 1.109 2020/09/23 19:11:50 martijn Exp $
 
 .PATH:		${.CURDIR}/..
 
@@ -7,6 +7,7 @@ PROG=		smtpd
 SRCS=	aliases.c
 SRCS+=	bounce.c
 SRCS+=	ca.c
+SRCS+=	cert.c
 SRCS+=	compress_backend.c
 SRCS+=	config.c
 SRCS+=	control.c
@@ -22,10 +23,12 @@ SRCS+=	iobuf.c
 SRCS+=	ioev.c
 SRCS+=	limit.c
 SRCS+=	lka.c
+SRCS+=	lka_filter.c
 SRCS+=	lka_session.c
 SRCS+=	log.c
 SRCS+=	mailaddr.c
 SRCS+=	mda.c
+SRCS+=	mda_mbox.c
 SRCS+=	mda_unpriv.c
 SRCS+=	mda_variables.c
 SRCS+=	mproc.c
@@ -33,8 +36,10 @@ SRCS+=	mta.c
 SRCS+=	mta_session.c
 SRCS+=	parse.y
 SRCS+=	pony.c
+SRCS+=	proxy.c
 SRCS+=	queue.c
 SRCS+=	queue_backend.c
+SRCS+=	report_smtp.c
 SRCS+=	resolver.c
 SRCS+=	rfc5322.c
 SRCS+=	ruleset.c
@@ -43,10 +48,11 @@ SRCS+=	scheduler.c
 SRCS+=	scheduler_backend.c
 SRCS+=	smtp.c
 SRCS+=	smtp_session.c
-SRCS+=	smtpf_session.c
 SRCS+=	smtpd.c
+SRCS+=	srs.c
 SRCS+=	ssl.c
 SRCS+=	ssl_smtpd.c
+SRCS+=	ssl_verify.c
 SRCS+=	stat_backend.c
 SRCS+=	table.c
 SRCS+=	to.c
@@ -87,7 +93,7 @@ CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
 CFLAGS+=	-Wsign-compare
 CFLAGS+=	-Werror-implicit-function-declaration
 #CFLAGS+=	-Werror # during development phase (breaks some archs)
-CFLAGS+=	-DIO_SSL
+CFLAGS+=	-DIO_TLS
 CFLAGS+=	-DQUEUE_PROFILING
 YFLAGS=
 

@@ -1,4 +1,4 @@
-/*	$OpenBSD: in.h,v 1.132 2018/09/11 21:04:03 bluhm Exp $	*/
+/*	$OpenBSD: in.h,v 1.138 2020/08/22 17:55:30 gnezdo Exp $	*/
 /*	$NetBSD: in.h,v 1.20 1996/02/13 23:41:47 christos Exp $	*/
 
 /*
@@ -68,7 +68,7 @@ typedef __in_port_t	in_port_t;	/* IP port type */
  * Protocols
  */
 #define	IPPROTO_IP		0		/* dummy for IP */
-#define IPPROTO_HOPOPTS		IPPROTO_IP	/* Hop-by-hop option header */
+#define	IPPROTO_HOPOPTS		IPPROTO_IP	/* Hop-by-hop option header */
 #define	IPPROTO_ICMP		1		/* control message protocol */
 #define	IPPROTO_IGMP		2		/* group mgmt protocol */
 #define	IPPROTO_GGP		3		/* gateway^2 (deprecated) */
@@ -79,24 +79,25 @@ typedef __in_port_t	in_port_t;	/* IP port type */
 #define	IPPROTO_PUP		12		/* pup */
 #define	IPPROTO_UDP		17		/* user datagram protocol */
 #define	IPPROTO_IDP		22		/* xns idp */
-#define	IPPROTO_TP		29 		/* tp-4 w/ class negotiation */
-#define IPPROTO_IPV6		41		/* IPv6 in IPv6 */
-#define IPPROTO_ROUTING		43		/* Routing header */
-#define IPPROTO_FRAGMENT	44		/* Fragmentation/reassembly header */
-#define IPPROTO_RSVP		46		/* resource reservation */
+#define	IPPROTO_TP		29		/* tp-4 w/ class negotiation */
+#define	IPPROTO_IPV6		41		/* IPv6 in IPv6 */
+#define	IPPROTO_ROUTING		43		/* Routing header */
+#define	IPPROTO_FRAGMENT	44		/* Fragmentation/reassembly header */
+#define	IPPROTO_RSVP		46		/* resource reservation */
 #define	IPPROTO_GRE		47		/* GRE encap, RFCs 1701/1702 */
 #define	IPPROTO_ESP		50		/* Encap. Security Payload */
 #define	IPPROTO_AH		51		/* Authentication header */
 #define	IPPROTO_MOBILE		55		/* IP Mobility, RFC 2004 */
-#define IPPROTO_ICMPV6		58		/* ICMP for IPv6 */
-#define IPPROTO_NONE		59		/* No next header */
-#define IPPROTO_DSTOPTS		60		/* Destination options header */
+#define	IPPROTO_ICMPV6		58		/* ICMP for IPv6 */
+#define	IPPROTO_NONE		59		/* No next header */
+#define	IPPROTO_DSTOPTS		60		/* Destination options header */
 #define	IPPROTO_EON		80		/* ISO cnlp */
-#define IPPROTO_ETHERIP		97		/* Ethernet in IPv4 */
+#define	IPPROTO_ETHERIP		97		/* Ethernet in IPv4 */
 #define	IPPROTO_ENCAP		98		/* encapsulation header */
-#define IPPROTO_PIM		103		/* Protocol indep. multicast */
-#define IPPROTO_IPCOMP		108		/* IP Payload Comp. Protocol */
+#define	IPPROTO_PIM		103		/* Protocol indep. multicast */
+#define	IPPROTO_IPCOMP		108		/* IP Payload Comp. Protocol */
 #define	IPPROTO_CARP		112		/* CARP */
+#define	IPPROTO_UDPLITE		136		/* UDP-Lite, RFC 3828 */
 #define	IPPROTO_MPLS		137		/* unicast MPLS packet */
 #define	IPPROTO_PFSYNC		240		/* PFSYNC */
 #define	IPPROTO_RAW		255		/* raw IP packet */
@@ -440,7 +441,7 @@ struct ip_mreq {
 	{ 0, 0 }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
-	{ "mobileip", CTLTYPE_NODE }, \
+	{ 0, 0 }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
 	{ 0, 0 }, \
@@ -688,7 +689,8 @@ struct ip_mreq {
 #define	IPCTL_MRTVIF		38
 #define	IPCTL_ARPTIMEOUT	39
 #define	IPCTL_ARPDOWN		40
-#define	IPCTL_MAXID		41
+#define	IPCTL_ARPQUEUE		41
+#define	IPCTL_MAXID		42
 
 #define	IPCTL_NAMES { \
 	{ 0, 0 }, \
@@ -732,49 +734,7 @@ struct ip_mreq {
 	{ "mrtvif", CTLTYPE_STRUCT }, \
 	{ "arptimeout", CTLTYPE_INT }, \
 	{ "arpdown", CTLTYPE_INT }, \
-}
-#define	IPCTL_VARS { \
-	NULL, \
-	&ipforwarding, \
-	&ipsendredirects, \
-	&ip_defttl, \
-	NULL, \
-	NULL, \
-	&ip_directedbcast, \
-	&ipport_firstauto, \
-	&ipport_lastauto, \
-	&ipport_hifirstauto, \
-	&ipport_hilastauto, \
-	&ip_maxqueue, \
-	NULL /* encdebug */, \
-	NULL /* ipsecstat */, \
-	NULL /* ipsec_expire_acquire */, \
-	NULL /* ipsec_keep_invalid */, \
-	NULL /* ipsec_require_pfs */, \
-	NULL /* ipsec_soft_allocations */, \
-	NULL /* ipsec_exp_allocations */, \
-	NULL /* ipsec_soft_bytes */, \
-	NULL /* ipsec_exp_bytes */, \
-	NULL /* ipsec_exp_timeout */, \
-	NULL /* ipsec_soft_timeout */, \
-	NULL /* ipsec_soft_first_use */, \
-	NULL /* ipsec_exp_first_use */, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	NULL, \
-	&ipmforwarding, \
-	&ipmultipath, \
-	NULL, \
-	NULL, \
-	NULL, \
-	&la_hold_total, \
-	NULL, \
-	NULL, \
-	&arpt_keep, \
-	&arpt_down, \
+	{ "arpq", CTLTYPE_NODE }, \
 }
 
 #endif /* __BSD_VISIBLE */
@@ -815,6 +775,7 @@ void	   in_ifdetach(struct ifnet *);
 int	   in_mask2len(struct in_addr *);
 void	   in_len2mask(struct in_addr *, int);
 int	   in_nam2sin(const struct mbuf *, struct sockaddr_in **);
+int	   in_sa2sin(struct sockaddr *, struct sockaddr_in **);
 
 char	  *inet_ntoa(struct in_addr);
 int	   inet_nat64(int, const void *, void *, const void *, u_int8_t);

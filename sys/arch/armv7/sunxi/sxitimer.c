@@ -1,4 +1,4 @@
-/*	$OpenBSD: sxitimer.c,v 1.12 2018/06/04 09:25:16 kettenis Exp $	*/
+/*	$OpenBSD: sxitimer.c,v 1.14 2020/07/06 13:33:07 pirofti Exp $	*/
 /*
  * Copyright (c) 2007,2009 Dale Rahn <drahn@openbsd.org>
  * Copyright (c) 2013 Raphael Graf <r@undefined.ch>
@@ -89,7 +89,7 @@ void	sxitimer_delay(u_int);
 u_int sxitimer_get_timecount(struct timecounter *);
 
 static struct timecounter sxitimer_timecounter = {
-	sxitimer_get_timecount, NULL, 0xffffffff, 0, "sxitimer", 0, NULL
+	sxitimer_get_timecount, NULL, 0xffffffff, 0, "sxitimer", 0, NULL, 0
 };
 
 bus_space_tag_t		sxitimer_iot;
@@ -267,7 +267,7 @@ sxitimer_cpu_initclocks(void)
 	    ctrl | TIMER_ENABLE | TIMER_RELOAD | TIMER_SINGLESHOT);
 }
 
-/* 
+/*
  * See comment in arm/xscale/i80321_clock.c
  *
  * Counter is count up, but with autoreload timers it is not possible

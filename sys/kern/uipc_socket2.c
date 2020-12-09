@@ -1,4 +1,4 @@
-/*	$OpenBSD: uipc_socket2.c,v 1.96 2018/07/10 10:02:14 bluhm Exp $	*/
+/*	$OpenBSD: uipc_socket2.c,v 1.104 2020/04/11 14:07:06 claudio Exp $	*/
 /*	$NetBSD: uipc_socket2.c,v 1.11 1996/02/04 02:17:55 christos Exp $	*/
 
 /*
@@ -166,14 +166,11 @@ sonewconn(struct socket *head, int connstatus)
 	so->so_state = head->so_state | SS_NOFDREF;
 	so->so_proto = head->so_proto;
 	so->so_timeo = head->so_timeo;
-	so->so_pgid = head->so_pgid;
 	so->so_euid = head->so_euid;
 	so->so_ruid = head->so_ruid;
 	so->so_egid = head->so_egid;
 	so->so_rgid = head->so_rgid;
 	so->so_cpid = head->so_cpid;
-	so->so_siguid = head->so_siguid;
-	so->so_sigeuid = head->so_sigeuid;
 
 	/*
 	 * Inherit watermarks but those may get clamped in low mem situations.
@@ -184,14 +181,18 @@ sonewconn(struct socket *head, int connstatus)
 	}
 	so->so_snd.sb_wat = head->so_snd.sb_wat;
 	so->so_snd.sb_lowat = head->so_snd.sb_lowat;
-	so->so_snd.sb_timeo = head->so_snd.sb_timeo;
+	so->so_snd.sb_timeo_nsecs = head->so_snd.sb_timeo_nsecs;
 	so->so_rcv.sb_wat = head->so_rcv.sb_wat;
 	so->so_rcv.sb_lowat = head->so_rcv.sb_lowat;
-	so->so_rcv.sb_timeo = head->so_rcv.sb_timeo;
+	so->so_rcv.sb_timeo_nsecs = head->so_rcv.sb_timeo_nsecs;
+
+	sigio_init(&so->so_sigio);
+	sigio_copy(&so->so_sigio, &head->so_sigio);
 
 	soqinsque(head, so, soqueue);
 	if ((*so->so_proto->pr_attach)(so, 0)) {
 		(void) soqremque(so, soqueue);
+		sigio_free(&so->so_sigio);
 		pool_put(&socket_pool, so);
 		return (NULL);
 	}
@@ -331,14 +332,15 @@ soassertlocked(struct socket *so)
 }
 
 int
-sosleep(struct socket *so, void *ident, int prio, const char *wmesg, int timo)
+sosleep_nsec(struct socket *so, void *ident, int prio, const char *wmesg,
+    uint64_t nsecs)
 {
 	if ((so->so_proto->pr_domain->dom_family != PF_UNIX) &&
 	    (so->so_proto->pr_domain->dom_family != PF_ROUTE) &&
 	    (so->so_proto->pr_domain->dom_family != PF_KEY)) {
-		return rwsleep(ident, &netlock, prio, wmesg, timo);
+		return rwsleep_nsec(ident, &netlock, prio, wmesg, nsecs);
 	} else
-		return tsleep(ident, prio, wmesg, timo);
+		return tsleep_nsec(ident, prio, wmesg, nsecs);
 }
 
 /*
@@ -352,7 +354,7 @@ sbwait(struct socket *so, struct sockbuf *sb)
 	soassertlocked(so);
 
 	sb->sb_flags |= SB_WAIT;
-	return (sosleep(so, &sb->sb_cc, prio, "netio", sb->sb_timeo));
+	return sosleep_nsec(so, &sb->sb_cc, prio, "netio", sb->sb_timeo_nsecs);
 }
 
 int
@@ -371,7 +373,7 @@ sblock(struct socket *so, struct sockbuf *sb, int wait)
 
 	while (sb->sb_flags & SB_LOCK) {
 		sb->sb_flags |= SB_WANT;
-		error = sosleep(so, &sb->sb_flags, prio, "netlck", 0);
+		error = sosleep_nsec(so, &sb->sb_flags, prio, "netlck", INFSLP);
 		if (error)
 			return (error);
 	}
@@ -406,11 +408,9 @@ sowakeup(struct socket *so, struct sockbuf *sb)
 		sb->sb_flags &= ~SB_WAIT;
 		wakeup(&sb->sb_cc);
 	}
-	KERNEL_LOCK();
 	if (so->so_state & SS_ASYNC)
-		csignal(so->so_pgid, SIGIO, so->so_siguid, so->so_sigeuid);
+		pgsigio(&so->so_sigio, SIGIO, 0);
 	selwakeup(&sb->sb_sel);
-	KERNEL_UNLOCK();
 }
 
 /*
@@ -483,8 +483,7 @@ sbreserve(struct socket *so, struct sockbuf *sb, u_long cc)
 	if (cc == 0 || cc > sb_max)
 		return (1);
 	sb->sb_hiwat = cc;
-	sb->sb_mbmax = max(3 * MAXMCLBYTES,
-	    min(cc * 2, sb_max + (sb_max / MCLBYTES) * MSIZE));
+	sb->sb_mbmax = max(3 * MAXMCLBYTES, cc * 8);
 	if (sb->sb_lowat > sb->sb_hiwat)
 		sb->sb_lowat = sb->sb_hiwat;
 	return (0);
@@ -620,6 +619,7 @@ sbappend(struct socket *so, struct sockbuf *sb, struct mbuf *m)
 	if (m == NULL)
 		return;
 
+	soassertlocked(so);
 	SBLASTRECORDCHK(sb, "sbappend 1");
 
 	if ((n = sb->sb_lastrecord) != NULL) {
@@ -785,6 +785,8 @@ sbappendaddr(struct socket *so, struct sockbuf *sb, const struct sockaddr *asa,
 	struct mbuf *m, *n, *nlast;
 	int space = asa->sa_len;
 
+	soassertlocked(so);
+
 	if (m0 && (m0->m_flags & M_PKTHDR) == 0)
 		panic("sbappendaddr");
 	if (m0)
@@ -885,9 +887,10 @@ sbcompress(struct sockbuf *sb, struct mbuf *m, struct mbuf *n)
 			continue;
 		}
 		if (n && (n->m_flags & M_EOR) == 0 &&
-		    /* M_TRAILINGSPACE() checks buffer writeability */
-		    m->m_len <= MCLBYTES / 4 && /* XXX Don't copy too much */
-		    m->m_len <= M_TRAILINGSPACE(n) &&
+		    /* m_trailingspace() checks buffer writeability */
+		    m->m_len <= ((n->m_flags & M_EXT)? n->m_ext.ext_size :
+		       MCLBYTES) / 4 && /* XXX Don't copy too much */
+		    m->m_len <= m_trailingspace(n) &&
 		    n->m_type == m->m_type) {
 			memcpy(mtod(n, caddr_t) + n->m_len, mtod(m, caddr_t),
 			    m->m_len);
@@ -1020,14 +1023,14 @@ sbdroprecord(struct sockbuf *sb)
  * with the specified type for presentation on a socket buffer.
  */
 struct mbuf *
-sbcreatecontrol(caddr_t p, int size, int type, int level)
+sbcreatecontrol(const void *p, size_t size, int type, int level)
 {
 	struct cmsghdr *cp;
 	struct mbuf *m;
 
 	if (CMSG_SPACE(size) > MCLBYTES) {
-		printf("sbcreatecontrol: message too large %d\n", size);
-		return NULL;
+		printf("sbcreatecontrol: message too large %zu\n", size);
+		return (NULL);
 	}
 
 	if ((m = m_get(M_DONTWAIT, MT_CONTROL)) == NULL)

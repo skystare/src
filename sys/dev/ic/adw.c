@@ -1,4 +1,4 @@
-/*	$OpenBSD: adw.c,v 1.55 2017/09/08 05:36:52 deraadt Exp $ */
+/*	$OpenBSD: adw.c,v 1.68 2020/09/22 19:32:52 krw Exp $ */
 /* $NetBSD: adw.c,v 1.23 2000/05/27 18:24:50 dante Exp $	 */
 
 /*
@@ -65,7 +65,6 @@ int adw_queue_ccb(ADW_SOFTC *, ADW_CCB *, int);
 void adw_scsi_cmd(struct scsi_xfer *);
 int adw_build_req(struct scsi_xfer *, ADW_CCB *, int);
 void adw_build_sglist(ADW_CCB *, ADW_SCSI_REQ_Q *, ADW_SG_BLOCK *);
-void adw_minphys(struct buf *, struct scsi_link *);
 void adw_isr_callback(ADW_SOFTC *, ADW_SCSI_REQ_Q *);
 void adw_async_callback(ADW_SOFTC *, u_int8_t);
 
@@ -83,6 +82,10 @@ struct cfdriver adw_cd = {
 	NULL, "adw", DV_DULL
 };
 
+struct scsi_adapter adw_switch = {
+	adw_scsi_cmd, NULL, NULL, NULL, NULL
+};
+
 /******************************************************************************/
 /*                       DMA Mapping for Control Blocks                       */
 /******************************************************************************/
@@ -95,8 +98,8 @@ adw_alloc_controls(ADW_SOFTC *sc)
 	int             error, rseg;
 
 	/*
-         * Allocate the control structure.
-         */
+	 * Allocate the control structure.
+	 */
 	if ((error = bus_dmamem_alloc(sc->sc_dmat, sizeof(struct adw_control),
 	    NBPG, 0, &seg, 1, &rseg, BUS_DMA_NOWAIT | BUS_DMA_ZERO)) != 0) {
 		printf("%s: unable to allocate control structures,"
@@ -112,8 +115,8 @@ adw_alloc_controls(ADW_SOFTC *sc)
 	}
 
 	/*
-         * Create and load the DMA map used for the control blocks.
-         */
+	 * Create and load the DMA map used for the control blocks.
+	 */
 	if ((error = bus_dmamap_create(sc->sc_dmat, sizeof(struct adw_control),
 			   1, sizeof(struct adw_control), 0, BUS_DMA_NOWAIT,
 				       &sc->sc_dmamap_control)) != 0) {
@@ -140,11 +143,11 @@ adw_alloc_carriers(ADW_SOFTC *sc)
 	int             error, rseg;
 
 	/*
-         * Allocate the control structure.
-         */
-	sc->sc_control->carriers = 
-		malloc(ADW_MAX_CARRIER * sizeof(ADW_CARRIER), M_DEVBUF,
-		       M_NOWAIT);
+	 * Allocate the control structure.
+	 */
+	sc->sc_control->carriers =
+	    malloc(ADW_MAX_CARRIER * sizeof(ADW_CARRIER), M_DEVBUF,
+		M_NOWAIT);
 	if (sc->sc_control->carriers == NULL)
 		return (ENOMEM);
 
@@ -166,8 +169,8 @@ adw_alloc_carriers(ADW_SOFTC *sc)
 	}
 
 	/*
-         * Create and load the DMA map used for the control blocks.
-         */
+	 * Create and load the DMA map used for the control blocks.
+	 */
 	if ((error = bus_dmamap_create(sc->sc_dmat,
 			sizeof(ADW_CARRIER) * ADW_MAX_CARRIER, 1,
 			sizeof(ADW_CARRIER) * ADW_MAX_CARRIER, 0,BUS_DMA_NOWAIT,
@@ -249,8 +252,8 @@ adw_init_ccb(ADW_SOFTC *sc, ADW_CCB *ccb)
 	int	hashnum, error;
 
 	/*
-         * Create the DMA map for this CCB.
-         */
+	 * Create the DMA map for this CCB.
+	 */
 	error = bus_dmamap_create(sc->sc_dmat,
 				  (ADW_MAX_SG_LIST - 1) * PAGE_SIZE,
 			 ADW_MAX_SG_LIST, (ADW_MAX_SG_LIST - 1) * PAGE_SIZE,
@@ -416,8 +419,8 @@ adw_attach(ADW_SOFTC *sc)
 	scsi_iopool_init(&sc->sc_iopool, sc, adw_ccb_alloc, adw_ccb_free);
 
 	/*
-         * Allocate the Control Blocks.
-         */
+	 * Allocate the Control Blocks.
+	 */
 	error = adw_alloc_controls(sc);
 	if (error)
 		return; /* (error) */ ;
@@ -499,36 +502,17 @@ adw_attach(ADW_SOFTC *sc)
 		break;
 	}
 
-	/*
-	 * Fill in the adapter.
-	 */
-	sc->sc_adapter.scsi_cmd = adw_scsi_cmd;
-	sc->sc_adapter.scsi_minphys = adw_minphys;
-
-	/*
-         * fill in the prototype scsi_link.
-         */
-	sc->sc_link.adapter_softc = sc;
-	sc->sc_link.adapter_target = sc->chip_scsi_id;
-	sc->sc_link.adapter = &sc->sc_adapter;
-	sc->sc_link.openings = 4;
-	sc->sc_link.adapter_buswidth = ADW_MAX_TID+1;
-	sc->sc_link.pool = &sc->sc_iopool;
-
-	bzero(&saa, sizeof(saa));
-	saa.saa_sc_link = &sc->sc_link;
+	saa.saa_adapter_softc = sc;
+	saa.saa_adapter_target = sc->chip_scsi_id;
+	saa.saa_adapter = &adw_switch;
+	saa.saa_adapter_buswidth = ADW_MAX_TID+1;
+	saa.saa_luns = 8;
+	saa.saa_openings = 4;
+	saa.saa_pool = &sc->sc_iopool;
+	saa.saa_quirks = saa.saa_flags = 0;
+	saa.saa_wwpn = saa.saa_wwnn = 0;
 
 	config_found(&sc->sc_dev, &saa, scsiprint);
-}
-
-
-void
-adw_minphys(struct buf *bp, struct scsi_link *sl)
-{
-
-	if (bp->b_bcount > ((ADW_MAX_SG_LIST - 1) * PAGE_SIZE))
-		bp->b_bcount = ((ADW_MAX_SG_LIST - 1) * PAGE_SIZE);
-	minphys(bp);
 }
 
 
@@ -540,26 +524,22 @@ void
 adw_scsi_cmd(struct scsi_xfer *xs)
 {
 	struct scsi_link *sc_link = xs->sc_link;
-	ADW_SOFTC      *sc = sc_link->adapter_softc;
+	ADW_SOFTC      *sc = sc_link->bus->sb_adapter_softc;
 	ADW_CCB        *ccb;
-	int             s, nowait = 0, retry = 0;
-	int		flags;
+	int             s, retry = 0;
 
 	/*
-         * get a ccb to use. If the transfer
-         * is from a buf (possibly from interrupt time)
-         * then we can't allow it to sleep
-         */
+	 * get a ccb to use. If the transfer
+	 * is from a buf (possibly from interrupt time)
+	 * then we can't allow it to sleep
+	 */
 
-	flags = xs->flags;
-	if (nowait)
-		flags |= SCSI_NOSLEEP;
 	ccb = xs->io;
 
 	ccb->xs = xs;
 	ccb->timeout = xs->timeout;
 
-	if (adw_build_req(xs, ccb, flags)) {
+	if (adw_build_req(xs, ccb, xs->flags)) {
 retryagain:
 		s = splbio();
 		retry = adw_queue_ccb(sc, ccb, retry);
@@ -575,15 +555,12 @@ retryagain:
 			return;
 		}
 
-		/*
-	         * Usually return SUCCESSFULLY QUEUED
-	         */
 		if ((xs->flags & SCSI_POLL) == 0)
 			return;
 
 		/*
-	         * If we can't use interrupts, poll on completion
-	         */
+		 * If we can't use interrupts, poll on completion
+		 */
 		if (adw_poll(sc, xs, ccb->timeout)) {
 			adw_timeout(ccb);
 			if (adw_poll(sc, xs, ccb->timeout))
@@ -603,7 +580,7 @@ int
 adw_build_req(struct scsi_xfer *xs, ADW_CCB *ccb, int flags)
 {
 	struct scsi_link *sc_link = xs->sc_link;
-	ADW_SOFTC      *sc = sc_link->adapter_softc;
+	ADW_SOFTC      *sc = sc_link->bus->sb_adapter_softc;
 	bus_dma_tag_t   dmat = sc->sc_dmat;
 	ADW_SCSI_REQ_Q *scsiqp;
 	int             error;
@@ -627,8 +604,8 @@ adw_build_req(struct scsi_xfer *xs, ADW_CCB *ccb, int flags)
 	 * is supported.
 	 */
 	scsiqp->cdb_len = xs->cmdlen;
-	bcopy((caddr_t)xs->cmd, &scsiqp->cdb, 12);
-	bcopy((caddr_t)xs->cmd + 12, &scsiqp->cdb16, 4);
+	bcopy(&xs->cmd, &scsiqp->cdb, 12);
+	bcopy((caddr_t)&xs->cmd + 12, &scsiqp->cdb16, 4);
 
 	scsiqp->target_id = sc_link->target;
 	scsiqp->target_lun = sc_link->lun;
@@ -643,8 +620,8 @@ adw_build_req(struct scsi_xfer *xs, ADW_CCB *ccb, int flags)
 	 */
 	if (xs->datalen) {
 		/*
-                 * Map the DMA transfer.
-                 */
+		 * Map the DMA transfer.
+		 */
 		error = bus_dmamap_load(dmat,
 		      ccb->dmamap_xfer, xs->data, xs->datalen, NULL,
 			(flags & SCSI_NOSLEEP) ?
@@ -679,8 +656,8 @@ adw_build_req(struct scsi_xfer *xs, ADW_CCB *ccb, int flags)
 		adw_build_sglist(ccb, scsiqp, ccb->sg_block);
 	} else {
 		/*
-                 * No data xfer, use non S/G values.
-                 */
+		 * No data xfer, use non S/G values.
+		 */
 		scsiqp->data_cnt = 0;
 		scsiqp->vdata_addr = 0;
 		scsiqp->data_addr = 0;
@@ -769,7 +746,7 @@ adw_poll(ADW_SOFTC *sc, struct scsi_xfer *xs, int count)
 		adw_intr(sc);
 		splx(s);
 		if (xs->flags & ITSDONE) {
-			if ((xs->cmd->opcode == INQUIRY)
+			if ((xs->cmd.opcode == INQUIRY)
 			    && (xs->sc_link->lun == 0)
 			    && (xs->error == XS_NOERROR))
 				adw_print_info(sc, xs->sc_link->target);
@@ -788,7 +765,7 @@ adw_timeout(void *arg)
 	ADW_CCB        *ccb = arg;
 	struct scsi_xfer *xs = ccb->xs;
 	struct scsi_link *sc_link = xs->sc_link;
-	ADW_SOFTC      *sc = sc_link->adapter_softc;
+	ADW_SOFTC      *sc = sc_link->bus->sb_adapter_softc;
 	int             s;
 
 	sc_print_addr(sc_link);
@@ -879,7 +856,7 @@ adw_timeout(void *arg)
 
 
 void
-adw_reset_bus(ADW_SOFTC *sc) 
+adw_reset_bus(ADW_SOFTC *sc)
 {
 	ADW_CCB	*ccb;
 	int	 s;
@@ -888,7 +865,7 @@ adw_reset_bus(ADW_SOFTC *sc)
 	AdwResetSCSIBus(sc); /* XXX - should check return value? */
 	while((ccb = TAILQ_LAST(&sc->sc_pending_ccb,
 			adw_pending_ccb)) != NULL) {
-	        timeout_del(&ccb->xs->stimeout);
+		timeout_del(&ccb->xs->stimeout);
 		TAILQ_REMOVE(&sc->sc_pending_ccb, ccb, chain);
 		TAILQ_INSERT_HEAD(&sc->sc_waiting_ccb, ccb, chain);
 	}
@@ -933,7 +910,7 @@ adw_print_info(ADW_SOFTC *sc, int tid)
 	else {
 		period = (hshk_cfg & 0x1f00) >> 8;
 		switch (period) {
-		case 0x11: 
+		case 0x11:
 			printf("80.0 ");
 			break;
 		case 0x10:
@@ -948,7 +925,7 @@ adw_print_info(ADW_SOFTC *sc, int tid)
 	}
 
 	printf("xfers\n");
-}	
+}
 
 
 /******************************************************************************/
@@ -987,15 +964,15 @@ adw_isr_callback(ADW_SOFTC *sc, ADW_SCSI_REQ_Q *scsiq)
 	timeout_del(&xs->stimeout);
 
 	/*
-         * If we were a data transfer, unload the map that described
-         * the data buffer.
-         */
+	 * If we were a data transfer, unload the map that described
+	 * the data buffer.
+	 */
 	dmat = sc->sc_dmat;
 	if (xs->datalen) {
 		bus_dmamap_sync(dmat, ccb->dmamap_xfer,
 		    0, ccb->dmamap_xfer->dm_mapsize,
 		    ((xs->flags & SCSI_DATA_IN) ?
-		        BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE));
+		    BUS_DMASYNC_POSTREAD : BUS_DMASYNC_POSTWRITE));
 		bus_dmamap_unload(dmat, ccb->dmamap_xfer);
 	}
 
@@ -1023,10 +1000,10 @@ NO_ERROR:
 			case SCSI_INTERM:
 			case SCSI_INTERM_COND_MET:
 				/*
-				 * These non-zero status values are 
+				 * These non-zero status values are
 				 * not really error conditions.
 				 *
-				 * XXX - would it be too paranoid to 
+				 * XXX - would it be too paranoid to
 				 *       add SCSI_OK here in
 				 *       case the docs are wrong re
 				 *       QD_NO_ERROR?
@@ -1048,7 +1025,7 @@ NO_ERROR:
 				sc->sc_freeze_dev[scsiq->target_id] = 1;
 				xs->error = XS_BUSY;
 				break;
-		
+
 			default: /* scsiq->scsi_status value */
 				printf("%s: bad scsi_status: 0x%02x.\n"
 				    ,sc->sc_dev.dv_xname
@@ -1057,7 +1034,7 @@ NO_ERROR:
 				break;
 			}
 			break;
-		
+
 		case QHSTA_M_SEL_TIMEOUT:
 			xs->error = XS_SELTIMEOUT;
 			break;
@@ -1105,17 +1082,17 @@ NO_ERROR:
 			adw_reset_bus(sc);
 			xs->error = XS_RESET;
 			break;
-			
+
 		default: /* scsiq->host_status value */
 			/*
 			 * XXX - is a panic really appropriate here? If
-			 *       not, would it be better to make the 
-			 *       XS_DRIVER_STUFFUP case above the 
+			 *       not, would it be better to make the
+			 *       XS_DRIVER_STUFFUP case above the
 			 *       default behaviour? Or XS_RESET?
 			 */
 			panic("%s: bad host_status: 0x%02x"
 			    ,sc->sc_dev.dv_xname, scsiq->host_status);
-			break;      
+			break;
 		}
 		break;
 
@@ -1173,10 +1150,10 @@ adw_async_callback(ADW_SOFTC *sc, u_int8_t code)
 
 
 	case ADW_ASYNC_CARRIER_READY_FAILURE:
-		/* 
+		/*
 		 * Carrier Ready failure.
-	         *
-		 * A warning only - RISC too busy to realize it's been 
+		 *
+		 * A warning only - RISC too busy to realize it's been
 		 * tickled. Occurs in normal operation under heavy
 		 * load, so a message is printed only when ADW_DEBUG'ing
 		 */
@@ -1186,7 +1163,7 @@ adw_async_callback(ADW_SOFTC *sc, u_int8_t code)
 		break;
 
 	default:
-	        printf("%s: Unknown Async callback code (ignored): 0x%02x\n",
+		printf("%s: Unknown Async callback code (ignored): 0x%02x\n",
 		    sc->sc_dev.dv_xname, code);
 		break;
 	}

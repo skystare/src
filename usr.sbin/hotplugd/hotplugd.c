@@ -1,4 +1,4 @@
-/*	$OpenBSD: hotplugd.c,v 1.14 2016/07/31 20:13:12 natano Exp $	*/
+/*	$OpenBSD: hotplugd.c,v 1.16 2020/10/15 19:45:50 naddy Exp $	*/
 /*
  * Copyright (c) 2004 Alexander Yurchenko <grange@openbsd.org>
  *
@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -61,9 +62,6 @@ main(int argc, char *argv[])
 	struct sigaction sact;
 	struct hotplug_event he;
 
-	if (pledge("stdio rpath proc exec", NULL) == -1)
-		err(1, "pledge");
-
 	while ((ch = getopt(argc, argv, "d:")) != -1)
 		switch (ch) {
 		case 'd':
@@ -79,6 +77,15 @@ main(int argc, char *argv[])
 	argv += optind;
 	if (argc > 0)
 		usage();
+	
+	if (unveil(device, "r") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_ETC_HOTPLUG_ATTACH, "rx") == -1)
+		err(1, "unveil");
+	if (unveil(_PATH_ETC_HOTPLUG_DETACH, "rx") == -1)
+		err(1, "unveil");
+	if (pledge("stdio rpath proc exec", NULL) == -1)
+		err(1, "pledge");
 
 	if ((devfd = open(device, O_RDONLY | O_CLOEXEC)) == -1)
 		err(1, "%s", device);
@@ -157,7 +164,10 @@ exec_script(const char *file, int class, char *name)
 	}
 	if (pid == 0) {
 		/* child process */
-		execl(file, basename(file), strclass, name, (char *)NULL);
+		char filebuf[PATH_MAX];
+
+		strlcpy(filebuf, file, sizeof(filebuf));
+		execl(file, basename(filebuf), strclass, name, (char *)NULL);
 		syslog(LOG_ERR, "execl %s: %m", file);
 		_exit(1);
 		/* NOTREACHED */

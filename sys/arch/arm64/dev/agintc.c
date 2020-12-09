@@ -1,4 +1,4 @@
-/* $OpenBSD: agintc.c,v 1.14 2018/08/18 10:10:19 kettenis Exp $ */
+/* $OpenBSD: agintc.c,v 1.29 2020/11/28 18:33:43 patrick Exp $ */
 /*
  * Copyright (c) 2007, 2009, 2011, 2017 Dale Rahn <drahn@dalerahn.com>
  * Copyright (c) 2018 Mark Kettenis <kettenis@openbsd.org>
@@ -65,9 +65,10 @@
 #define GICD_CTLR		0x0000
 /* non-secure */
 #define  GICD_CTLR_RWP			(1U << 31)
-#define  GICD_CTRL_EnableGrp1		(1 << 0)
-#define  GICD_CTRL_EnableGrp1A		(1 << 1)
-#define  GICD_CTRL_ARE_NS		(1 << 4)
+#define  GICD_CTLR_EnableGrp1		(1 << 0)
+#define  GICD_CTLR_EnableGrp1A		(1 << 1)
+#define  GICD_CTLR_ARE_NS		(1 << 4)
+#define  GICD_CTLR_DS			(1 << 6)
 #define GICD_TYPER		0x0004
 #define  GICD_TYPER_LPIS		(1 << 16)
 #define  GICD_TYPER_ITLINE_M		0x1f
@@ -80,6 +81,9 @@
 #define GICD_ICACTIVER(i)	(0x0380 + (IRQ_TO_REG32(i) * 4))
 #define GICD_IPRIORITYR(i)	(0x0400 + (i))
 #define GICD_ICFGR(i)		(0x0c00 + (IRQ_TO_REG16(i) * 4))
+#define  GICD_ICFGR_TRIG_LEVEL(i)	(0x0 << (IRQ_TO_REG16BIT(i) * 2))
+#define  GICD_ICFGR_TRIG_EDGE(i)	(0x2 << (IRQ_TO_REG16BIT(i) * 2))
+#define  GICD_ICFGR_TRIG_MASK(i)	(0x2 << (IRQ_TO_REG16BIT(i) * 2))
 #define GICD_NSACR(i)		(0x0e00 + (IRQ_TO_REG16(i) * 4))
 #define GICD_IROUTER(i)		(0x6000 + ((i) * 8))
 
@@ -141,10 +145,12 @@ struct agintc_softc {
 	bus_space_handle_t	*sc_r_ioh;
 	bus_space_handle_t	 sc_redist_base;
 	bus_dma_tag_t		 sc_dmat;
-	uint64_t		*sc_affinity;
+	uint16_t		*sc_processor;
 	int			 sc_cpuremap[MAXCPUS];
 	int			 sc_nintr;
 	int			 sc_nlpi;
+	int			 sc_prio_shift;
+	int			 sc_pmr_shift;
 	int			 sc_rk3399_quirk;
 	struct evcount		 sc_spur;
 	int			 sc_ncells;
@@ -167,12 +173,14 @@ struct intrhand {
 	int			 ih_irq;		/* IRQ number */
 	struct evcount		 ih_count;
 	char			*ih_name;
+	struct cpu_info		*ih_ci;			/* CPU the IRQ runs on */
 };
 
 struct intrq {
 	TAILQ_HEAD(, intrhand)	iq_list;	/* handler list */
-	int			iq_irq;		/* IRQ to mask while handling */
-	int			iq_levels;	/* IPL_*'s this IRQ has */
+	struct cpu_info		*iq_ci;		/* CPU the IRQ runs on */
+	int			iq_irq_max;	/* IRQ to mask while handling */
+	int			iq_irq_min;	/* lowest IRQ when shared */
 	int			iq_ist;		/* share type */
 	int			iq_route;
 };
@@ -201,11 +209,11 @@ void		agintc_splx(int);
 int		agintc_splraise(int);
 void		agintc_setipl(int);
 void		agintc_calc_mask(void);
-void		agintc_calc_irq(struct agintc_softc	*sc, int irq);
-void		*agintc_intr_establish(int, int, int (*)(void *), void *,
-		    char *);
+void		agintc_calc_irq(struct agintc_softc *sc, int irq);
+void		*agintc_intr_establish(int, int, int, struct cpu_info *,
+		    int (*)(void *), void *, char *);
 void		*agintc_intr_establish_fdt(void *cookie, int *cell, int level,
-		    int (*func)(void *), void *arg, char *name);
+		    struct cpu_info *, int (*func)(void *), void *arg, char *name);
 void		agintc_intr_disestablish(void *);
 void		agintc_irq_handler(void *);
 uint32_t	agintc_iack(void);
@@ -213,9 +221,11 @@ void		agintc_eoi(uint32_t);
 void		agintc_set_priority(struct agintc_softc *sc, int, int);
 void		agintc_intr_enable(struct agintc_softc *, int);
 void		agintc_intr_disable(struct agintc_softc *, int);
+void		agintc_intr_config(struct agintc_softc *, int, int);
 void		agintc_route(struct agintc_softc *, int, int,
 		    struct cpu_info *);
 void		agintc_route_irq(void *, int, struct cpu_info *);
+void		agintc_intr_barrier(void *);
 void		agintc_wait_rwp(struct agintc_softc *sc);
 void		agintc_r_wait_rwp(struct agintc_softc *sc);
 uint32_t	agintc_r_ictlr(void);
@@ -263,10 +273,14 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 {
 	struct agintc_softc	*sc = (struct agintc_softc *)self;
 	struct fdt_attach_args	*faa = aux;
+	struct cpu_info		*ci;
+	CPU_INFO_ITERATOR	 cii;
 	uint32_t		 typer;
 	uint32_t		 nsacr, oldnsacr;
+	uint32_t		 pmr, oldpmr;
 	uint32_t		 ctrl, bits;
-	int			 i, j, nintr;
+	uint32_t		 affinity;
+	int			 i, nbits, nintr;
 	int			 psw;
 	int			 offset, nredist;
 #ifdef MULTIPROCESSOR
@@ -311,6 +325,38 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 	}
 
 	/*
+	 * We are guaranteed to have at least 16 priority levels, so
+	 * in principle we just want to use the top 4 bits of the
+	 * (non-secure) priority field.
+	 */
+	sc->sc_prio_shift = sc->sc_pmr_shift = 4;
+
+	/*
+	 * If the system supports two security states and SCR_EL3.FIQ
+	 * is zero, the non-secure shifted view applies.  We detect
+	 * this by checking whether the number of writable bits
+	 * matches the number of implemented priority bits.  If that
+	 * is the case we will need to adjust the priorities that we
+	 * write into ICC_PMR_EL1 accordingly.
+	 *
+	 * On Ampere eMAG it appears as if there are five writable
+	 * bits when we write 0xff.  But for higher priorities
+	 * (smaller values) only the top 4 bits stick.  So we use 0xbf
+	 * instead to determine the number of writable bits.
+	 */
+	ctrl = bus_space_read_4(sc->sc_iot, sc->sc_d_ioh, GICD_CTLR);
+	if ((ctrl & GICD_CTLR_DS) == 0) {
+		__asm volatile("mrs %x0, "STR(ICC_CTLR_EL1) : "=r"(ctrl));
+		nbits = ICC_CTLR_EL1_PRIBITS(ctrl) + 1;
+		__asm volatile("mrs %x0, "STR(ICC_PMR) : "=r"(oldpmr));
+		__asm volatile("msr "STR(ICC_PMR)", %x0" :: "r"(0xbf));
+		__asm volatile("mrs %x0, "STR(ICC_PMR) : "=r"(pmr));
+		__asm volatile("msr "STR(ICC_PMR)", %x0" :: "r"(oldpmr));
+		if (nbits == 8 - (ffs(pmr) - 1))
+			sc->sc_pmr_shift--;
+	}
+
+	/*
 	 * The Rockchip RK3399 is busted.  Its GIC-500 treats all
 	 * access to its memory mapped registers as "secure".  As a
 	 * result, several registers don't behave as expected.  For
@@ -323,7 +369,9 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 	 *
 	 * We check whether we have secure mode access to these
 	 * registers by attempting to write to the GICD_NSACR register
-	 * and check whether its contents actually change.
+	 * and check whether its contents actually change.  In that
+	 * case we need to adjust the priorities we write into
+	 * GICD_IPRIORITYRn and GICRIPRIORITYRn accordingly.
 	 */
 	oldnsacr = bus_space_read_4(sc->sc_iot, sc->sc_d_ioh, GICD_NSACR(32));
 	bus_space_write_4(sc->sc_iot, sc->sc_d_ioh, GICD_NSACR(32),
@@ -333,7 +381,11 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 		bus_space_write_4(sc->sc_iot, sc->sc_d_ioh, GICD_NSACR(32),
 		    oldnsacr);
 		sc->sc_rk3399_quirk = 1;
+		sc->sc_prio_shift--;
+		printf(" sec");
 	}
+
+	printf(" shift %d:%d", sc->sc_prio_shift, sc->sc_pmr_shift);
 
 	evcount_attach(&sc->sc_spur, "irq1023/spur", NULL);
 
@@ -370,12 +422,12 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 		}
 	}
 
-	printf(" nirq %d, nredist %d", nintr, sc->sc_num_redist);
+	printf(" nirq %d nredist %d", nintr, sc->sc_num_redist);
 	
 	sc->sc_r_ioh = mallocarray(sc->sc_num_redist,
 	    sizeof(*sc->sc_r_ioh), M_DEVBUF, M_WAITOK);
-	sc->sc_affinity = mallocarray(sc->sc_num_redist,
-	    sizeof(*sc->sc_affinity), M_DEVBUF, M_WAITOK);
+	sc->sc_processor = mallocarray(sc->sc_num_redist,
+	    sizeof(*sc->sc_processor), M_DEVBUF, M_WAITOK);
 
 	/* submap and configure the redistributors. */
 	offset = 0;
@@ -389,8 +441,23 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 		if (typer & GICR_TYPER_VLPIS)
 			sz += (64 * 1024 * 2);
 
-		sc->sc_affinity[nredist] = bus_space_read_8(sc->sc_iot,
+		affinity = bus_space_read_8(sc->sc_iot,
 		    sc->sc_redist_base, offset + GICR_TYPER) >> 32;
+		CPU_INFO_FOREACH(cii, ci) {
+			if (affinity == (((ci->ci_mpidr >> 8) & 0xff000000) |
+			    (ci->ci_mpidr & 0x00ffffff)))
+				break;
+		}
+		if (ci != NULL)
+			sc->sc_cpuremap[ci->ci_cpuid] = nredist;
+#ifdef MULTIPROCESSOR
+		else
+			panic("%s: no CPU found for affinity %08x",
+			    sc->sc_sbus.sc_dev.dv_xname, affinity);
+#endif
+
+		sc->sc_processor[nredist] = bus_space_read_8(sc->sc_iot,
+		    sc->sc_redist_base, offset + GICR_TYPER) >> 8;
 
 		bus_space_subregion(sc->sc_iot, sc->sc_redist_base,
 		    offset, sz, &sc->sc_r_ioh[nredist]);
@@ -417,11 +484,6 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 	for (i = 1; i < nintr / 32; i++) {
 		bus_space_write_4(sc->sc_iot, sc->sc_d_ioh,
 		    GICD_ICENABLER(i * 32), ~0);
-		for (j = 0; j < 32; j++) {
-			__asm volatile("msr "STR(ICC_DIR)", %x0" : :
-			    "r" ((i * 32) + j));
-			__isb();
-		}
 	}
 
 	for (i = 4; i < nintr; i += 4) {
@@ -457,9 +519,9 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 
 	/* enable interrupts */
 	ctrl = bus_space_read_4(sc->sc_iot, sc->sc_d_ioh, GICD_CTLR);
-	bits = GICD_CTRL_ARE_NS | GICD_CTRL_EnableGrp1A | GICD_CTRL_EnableGrp1;
+	bits = GICD_CTLR_ARE_NS | GICD_CTLR_EnableGrp1A | GICD_CTLR_EnableGrp1;
 	if (sc->sc_rk3399_quirk) {
-		bits &= ~GICD_CTRL_EnableGrp1A;
+		bits &= ~GICD_CTLR_EnableGrp1A;
 		bits <<= 1;
 	}
 	bus_space_write_4(sc->sc_iot, sc->sc_d_ioh, GICD_CTLR, ctrl | bits);
@@ -511,16 +573,19 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 	switch (nipi) {
 	case 1:
 		sc->sc_ipi_irq[0] = agintc_intr_establish(ipiirq[0],
-		    IPL_IPI|IPL_MPSAFE, agintc_ipi_combined, sc, "ipi");
+		    IST_EDGE_RISING, IPL_IPI|IPL_MPSAFE, NULL,
+		    agintc_ipi_combined, sc, "ipi");
 		sc->sc_ipi_num[ARM_IPI_NOP] = ipiirq[0];
 		sc->sc_ipi_num[ARM_IPI_DDB] = ipiirq[0];
 		break;
 	case 2:
 		sc->sc_ipi_irq[0] = agintc_intr_establish(ipiirq[0],
-		    IPL_IPI|IPL_MPSAFE, agintc_ipi_nop, sc, "ipinop");
+		    IST_EDGE_RISING, IPL_IPI|IPL_MPSAFE, NULL,
+		    agintc_ipi_nop, sc, "ipinop");
 		sc->sc_ipi_num[ARM_IPI_NOP] = ipiirq[0];
 		sc->sc_ipi_irq[1] = agintc_intr_establish(ipiirq[1],
-		    IPL_IPI|IPL_MPSAFE, agintc_ipi_ddb, sc, "ipiddb");
+		    IST_EDGE_RISING, IPL_IPI|IPL_MPSAFE, NULL,
+		    agintc_ipi_ddb, sc, "ipiddb");
 		sc->sc_ipi_num[ARM_IPI_DDB] = ipiirq[1];
 		break;
 	default:
@@ -536,6 +601,7 @@ agintc_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_ic.ic_disestablish = agintc_intr_disestablish;
 	sc->sc_ic.ic_route = agintc_route_irq;
 	sc->sc_ic.ic_cpu_enable = agintc_cpuinit;
+	sc->sc_ic.ic_barrier = agintc_intr_barrier;
 	arm_intr_register_fdt(&sc->sc_ic);
 
 	restore_interrupts(psw);
@@ -550,9 +616,9 @@ unmap:
 		free(sc->sc_r_ioh, M_DEVBUF,
 		    sc->sc_num_redist * sizeof(*sc->sc_r_ioh));
 	}
-	if (sc->sc_affinity) {
-		free(sc->sc_affinity, M_DEVBUF,
-		     sc->sc_num_redist * sizeof(*sc->sc_affinity));
+	if (sc->sc_processor) {
+		free(sc->sc_processor, M_DEVBUF,
+		     sc->sc_num_redist * sizeof(*sc->sc_processor));
 	}
 
 	if (sc->sc_pend)
@@ -568,35 +634,13 @@ unmap:
 void
 agintc_cpuinit(void)
 {
-	struct cpu_info *ci = curcpu();
 	struct agintc_softc *sc = agintc_sc;
-	uint64_t mpidr = READ_SPECIALREG(mpidr_el1);
-	uint32_t affinity, waker;
+	uint32_t waker;
 	int timeout = 100000;
-	int hwcpu = -1;
+	int hwcpu;
 	int i;
 
-	/* match this processor to one of the redistributors */
-	affinity = (((mpidr >> 8) & 0xff000000) | (mpidr & 0x00ffffff));
-
-	for (i = 0; i < sc->sc_num_redist; i++) {
-		if (affinity == sc->sc_affinity[i]) {
-			sc->sc_cpuremap[ci->ci_cpuid] = hwcpu = i;
-#ifdef DEBUG_AGINTC
-			printf("found cpu%d at %d\n", ci->ci_cpuid, i);
-#endif
-			break;
-		}
-	}
-
-	if (hwcpu == -1) {
-		printf("cpu mpidr not found mpidr %llx affinity %08x\n",
-		    mpidr, affinity);
-		for (i = 0; i < sc->sc_num_redist; i++)
-			printf("rdist%d: %016llx\n", i, sc->sc_affinity[i]);
-		panic("failed to indentify cpunumber %d", ci->ci_cpuid);
-	}
-
+	hwcpu = sc->sc_cpuremap[cpu_number()];
 	waker = bus_space_read_4(sc->sc_iot, sc->sc_r_ioh[hwcpu],
 	    GICR_WAKER);
 	waker &= ~(GICR_WAKER_PROCESSORSLEEP);
@@ -633,21 +677,13 @@ agintc_cpuinit(void)
 }
 
 void
-agintc_set_priority(struct agintc_softc *sc, int irq, int pri)
+agintc_set_priority(struct agintc_softc *sc, int irq, int ipl)
 {
 	struct cpu_info	*ci = curcpu();
 	int		 hwcpu = sc->sc_cpuremap[ci->ci_cpuid];
 	uint32_t	 prival;
 
-	/*
-	 * The interrupt priority registers only expose the priorities
-	 * available in non-secure mode, so the top bit is hidden.  So
-	 * here we shift into bits 4-7.
-	 * Also low values are higher priority thus NIPL - pri
-	 */
-	prival = ((NIPL - pri) << 4);
-	if (sc->sc_rk3399_quirk)
-		prival = 0x80 | (prival >> 1);
+	prival = ((0xff - ipl) << sc->sc_prio_shift) & 0xff;
 
 	if (irq >= SPI_BASE) {
 		bus_space_write_1(sc->sc_iot, sc->sc_d_ioh,
@@ -660,29 +696,18 @@ agintc_set_priority(struct agintc_softc *sc, int irq, int pri)
 }
 
 void
-agintc_setipl(int new)
+agintc_setipl(int ipl)
 {
+	struct agintc_softc	*sc = agintc_sc;
 	struct cpu_info		*ci = curcpu();
 	int			 psw;
 	uint32_t		 prival;
 
 	/* disable here is only to keep hardware in sync with ci->ci_cpl */
 	psw = disable_interrupts();
-	ci->ci_cpl = new;
+	ci->ci_cpl = ipl;
 
-	/*
-	 * The priority mask register exposes the full range of
-	 * priorities available in secure mode, and at least bit 3-7
-	 * must be implemented.  For non-secure interrupts the top bit
-	 * must be one.  We only use 16 (13 really) interrupt
-	 * priorities, so shift into bits 3-6.
-	 * Low values are higher priority thus NIPL - pri
-	 */
-	if (new == IPL_NONE)
-		prival = 0xff;		/* minimum priority */
-	else
-		prival = 0x80 | ((NIPL - new) << 3);
-
+	prival = ((0xff - ipl) << sc->sc_pmr_shift) & 0xff;
 	__asm volatile("msr "STR(ICC_PMR)", %x0" : : "r" (prival));
 	__isb();
 
@@ -721,6 +746,24 @@ agintc_intr_disable(struct agintc_softc *sc, int irq)
 }
 
 void
+agintc_intr_config(struct agintc_softc *sc, int irq, int type)
+{
+	uint32_t reg;
+
+	/* Don't dare to change SGIs or PPIs (yet) */
+	if (irq < 32)
+		return;
+
+	reg = bus_space_read_4(sc->sc_iot, sc->sc_d_ioh, GICD_ICFGR(irq));
+	reg &= ~GICD_ICFGR_TRIG_MASK(irq);
+	if (type == IST_EDGE_RISING)
+		reg |= GICD_ICFGR_TRIG_EDGE(irq);
+	else
+		reg |= GICD_ICFGR_TRIG_LEVEL(irq);
+	bus_space_write_4(sc->sc_iot, sc->sc_d_ioh, GICD_ICFGR(irq), reg);
+}
+
+void
 agintc_calc_mask(void)
 {
 	struct agintc_softc	*sc = agintc_sc;
@@ -733,7 +776,7 @@ agintc_calc_mask(void)
 void
 agintc_calc_irq(struct agintc_softc *sc, int irq)
 {
-	struct cpu_info	*ci = curcpu();
+	struct cpu_info	*ci = sc->sc_handler[irq].iq_ci;
 	struct intrhand	*ih;
 	int max = IPL_NONE;
 	int min = IPL_HIGH;
@@ -746,12 +789,15 @@ agintc_calc_irq(struct agintc_softc *sc, int irq)
 			min = ih->ih_ipl;
 	}
 
-	if (sc->sc_handler[irq].iq_irq == max)
-		return;
-	sc->sc_handler[irq].iq_irq = max;
-
 	if (max == IPL_NONE)
 		min = IPL_NONE;
+
+	if (sc->sc_handler[irq].iq_irq_max == max &&
+	    sc->sc_handler[irq].iq_irq_min == min)
+		return;
+
+	sc->sc_handler[irq].iq_irq_max = max;
+	sc->sc_handler[irq].iq_irq_min = min;
 
 #ifdef DEBUG_AGINTC
 	if (min != IPL_NONE)
@@ -828,7 +874,7 @@ agintc_route_irq(void *v, int enable, struct cpu_info *ci)
 
 	if (enable) {
 		agintc_set_priority(sc, ih->ih_irq,
-		    sc->sc_handler[ih->ih_irq].iq_irq);
+		    sc->sc_handler[ih->ih_irq].iq_irq_min);
 		agintc_route(sc, ih->ih_irq, IRQ_ENABLE, ci);
 		agintc_intr_enable(sc, ih->ih_irq);
 	}
@@ -842,11 +888,18 @@ agintc_route(struct agintc_softc *sc, int irq, int enable, struct cpu_info *ci)
 #ifdef DEBUG_AGINTC
 		printf("router %x irq %d val %016llx\n", GICD_IROUTER(irq),
 		    irq, ci->ci_mpidr & MPIDR_AFF);
-		    val);
 #endif
 		bus_space_write_8(sc->sc_iot, sc->sc_d_ioh,
 		    GICD_IROUTER(irq), ci->ci_mpidr & MPIDR_AFF);
 	}
+}
+
+void
+agintc_intr_barrier(void *cookie)
+{
+	struct intrhand		*ih = cookie;
+
+	sched_barrier(ih->ih_ci);
 }
 
 void
@@ -887,12 +940,10 @@ agintc_run_handler(struct intrhand *ih, void *frame, int s)
 void
 agintc_irq_handler(void *frame)
 {
-	struct cpu_info		*ci = curcpu();
 	struct agintc_softc	*sc = agintc_sc;
 	struct intrhand		*ih;
 	int			 irq, pri, s;
 
-	ci->ci_idepth++;
 	irq = agintc_iack();
 
 #ifdef DEBUG_AGINTC
@@ -911,33 +962,28 @@ agintc_irq_handler(void *frame)
 
 	if (irq == 1023) {
 		sc->sc_spur.ec_count++;
-		ci->ci_idepth--;
 		return;
 	}
 
 	if ((irq >= sc->sc_nintr && irq < LPI_BASE) ||
 	    irq >= LPI_BASE + sc->sc_nlpi) {
-		ci->ci_idepth--;
 		return;
 	}
 
 	if (irq >= LPI_BASE) {
 		ih = sc->sc_lpi_handler[irq - LPI_BASE];
-		if (ih == NULL) {
-			ci->ci_idepth--;
+		if (ih == NULL)
 			return;
-		}
 		
 		s = agintc_splraise(ih->ih_ipl);
 		agintc_run_handler(ih, frame, s);
 		agintc_eoi(irq);
 
 		agintc_splx(s);
-		ci->ci_idepth--;
 		return;
 	}
 
-	pri = sc->sc_handler[irq].iq_irq;
+	pri = sc->sc_handler[irq].iq_irq_max;
 	s = agintc_splraise(pri);
 	TAILQ_FOREACH(ih, &sc->sc_handler[irq].iq_list, ih_list) {
 		agintc_run_handler(ih, frame, s);
@@ -945,15 +991,15 @@ agintc_irq_handler(void *frame)
 	agintc_eoi(irq);
 
 	agintc_splx(s);
-	ci->ci_idepth--;
 }
 
 void *
 agintc_intr_establish_fdt(void *cookie, int *cell, int level,
-    int (*func)(void *), void *arg, char *name)
+    struct cpu_info *ci, int (*func)(void *), void *arg, char *name)
 {
 	struct agintc_softc	*sc = agintc_sc;
 	int			 irq;
+	int			 type;
 
 	/* 2nd cell contains the interrupt number */
 	irq = cell[1];
@@ -966,12 +1012,18 @@ agintc_intr_establish_fdt(void *cookie, int *cell, int level,
 	else
 		panic("%s: bogus interrupt type", sc->sc_sbus.sc_dev.dv_xname);
 
-	return agintc_intr_establish(irq, level, func, arg, name);
+	/* SPIs are only active-high level or low-to-high edge */
+	if (cell[2] & 0x3)
+		type = IST_EDGE_RISING;
+	else
+		type = IST_LEVEL_HIGH;
+
+	return agintc_intr_establish(irq, type, level, ci, func, arg, name);
 }
 
 void *
-agintc_intr_establish(int irqno, int level, int (*func)(void *),
-    void *arg, char *name)
+agintc_intr_establish(int irqno, int type, int level, struct cpu_info *ci,
+    int (*func)(void *), void *arg, char *name)
 {
 	struct agintc_softc	*sc = agintc_sc;
 	struct intrhand		*ih;
@@ -982,6 +1034,9 @@ agintc_intr_establish(int irqno, int level, int (*func)(void *),
 		panic("agintc_intr_establish: bogus irqnumber %d: %s",
 		    irqno, name);
 
+	if (ci == NULL)
+		ci = &cpu_info_primary;
+
 	ih = malloc(sizeof *ih, M_DEVBUF, M_WAITOK);
 	ih->ih_func = func;
 	ih->ih_arg = arg;
@@ -989,12 +1044,20 @@ agintc_intr_establish(int irqno, int level, int (*func)(void *),
 	ih->ih_flags = level & IPL_FLAGMASK;
 	ih->ih_irq = irqno;
 	ih->ih_name = name;
+	ih->ih_ci = ci;
 
 	psw = disable_interrupts();
 
-	if (irqno < LPI_BASE)
+	if (irqno < LPI_BASE) {
+		if (!TAILQ_EMPTY(&sc->sc_handler[irqno].iq_list) &&
+		    sc->sc_handler[irqno].iq_ci != ci) {
+			free(ih, M_DEVBUF, sizeof *ih);
+			restore_interrupts(psw);
+			return NULL;
+		}
 		TAILQ_INSERT_TAIL(&sc->sc_handler[irqno].iq_list, ih, ih_list);
-	else
+		sc->sc_handler[irqno].iq_ci = ci;
+	} else
 		sc->sc_lpi_handler[irqno - LPI_BASE] = ih;
 
 	if (name != NULL)
@@ -1005,11 +1068,12 @@ agintc_intr_establish(int irqno, int level, int (*func)(void *),
 #endif
 
 	if (irqno < LPI_BASE) {
+		agintc_intr_config(sc, irqno, type);
 		agintc_calc_irq(sc, irqno);
 	} else {
 		uint8_t *prop = AGINTC_DMA_KVA(sc->sc_prop);
 
-		prop[irqno - LPI_BASE] = ((NIPL - ih->ih_ipl) << 4) |
+		prop[irqno - LPI_BASE] = (((0xff - ih->ih_ipl) << 4) & 0xff) |
 		    GICR_PROP_GROUP1 | GICR_PROP_ENABLE;
 
 		/* Make globally visible. */
@@ -1049,16 +1113,6 @@ agintc_eoi(uint32_t eoi)
 	__isb();
 }
 
-uint32_t
-agintc_r_ictlr(void)
-{
-	int ictlr;
-
-	__asm volatile("mrs %x0, "STR(ICC_CTLR) : "=r" (ictlr));
-	__isb();
-	return ictlr;
-}
-
 void
 agintc_d_wait_rwp(struct agintc_softc *sc)
 {
@@ -1095,7 +1149,9 @@ int
 agintc_ipi_ddb(void *v)
 {
 	/* XXX */
+#ifdef DDB
 	db_enter();
+#endif
 	return 1;
 }
 
@@ -1152,6 +1208,7 @@ agintc_send_ipi(struct cpu_info *ci, int id)
 #define  GITS_TYPER_CIL		(1ULL << 36)
 #define  GITS_TYPER_HCC(x)	(((x) >> 24) & 0xff)
 #define  GITS_TYPER_PTA		(1ULL << 19)
+#define  GITS_TYPER_DEVBITS(x)	(((x) >> 13) & 0x1f)
 #define  GITS_TYPER_ITE_SZ(x)	(((x) >> 4) & 0xf)
 #define  GITS_TYPER_PHYS	(1ULL << 0)
 #define GITS_CBASER		0x0080
@@ -1166,8 +1223,15 @@ agintc_send_ipi(struct cpu_info *ci, int id)
 #define  GITS_BASER_IC_NORM_NC	(1ULL << 59)
 #define  GITS_BASER_TYPE_MASK	(7ULL << 56)
 #define  GITS_BASER_TYPE_DEVICE	(1ULL << 56)
-#define  GITS_BASER_MASK	0x7ffffffff000ULL
+#define  GITS_BASER_DTE_SZ(x)	(((x) >> 48) & 0x1f)
+#define  GITS_BASER_PGSZ_MASK	(3ULL << 8)
+#define  GITS_BASER_PGSZ_4K	(0ULL << 8)
+#define  GITS_BASER_PGSZ_16K	(1ULL << 8)
+#define  GITS_BASER_PGSZ_64K	(2ULL << 8)
+#define  GITS_BASER_PA_MASK	0x7ffffffff000ULL
 #define GITS_TRANSLATER		0x10040
+
+#define GITS_NUM_BASER		8
 
 struct gits_cmd {
 	uint8_t cmd;
@@ -1189,8 +1253,6 @@ struct gits_cmd {
 #define GITS_CMDQ_SIZE		(64 * 1024)
 #define GITS_CMDQ_NENTRIES	(GITS_CMDQ_SIZE / sizeof(struct gits_cmd))
 
-#define GITS_DTT_SIZE		(64 * 1024)
-
 struct agintc_msi_device {
 	LIST_ENTRY(agintc_msi_device) md_list;
 
@@ -1202,8 +1264,9 @@ struct agintc_msi_device {
 int	 agintc_msi_match(struct device *, void *, void *);
 void	 agintc_msi_attach(struct device *, struct device *, void *);
 void	*agintc_intr_establish_msi(void *, uint64_t *, uint64_t *,
-	    int , int (*)(void *), void *, char *);
+	    int , struct cpu_info *, int (*)(void *), void *, char *);
 void	 agintc_intr_disestablish_msi(void *);
+void	 agintc_intr_barrier_msi(void *);
 
 struct agintc_msi_softc {
 	struct device			sc_dev;
@@ -1219,7 +1282,11 @@ struct agintc_msi_softc {
 
 	struct agintc_dmamem		*sc_cmdq;
 	uint16_t			sc_cmdidx;
+
+	int				sc_devbits;
 	struct agintc_dmamem		*sc_dtt;
+	size_t				sc_dtt_pgsz;
+	uint8_t				sc_dte_sz;
 	uint8_t				sc_ite_sz;
 
 	LIST_HEAD(, agintc_msi_device)	sc_msi_devices;
@@ -1254,7 +1321,7 @@ agintc_msi_attach(struct device *parent, struct device *self, void *aux)
 	struct gits_cmd cmd;
 	uint32_t pre_its[2];
 	uint64_t typer;
-	int i;
+	int i, hwcpu;
 
 	if (faa->fa_nreg < 1) {
 		printf(": no registers\n");
@@ -1278,11 +1345,12 @@ agintc_msi_attach(struct device *parent, struct device *self, void *aux)
 
 	typer = bus_space_read_8(sc->sc_iot, sc->sc_ioh, GITS_TYPER);
 	if ((typer & GITS_TYPER_PHYS) == 0 || typer & GITS_TYPER_PTA ||
-	    GITS_TYPER_HCC(typer) == 0 || typer & GITS_TYPER_CIL) {
+	    GITS_TYPER_HCC(typer) < ncpus || typer & GITS_TYPER_CIL) {
 		printf(": unsupported type 0x%016llx\n", typer);
 		goto unmap;
 	}
 	sc->sc_ite_sz = GITS_TYPER_ITE_SZ(typer) + 1;
+	sc->sc_devbits = GITS_TYPER_DEVBITS(typer) + 1;
 
 	sc->sc_nlpi = agintc_sc->sc_nlpi;
 	sc->sc_lpi = mallocarray(sc->sc_nlpi, sizeof(void *), M_DEVBUF,
@@ -1300,22 +1368,64 @@ agintc_msi_attach(struct device *parent, struct device *self, void *aux)
 	    (GITS_CMDQ_SIZE / PAGE_SIZE) - 1 | GITS_CBASER_VALID);
 
 	/* Set up device translation table. */
-	for (i = 0; i < 8; i++) {
+	for (i = 0; i < GITS_NUM_BASER; i++) {
 		uint64_t baser;
+		paddr_t dtt_pa;
+		size_t size;
 
 		baser = bus_space_read_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i));
 		if ((baser & GITS_BASER_TYPE_MASK) != GITS_BASER_TYPE_DEVICE)
 			continue;
 
+		/* Determine the maximum supported page size. */
+		bus_space_write_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i),
+		    (baser & ~GITS_BASER_PGSZ_MASK) | GITS_BASER_PGSZ_64K);
+		baser = bus_space_read_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i));
+		if ((baser & GITS_BASER_PGSZ_MASK) == GITS_BASER_PGSZ_64K)
+			goto found;
+		
+		bus_space_write_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i),
+		    (baser & ~GITS_BASER_PGSZ_MASK) | GITS_BASER_PGSZ_16K);
+		baser = bus_space_read_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i));
+		if ((baser & GITS_BASER_PGSZ_MASK) == GITS_BASER_PGSZ_16K)
+			goto found;
+
+		bus_space_write_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i),
+		    (baser & ~GITS_BASER_PGSZ_MASK) | GITS_BASER_PGSZ_4K);
+		baser = bus_space_read_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i));
+
+	found:
+		switch (baser & GITS_BASER_PGSZ_MASK) {
+		case GITS_BASER_PGSZ_4K:
+			sc->sc_dtt_pgsz = PAGE_SIZE;
+			break;
+		case GITS_BASER_PGSZ_16K:
+			sc->sc_dtt_pgsz = 4 * PAGE_SIZE;
+			break;
+		case GITS_BASER_PGSZ_64K:
+			sc->sc_dtt_pgsz = 16 * PAGE_SIZE;
+			break;
+		}
+
+		/* Calculate table size. */
+		sc->sc_dte_sz = GITS_BASER_DTE_SZ(baser) + 1;
+		size = (1ULL << sc->sc_devbits) * sc->sc_dte_sz;
+		size = roundup(size, sc->sc_dtt_pgsz);
+
+		/* Allocate table. */
 		sc->sc_dtt = agintc_dmamem_alloc(sc->sc_dmat,
-		    GITS_DTT_SIZE, GITS_DTT_SIZE);
+		    size, sc->sc_dtt_pgsz);
 		if (sc->sc_dtt == NULL) {
 			printf(": can't alloc translation table\n");
 			goto unmap;
 		}
+
+		/* Configure table. */
+		dtt_pa = AGINTC_DMA_DVA(sc->sc_dtt);
+		KASSERT((dtt_pa & GITS_BASER_PA_MASK) == dtt_pa);
 		bus_space_write_8(sc->sc_iot, sc->sc_ioh, GITS_BASER(i),
-		    AGINTC_DMA_DVA(sc->sc_dtt) | GITS_BASER_IC_NORM_NC |
-		    (GITS_DTT_SIZE / PAGE_SIZE) - 1 | GITS_BASER_VALID);
+		    GITS_BASER_IC_NORM_NC | baser & GITS_BASER_PGSZ_MASK | 
+		    dtt_pa | (size / sc->sc_dtt_pgsz) - 1 | GITS_BASER_VALID);
 	}
 
 	/* Enable ITS. */
@@ -1324,12 +1434,17 @@ agintc_msi_attach(struct device *parent, struct device *self, void *aux)
 
 	LIST_INIT(&sc->sc_msi_devices);
 
-	/* Map collection 0 to redistributor 0. */
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.cmd = MAPC;
-	cmd.dw2 = GITS_CMD_VALID;
-	agintc_msi_send_cmd(sc, &cmd);
-	agintc_msi_wait_cmd(sc);
+	/* Create one collection per core. */
+	KASSERT(ncpus <= agintc_sc->sc_num_redist);
+	for (i = 0; i < ncpus; i++) {
+		hwcpu = agintc_sc->sc_cpuremap[i];
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.cmd = MAPC;
+		cmd.dw2 = GITS_CMD_VALID |
+		    (agintc_sc->sc_processor[hwcpu] << 16) | i;
+		agintc_msi_send_cmd(sc, &cmd);
+		agintc_msi_wait_cmd(sc);
+	}
 
 	printf("\n");
 
@@ -1337,6 +1452,7 @@ agintc_msi_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_ic.ic_cookie = sc;
 	sc->sc_ic.ic_establish_msi = agintc_intr_establish_msi;
 	sc->sc_ic.ic_disestablish = agintc_intr_disestablish_msi;
+	sc->sc_ic.ic_barrier = agintc_intr_barrier_msi;
 	arm_intr_register_fdt(&sc->sc_ic);
 	return;
 
@@ -1423,7 +1539,7 @@ agintc_msi_find_device(struct agintc_msi_softc *sc, uint32_t deviceid)
 
 void *
 agintc_intr_establish_msi(void *self, uint64_t *addr, uint64_t *data,
-    int level, int (*func)(void *), void *arg, char *name)
+    int level, struct cpu_info *ci, int (*func)(void *), void *arg, char *name)
 {
 	struct agintc_msi_softc *sc = (struct agintc_msi_softc *)self;
 	struct agintc_msi_device *md;
@@ -1431,7 +1547,11 @@ agintc_intr_establish_msi(void *self, uint64_t *addr, uint64_t *data,
 	uint32_t deviceid = *data;
 	uint32_t eventid;
 	void *cookie;
-	int i;
+	int i, hwcpu;
+
+	if (ci == NULL)
+		ci = &cpu_info_primary;
+	hwcpu = agintc_sc->sc_cpuremap[ci->ci_cpuid];
 
 	md = agintc_msi_find_device(sc, deviceid);
 	if (md == NULL)
@@ -1446,7 +1566,7 @@ agintc_intr_establish_msi(void *self, uint64_t *addr, uint64_t *data,
 			continue;
 
 		cookie = agintc_intr_establish(LPI_BASE + i,
-		    level, func, arg, name);
+		    IST_EDGE_RISING, level, ci, func, arg, name);
 		if (cookie == NULL)
 			return NULL;
 
@@ -1455,12 +1575,12 @@ agintc_intr_establish_msi(void *self, uint64_t *addr, uint64_t *data,
 		cmd.deviceid = deviceid;
 		cmd.eventid = eventid;
 		cmd.intid = LPI_BASE + i;
-		cmd.dw2 = GITS_CMD_VALID;
+		cmd.dw2 = ci->ci_cpuid;
 		agintc_msi_send_cmd(sc, &cmd);
 
 		memset(&cmd, 0, sizeof(cmd));
 		cmd.cmd = SYNC;
-		cmd.dw2 = 0;
+		cmd.dw2 = agintc_sc->sc_processor[hwcpu] << 16;
 		agintc_msi_send_cmd(sc, &cmd);
 		agintc_msi_wait_cmd(sc);
 
@@ -1478,6 +1598,12 @@ agintc_intr_disestablish_msi(void *cookie)
 {
 	agintc_intr_disestablish(*(void **)cookie);
 	*(void **)cookie = NULL;
+}
+
+void
+agintc_intr_barrier_msi(void *cookie)
+{
+	agintc_intr_barrier(*(void **)cookie);
 }
 
 struct agintc_dmamem *

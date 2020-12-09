@@ -1,4 +1,4 @@
-/*	$OpenBSD: nfs_subs.c,v 1.137 2018/07/02 20:56:22 bluhm Exp $	*/
+/*	$OpenBSD: nfs_subs.c,v 1.144 2020/06/24 22:03:44 cheloha Exp $	*/
 /*	$NetBSD: nfs_subs.c,v 1.27.4.3 1996/07/08 20:34:24 jtc Exp $	*/
 
 /*
@@ -583,7 +583,7 @@ nfsm_rpchead(struct nfsreq *req, struct ucred *cr, int auth_type)
 		auth_len = (ngroups << 2) + 5 * NFSX_UNSIGNED;
 		authsiz = nfsm_rndup(auth_len);
 		/* The authorization size + the size of the static part */
-		MH_ALIGN(mb, authsiz + 10 * NFSX_UNSIGNED);
+		m_align(mb, authsiz + 10 * NFSX_UNSIGNED);
 		break;
 	}
 
@@ -713,7 +713,7 @@ nfsm_uiotombuf(struct mbuf **mp, struct uio *uiop, size_t len)
 	uiop->uio_rw = UIO_WRITE;
 
 	while (len) {
-		xfer = ulmin(len, M_TRAILINGSPACE(mb));
+		xfer = ulmin(len, m_trailingspace(mb));
 		uiomove(mb_offset(mb), xfer, uiop);
 		mb->m_len += xfer;
 		len -= xfer;
@@ -728,7 +728,7 @@ nfsm_uiotombuf(struct mbuf **mp, struct uio *uiop, size_t len)
 	}
 
 	if (pad > 0) {
-		if (pad > M_TRAILINGSPACE(mb)) {
+		if (pad > m_trailingspace(mb)) {
 			MGET(mb2, M_WAIT, MT_DATA);
 			mb2->m_len = 0;
 			mb->m_next = mb2;
@@ -937,7 +937,7 @@ nfs_loadattrcache(struct vnode **vpp, struct mbuf **mdp, caddr_t *dposp,
 	struct vnode *vp = *vpp;
 	struct vattr *vap;
 	struct nfs_fattr *fp;
-	extern struct vops nfs_specvops;
+	extern const struct vops nfs_specvops;
 	struct nfsnode *np;
 	int32_t t1;
 	caddr_t cp2;
@@ -994,7 +994,7 @@ nfs_loadattrcache(struct vnode **vpp, struct mbuf **mdp, caddr_t *dposp,
 #ifndef FIFO
 			return (EOPNOTSUPP);
 #else
-                        extern struct vops nfs_fifovops;
+                        extern const struct vops nfs_fifovops;
 			vp->v_op = &nfs_fifovops;
 #endif /* FIFO */
 		}
@@ -1092,7 +1092,7 @@ nfs_loadattrcache(struct vnode **vpp, struct mbuf **mdp, caddr_t *dposp,
 		} else
 			np->n_size = vap->va_size;
 	}
-	np->n_attrstamp = time_second;
+	np->n_attrstamp = gettime();
 	if (vaper != NULL) {
 		bcopy(vap, vaper, sizeof(*vap));
 		if (np->n_flag & NCHG) {
@@ -1110,7 +1110,7 @@ nfs_attrtimeo(struct nfsnode *np)
 {
 	struct vnode *vp = np->n_vnode;
 	struct nfsmount *nmp = VFSTONFS(vp->v_mount);
-	int tenthage = (time_second - np->n_mtime.tv_sec) / 10;
+	int tenthage = (gettime() - np->n_mtime.tv_sec) / 10;
 	int minto, maxto;
 
 	if (vp->v_type == VDIR) {
@@ -1142,7 +1142,7 @@ nfs_getattrcache(struct vnode *vp, struct vattr *vaper)
 	struct vattr *vap;
 
 	if (np->n_attrstamp == 0 ||
-	    (time_second - np->n_attrstamp) >= nfs_attrtimeo(np)) {
+	    (gettime() - np->n_attrstamp) >= nfs_attrtimeo(np)) {
 		nfsstats.attrcache_misses++;
 		return (ENOENT);
 	}
@@ -1509,17 +1509,16 @@ netaddr_match(int family, union nethostaddr *haddr, struct mbuf *nam)
 void
 nfs_clearcommit(struct mount *mp)
 {
-	struct vnode *vp, *nvp;
-	struct buf *bp, *nbp;
+	struct vnode *vp;
+	struct buf *bp;
 	int s;
 
 	s = splbio();
 loop:
-	for (vp = LIST_FIRST(&mp->mnt_vnodelist); vp != NULL; vp = nvp) {
+	TAILQ_FOREACH(vp, &mp->mnt_vnodelist, v_mntvnodes) {
 		if (vp->v_mount != mp)	/* Paranoia */
 			goto loop;
-		nvp = LIST_NEXT(vp, v_mntvnodes);
-		LIST_FOREACH_SAFE(bp, &vp->v_dirtyblkhd, b_vnbufs, nbp) {
+		LIST_FOREACH(bp, &vp->v_dirtyblkhd, b_vnbufs) {
 			if ((bp->b_flags & (B_BUSY | B_DELWRI | B_NEEDCOMMIT))
 			    == (B_DELWRI | B_NEEDCOMMIT))
 				bp->b_flags &= ~B_NEEDCOMMIT;
@@ -1752,7 +1751,7 @@ nfsm_v3attrbuild(struct mbuf **mp, struct vattr *a, int full)
 		*tl = nfs_false;
 	}
 	if (a->va_atime.tv_nsec != VNOVAL) {
-		if (a->va_atime.tv_sec != time_second) {
+		if (a->va_atime.tv_sec != gettime()) {
 			tl = nfsm_build(&mb, 3 * NFSX_UNSIGNED);
 			*tl++ = txdr_unsigned(NFSV3SATTRTIME_TOCLIENT);
 			txdr_nfsv3time(&a->va_atime, tl);
@@ -1765,7 +1764,7 @@ nfsm_v3attrbuild(struct mbuf **mp, struct vattr *a, int full)
 		*tl = txdr_unsigned(NFSV3SATTRTIME_DONTCHANGE);
 	}
 	if (a->va_mtime.tv_nsec != VNOVAL) {
-		if (a->va_mtime.tv_sec != time_second) {
+		if (a->va_mtime.tv_sec != gettime()) {
 			tl = nfsm_build(&mb, 3 * NFSX_UNSIGNED);
 			*tl++ = txdr_unsigned(NFSV3SATTRTIME_TOCLIENT);
 			txdr_nfsv3time(&a->va_mtime, tl);
@@ -1793,7 +1792,7 @@ nfsm_build(struct mbuf **mp, u_int len)
 	mb = *mp;
 	bpos = mb_offset(mb);
 
-	if (len > M_TRAILINGSPACE(mb)) {
+	if (len > m_trailingspace(mb)) {
 		MGET(mb2, M_WAIT, MT_DATA);
 		if (len > MLEN)
 			panic("build > MLEN");

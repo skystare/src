@@ -1,6 +1,6 @@
-/*	$OpenBSD: roff_term.c,v 1.15 2018/08/10 20:40:43 schwarze Exp $ */
+/* $OpenBSD: roff_term.c,v 1.21 2020/09/03 20:33:20 schwarze Exp $ */
 /*
- * Copyright (c) 2010,2014,2015,2017,2018 Ingo Schwarze <schwarze@openbsd.org>
+ * Copyright (c) 2010,2014,2015,2017-2020 Ingo Schwarze <schwarze@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,7 +17,8 @@
 #include <sys/types.h>
 
 #include <assert.h>
-#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "mandoc.h"
 #include "roff.h"
@@ -41,9 +42,11 @@ static	void	  roff_term_pre_ti(ROFF_TERM_ARGS);
 static	const roff_term_pre_fp roff_term_pre_acts[ROFF_MAX] = {
 	roff_term_pre_br,  /* br */
 	roff_term_pre_ce,  /* ce */
+	roff_term_pre_br,  /* fi */
 	roff_term_pre_ft,  /* ft */
 	roff_term_pre_ll,  /* ll */
 	roff_term_pre_mc,  /* mc */
+	roff_term_pre_br,  /* nf */
 	roff_term_pre_po,  /* po */
 	roff_term_pre_ce,  /* rj */
 	roff_term_pre_sp,  /* sp */
@@ -66,7 +69,9 @@ roff_term_pre_br(ROFF_TERM_ARGS)
 	if (p->flags & TERMP_BRIND) {
 		p->tcol->offset = p->tcol->rmargin;
 		p->tcol->rmargin = p->maxrmargin;
+		p->trailspace = 0;
 		p->flags &= ~(TERMP_NOBREAK | TERMP_BRIND);
+		p->flags |= TERMP_NOSPACE;
 	}
 }
 
@@ -74,27 +79,16 @@ static void
 roff_term_pre_ce(ROFF_TERM_ARGS)
 {
 	const struct roff_node	*nc1, *nc2;
-	size_t			 len, lm;
 
 	roff_term_pre_br(p, n);
-	lm = p->tcol->offset;
+	p->flags |= n->tok == ROFF_ce ? TERMP_CENTER : TERMP_RIGHT;
 	nc1 = n->child->next;
 	while (nc1 != NULL) {
 		nc2 = nc1;
-		len = 0;
 		do {
-			if (nc2->type == ROFFT_TEXT) {
-				if (len)
-					len++;
-				len += term_strlen(p, nc2->string);
-			}
 			nc2 = nc2->next;
 		} while (nc2 != NULL && (nc2->type != ROFFT_TEXT ||
 		    (nc2->flags & NODE_LINE) == 0));
-		p->tcol->offset = len >= p->tcol->rmargin ? 0 :
-		    lm + len >= p->tcol->rmargin ? p->tcol->rmargin - len :
-		    n->tok == ROFF_rj ? p->tcol->rmargin - len :
-		    (lm + p->tcol->rmargin - len) / 2;
 		while (nc1 != nc2) {
 			if (nc1->type == ROFFT_TEXT)
 				term_word(p, nc1->string);
@@ -105,7 +99,7 @@ roff_term_pre_ce(ROFF_TERM_ARGS)
 		p->flags |= TERMP_NOSPACE;
 		term_flushln(p);
 	}
-	p->tcol->offset = lm;
+	p->flags &= ~(TERMP_CENTER | TERMP_RIGHT);
 }
 
 static void
@@ -113,25 +107,22 @@ roff_term_pre_ft(ROFF_TERM_ARGS)
 {
 	const char	*cp;
 
-	if (*(cp = n->child->string) == 'C')
-		cp++;
-
-	switch (*cp) {
-	case '4':
-	case '3':
-	case 'B':
+	cp = n->child->string;
+	switch (mandoc_font(cp, (int)strlen(cp))) {
+	case ESCAPE_FONTBOLD:
 		term_fontrepl(p, TERMFONT_BOLD);
 		break;
-	case '2':
-	case 'I':
+	case ESCAPE_FONTITALIC:
 		term_fontrepl(p, TERMFONT_UNDER);
 		break;
-	case 'P':
+	case ESCAPE_FONTBI:
+		term_fontrepl(p, TERMFONT_BI);
+		break;
+	case ESCAPE_FONTPREV:
 		term_fontlast(p);
 		break;
-	case '1':
-	case 'C':
-	case 'R':
+	case ESCAPE_FONTROMAN:
+	case ESCAPE_FONTCW:
 		term_fontrepl(p, TERMFONT_NONE);
 		break;
 	default:
@@ -164,9 +155,13 @@ static void
 roff_term_pre_po(ROFF_TERM_ARGS)
 {
 	struct roffsu	 su;
-	static int	 po, polast;
+	static int	 po, pouse, polast;
 	int		 ponew;
 
+	/* Revert the currently active page offset. */
+	p->tcol->offset -= pouse;
+
+	/* Determine the requested page offset. */
 	if (n->child != NULL &&
 	    a2roffsu(n->child->string, &su, SCALE_EM) != NULL) {
 		ponew = term_hen(p, &su);
@@ -175,11 +170,15 @@ roff_term_pre_po(ROFF_TERM_ARGS)
 			ponew += po;
 	} else
 		ponew = polast;
+
+	/* Remeber both the previous and the newly requested offset. */
 	polast = po;
 	po = ponew;
 
-	ponew = po - polast + (int)p->tcol->offset;
-	p->tcol->offset = ponew > 0 ? ponew : 0;
+	/* Truncate to the range [-offset, 60], remember, and apply it. */
+	pouse = po >= 60 ? 60 :
+	    po < -(int)p->tcol->offset ? -p->tcol->offset : po;
+	p->tcol->offset += pouse;
 }
 
 static void
@@ -217,6 +216,7 @@ roff_term_pre_ti(ROFF_TERM_ARGS)
 {
 	struct roffsu	 su;
 	const char	*cp;
+	const size_t	 maxoff = 72;
 	int		 len, sign;
 
 	roff_term_pre_br(p, n);
@@ -237,17 +237,26 @@ roff_term_pre_ti(ROFF_TERM_ARGS)
 		return;
 	len = term_hen(p, &su);
 
-	if (sign == 0) {
+	switch (sign) {
+	case 1:
+		if (p->tcol->offset + len <= maxoff)
+			p->ti = len;
+		else if (p->tcol->offset < maxoff)
+			p->ti = maxoff - p->tcol->offset;
+		else
+			p->ti = 0;
+		break;
+	case -1:
+		if ((size_t)len < p->tcol->offset)
+			p->ti = -len;
+		else
+			p->ti = -p->tcol->offset;
+		break;
+	default:
+		if ((size_t)len > maxoff)
+			len = maxoff;
 		p->ti = len - p->tcol->offset;
-		p->tcol->offset = len;
-	} else if (sign == 1) {
-		p->ti = len;
-		p->tcol->offset += len;
-	} else if ((size_t)len < p->tcol->offset) {
-		p->ti = -len;
-		p->tcol->offset -= len;
-	} else {
-		p->ti = -p->tcol->offset;
-		p->tcol->offset = 0;
+		break;
 	}
+	p->tcol->offset += p->ti;
 }

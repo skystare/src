@@ -13,10 +13,14 @@
 #define A10_CLK_PLL_PERIPH	15
 
 #define A10_CLK_CPU		20
+#define A10_CLK_AXI		21
+#define A10_CLK_AHB		23
 #define A10_CLK_APB1		25
 
 #define A10_CLK_AHB_EHCI0	27
+#define A10_CLK_AHB_OHCI0	28
 #define A10_CLK_AHB_EHCI1	29
+#define A10_CLK_AHB_OHCI1	30
 #define A10_CLK_AHB_MMC0	34
 #define A10_CLK_AHB_MMC1	35
 #define A10_CLK_AHB_MMC2	36
@@ -44,20 +48,24 @@
 #define A10_CLK_MMC2		104
 #define A10_CLK_MMC3		107
 #define A10_CLK_SATA		122
+#define A10_CLK_USB_OHCI0	123
+#define A10_CLK_USB_OHCI1	124
 #define A10_CLK_USB_PHY		125
 
 #define A10_CLK_LOSC		254
 
 struct sxiccmu_ccu_bit sun4i_a10_gates[] = {
 	[A10_CLK_AHB_EHCI0] =  { 0x0060, 1 },
+	[A10_CLK_AHB_OHCI0] =  { 0x0060, 2 },
 	[A10_CLK_AHB_EHCI1] =  { 0x0060, 3 },
+	[A10_CLK_AHB_OHCI1] =  { 0x0060, 4 },
 	[A10_CLK_AHB_MMC0] =   { 0x0060, 8 },
 	[A10_CLK_AHB_MMC1] =   { 0x0060, 9 },
 	[A10_CLK_AHB_MMC2] =   { 0x0060, 10 },
 	[A10_CLK_AHB_MMC3] =   { 0x0060, 11 },
 	[A10_CLK_AHB_EMAC] =   { 0x0060, 17 },
 	[A10_CLK_AHB_SATA] =   { 0x0060, 25 },
-	[A10_CLK_AHB_GMAC] =   { 0x0064, 17 },
+	[A10_CLK_AHB_GMAC] =   { 0x0064, 17, A10_CLK_AHB },
 	[A10_CLK_APB0_PIO] =   { 0x0068, 5 },
 	[A10_CLK_APB1_I2C0] =  { 0x006c, 0, A10_CLK_APB1 },
 	[A10_CLK_APB1_I2C1] =  { 0x006c, 1, A10_CLK_APB1 },
@@ -77,6 +85,8 @@ struct sxiccmu_ccu_bit sun4i_a10_gates[] = {
 	[A10_CLK_MMC2] =       { 0x0090, 31 },
 	[A10_CLK_MMC3] =       { 0x0094, 31 },
 	[A10_CLK_SATA] =       { 0x00c8, 31 },
+	[A10_CLK_USB_OHCI0] =  { 0x00cc, 6 },
+	[A10_CLK_USB_OHCI1] =  { 0x00cc, 7 },
 	[A10_CLK_USB_PHY] =    { 0x00cc, 8 },
 };
 
@@ -107,6 +117,7 @@ struct sxiccmu_ccu_bit sun4i_a10_gates[] = {
 #define A23_CLK_MMC0		60
 #define A23_CLK_MMC1		63
 #define A23_CLK_MMC2		66
+#define A23_CLK_USB_OHCI	78
 
 struct sxiccmu_ccu_bit sun8i_a23_gates[] = {
 	[A23_CLK_BUS_MMC0] =  { 0x0060, 8 },
@@ -126,13 +137,17 @@ struct sxiccmu_ccu_bit sun8i_a23_gates[] = {
 	[A23_CLK_MMC0] =      { 0x0088, 31 },
 	[A23_CLK_MMC1] =      { 0x008c, 31 },
 	[A23_CLK_MMC2] =      { 0x0090, 31 },
+	[A23_CLK_USB_OHCI] =  { 0x00cc, 16 },
 };
 
 /* A64 */
 
+#define A64_CLK_PLL_CPUX	1
+
 #define A64_CLK_PLL_PERIPH0	11
 #define A64_CLK_PLL_PERIPH0_2X	12
 
+#define A64_CLK_CPUX		21
 #define A64_CLK_AXI		22
 #define A64_CLK_APB		23
 #define A64_CLK_AHB1		24
@@ -204,7 +219,10 @@ struct sxiccmu_ccu_bit sun50i_a64_gates[] = {
 /* A80 */
 
 #define A80_CLK_PLL_PERIPH0	3
+#define A80_CLK_PLL_PERIPH1	11
 
+#define A80_CLK_GTBUS		18
+#define A80_CLK_AHB1		20
 #define A80_CLK_APB1		23
 
 #define A80_CLK_MMC0		33
@@ -214,7 +232,13 @@ struct sxiccmu_ccu_bit sun50i_a64_gates[] = {
 
 #define A80_CLK_BUS_MMC		84
 #define A80_CLK_BUS_USB		96
+#define A80_CLK_BUS_GMAC	97
 #define A80_CLK_BUS_PIO		111
+#define A80_CLK_BUS_I2C0	119
+#define A80_CLK_BUS_I2C1	120
+#define A80_CLK_BUS_I2C2	121
+#define A80_CLK_BUS_I2C3	122
+#define A80_CLK_BUS_I2C4	123
 #define A80_CLK_BUS_UART0	124
 #define A80_CLK_BUS_UART1	125
 #define A80_CLK_BUS_UART2	126
@@ -228,8 +252,14 @@ struct sxiccmu_ccu_bit sun9i_a80_gates[] = {
 	[A80_CLK_MMC2] =      { 0x0418, 31 },
 	[A80_CLK_MMC3] =      { 0x041c, 31 }, /* Undocumented */
 	[A80_CLK_BUS_MMC] =   { 0x0580, 8 },
+	[A80_CLK_BUS_GMAC] =  { 0x0584, 17, A80_CLK_AHB1 },
 	[A80_CLK_BUS_USB] =   { 0x0584, 1 },
 	[A80_CLK_BUS_PIO] =   { 0x0590, 5 },
+	[A80_CLK_BUS_I2C0] =  { 0x0594, 0, A80_CLK_APB1 },
+	[A80_CLK_BUS_I2C1] =  { 0x0594, 1, A80_CLK_APB1 },
+	[A80_CLK_BUS_I2C2] =  { 0x0594, 2, A80_CLK_APB1 },
+	[A80_CLK_BUS_I2C3] =  { 0x0594, 3, A80_CLK_APB1 },
+	[A80_CLK_BUS_I2C4] =  { 0x0594, 4, A80_CLK_APB1 },
 	[A80_CLK_BUS_UART0] = { 0x0594, 16, A80_CLK_APB1 },
 	[A80_CLK_BUS_UART1] = { 0x0594, 17, A80_CLK_APB1 },
 	[A80_CLK_BUS_UART2] = { 0x0594, 18, A80_CLK_APB1 },
@@ -315,6 +345,10 @@ struct sxiccmu_ccu_bit sun9i_a80_mmc_gates[] = {
 #define H3_CLK_USB_PHY1		89
 #define H3_CLK_USB_PHY2		90
 #define H3_CLK_USB_PHY3		91
+#define H3_CLK_USB_OHCI0	92
+#define H3_CLK_USB_OHCI1	93
+#define H3_CLK_USB_OHCI2	94
+#define H3_CLK_USB_OHCI3	95
 
 #define H3_CLK_LOSC		254
 #define H3_CLK_HOSC		253
@@ -351,6 +385,10 @@ struct sxiccmu_ccu_bit sun8i_h3_gates[] = {
 	[H3_CLK_USB_PHY1]  = { 0x00cc, 9 },
 	[H3_CLK_USB_PHY2]  = { 0x00cc, 10 },
 	[H3_CLK_USB_PHY3]  = { 0x00cc, 11 },
+	[H3_CLK_USB_OHCI0] = { 0x00cc, 16 },
+	[H3_CLK_USB_OHCI1] = { 0x00cc, 17 },
+	[H3_CLK_USB_OHCI2] = { 0x00cc, 18 },
+	[H3_CLK_USB_OHCI3] = { 0x00cc, 19 },
 };
 
 #define H3_R_CLK_AHB0		1
@@ -364,6 +402,59 @@ struct sxiccmu_ccu_bit sun8i_h3_r_gates[] = {
 	[H3_R_CLK_APB0_PIO] = { 0x0028, 0 },
 	[H3_R_CLK_APB0_RSB] = { 0x0028, 3, H3_R_CLK_APB0 },
 	[H3_R_CLK_APB0_I2C] = { 0x0028, 6, H3_R_CLK_APB0 },
+};
+
+/* H6 */
+
+#define H6_CLK_PLL_PERIPH0	3
+#define H6_CLK_PLL_PERIPH0_2X	4
+#define H6_CLK_APB1		26
+#define H6_CLK_APB2		27
+#define H6_CLK_MMC0		64
+#define H6_CLK_MMC1		65
+#define H6_CLK_MMC2		66
+#define H6_CLK_BUS_MMC0		67
+#define H6_CLK_BUS_MMC1		68
+#define H6_CLK_BUS_MMC2		69
+#define H6_CLK_BUS_UART0	70
+#define H6_CLK_BUS_UART1	71
+#define H6_CLK_BUS_UART2	72
+#define H6_CLK_BUS_UART3	73
+#define H6_CLK_USB_OHCI0	104
+#define H6_CLK_USB_OHCI3	107
+#define H6_CLK_BUS_OHCI0	111
+#define H6_CLK_BUS_OHCI3	112
+#define H6_CLK_BUS_EHCI0	113
+#define H6_CLK_BUS_EHCI3	115
+
+struct sxiccmu_ccu_bit sun50i_h6_gates[] = {
+	[H6_CLK_PLL_PERIPH0] = { 0x0020, 31 },
+	[H6_CLK_APB1] = { 0xffff, 0xff },
+	[H6_CLK_MMC0] = { 0x0830, 31 },
+	[H6_CLK_MMC1] = { 0x0834, 31 },
+	[H6_CLK_MMC2] = { 0x0838, 31 },
+	[H6_CLK_BUS_MMC0] = { 0x084c, 0 },
+	[H6_CLK_BUS_MMC1] = { 0x084c, 1 },
+	[H6_CLK_BUS_MMC2] = { 0x084c, 2 },
+	[H6_CLK_BUS_UART0] = { 0x090c, 0, H6_CLK_APB2 },
+	[H6_CLK_BUS_UART1] = { 0x090c, 1, H6_CLK_APB2 },
+	[H6_CLK_BUS_UART2] = { 0x090c, 2, H6_CLK_APB2 },
+	[H6_CLK_BUS_UART3] = { 0x090c, 3, H6_CLK_APB2 },
+	[H6_CLK_USB_OHCI0] = { 0x0a70, 31 },
+	[H6_CLK_USB_OHCI3] = { 0x0a7c, 31 },
+	[H6_CLK_BUS_OHCI0] = { 0x0a8c, 0 },
+	[H6_CLK_BUS_OHCI3] = { 0x0a8c, 3 },
+	[H6_CLK_BUS_EHCI0] = { 0x0a8c, 4 },
+	[H6_CLK_BUS_EHCI3] = { 0x0a8c, 7 },
+};
+
+#define H6_R_CLK_APB1		2
+#define H6_R_CLK_APB2		3
+#define H6_R_CLK_APB2_I2C	8
+
+struct sxiccmu_ccu_bit sun50i_h6_r_gates[] = {
+	[H6_R_CLK_APB1] = { 0xffff, 0xff },
+	[H6_R_CLK_APB2_I2C] = { 0x019c, 1, H6_R_CLK_APB2 },
 };
 
 /* R40 */
@@ -412,6 +503,9 @@ struct sxiccmu_ccu_bit sun8i_h3_r_gates[] = {
 #define R40_CLK_USB_PHY0	124
 #define R40_CLK_USB_PHY1	125
 #define R40_CLK_USB_PHY2	126
+#define R40_CLK_USB_OHCI0	127
+#define R40_CLK_USB_OHCI1	128
+#define R40_CLK_USB_OHCI2	129
 
 #define R40_CLK_HOSC		253
 #define R40_CLK_LOSC		254
@@ -453,6 +547,61 @@ struct sxiccmu_ccu_bit sun8i_r40_gates[] = {
 	[R40_CLK_USB_PHY0]  = { 0x00cc, 8 },
 	[R40_CLK_USB_PHY1]  = { 0x00cc, 9 },
 	[R40_CLK_USB_PHY2]  = { 0x00cc, 10 },
+	[R40_CLK_USB_OHCI0] = { 0x00cc, 16 },
+	[R40_CLK_USB_OHCI1] = { 0x00cc, 17 },
+	[R40_CLK_USB_OHCI2] = { 0x00cc, 18 },
+};
+
+/* V3s */
+
+#define V3S_CLK_PLL_PERIPH0	9
+#define V3S_CLK_AXI		15
+#define V3S_CLK_AHB1		16
+#define V3S_CLK_APB2		18
+#define V3S_CLK_AHB2		19
+
+#define V3S_CLK_BUS_MMC0	22
+#define V3S_CLK_BUS_MMC1	23
+#define V3S_CLK_BUS_MMC2	24
+#define V3S_CLK_BUS_EMAC	26
+#define V3S_CLK_BUS_EHCI0	30
+#define V3S_CLK_BUS_OHCI0	31
+#define V3S_CLK_BUS_PIO		37
+#define V3S_CLK_BUS_I2C0	38
+#define V3S_CLK_BUS_I2C1	39
+#define V3S_CLK_BUS_UART0	40
+#define V3S_CLK_BUS_UART1	41
+#define V3S_CLK_BUS_UART2	42
+#define V3S_CLK_BUS_EPHY	43
+
+#define V3S_CLK_MMC0		45
+#define V3S_CLK_MMC1		48
+#define V3S_CLK_MMC2		51
+#define V3S_CLK_USB_PHY0	56
+#define V3S_CLK_USB_OHCI0	57
+
+#define V3S_CLK_LOSC		254
+#define V3S_CLK_HOSC		253
+
+struct sxiccmu_ccu_bit sun8i_v3s_gates[] = {
+	[V3S_CLK_BUS_OHCI0] =	{ 0x0060, 29 },
+	[V3S_CLK_BUS_EHCI0] =	{ 0x0060, 26 },
+	[V3S_CLK_BUS_EMAC] =	{ 0x0060, 17, V3S_CLK_AHB2 },
+	[V3S_CLK_BUS_MMC2] =	{ 0x0060, 10 },
+	[V3S_CLK_BUS_MMC1] =	{ 0x0060, 9 },
+	[V3S_CLK_BUS_MMC0] =	{ 0x0060, 8 },
+	[V3S_CLK_BUS_PIO] =	{ 0x0068, 5 },
+	[V3S_CLK_BUS_UART2] =	{ 0x006c, 18, V3S_CLK_APB2 },
+	[V3S_CLK_BUS_UART1] =	{ 0x006c, 17, V3S_CLK_APB2 },
+	[V3S_CLK_BUS_UART0] =	{ 0x006c, 16, V3S_CLK_APB2 },
+	[V3S_CLK_BUS_I2C1] =	{ 0x006c, 1, V3S_CLK_APB2 },
+	[V3S_CLK_BUS_I2C0] =	{ 0x006c, 0, V3S_CLK_APB2 },
+	[V3S_CLK_BUS_EPHY] =	{ 0x0070, 0 },
+	[V3S_CLK_MMC0] =	{ 0x0088, 31 },
+	[V3S_CLK_MMC1] =	{ 0x008c, 31 },
+	[V3S_CLK_MMC2] =	{ 0x0090, 31 },
+	[V3S_CLK_USB_OHCI0] =	{ 0x00cc, 16 },
+	[V3S_CLK_USB_PHY0] =	{ 0x00cc, 8 },
 };
 
 /*
@@ -520,6 +669,11 @@ struct sxiccmu_ccu_bit sun8i_a23_resets[] = {
 #define A64_RST_BUS_I2C0	42
 #define A64_RST_BUS_I2C1	43
 #define A64_RST_BUS_I2C2	44
+#define A64_RST_BUS_UART0	46
+#define A64_RST_BUS_UART1	47
+#define A64_RST_BUS_UART2	48
+#define A64_RST_BUS_UART3	49
+#define A64_RST_BUS_UART4	50
 
 struct sxiccmu_ccu_bit sun50i_a64_resets[] = {
 	[A64_RST_USB_PHY0] =  { 0x00cc, 0 },
@@ -536,11 +690,22 @@ struct sxiccmu_ccu_bit sun50i_a64_resets[] = {
 	[A64_RST_BUS_I2C0] =  { 0x02d8, 0 },
 	[A64_RST_BUS_I2C1] =  { 0x02d8, 1 },
 	[A64_RST_BUS_I2C2] =  { 0x02d8, 2 },
+	[A64_RST_BUS_UART0] = { 0x02d8, 16 },
+	[A64_RST_BUS_UART1] = { 0x02d8, 17 },
+	[A64_RST_BUS_UART2] = { 0x02d8, 18 },
+	[A64_RST_BUS_UART3] = { 0x02d8, 19 },
+	[A64_RST_BUS_UART4] = { 0x02d8, 20 },
 };
 
 /* A80 */
 
 #define A80_RST_BUS_MMC		4
+#define A80_RST_BUS_GMAC	17
+#define A80_RST_BUS_I2C0	40
+#define A80_RST_BUS_I2C1	41
+#define A80_RST_BUS_I2C2	42
+#define A80_RST_BUS_I2C3	43
+#define A80_RST_BUS_I2C4	44
 #define A80_RST_BUS_UART0	45
 #define A80_RST_BUS_UART1	46
 #define A80_RST_BUS_UART2	47
@@ -550,6 +715,12 @@ struct sxiccmu_ccu_bit sun50i_a64_resets[] = {
 
 struct sxiccmu_ccu_bit sun9i_a80_resets[] = {
 	[A80_RST_BUS_MMC] =   { 0x05a0, 8 },
+	[A80_RST_BUS_GMAC] =  { 0x05a4, 17 },
+	[A80_RST_BUS_I2C0] =  { 0x05b4, 0 },
+	[A80_RST_BUS_I2C1] =  { 0x05b4, 1 },
+	[A80_RST_BUS_I2C2] =  { 0x05b4, 2 },
+	[A80_RST_BUS_I2C3] =  { 0x05b4, 3 },
+	[A80_RST_BUS_I2C4] =  { 0x05b4, 4 },
 	[A80_RST_BUS_UART0] = { 0x05b4, 16 },
 	[A80_RST_BUS_UART1] = { 0x05b4, 17 },
 	[A80_RST_BUS_UART2] = { 0x05b4, 18 },
@@ -612,6 +783,10 @@ struct sxiccmu_ccu_bit sun9i_a80_mmc_resets[] = {
 #define H3_RST_BUS_I2C0		46
 #define H3_RST_BUS_I2C1		47
 #define H3_RST_BUS_I2C2		48
+#define H3_RST_BUS_UART0	49
+#define H3_RST_BUS_UART1	50
+#define H3_RST_BUS_UART2	51
+#define H3_RST_BUS_UART3	52
 
 struct sxiccmu_ccu_bit sun8i_h3_resets[] = {
 	[H3_RST_USB_PHY0] =  { 0x00cc, 0 },
@@ -635,6 +810,10 @@ struct sxiccmu_ccu_bit sun8i_h3_resets[] = {
 	[H3_RST_BUS_I2C0]  = { 0x02d8, 0 },
 	[H3_RST_BUS_I2C1]  = { 0x02d8, 1 },
 	[H3_RST_BUS_I2C2]  = { 0x02d8, 2 },
+	[H3_RST_BUS_UART0] = { 0x02d8, 16 },
+	[H3_RST_BUS_UART1] = { 0x02d8, 17 },
+	[H3_RST_BUS_UART2] = { 0x02d8, 18 },
+	[H3_RST_BUS_UART3] = { 0x02d8, 19 },
 };
 
 #define H3_R_RST_APB0_RSB	2
@@ -643,6 +822,40 @@ struct sxiccmu_ccu_bit sun8i_h3_resets[] = {
 struct sxiccmu_ccu_bit sun8i_h3_r_resets[] = {
 	[H3_R_RST_APB0_RSB] = { 0x00b0, 3 },
 	[H3_R_RST_APB0_I2C] = { 0x00b0, 6 },
+};
+
+/* H6 */
+
+#define H6_RST_BUS_MMC0		18
+#define H6_RST_BUS_MMC1		19
+#define H6_RST_BUS_MMC2		20
+#define H6_RST_BUS_UART0	21
+#define H6_RST_BUS_UART1	22
+#define H6_RST_BUS_UART2	23
+#define H6_RST_BUS_UART3	24
+#define H6_RST_BUS_OHCI0	48
+#define H6_RST_BUS_OHCI3	49
+#define H6_RST_BUS_EHCI0	50
+#define H6_RST_BUS_EHCI3	52
+
+struct sxiccmu_ccu_bit sun50i_h6_resets[] = {
+	[H6_RST_BUS_MMC0] = { 0x084c, 16 },
+	[H6_RST_BUS_MMC1] = { 0x084c, 17 },
+	[H6_RST_BUS_MMC2] = { 0x084c, 18 },
+	[H6_RST_BUS_UART0] = { 0x090c, 16 },
+	[H6_RST_BUS_UART1] = { 0x090c, 17 },
+	[H6_RST_BUS_UART2] = { 0x090c, 18 },
+	[H6_RST_BUS_UART3] = { 0x090c, 19 },
+	[H6_RST_BUS_OHCI0] = { 0x0a8c, 16 },
+	[H6_RST_BUS_OHCI3] = { 0x0a8c, 19 },
+	[H6_RST_BUS_EHCI0] = { 0x0a8c, 20 },
+	[H6_RST_BUS_EHCI3] = { 0x0a8c, 23 },
+};
+
+#define H6_R_RST_APB2_I2C	4
+
+struct sxiccmu_ccu_bit sun50i_h6_r_resets[] = {
+	[H6_R_RST_APB2_I2C] = { 0x019c, 16 },
 };
 
 /* R40 */
@@ -708,4 +921,37 @@ struct sxiccmu_ccu_bit sun8i_r40_resets[] = {
 	[R40_RST_BUS_UART5] = { 0x02d8, 21 },
 	[R40_RST_BUS_UART6] = { 0x02d8, 22 },
 	[R40_RST_BUS_UART7] = { 0x02d8, 23 },
+};
+
+/* V3s */
+
+#define V3S_RST_USB_PHY0	0
+
+#define V3S_RST_BUS_MMC0	7
+#define V3S_RST_BUS_MMC1	8
+#define V3S_RST_BUS_MMC2	9
+#define V3S_RST_BUS_EMAC	12
+#define V3S_RST_BUS_EHCI0	18
+#define V3S_RST_BUS_OHCI0	22
+#define V3S_RST_BUS_EPHY	39
+#define V3S_RST_BUS_I2C0	46
+#define V3S_RST_BUS_I2C1	47
+#define V3S_RST_BUS_UART0	49
+#define V3S_RST_BUS_UART1	50
+#define V3S_RST_BUS_UART2	51
+
+struct sxiccmu_ccu_bit sun8i_v3s_resets[] = {
+	[V3S_RST_USB_PHY0] =	{ 0x00cc, 0 },
+	[V3S_RST_BUS_OHCI0] =	{ 0x02c0, 29 },
+	[V3S_RST_BUS_EHCI0] =	{ 0x02c0, 26 },
+	[V3S_RST_BUS_EMAC] =	{ 0x02c0, 17 },
+	[V3S_RST_BUS_MMC2] =	{ 0x02c0, 10 },
+	[V3S_RST_BUS_MMC1] =	{ 0x02c0, 9 },
+	[V3S_RST_BUS_MMC0] =	{ 0x02c0, 8 },
+	[V3S_RST_BUS_EPHY] =	{ 0x02c8, 2 },
+	[V3S_RST_BUS_UART2] =	{ 0x02d8, 18 },
+	[V3S_RST_BUS_UART1] =	{ 0x02d8, 17 },
+	[V3S_RST_BUS_UART0] =	{ 0x02d8, 16 },
+	[V3S_RST_BUS_I2C1] =	{ 0x02d8, 1 },
+	[V3S_RST_BUS_I2C0] =	{ 0x02d8, 0 },
 };

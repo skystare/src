@@ -1,4 +1,4 @@
-/*	$OpenBSD: octeonvar.h,v 1.45 2018/04/09 13:46:15 visa Exp $	*/
+/*	$OpenBSD: octeonvar.h,v 1.49 2020/09/04 15:18:05 visa Exp $	*/
 /*	$NetBSD: maltavar.h,v 1.3 2002/03/18 10:10:16 simonb Exp $	*/
 
 /*-
@@ -16,13 +16,6 @@
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. All advertising materials mentioning features or use of this software
- *    must display the following acknowledgement:
- *	This product includes software developed by the NetBSD
- *	Foundation, Inc. and its contributors.
- * 4. Neither the name of The NetBSD Foundation nor the names of its
- *    contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
  *
  * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
@@ -74,6 +67,10 @@ struct octeon_config {
 	bus_dma_tag_t mc_iobus_dmat;
 	bus_dma_tag_t mc_bootbus_dmat;
 };
+
+#define	GPIO_CONFIG_MD_OUTPUT_SEL_MASK	(GPIO_CONFIG_MD0 | GPIO_CONFIG_MD1)
+#define	GPIO_CONFIG_MD_USB0_VBUS_CTRL	GPIO_CONFIG_MD0
+#define	GPIO_CONFIG_MD_USB1_VBUS_CTRL	GPIO_CONFIG_MD1
 
 /*
  * FPA map
@@ -157,6 +154,53 @@ struct octeon_fau_map {
 #define	OCTEON_POW_QOS_XXX_7		7
 
 #define	OCTEON_POW_GROUP_MAX		16
+
+enum cnmac_stat {
+	cnmac_stat_rx_toto_gmx,
+	cnmac_stat_rx_totp_gmx,
+	cnmac_stat_rx_toto_pip,
+	cnmac_stat_rx_totp_pip,
+	cnmac_stat_rx_h64,
+	cnmac_stat_rx_h127,
+	cnmac_stat_rx_h255,
+	cnmac_stat_rx_h511,
+	cnmac_stat_rx_h1023,
+	cnmac_stat_rx_h1518,
+	cnmac_stat_rx_hmax,
+	cnmac_stat_rx_bcast,
+	cnmac_stat_rx_mcast,
+	cnmac_stat_rx_qdpo,
+	cnmac_stat_rx_qdpp,
+	cnmac_stat_rx_fcs,
+	cnmac_stat_rx_frag,
+	cnmac_stat_rx_undersz,
+	cnmac_stat_rx_jabber,
+	cnmac_stat_rx_oversz,
+	cnmac_stat_rx_raw,
+	cnmac_stat_rx_bad,
+	cnmac_stat_rx_drop,
+	cnmac_stat_rx_ctl,
+	cnmac_stat_rx_dmac,
+	cnmac_stat_tx_toto,
+	cnmac_stat_tx_totp,
+	cnmac_stat_tx_hmin,
+	cnmac_stat_tx_h64,
+	cnmac_stat_tx_h127,
+	cnmac_stat_tx_h255,
+	cnmac_stat_tx_h511,
+	cnmac_stat_tx_h1023,
+	cnmac_stat_tx_h1518,
+	cnmac_stat_tx_hmax,
+	cnmac_stat_tx_bcast,
+	cnmac_stat_tx_mcast,
+	cnmac_stat_tx_coll,
+	cnmac_stat_tx_defer,
+	cnmac_stat_tx_scol,
+	cnmac_stat_tx_mcol,
+	cnmac_stat_tx_ctl,
+	cnmac_stat_tx_uflow,
+	cnmac_stat_count
+};
 
 /*
  * Octeon board types known to work with OpenBSD/octeon.
@@ -271,6 +315,13 @@ extern struct boot_info *octeon_boot_info;
 #define BOOTINFO_CFG_FLAG_PCI_TARGET	(1ull << 1)
 #define BOOTINFO_CFG_FLAG_DEBUG		(1ull << 2)
 #define BOOTINFO_CFG_FLAG_NO_MAGIC	(1ull << 3)
+
+#define BOOTMEM_BLOCK_ALIGN		16
+#define BOOTMEM_BLOCK_MASK		(BOOTMEM_BLOCK_ALIGN - 1)
+#define BOOTMEM_BLOCK_MIN_SIZE		16
+
+int	bootmem_alloc_region(paddr_t, size_t);
+void	bootmem_free(paddr_t, size_t);
 
 int	octeon_ioclock_speed(void);
 

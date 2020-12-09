@@ -1,4 +1,4 @@
-/* $OpenBSD: cmd-select-layout.c,v 1.35 2018/07/02 12:39:14 nicm Exp $ */
+/* $OpenBSD: cmd-select-layout.c,v 1.38 2020/04/13 10:59:58 nicm Exp $ */
 
 /*
  * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
@@ -71,20 +71,21 @@ const struct cmd_entry cmd_previous_layout_entry = {
 static enum cmd_retval
 cmd_select_layout_exec(struct cmd *self, struct cmdq_item *item)
 {
-	struct args		*args = self->args;
-	struct winlink		*wl = item->target.wl;
+	struct args		*args = cmd_get_args(self);
+	struct cmd_find_state	*target = cmdq_get_target(item);
+	struct winlink		*wl = target->wl;
 	struct window		*w = wl->window;
-	struct window_pane	*wp = item->target.wp;
+	struct window_pane	*wp = target->wp;
 	const char		*layoutname;
 	char			*oldlayout;
 	int			 next, previous, layout;
 
 	server_unzoom_window(w);
 
-	next = self->entry == &cmd_next_layout_entry;
+	next = (cmd_get_entry(self) == &cmd_next_layout_entry);
 	if (args_has(args, 'n'))
 		next = 1;
-	previous = self->entry == &cmd_previous_layout_entry;
+	previous = (cmd_get_entry(self) == &cmd_previous_layout_entry);
 	if (args_has(args, 'p'))
 		previous = 1;
 
@@ -135,6 +136,7 @@ cmd_select_layout_exec(struct cmd *self, struct cmdq_item *item)
 
 changed:
 	free(oldlayout);
+	recalculate_sizes();
 	server_redraw_window(w);
 	notify_window("window-layout-changed", w);
 	return (CMD_RETURN_NORMAL);

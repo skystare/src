@@ -1,4 +1,4 @@
-/*	$OpenBSD: rt2661.c,v 1.94 2017/10/26 15:00:28 mpi Exp $	*/
+/*	$OpenBSD: rt2661.c,v 1.98 2020/07/20 07:45:44 stsp Exp $	*/
 
 /*-
  * Copyright (c) 2006
@@ -1153,6 +1153,7 @@ rt2661_tx_dma_intr(struct rt2661_softc *sc, struct rt2661_tx_ring *txq)
 void
 rt2661_rx_intr(struct rt2661_softc *sc)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
 	struct ieee80211_frame *wh;
@@ -1246,7 +1247,6 @@ rt2661_rx_intr(struct rt2661_softc *sc)
 
 #if NBPFILTER > 0
 		if (sc->sc_drvbpf != NULL) {
-			struct mbuf mb;
 			struct rt2661_rx_radiotap_header *tap = &sc->sc_rxtap;
 			uint32_t tsf_lo, tsf_hi;
 
@@ -1262,13 +1262,8 @@ rt2661_rx_intr(struct rt2661_softc *sc)
 			tap->wr_chan_flags = htole16(sc->sc_curchan->ic_flags);
 			tap->wr_antsignal = desc->rssi;
 
-			mb.m_data = (caddr_t)tap;
-			mb.m_len = sc->sc_rxtap_len;
-			mb.m_next = m;
-			mb.m_nextpkt = NULL;
-			mb.m_type = 0;
-			mb.m_flags = 0;
-			bpf_mtap(sc->sc_drvbpf, &mb, BPF_DIRECTION_IN);
+			bpf_mtap_hdr(sc->sc_drvbpf, tap, sc->sc_rxtap_len, m,
+			    BPF_DIRECTION_IN);
 		}
 #endif
 
@@ -1279,7 +1274,7 @@ rt2661_rx_intr(struct rt2661_softc *sc)
 		rxi.rxi_flags = 0;
 		rxi.rxi_rssi = desc->rssi;
 		rxi.rxi_tstamp = 0;	/* unused */
-		ieee80211_input(ifp, m, ni, &rxi);
+		ieee80211_inputm(ifp, m, ni, &rxi, &ml);
 
 		/*-
 		 * Keep track of the average RSSI using an Exponential Moving
@@ -1302,6 +1297,7 @@ skip:		desc->flags |= htole32(RT2661_RX_BUSY);
 
 		sc->rxq.cur = (sc->rxq.cur + 1) % RT2661_RX_RING_COUNT;
 	}
+	if_input(ifp, &ml);
 }
 
 #ifndef IEEE80211_STA_ONLY
@@ -1630,7 +1626,6 @@ rt2661_tx_mgt(struct rt2661_softc *sc, struct mbuf *m0,
 
 #if NBPFILTER > 0
 	if (sc->sc_drvbpf != NULL) {
-		struct mbuf mb;
 		struct rt2661_tx_radiotap_header *tap = &sc->sc_txtap;
 
 		tap->wt_flags = 0;
@@ -1638,13 +1633,8 @@ rt2661_tx_mgt(struct rt2661_softc *sc, struct mbuf *m0,
 		tap->wt_chan_freq = htole16(sc->sc_curchan->ic_freq);
 		tap->wt_chan_flags = htole16(sc->sc_curchan->ic_flags);
 
-		mb.m_data = (caddr_t)tap;
-		mb.m_len = sc->sc_txtap_len;
-		mb.m_next = m0;
-		mb.m_nextpkt = NULL;
-		mb.m_type = 0;
-		mb.m_flags = 0;
-		bpf_mtap(sc->sc_drvbpf, &mb, BPF_DIRECTION_OUT);
+		bpf_mtap_hdr(sc->sc_drvbpf, tap, sc->sc_txtap_len, m0,
+		    BPF_DIRECTION_OUT);
 	}
 #endif
 
@@ -1862,7 +1852,6 @@ rt2661_tx_data(struct rt2661_softc *sc, struct mbuf *m0,
 
 #if NBPFILTER > 0
 	if (sc->sc_drvbpf != NULL) {
-		struct mbuf mb;
 		struct rt2661_tx_radiotap_header *tap = &sc->sc_txtap;
 
 		tap->wt_flags = 0;
@@ -1870,13 +1859,8 @@ rt2661_tx_data(struct rt2661_softc *sc, struct mbuf *m0,
 		tap->wt_chan_freq = htole16(sc->sc_curchan->ic_freq);
 		tap->wt_chan_flags = htole16(sc->sc_curchan->ic_flags);
 
-		mb.m_data = (caddr_t)tap;
-		mb.m_len = sc->sc_txtap_len;
-		mb.m_next = m0;
-		mb.m_nextpkt = NULL;
-		mb.m_type = 0;
-		mb.m_flags = 0;
-		bpf_mtap(sc->sc_drvbpf, &mb, BPF_DIRECTION_OUT);
+		bpf_mtap_hdr(sc->sc_drvbpf, tap, sc->sc_txtap_len, m0,
+		    BPF_DIRECTION_OUT);
 	}
 #endif
 
@@ -1953,7 +1937,7 @@ rt2661_start(struct ifnet *ifp)
 			if (ic->ic_state != IEEE80211_S_RUN)
 				break;
 
-			IFQ_DEQUEUE(&ifp->if_snd, m0);
+			m0 = ifq_dequeue(&ifp->if_snd);
 			if (m0 == NULL)
 				break;
 #if NBPFILTER > 0
@@ -2951,7 +2935,7 @@ rt2661_prepare_beacon(struct rt2661_softc *sc)
 		    RT2661_HW_BEACON_BASE0 + 24 +
 		    sizeof (struct ieee80211_frame) +
 		    8 + 2 + 2 +
-		    ((ic->ic_flags & IEEE80211_F_HIDENWID) ?
+		    ((ic->ic_userflags & IEEE80211_F_HIDENWID) ?
 			1 : 2 + ni->ni_esslen) +
 		    2 + min(ni->ni_rates.rs_nrates, IEEE80211_RATE_SIZE) +
 		    2 + 1 +

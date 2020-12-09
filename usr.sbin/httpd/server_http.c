@@ -1,6 +1,7 @@
-/*	$OpenBSD: server_http.c,v 1.123 2018/09/07 09:31:13 florian Exp $	*/
+/*	$OpenBSD: server_http.c,v 1.142 2020/10/29 12:30:52 denis Exp $	*/
 
 /*
+ * Copyright (c) 2020 Matthias Pressfreund <mpfr@fn.de>
  * Copyright (c) 2006 - 2018 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -20,6 +21,7 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/tree.h>
+#include <sys/stat.h>
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -36,6 +38,7 @@
 #include <event.h>
 #include <ctype.h>
 #include <vis.h>
+#include <fcntl.h>
 
 #include "httpd.h"
 #include "http.h"
@@ -100,10 +103,14 @@ server_httpdesc_free(struct http_descriptor *desc)
 
 	free(desc->http_path);
 	desc->http_path = NULL;
+	free(desc->http_path_orig);
+	desc->http_path_orig = NULL;
 	free(desc->http_path_alias);
 	desc->http_path_alias = NULL;
 	free(desc->http_query);
 	desc->http_query = NULL;
+	free(desc->http_query_alias);
+	desc->http_query_alias = NULL;
 	free(desc->http_version);
 	desc->http_version = NULL;
 	free(desc->http_host);
@@ -151,9 +158,6 @@ server_http_authenticate(struct server_config *srv_conf, struct client *clt)
 	if ((clt->clt_remote_user = strdup(clt_user)) == NULL)
 		goto done;
 
-	if (clt_pass == NULL)
-		goto done;
-
 	if ((fp = fopen(auth->auth_htpasswd, "r")) == NULL)
 		goto done;
 
@@ -198,7 +202,6 @@ void
 server_read_http(struct bufferevent *bev, void *arg)
 {
 	struct client		*clt = arg;
-	struct server_config	*srv_conf = clt->clt_srv_conf;
 	struct http_descriptor	*desc = clt->clt_descreq;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line = NULL, *key, *value;
@@ -220,7 +223,7 @@ server_read_http(struct bufferevent *bev, void *arg)
 		if (!clt->clt_line) {
 			/* Peek into the buffer to see if it looks like HTTP */
 			key = EVBUFFER_DATA(src);
-			if (!isalpha(*key)) {
+			if (!isalpha((unsigned char)*key)) {
 				server_abort_http(clt, 400,
 				    "invalid request line");
 				goto abort;
@@ -355,11 +358,6 @@ server_read_http(struct bufferevent *bev, void *arg)
 			    &errstr);
 			if (errstr) {
 				server_abort_http(clt, 500, errstr);
-				goto abort;
-			}
-			if ((size_t)clt->clt_toread >
-			    srv_conf->maxrequestbody) {
-				server_abort_http(clt, 413, NULL);
 				goto abort;
 			}
 		}
@@ -928,15 +926,17 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 	/* A CSS stylesheet allows minimal customization by the user */
 	style = "body { background-color: white; color: black; font-family: "
 	    "'Comic Sans MS', 'Chalkboard SE', 'Comic Neue', sans-serif; }\n"
-	    "hr { border: 0; border-bottom: 1px dashed; }\n";
+	    "hr { border: 0; border-bottom: 1px dashed; }\n"
+	    "@media (prefers-color-scheme: dark) {\n"
+	    "body { background-color: #1E1F21; color: #EEEFF1; }\n"
+	    "a { color: #BAD7FF; }\n}";
 
 	/* Generate simple HTML error document */
 	if ((bodylen = asprintf(&body,
 	    "<!DOCTYPE html>\n"
 	    "<html>\n"
 	    "<head>\n"
-	    "<meta http-equiv=\"Content-Type\" content=\"text/html; "
-	    "charset=utf-8\"/>\n"
+	    "<meta charset=\"utf-8\">\n"
 	    "<title>%03d %s</title>\n"
 	    "<style type=\"text/css\"><!--\n%s\n--></style>\n"
 	    "</head>\n"
@@ -950,7 +950,8 @@ server_abort_http(struct client *clt, unsigned int code, const char *msg)
 		goto done;
 	}
 
-	if (srv_conf->flags & SRVFLAG_SERVER_HSTS) {
+	if (srv_conf->flags & SRVFLAG_SERVER_HSTS &&
+	    srv_conf->flags & SRVFLAG_TLS) {
 		if (asprintf(&hstsheader, "Strict-Transport-Security: "
 		    "max-age=%d%s%s\r\n", srv_conf->hsts_max_age,
 		    srv_conf->hsts_flags & HSTSFLAG_SUBDOMAINS ?
@@ -1037,7 +1038,7 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 {
 	struct http_descriptor	*desc = clt->clt_descreq;
 	struct server_config	*srv_conf = clt->clt_srv_conf;
-	char			 ibuf[128], *str, *path;
+	char			 ibuf[128], *str, *path, *query;
 	const char		*errstr = NULL, *p;
 	size_t			 size;
 	int			 n, ret;
@@ -1074,6 +1075,18 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 			return (NULL);
 		ret = expand_string(buf, len, "$DOCUMENT_URI", path);
 		free(path);
+		if (ret != 0)
+			return (NULL);
+	}
+	if (strstr(val, "$QUERY_STRING_ENC") != NULL) {
+		if (desc->http_query == NULL) {
+			ret = expand_string(buf, len, "$QUERY_STRING_ENC", "");
+		} else {
+			if ((query = url_encode(desc->http_query)) == NULL)
+				return (NULL);
+			ret = expand_string(buf, len, "$QUERY_STRING_ENC", query);
+			free(query);
+		}
 		if (ret != 0)
 			return (NULL);
 	}
@@ -1142,6 +1155,15 @@ server_expand_http(struct client *clt, const char *val, char *buf,
 		if (ret != 0)
 			return (NULL);
 	}
+	if (strstr(val, "$REQUEST_SCHEME") != NULL) {
+		if (srv_conf->flags & SRVFLAG_TLS) {
+			ret = expand_string(buf, len, "$REQUEST_SCHEME", "https");
+		} else {
+			ret = expand_string(buf, len, "$REQUEST_SCHEME", "http");
+		}
+		if (ret != 0)
+			return (NULL);
+	}
 	if (strstr(val, "$SERVER_") != NULL) {
 		if (strstr(val, "$SERVER_ADDR") != NULL) {
 			if (print_host(&srv_conf->ss,
@@ -1187,9 +1209,13 @@ server_response(struct httpd *httpd, struct client *clt)
 	char			*hostval, *query;
 	const char		*errstr = NULL;
 
-	/* Decode the URL */
+	/* Preserve original path */
 	if (desc->http_path == NULL ||
-	    url_decode(desc->http_path) == NULL)
+	    (desc->http_path_orig = strdup(desc->http_path)) == NULL)
+		goto fail;
+
+	/* Decode the URL */
+	if (url_decode(desc->http_path) == NULL)
 		goto fail;
 
 	/* Canonicalize the request path */
@@ -1226,13 +1252,6 @@ server_response(struct httpd *httpd, struct client *clt)
 			clt->clt_persist = 0;
 	}
 
-	if (clt->clt_persist >= srv_conf->maxrequests)
-		clt->clt_persist = 0;
-
-	/* pipelining should end after the first "idempotent" method */
-	if (clt->clt_pipelining && clt->clt_toread > 0)
-		clt->clt_persist = 0;
-
 	/*
 	 * Do we have a Host header and matching configuration?
 	 * XXX the Host can also appear in the URL path.
@@ -1263,8 +1282,7 @@ server_response(struct httpd *httpd, struct client *clt)
 				    hostname, FNM_CASEFOLD);
 			}
 			if (ret == 0 &&
-			    (portval == -1 ||
-			    (portval != -1 && portval == srv_conf->port))) {
+			    (portval == -1 || portval == srv_conf->port)) {
 				/* Replace host configuration */
 				clt->clt_srv_conf = srv_conf;
 				srv_conf = NULL;
@@ -1286,6 +1304,13 @@ server_response(struct httpd *httpd, struct client *clt)
 		srv_conf = clt->clt_srv_conf;
 	}
 
+	if (clt->clt_persist >= srv_conf->maxrequests)
+		clt->clt_persist = 0;
+
+	/* pipelining should end after the first "idempotent" method */
+	if (clt->clt_pipelining && clt->clt_toread > 0)
+		clt->clt_persist = 0;
+
 	if ((desc->http_host = strdup(hostname)) == NULL)
 		goto fail;
 
@@ -1295,7 +1320,11 @@ server_response(struct httpd *httpd, struct client *clt)
 		goto fail;
 
 	/* Now search for the location */
-	srv_conf = server_getlocation(clt, desc->http_path);
+	if ((srv_conf = server_getlocation(clt,
+	    desc->http_path)) == NULL) {
+		server_abort_http(clt, 500, desc->http_path);
+		return (-1);
+	}
 
 	/* Optional rewrite */
 	if (srv_conf->flags & SRVFLAG_PATH_REWRITE) {
@@ -1309,11 +1338,11 @@ server_response(struct httpd *httpd, struct client *clt)
 		 * be URL encoded - either specified by the user or by using the
 		 * original $QUERY_STRING.
 		 */
-		free(desc->http_query);
-		desc->http_query = NULL;
+		free(desc->http_query_alias);
+		desc->http_query_alias = NULL;
 		if ((query = strchr(path, '?')) != NULL) {
 			*query++ = '\0';
-			if ((desc->http_query = strdup(query)) == NULL)
+			if ((desc->http_query_alias = strdup(query)) == NULL)
 				goto fail;
 		}
 
@@ -1322,15 +1351,26 @@ server_response(struct httpd *httpd, struct client *clt)
 		    path, sizeof(path)) == NULL)
 			goto fail;
 
-		log_debug("%s: rewrote %s -> %s?%s", __func__,
-		    desc->http_path, path, desc->http_query);
+		log_debug("%s: rewrote %s?%s -> %s?%s", __func__,
+		    desc->http_path, desc->http_query ? desc->http_query : "",
+		    path, query ? query : "");
 
-		free(desc->http_path);
-		if ((desc->http_path = strdup(path)) == NULL)
+		free(desc->http_path_alias);
+		if ((desc->http_path_alias = strdup(path)) == NULL)
 			goto fail;
 
 		/* Now search for the updated location */
-		srv_conf = server_getlocation(clt, desc->http_path);
+		if ((srv_conf = server_getlocation(clt,
+		    desc->http_path_alias)) == NULL) {
+			server_abort_http(clt, 500, desc->http_path_alias);
+			return (-1);
+		}
+	}
+
+	if (clt->clt_toread > 0 && (size_t)clt->clt_toread >
+	    srv_conf->maxrequestbody) {
+		server_abort_http(clt, 413, NULL);
+		return (-1);
 	}
 
 	if (srv_conf->flags & SRVFLAG_BLOCK) {
@@ -1390,6 +1430,12 @@ server_getlocation(struct client *clt, const char *path)
 				    path, FNM_CASEFOLD);
 			}
 			if (ret == 0 && errstr == NULL) {
+				if ((ret = server_locationaccesstest(location,
+				    path)) == -1)
+					return (NULL);
+
+				if (ret)
+					continue;
 				/* Replace host configuration */
 				clt->clt_srv_conf = srv_conf = location;
 				break;
@@ -1398,6 +1444,27 @@ server_getlocation(struct client *clt, const char *path)
 	}
 
 	return (srv_conf);
+}
+
+int
+server_locationaccesstest(struct server_config *srv_conf, const char *path)
+{
+	int		 rootfd, ret;
+	struct stat	 sb;
+
+	if (((SRVFLAG_LOCATION_FOUND | SRVFLAG_LOCATION_NOT_FOUND) &
+	    srv_conf->flags) == 0)
+		return (0);
+
+	if ((rootfd = open(srv_conf->root, O_RDONLY)) == -1)
+		return (-1);
+
+	path = server_root_strip(path, srv_conf->strip) + 1;
+	if ((ret = faccessat(rootfd, path, R_OK, 0)) != -1)
+		ret = fstatat(rootfd, path, &sb, 0);
+	close(rootfd);
+	return ((ret == -1 && SRVFLAG_LOCATION_FOUND & srv_conf->flags) ||
+	    (ret == 0 && SRVFLAG_LOCATION_NOT_FOUND & srv_conf->flags));
 }
 
 int
@@ -1452,7 +1519,8 @@ server_response_http(struct client *clt, unsigned int code,
 		return (-1);
 
 	/* HSTS header */
-	if (srv_conf->flags & SRVFLAG_SERVER_HSTS) {
+	if (srv_conf->flags & SRVFLAG_SERVER_HSTS &&
+	    srv_conf->flags & SRVFLAG_TLS) {
 		if ((cl =
 		    kv_add(&resp->http_headers, "Strict-Transport-Security",
 		    NULL)) == NULL ||
@@ -1630,7 +1698,7 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 	static char		 tstamp[64];
 	static char		 ip[INET6_ADDRSTRLEN];
 	time_t			 t;
-	struct kv		 key, *agent, *referrer;
+	struct kv		 key, *agent, *referrer, *xff, *xfp;
 	struct tm		*tm;
 	struct server_config	*srv_conf;
 	struct http_descriptor	*desc;
@@ -1640,6 +1708,8 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 	char			*version = NULL;
 	char			*referrer_v = NULL;
 	char			*agent_v = NULL;
+	char			*xff_v = NULL;
+	char			*xfp_v = NULL;
 
 	if ((srv_conf = clt->clt_srv_conf) == NULL)
 		return (-1);
@@ -1696,6 +1766,7 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 		break;
 
 	case LOG_FORMAT_COMBINED:
+	case LOG_FORMAT_FORWARDED:
 		key.kv_key = "Referer"; /* sic */
 		if ((referrer = kv_find(&desc->http_headers, &key)) != NULL &&
 		    referrer->kv_value == NULL)
@@ -1709,6 +1780,13 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 		/* Use vis to encode input values from the header */
 		if (clt->clt_remote_user &&
 		    stravis(&user, clt->clt_remote_user, HTTPD_LOGVIS) == -1)
+			goto done;
+		if (clt->clt_remote_user == NULL &&
+		    clt->clt_tls_ctx != NULL &&
+		    (srv_conf->tls_flags & TLSFLAG_CA) &&
+		    tls_peer_cert_subject(clt->clt_tls_ctx) != NULL &&
+		    stravis(&user, tls_peer_cert_subject(clt->clt_tls_ctx),
+		    HTTPD_LOGVIS) == -1)
 			goto done;
 		if (desc->http_version &&
 		    stravis(&version, desc->http_version, HTTPD_LOGVIS) == -1)
@@ -1725,10 +1803,10 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 		    (referrer_v = url_encode(referrer->kv_value)) == NULL)
 			goto done;
 
-		ret = evbuffer_add_printf(clt->clt_log,
+		if ((ret = evbuffer_add_printf(clt->clt_log,
 		    "%s %s - %s [%s] \"%s %s%s%s%s%s\""
-		    " %03d %zu \"%s\" \"%s\"\n",
-		    srv_conf->name, ip, clt->clt_remote_user == NULL ? "-" :
+		    " %03d %zu \"%s\" \"%s\"",
+		    srv_conf->name, ip, user == NULL ? "-" :
 		    user, tstamp,
 		    server_httpmethod_byid(desc->http_method),
 		    desc->http_path == NULL ? "" : path,
@@ -1738,7 +1816,38 @@ server_log_http(struct client *clt, unsigned int code, size_t len)
 		    desc->http_version == NULL ? "" : version,
 		    code, len,
 		    referrer == NULL ? "" : referrer_v,
-		    agent == NULL ? "" : agent_v);
+		    agent == NULL ? "" : agent_v)) == -1)
+			break;
+
+		if (srv_conf->logformat == LOG_FORMAT_COMBINED)
+			goto finish;
+
+		xff = xfp = NULL;
+
+		key.kv_key = "X-Forwarded-For";
+		if ((xff = kv_find(&desc->http_headers, &key)) != NULL
+		    && xff->kv_value == NULL)
+			xff = NULL;
+
+		if (xff &&
+		    stravis(&xff_v, xff->kv_value, HTTPD_LOGVIS) == -1)
+			goto finish;
+
+		key.kv_key = "X-Forwarded-Port";
+		if ((xfp = kv_find(&desc->http_headers, &key)) != NULL &&
+		    (xfp->kv_value == NULL))
+			xfp = NULL;
+
+		if (xfp &&
+		    stravis(&xfp_v, xfp->kv_value, HTTPD_LOGVIS) == -1)
+			goto finish;
+
+		if ((ret = evbuffer_add_printf(clt->clt_log, " %s %s",
+		    xff == NULL ? "-" : xff_v,
+		    xfp == NULL ? "-" : xfp_v)) == -1)
+			break;
+finish:
+		ret = evbuffer_add_printf(clt->clt_log, "\n");
 
 		break;
 
@@ -1760,6 +1869,8 @@ done:
 	free(version);
 	free(referrer_v);
 	free(agent_v);
+	free(xff_v);
+	free(xfp_v);
 
 	return (ret);
 }

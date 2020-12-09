@@ -1,4 +1,4 @@
-/*	$OpenBSD: sxiintc.c,v 1.4 2018/06/04 09:24:49 kettenis Exp $	*/
+/*	$OpenBSD: sxiintc.c,v 1.7 2020/07/14 15:34:15 patrick Exp $	*/
 /*
  * Copyright (c) 2007,2009 Dale Rahn <drahn@openbsd.org>
  * Copyright (c) 2013 Artturi Alm
@@ -149,8 +149,8 @@ int	sxiintc_spllower(int);
 int	sxiintc_splraise(int);
 void	sxiintc_setipl(int);
 void	sxiintc_calc_masks(void);
-void	*sxiintc_intr_establish_fdt(void *, int *, int, int (*)(void *),
-	    void *, char *);
+void	*sxiintc_intr_establish_fdt(void *, int *, int, struct cpu_info *,
+	    int (*)(void *), void *, char *);
 
 struct cfattach	sxiintc_ca = {
 	sizeof (struct device), sxiintc_match, sxiintc_attach
@@ -254,7 +254,7 @@ sxiintc_calc_masks(void)
 		for (; i < NIPL; i++)
 			sxiintc_imask[IRQ2REG32(irq)][i] |=
 			    (1 << IRQ2BIT32(irq));
-		/* XXX - set enable/disable, priority */ 
+		/* XXX - set enable/disable, priority */
 	}
 
 	sxiintc_setipl(ci->ci_cpl);
@@ -297,7 +297,7 @@ sxiintc_splraise(int new)
 		new = old;
 
 	sxiintc_setipl(new);
-  
+
 	return (old);
 }
 
@@ -365,15 +365,15 @@ sxiintc_irq_handler(void *frame)
 		else
 			arg = frame;
 
-		if (ih->ih_func(arg)) 
+		if (ih->ih_func(arg))
 			ih->ih_count.ec_count++;
 	}
 	sxiintc_splx(s);
 }
 
 void *
-sxiintc_intr_establish(int irq, int level, int (*func)(void *),
-    void *arg, char *name)
+sxiintc_intr_establish(int irq, int level, struct cpu_info *ci,
+    int (*func)(void *), void *arg, char *name)
 {
 	int psw;
 	struct intrhand *ih;
@@ -381,6 +381,11 @@ sxiintc_intr_establish(int irq, int level, int (*func)(void *),
 
 	if (irq <= 0 || irq >= NIRQ)
 		panic("intr_establish: bogus irq %d %s\n", irq, name);
+
+	if (ci == NULL)
+		ci = &cpu_info_primary;
+	else if (!CPU_IS_PRIMARY(ci))
+		return NULL;
 
 	DPRINTF(("intr_establish: irq %d level %d [%s]\n", irq, level,
 	    name != NULL ? name : "NULL"));
@@ -390,7 +395,7 @@ sxiintc_intr_establish(int irq, int level, int (*func)(void *),
 	ih = malloc(sizeof(*ih), M_DEVBUF, M_WAITOK);
 	ih->ih_func = func;
 	ih->ih_arg = arg;
-	ih->ih_ipl = level;
+	ih->ih_ipl = level & IPL_IRQMASK;
 	ih->ih_irq = irq;
 	ih->ih_name = name;
 
@@ -413,9 +418,9 @@ sxiintc_intr_establish(int irq, int level, int (*func)(void *),
 
 void *
 sxiintc_intr_establish_fdt(void *cookie, int *cell, int level,
-    int (*func)(void *), void *arg, char *name)
+    struct cpu_info *ci, int (*func)(void *), void *arg, char *name)
 {
-	return sxiintc_intr_establish(cell[0], level, func, arg, name);
+	return sxiintc_intr_establish(cell[0], level, ci, func, arg, name);
 }
 
 void

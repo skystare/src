@@ -1,4 +1,4 @@
-/*	$OpenBSD: gmon.c,v 1.30 2016/09/21 04:38:56 guenther Exp $ */
+/*	$OpenBSD: gmon.c,v 1.32 2020/10/12 22:08:33 deraadt Exp $ */
 /*-
  * Copyright (c) 1983, 1992, 1993
  *	The Regents of the University of California.  All rights reserved.
@@ -146,7 +146,7 @@ _mcleanup(void)
 	struct gmonparam *p = &_gmonparam;
 	struct gmonhdr gmonhdr, *hdr;
 	struct clockinfo clockinfo;
-	int mib[2];
+	const int mib[2] = { CTL_KERN, KERN_CLOCKRATE };
 	size_t size;
 	char *profdir;
 	char *proffile;
@@ -160,9 +160,7 @@ _mcleanup(void)
 		ERR("_mcleanup: tos overflow\n");
 
 	size = sizeof(clockinfo);
-	mib[0] = CTL_KERN;
-	mib[1] = KERN_CLOCKRATE;
-	if (sysctl(mib, 2, &clockinfo, &size, NULL, 0) < 0) {
+	if (sysctl(mib, 2, &clockinfo, &size, NULL, 0) == -1) {
 		/*
 		 * Best guess
 		 */
@@ -221,13 +219,13 @@ _mcleanup(void)
 	}
 
 	fd = open(proffile , O_CREAT|O_TRUNC|O_WRONLY, 0664);
-	if (fd < 0) {
+	if (fd == -1) {
 		perror( proffile );
 		return;
 	}
 #ifdef DEBUG
 	log = open("gmon.log", O_CREAT|O_TRUNC|O_WRONLY, 0664);
-	if (log < 0) {
+	if (log == -1) {
 		perror("mcount: gmon.log");
 		close(fd);
 		return;

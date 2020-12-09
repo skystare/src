@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_otus.c,v 1.60 2017/10/26 15:00:28 mpi Exp $	*/
+/*	$OpenBSD: if_otus.c,v 1.68 2020/11/30 16:09:33 krw Exp $	*/
 
 /*-
  * Copyright (c) 2009 Damien Bergamini <damien.bergamini@free.fr>
@@ -124,7 +124,8 @@ void		otus_newassoc(struct ieee80211com *, struct ieee80211_node *,
 		    int);
 void		otus_intr(struct usbd_xfer *, void *, usbd_status);
 void		otus_cmd_rxeof(struct otus_softc *, uint8_t *, int);
-void		otus_sub_rxeof(struct otus_softc *, uint8_t *, int);
+void		otus_sub_rxeof(struct otus_softc *, uint8_t *, int,
+		    struct mbuf_list *);
 void		otus_rxeof(struct usbd_xfer *, void *, usbd_status);
 void		otus_txeof(struct usbd_xfer *, void *, usbd_status);
 int		otus_tx(struct otus_softc *, struct mbuf *,
@@ -554,10 +555,8 @@ otus_close_pipes(struct otus_softc *sc)
 
 	if (sc->data_rx_pipe != NULL)
 		usbd_close_pipe(sc->data_rx_pipe);
-	if (sc->cmd_rx_pipe != NULL) {
-		usbd_abort_pipe(sc->cmd_rx_pipe);
+	if (sc->cmd_rx_pipe != NULL)
 		usbd_close_pipe(sc->cmd_rx_pipe);
-	}
 	if (sc->ibuf != NULL)
 		free(sc->ibuf, M_USBDEV, sc->ibuflen);
 	if (sc->data_tx_pipe != NULL)
@@ -582,6 +581,7 @@ otus_alloc_tx_cmd(struct otus_softc *sc)
 		printf("%s: could not allocate xfer buffer\n",
 		    sc->sc_dev.dv_xname);
 		usbd_free_xfer(cmd->xfer);
+		cmd->xfer = NULL;
 		return ENOMEM;
 	}
 	return 0;
@@ -691,13 +691,16 @@ void
 otus_next_scan(void *arg)
 {
 	struct otus_softc *sc = arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ifnet *ifp = &ic->ic_if;
 
 	if (usbd_is_dying(sc->sc_udev))
 		return;
 
 	usbd_ref_incr(sc->sc_udev);
 
-	if (sc->sc_ic.ic_state == IEEE80211_S_SCAN)
+	if (sc->sc_ic.ic_state == IEEE80211_S_SCAN &&
+	    (ifp->if_flags & IFF_RUNNING))
 		ieee80211_next_scan(&sc->sc_ic.ic_if);
 
 	usbd_ref_decr(sc->sc_udev);
@@ -844,7 +847,7 @@ otus_cmd(struct otus_softc *sc, uint8_t code, const void *idata, int ilen,
 		return EIO;
 	}
 	if (!cmd->done)
-		error = tsleep(cmd, PCATCH, "otuscmd", hz);
+		error = tsleep_nsec(cmd, PCATCH, "otuscmd", SEC_TO_NSEC(1));
 	cmd->odata = NULL;	/* In case answer is received too late. */
 	splx(s);
 	if (error != 0) {
@@ -1060,7 +1063,8 @@ otus_cmd_rxeof(struct otus_softc *sc, uint8_t *buf, int len)
 }
 
 void
-otus_sub_rxeof(struct otus_softc *sc, uint8_t *buf, int len)
+otus_sub_rxeof(struct otus_softc *sc, uint8_t *buf, int len,
+    struct mbuf_list *ml)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
@@ -1191,7 +1195,7 @@ otus_sub_rxeof(struct otus_softc *sc, uint8_t *buf, int len)
 	rxi.rxi_flags = 0;
 	rxi.rxi_rssi = tail->rssi;
 	rxi.rxi_tstamp = 0;	/* unused */
-	ieee80211_input(ifp, m, ni, &rxi);
+	ieee80211_inputm(ifp, m, ni, &rxi, ml);
 
 	/* Node is no longer needed. */
 	ieee80211_release_node(ic, ni);
@@ -1201,6 +1205,7 @@ otus_sub_rxeof(struct otus_softc *sc, uint8_t *buf, int len)
 void
 otus_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 {
+	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 	struct otus_rx_data *data = priv;
 	struct otus_softc *sc = data->sc;
 	caddr_t buf = data->buf;
@@ -1230,13 +1235,14 @@ otus_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 			break;
 		}
 		/* Process sub-xfer. */
-		otus_sub_rxeof(sc, (uint8_t *)&head[1], hlen);
+		otus_sub_rxeof(sc, (uint8_t *)&head[1], hlen, &ml);
 
 		/* Next sub-xfer is aligned on a 32-bit boundary. */
 		hlen = (sizeof (*head) + hlen + 3) & ~3;
 		buf += hlen;
 		len -= hlen;
 	}
+	if_input(&sc->sc_ic.ic_if, &ml);
 
  resubmit:
 	usbd_setup_xfer(xfer, sc->data_rx_pipe, data, data->buf, OTUS_RXBUFSZ,
@@ -1420,7 +1426,7 @@ otus_start(struct ifnet *ifp)
 			break;
 
 		/* Encapsulate and send data frames. */
-		IFQ_DEQUEUE(&ifp->if_snd, m);
+		m = ifq_dequeue(&ifp->if_snd);
 		if (m == NULL)
 			break;
 #if NBPFILTER > 0
@@ -2048,9 +2054,10 @@ otus_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 
 	/* Do it in a process context. */
 	cmd.key = *k;
-	cmd.associd = (ni != NULL) ? ni->ni_associd : 0;
+	cmd.ni = *ni;
 	otus_do_async(sc, otus_set_key_cb, &cmd, sizeof cmd);
-	return 0;
+	sc->sc_key_tasks++
+	return EBUSY;
 }
 
 void
@@ -2061,6 +2068,8 @@ otus_set_key_cb(struct otus_softc *sc, void *arg)
 	struct ar_cmd_ekey key;
 	uint16_t cipher;
 	int error;
+
+	sc->sc_keys_tasks--;
 
 	memset(&key, 0, sizeof key);
 	if (k->k_flags & IEEE80211_KEY_GROUP) {
@@ -2087,18 +2096,32 @@ otus_set_key_cb(struct otus_softc *sc, void *arg)
 		cipher = AR_CIPHER_AES;
 		break;
 	default:
+		IEEE80211_SEND_MGMT(ic, cmd->ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+		    IEEE80211_REASON_AUTH_LEAVE);
+		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 		return;
 	}
 	key.cipher = htole16(cipher);
 	memcpy(key.key, k->k_key, MIN(k->k_len, 16));
 	error = otus_cmd(sc, AR_CMD_EKEY, &key, sizeof key, NULL);
-	if (error != 0 || k->k_cipher != IEEE80211_CIPHER_TKIP)
+	if (error != 0 || k->k_cipher != IEEE80211_CIPHER_TKIP) {
+		IEEE80211_SEND_MGMT(ic, cmd->ni, IEEE80211_FC0_SUBTYPE_DEAUTH,
+		    IEEE80211_REASON_AUTH_LEAVE);
+		ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
 		return;
+	}
 
 	/* TKIP: set Tx/Rx MIC Key. */
 	key.kix = htole16(1);
 	memcpy(key.key, k->k_key + 16, 16);
 	(void)otus_cmd(sc, AR_CMD_EKEY, &key, sizeof key, NULL);
+
+	if (sc->sc_key_tasks == 0) {
+		DPRINTF(("marking port %s valid\n",
+		    ether_sprintf(cmd->ni->ni_macaddr)));
+		cmd->ni->ni_port_valid = 1;
+		ieee80211_set_link_state(ic, LINK_STATE_UP);
+	}
 }
 
 void
@@ -2271,7 +2294,7 @@ otus_init(struct ifnet *ifp)
 	}
 
 	/* Start Rx. */
-	otus_write(sc, 0x1c3d30, 0x100);
+	otus_write(sc, AR_MAC_REG_DMA_TRIGGER, AR_DMA_TRIGGER_RXQ);
 	(void)otus_write_barrier(sc);
 
 	ifp->if_flags |= IFF_RUNNING;
@@ -2307,7 +2330,7 @@ otus_stop(struct ifnet *ifp)
 	splx(s);
 
 	/* Stop Rx. */
-	otus_write(sc, 0x1c3d30, 0);
+	otus_write(sc, AR_MAC_REG_DMA_TRIGGER, 0);
 	(void)otus_write_barrier(sc);
 
 	sc->tx_queued = 0;

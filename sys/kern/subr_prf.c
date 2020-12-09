@@ -1,4 +1,4 @@
-/*	$OpenBSD: subr_prf.c,v 1.95 2018/04/10 09:24:56 mpi Exp $	*/
+/*	$OpenBSD: subr_prf.c,v 1.102 2020/11/28 17:53:05 deraadt Exp $	*/
 /*	$NetBSD: subr_prf.c,v 1.45 1997/10/24 18:14:25 chuck Exp $	*/
 
 /*-
@@ -118,17 +118,16 @@ int	db_console = 1;
 #else
 int	db_console = 0;
 #endif
-
-/*
- * flag to indicate if we are currently in ddb (on some processor)
- */
-int db_is_active;
 #endif
 
 /*
  * panic on spl assertion failure?
  */
+#ifdef SPLASSERT_WATCH
+int splassert_ctl = 3;
+#else
 int splassert_ctl = 1;
+#endif
 
 /*
  * v_putc: routine to putc on virtual console
@@ -139,6 +138,14 @@ int splassert_ctl = 1;
 
 void (*v_putc)(int) = cnputc;	/* start with cnputc (normal cons) */
 
+/*
+ * Silence kernel printf when masquerading as a bootloader.
+ */
+#ifdef BOOT_QUIET
+int printf_flags = TOLOG;
+#else
+int printf_flags = TOCONS | TOLOG;
+#endif
 
 /*
  * functions
@@ -182,6 +189,9 @@ panic(const char *fmt, ...)
 
 	/* do not trigger assertions, we know that we are inconsistent */
 	splassert_ctl = 0;
+
+	/* make sure we see kernel printf output */
+	printf_flags |= TOCONS;
 
 	bootopt = RB_AUTOBOOT | RB_DUMP;
 	va_start(ap, fmt);
@@ -326,16 +336,11 @@ void
 kputchar(int c, int flags, struct tty *tp)
 {
 	extern int msgbufmapped;
-	int ddb_active = 0;
-
-#ifdef DDB
-	ddb_active = db_is_active;
-#endif
 
 	if (panicstr)
 		constty = NULL;
 
-	if ((flags & TOCONS) && tp == NULL && constty && !ddb_active) {
+	if ((flags & TOCONS) && tp == NULL && constty != NULL && !db_active) {
 		tp = constty;
 		flags |= TOTTY;
 	}
@@ -345,7 +350,7 @@ kputchar(int c, int flags, struct tty *tp)
 	if ((flags & TOLOG) &&
 	    c != '\0' && c != '\r' && c != 0177 && msgbufmapped)
 		msgbuf_putchar(msgbufp, c);
-	if ((flags & TOCONS) && (constty == NULL || ddb_active) && c != '\0')
+	if ((flags & TOCONS) && (constty == NULL || db_active) && c != '\0')
 		(*v_putc)(c);
 #ifdef DDB
 	if (flags & TODDB)
@@ -506,10 +511,9 @@ printf(const char *fmt, ...)
 	va_list ap;
 	int retval;
 
-
 	va_start(ap, fmt);
 	mtx_enter(&kprintf_mutex);
-	retval = kprintf(fmt, TOCONS | TOLOG, NULL, NULL, ap);
+	retval = kprintf(fmt, printf_flags, NULL, NULL, ap);
 	mtx_leave(&kprintf_mutex);
 	va_end(ap);
 	if (!panicstr)
@@ -655,17 +659,17 @@ vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
 	    (u_long)va_arg(ap, u_int))
 
 #define KPRINTF_PUTCHAR(C) do {					\
-	int chr = (C);							\
-	ret += 1;							\
-	if (oflags & TOBUFONLY) {					\
-		if ((vp != NULL) && (sbuf == tailp)) {			\
-			if (!(oflags & TOCOUNT))				\
-				goto overflow;				\
-		} else							\
-			*sbuf++ = chr;					\
-	} else {							\
-		kputchar(chr, oflags, (struct tty *)vp);			\
-	}								\
+	int chr = (C);						\
+	ret += 1;						\
+	if (oflags & TOBUFONLY) {				\
+		if ((vp != NULL) && (sbuf == tailp)) {		\
+			if (!(oflags & TOCOUNT))		\
+				goto overflow;			\
+		} else						\
+			*sbuf++ = chr;				\
+	} else {						\
+		kputchar(chr, oflags, (struct tty *)vp);	\
+	}							\
 } while(0)
 
 int
@@ -865,18 +869,8 @@ reswitch:	switch (ch) {
 			base = DEC;
 			goto number;
 		case 'n':
-			/* %n is unsupported in the kernel; just skip it */
-			if (flags & QUADINT)
-				(void)va_arg(ap, quad_t *);
-			else if (flags & LONGINT)
-				(void)va_arg(ap, long *);
-			else if (flags & SHORTINT)
-				(void)va_arg(ap, short *);
-			else if (flags & SIZEINT)
-				(void)va_arg(ap, ssize_t *);
-			else
-				(void)va_arg(ap, int *);
-			continue;	/* no output */
+			panic("no %%n support\n");
+			break;
 		case 'O':
 			flags |= LONGINT;
 			/*FALLTHROUGH*/

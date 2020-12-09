@@ -1,4 +1,4 @@
-/*	$OpenBSD: gdtvar.h,v 1.22 2013/03/04 00:41:54 dlg Exp $	*/
+/*	$OpenBSD: gdtvar.h,v 1.25 2020/07/22 13:16:04 krw Exp $	*/
 
 /*
  * Copyright (c) 1999, 2000 Niklas Hallqvist.  All rights reserved.
@@ -104,7 +104,6 @@ gdt_ccb_set_cmd(struct gdt_ccb *ccb, int flag)
 struct gdt_softc {
 	struct	device sc_dev;
 	void   *sc_ih;
-	struct	scsi_link sc_link;	/* Virtual SCSI bus for cache devs */
 
 	int	sc_class;		/* Controller class */
 #define GDT_ISA		0x01
@@ -236,7 +235,6 @@ struct gdt_softc {
 	int (*sc_test_busy)(struct gdt_softc *);
 };
 
-void	gdtminphys(struct buf *, struct scsi_link *);
 int	gdt_attach(struct gdt_softc *);
 int	gdt_intr(void *);
 

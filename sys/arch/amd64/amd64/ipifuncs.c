@@ -1,4 +1,4 @@
-/*	$OpenBSD: ipifuncs.c,v 1.32 2018/07/27 21:11:31 kettenis Exp $	*/
+/*	$OpenBSD: ipifuncs.c,v 1.35 2020/09/13 11:53:16 jsg Exp $	*/
 /*	$NetBSD: ipifuncs.c,v 1.1 2003/04/26 18:39:28 fvdl Exp $ */
 
 /*-
@@ -60,16 +60,20 @@
 
 void x86_64_ipi_nop(struct cpu_info *);
 void x86_64_ipi_halt(struct cpu_info *);
+void x86_64_ipi_wbinvd(struct cpu_info *);
 
 #if NVMM > 0
 void x86_64_ipi_start_vmm(struct cpu_info *);
 void x86_64_ipi_stop_vmm(struct cpu_info *);
 #endif /* NVMM > 0 */
 
-#ifdef HIBERNATE
-void x86_64_ipi_halt_realmode(struct cpu_info *);
-extern void hibernate_drop_to_real_mode(void);
-#endif /* HIBERNATE */
+#include "pctr.h"
+#if NPCTR > 0
+#include <machine/pctr.h>
+#define x86_64_ipi_reload_pctr pctr_reload
+#else
+#define x86_64_ipi_reload_pctr NULL
+#endif
 
 #ifdef MTRR
 void x86_64_ipi_reload_mtrr(struct cpu_info *);
@@ -83,7 +87,7 @@ void (*ipifunc[X86_NIPI])(struct cpu_info *) =
 	x86_64_ipi_nop,
 	NULL,
 	NULL,
-	NULL,
+	x86_64_ipi_reload_pctr,
 	x86_64_ipi_reload_mtrr,
 	x86_setperf_ipi,
 #ifdef DDB
@@ -98,6 +102,7 @@ void (*ipifunc[X86_NIPI])(struct cpu_info *) =
 	NULL,
 	NULL,
 #endif
+	x86_64_ipi_wbinvd,
 };
 
 void
@@ -144,3 +149,9 @@ x86_64_ipi_stop_vmm(struct cpu_info *ci)
 	stop_vmm_on_cpu(ci);
 }
 #endif /* NVMM > 0 */
+
+void
+x86_64_ipi_wbinvd(struct cpu_info *ci)
+{
+	wbinvd();
+}

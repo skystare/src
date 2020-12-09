@@ -1,4 +1,4 @@
-/*	$OpenBSD: mount.h,v 1.139 2018/09/16 11:41:44 visa Exp $	*/
+/*	$OpenBSD: mount.h,v 1.147 2020/01/18 08:40:19 visa Exp $	*/
 /*	$NetBSD: mount.h,v 1.48 1996/02/18 11:55:47 fvdl Exp $	*/
 
 /*
@@ -331,8 +331,6 @@ struct statfs {
  * array of operations and an instance record.  The file systems are
  * put on a doubly linked list.
  */
-LIST_HEAD(vnodelst, vnode);
-
 struct mount {
 	TAILQ_ENTRY(mount) mnt_list;		/* mount list */
 	SLIST_ENTRY(mount) mnt_dounmount;	/* unmount work queue */
@@ -340,7 +338,7 @@ struct mount {
 	struct vfsconf  *mnt_vfc;               /* configuration info */
 	struct vnode	*mnt_vnodecovered;	/* vnode we mounted on */
 	struct vnode    *mnt_syncer;            /* syncer vnode */
-	struct vnodelst	mnt_vnodelist;		/* list of vnodes this mount */
+	TAILQ_HEAD(, vnode) mnt_vnodelist;	/* list of vnodes this mount */
 	struct rwlock   mnt_lock;               /* mount structure lock */
 	int		mnt_flag;		/* flags */
 	struct statfs	mnt_stat;		/* cache of filesystem stats */
@@ -399,9 +397,14 @@ struct mount {
 #define	MNT_RELOAD	0x00040000	/* reload filesystem data */
 #define	MNT_FORCE	0x00080000	/* force unmount or readonly change */
 #define	MNT_STALLED	0x00100000	/* filesystem stalled */ 
+#define	MNT_SWAPPABLE	0x00200000	/* filesystem can be used for swap */
 #define MNT_WANTRDWR	0x02000000	/* want upgrade to read/write */
 #define MNT_SOFTDEP     0x04000000      /* soft dependencies being done */
 #define MNT_DOOMED	0x08000000	/* device behind filesystem is gone */
+
+#ifdef _KERNEL
+#define MNT_OP_FLAGS	(MNT_UPDATE | MNT_RELOAD | MNT_FORCE | MNT_WANTRDWR)
+#endif
 
 /*
  * Flags for various system call interfaces.
@@ -454,9 +457,8 @@ struct vfsconf {
 	const struct vfsops *vfc_vfsops; /* filesystem operations vector */
 	char	vfc_name[MFSNAMELEN];	/* filesystem type name */
 	int	vfc_typenum;		/* historic filesystem type number */
-	int	vfc_refcount;		/* number mounted of this type */
+	u_int	vfc_refcount;		/* number mounted of this type */
 	int	vfc_flags;		/* permanent flags */
-	struct	vfsconf *vfc_next;	/* next in list */
 	size_t	vfc_datasize;		/* size of data args */
 };
 
@@ -500,7 +502,6 @@ struct nameidata;
 struct mbuf;
 
 extern int maxvfsconf;		/* highest defined filesystem type */
-extern struct vfsconf *vfsconf;	/* head of list of filesystem types */
 
 struct vfsops {
 	int	(*vfs_mount)(struct mount *mp, const char *path,
@@ -544,6 +545,17 @@ struct vfsops {
 #define VFS_CHECKEXP(MP, NAM, EXFLG, CRED) \
 	(*(MP)->mnt_op->vfs_checkexp)(MP, NAM, EXFLG, CRED)
 
+/* Set up the filesystem operations for vnodes. */
+extern	const struct vfsops ffs_vfsops;
+extern	const struct vfsops mfs_vfsops;
+extern	const struct vfsops msdosfs_vfsops;
+extern	const struct vfsops nfs_vfsops;
+extern	const struct vfsops cd9660_vfsops;
+extern	const struct vfsops ext2fs_vfsops;
+extern	const struct vfsops ntfs_vfsops;
+extern	const struct vfsops udf_vfsops;
+extern	const struct vfsops fusefs_vfsops;
+extern	const struct vfsops tmpfs_vfsops;
 
 #include <net/radix.h>
 #include <sys/socket.h>		/* XXX for AF_MAX */
@@ -554,6 +566,7 @@ struct vfsops {
 struct netcred {
 	struct	radix_node netc_rnodes[2];
 	int	netc_exflags;
+	int	netc_len;			/* size of the allocation */
 	struct	ucred netc_anon;
 };
 
@@ -576,6 +589,8 @@ int	vfs_busy(struct mount *, int);
 #define VB_DUPOK	0x10	/* permit duplicate mount busying */
 
 int     vfs_isbusy(struct mount *);
+struct	mount *vfs_mount_alloc(struct vnode *, struct vfsconf *);
+void	vfs_mount_free(struct mount *);
 int     vfs_mount_foreach_vnode(struct mount *, int (*func)(struct vnode *,
 				    void *), void *);
 void	vfs_getnewfsid(struct mount *);
@@ -600,8 +615,6 @@ int	vfs_syncwait(struct proc *, int);   /* sync and wait for complete */
 void	vfs_shutdown(struct proc *);	    /* unmount and sync file systems */
 int	dounmount(struct mount *, int, struct proc *);
 void	vfsinit(void);
-int	vfs_register(struct vfsconf *);
-int	vfs_unregister(struct vfsconf *);
 struct	vfsconf *vfs_byname(const char *);
 struct	vfsconf *vfs_bytypenum(int);
 #else /* _KERNEL */

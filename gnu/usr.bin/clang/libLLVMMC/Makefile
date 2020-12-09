@@ -1,24 +1,24 @@
-# $OpenBSD: Makefile,v 1.5 2018/04/06 14:44:04 patrick Exp $
+# $OpenBSD: Makefile,v 1.8 2020/08/03 14:45:26 patrick Exp $
 
 LIB=	LLVMMC
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${LLVM_SRCS}/include/llvm/MC
 
-.include <bsd.own.mk>
-SRCS=	ConstantPools.cpp \
+SRCS+=	ConstantPools.cpp \
 	ELFObjectWriter.cpp \
 	MCAsmBackend.cpp \
 	MCAsmInfo.cpp \
 	MCAsmInfoCOFF.cpp \
 	MCAsmInfoDarwin.cpp \
 	MCAsmInfoELF.cpp \
+	MCAsmInfoWasm.cpp \
+	MCAsmInfoXCOFF.cpp \
+	MCAsmMacro.cpp \
 	MCAsmStreamer.cpp \
 	MCAssembler.cpp \
 	MCCodeEmitter.cpp \
 	MCCodeView.cpp \
-	MCCodePadder.cpp \
 	MCContext.cpp \
 	MCDwarf.cpp \
 	MCELFObjectTargetWriter.cpp \
@@ -44,6 +44,7 @@ SRCS=	ConstantPools.cpp \
 	MCSectionELF.cpp \
 	MCSectionMachO.cpp \
 	MCSectionWasm.cpp \
+	MCSectionXCOFF.cpp \
 	MCStreamer.cpp \
 	MCSubtargetInfo.cpp \
 	MCSymbol.cpp \
@@ -54,14 +55,13 @@ SRCS=	ConstantPools.cpp \
 	MCWin64EH.cpp \
 	MCWinCOFFStreamer.cpp \
 	MCWinEH.cpp \
+	MCXCOFFObjectTargetWriter.cpp \
+	MCXCOFFStreamer.cpp \
 	MachObjectWriter.cpp \
 	StringTableBuilder.cpp \
 	SubtargetFeature.cpp \
-	WinCOFFObjectWriter.cpp
+	WasmObjectWriter.cpp \
+	WinCOFFObjectWriter.cpp \
+	XCOFFObjectWriter.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/MC
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/MC

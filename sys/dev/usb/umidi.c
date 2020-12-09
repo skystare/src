@@ -1,4 +1,4 @@
-/*	$OpenBSD: umidi.c,v 1.49 2018/09/07 04:03:30 miko Exp $	*/
+/*	$OpenBSD: umidi.c,v 1.54 2020/07/31 10:49:33 mglocker Exp $	*/
 /*	$NetBSD: umidi.c,v 1.16 2002/07/11 21:14:32 augustss Exp $	*/
 /*
  * Copyright (c) 2001 The NetBSD Foundation, Inc.
@@ -44,7 +44,6 @@
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdi_util.h>
 
-#include <dev/usb/uaudioreg.h>
 #include <dev/usb/umidireg.h>
 #include <dev/usb/umidivar.h>
 #include <dev/usb/umidi_quirks.h>
@@ -317,7 +316,7 @@ umidi_flush(void *addr)
 	if (!mididev->out_jack || !mididev->opened)
 		return;
 
-	return out_jack_flush(mididev->out_jack);
+	out_jack_flush(mididev->out_jack);
 }
 
 void
@@ -368,7 +367,6 @@ static void
 free_pipe(struct umidi_endpoint *ep)
 {
 	DPRINTF(("%s: %s %p\n", ep->sc->sc_dev.dv_xname, __func__, ep));
-	usbd_abort_pipe(ep->pipe);
 	usbd_close_pipe(ep->pipe);
 	usbd_free_xfer(ep->xfer);
 }
@@ -406,7 +404,9 @@ alloc_all_endpoints(struct umidi_softc *sc)
 				ep--;
 				free_pipe(ep);
 			}
-			free(sc->sc_endpoints, M_USBDEV, 0);
+			free(sc->sc_endpoints, M_USBDEV,
+			    (sc->sc_out_num_endpoints + sc->sc_in_num_endpoints)
+			    * sizeof(*sc->sc_endpoints));
 			sc->sc_endpoints = sc->sc_out_ep = sc->sc_in_ep = NULL;
 			break;
 		}
@@ -422,8 +422,8 @@ free_all_endpoints(struct umidi_softc *sc)
 
 	for (i=0; i<sc->sc_in_num_endpoints+sc->sc_out_num_endpoints; i++)
 	    free_pipe(&sc->sc_endpoints[i]);
-	if (sc->sc_endpoints != NULL)
-		free(sc->sc_endpoints, M_USBDEV, 0);
+	free(sc->sc_endpoints, M_USBDEV, (sc->sc_out_num_endpoints +
+	    sc->sc_in_num_endpoints) * sizeof(*sc->sc_endpoints));
 	sc->sc_endpoints = sc->sc_out_ep = sc->sc_in_ep = NULL;
 }
 
@@ -440,7 +440,7 @@ alloc_all_endpoints_fixed_ep(struct umidi_softc *sc)
 	sc->sc_out_num_endpoints = fp->num_out_ep;
 	sc->sc_in_num_endpoints = fp->num_in_ep;
 	sc->sc_endpoints = mallocarray(sc->sc_out_num_endpoints +
-	    sc->sc_in_num_endpoints, sizeof(*sc->sc_out_ep), M_USBDEV,
+	    sc->sc_in_num_endpoints, sizeof(*sc->sc_endpoints), M_USBDEV,
 	    M_WAITOK | M_CANFAIL);
 	if (!sc->sc_endpoints)
 		return USBD_NOMEM;
@@ -449,6 +449,10 @@ alloc_all_endpoints_fixed_ep(struct umidi_softc *sc)
 	    sc->sc_in_num_endpoints ?
 		sc->sc_endpoints+sc->sc_out_num_endpoints : NULL;
 
+	if (sc->sc_in_ep == NULL || sc->sc_out_ep == NULL) {
+		printf("%s: cannot get valid endpoints", sc->sc_dev.dv_xname);
+		goto error;
+	}
 	ep = &sc->sc_out_ep[0];
 	for (i=0; i<sc->sc_out_num_endpoints; i++) {
 		epd = usbd_interface2endpoint_descriptor(
@@ -502,7 +506,8 @@ alloc_all_endpoints_fixed_ep(struct umidi_softc *sc)
 
 	return USBD_NORMAL_COMPLETION;
 error:
-	free(sc->sc_endpoints, M_USBDEV, 0);
+	free(sc->sc_endpoints, M_USBDEV, (sc->sc_out_num_endpoints +
+	    sc->sc_in_num_endpoints) * sizeof(*sc->sc_endpoints));
 	sc->sc_endpoints = NULL;
 	return USBD_INVAL;
 }
@@ -522,6 +527,9 @@ alloc_all_endpoints_yamaha(struct umidi_softc *sc)
 	desc = TO_D(usbd_get_interface_descriptor(sc->sc_iface));
 	for (i=(int)TO_IFD(desc)->bNumEndpoints-1; i>=0; i--) {
 		epd = usbd_interface2endpoint_descriptor(sc->sc_iface, i);
+		if (epd == NULL)
+			continue;
+
 		if (UE_GET_XFERTYPE(epd->bmAttributes) == UE_BULK) {
 			dir = UE_GET_DIR(epd->bEndpointAddress);
 			if (dir==UE_DIR_OUT && !out_addr)

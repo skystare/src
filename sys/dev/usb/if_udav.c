@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_udav.c,v 1.80 2018/07/03 14:33:43 kevlo Exp $ */
+/*	$OpenBSD: if_udav.c,v 1.84 2020/07/31 10:49:32 mglocker Exp $ */
 /*	$NetBSD: if_udav.c,v 1.3 2004/04/23 17:25:25 itojun Exp $	*/
 /*	$nabe: if_udav.c,v 1.3 2003/08/21 16:57:19 nabe Exp $	*/
 /*
@@ -213,13 +213,13 @@ udav_attach(struct device *parent, struct device *self, void *aux)
 			printf("couldn't get endpoint %d\n", i);
 			goto bad;
 		}
-		if ((ed->bmAttributes & UE_XFERTYPE) == UE_BULK &&
+		if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK &&
 		    UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN)
 			sc->sc_bulkin_no = ed->bEndpointAddress; /* RX */
-		else if ((ed->bmAttributes & UE_XFERTYPE) == UE_BULK &&
+		else if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK &&
 			 UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_OUT)
 			sc->sc_bulkout_no = ed->bEndpointAddress; /* TX */
-		else if ((ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT &&
+		else if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT &&
 			 UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN)
 			sc->sc_intrin_no = ed->bEndpointAddress; /* Status */
 	}
@@ -1028,7 +1028,7 @@ udav_txeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
 	m_freem(c->udav_mbuf);
 	c->udav_mbuf = NULL;
 
-	if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+	if (ifq_empty(&ifp->if_snd) == 0)
 		udav_start(ifp);
 
 	splx(s);
@@ -1134,7 +1134,7 @@ udav_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	DPRINTF(("%s: %s: enter\n", sc->sc_dev.dv_xname, __func__));
 
 	if (usbd_is_dying(sc->sc_udev))
-		return (EIO);
+		return ENXIO;
 
 	s = splnet();
 
@@ -1194,7 +1194,7 @@ udav_watchdog(struct ifnet *ifp)
 	usbd_get_xfer_status(c->udav_xfer, NULL, NULL, NULL, &stat);
 	udav_txeof(c->udav_xfer, c, stat);
 
-	if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+	if (ifq_empty(&ifp->if_snd) == 0)
 		udav_start(ifp);
 	splx(s);
 }
@@ -1226,7 +1226,6 @@ udav_stop(struct ifnet *ifp, int disable)
 	/* Stop transfers */
 	/* RX endpoint */
 	if (sc->sc_pipe_rx != NULL) {
-		usbd_abort_pipe(sc->sc_pipe_rx);
 		err = usbd_close_pipe(sc->sc_pipe_rx);
 		if (err)
 			printf("%s: close rx pipe failed: %s\n",
@@ -1236,7 +1235,6 @@ udav_stop(struct ifnet *ifp, int disable)
 
 	/* TX endpoint */
 	if (sc->sc_pipe_tx != NULL) {
-		usbd_abort_pipe(sc->sc_pipe_tx);
 		err = usbd_close_pipe(sc->sc_pipe_tx);
 		if (err)
 			printf("%s: close tx pipe failed: %s\n",
@@ -1248,7 +1246,6 @@ udav_stop(struct ifnet *ifp, int disable)
 	/* XXX: Interrupt endpoint is not yet supported!! */
 	/* Interrupt endpoint */
 	if (sc->sc_pipe_intr != NULL) {
-		usbd_abort_pipe(sc->sc_pipe_intr);
 		err = usbd_close_pipe(sc->sc_pipe_intr);
 		if (err)
 			printf("%s: close intr pipe failed: %s\n",
@@ -1394,7 +1391,7 @@ udav_tick_task(void *xsc)
 		DPRINTF(("%s: %s: got link\n",
 			 sc->sc_dev.dv_xname, __func__));
 		sc->sc_link++;
-		if (IFQ_IS_EMPTY(&ifp->if_snd) == 0)
+		if (ifq_empty(&ifp->if_snd) == 0)
 			   udav_start(ifp);
 	}
 

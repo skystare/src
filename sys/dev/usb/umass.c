@@ -1,4 +1,4 @@
-/*	$OpenBSD: umass.c,v 1.74 2017/01/09 14:44:28 mpi Exp $ */
+/*	$OpenBSD: umass.c,v 1.79 2020/11/23 21:33:37 krw Exp $ */
 /*	$NetBSD: umass.c,v 1.116 2004/06/30 05:53:46 mycroft Exp $	*/
 
 /*
@@ -441,14 +441,14 @@ umass_attach(struct device *parent, struct device *self, void *aux)
 			return;
 		}
 		if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN
-		    && (ed->bmAttributes & UE_XFERTYPE) == UE_BULK) {
+		    && UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK) {
 			sc->sc_epaddr[UMASS_BULKIN] = ed->bEndpointAddress;
 		} else if (UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_OUT
-		    && (ed->bmAttributes & UE_XFERTYPE) == UE_BULK) {
+		    && UE_GET_XFERTYPE(ed->bmAttributes) == UE_BULK) {
 			sc->sc_epaddr[UMASS_BULKOUT] = ed->bEndpointAddress;
 		} else if (sc->sc_wire == UMASS_WPROTO_CBI_I
 		    && UE_GET_DIR(ed->bEndpointAddress) == UE_DIR_IN
-		    && (ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT) {
+		    && UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT) {
 			sc->sc_epaddr[UMASS_INTRIN] = ed->bEndpointAddress;
 #ifdef UMASS_DEBUG
 			if (UGETW(ed->wMaxPacketSize) > 2) {
@@ -789,18 +789,18 @@ umass_setup_ctrl_transfer(struct umass_softc *sc, usb_device_request_t *req,
 	/* Initialise a USB control transfer and then schedule it */
 
 	usbd_setup_default_xfer(xfer, sc->sc_udev, (void *) sc,
-	    USBD_DEFAULT_TIMEOUT, req, buffer, buflen, flags,
-	    sc->sc_methods->wire_state);
+	    USBD_DEFAULT_TIMEOUT, req, buffer, buflen,
+	    flags | sc->sc_xfer_flags, sc->sc_methods->wire_state);
 
 	if (sc->sc_udev->bus->use_polling) {
 		DPRINTF(UDMASS_XFER,("%s: start polled ctrl xfer buffer=%p "
 		    "buflen=%d flags=0x%x\n", sc->sc_dev.dv_xname, buffer,
-		    buflen, flags));
+		    buflen, flags | sc->sc_xfer_flags));
 		err = umass_polled_transfer(sc, xfer);
 	} else {
 		DPRINTF(UDMASS_XFER,("%s: start ctrl xfer buffer=%p buflen=%d "
 		    "flags=0x%x\n", sc->sc_dev.dv_xname, buffer, buflen,
-		    flags));
+		    flags | sc->sc_xfer_flags));
 		err = usbd_transfer(xfer);
 	}
 	if (err && err != USBD_IN_PROGRESS) {
@@ -819,13 +819,13 @@ umass_adjust_transfer(struct umass_softc *sc)
 {
 	switch (sc->sc_cmd) {
 	case UMASS_CPROTO_UFI:
-		sc->cbw.bCDBLength = UFI_COMMAND_LENGTH; 
+		sc->cbw.bCDBLength = UFI_COMMAND_LENGTH;
 		/* Adjust the length field in certain scsi commands. */
 		switch (sc->cbw.CBWCDB[0]) {
 		case INQUIRY:
-			if (sc->transfer_datalen > 36) {
-				sc->transfer_datalen = 36;
-				sc->cbw.CBWCDB[4] = 36;
+			if (sc->transfer_datalen > SID_SCSI2_HDRLEN + SID_SCSI2_ALEN) {
+				sc->transfer_datalen = SID_SCSI2_HDRLEN + SID_SCSI2_ALEN;
+				sc->cbw.CBWCDB[4] = sc->transfer_datalen;
 			}
 			break;
 		case MODE_SENSE_BIG:
@@ -1152,13 +1152,9 @@ umass_bbb_state(struct usbd_xfer *xfer, void *priv, usbd_status err)
 
 		/* FALLTHROUGH, err == 0 (no data phase or successful) */
 	case TSTATE_BBB_DCLEAR: /* stall clear after data phase */
-		if (sc->transfer_dir == DIR_IN)
-			memcpy(sc->transfer_data, sc->data_buffer,
-			       sc->transfer_actlen);
-
 		DIF(UDMASS_BBB, if (sc->transfer_dir == DIR_IN)
-					umass_dump_buffer(sc, sc->transfer_data,
-						sc->transfer_datalen, 48));
+					umass_dump_buffer(sc, sc->data_buffer,
+					    sc->transfer_datalen, 48));
 
 		/* FALLTHROUGH, err == 0 (no data phase or successful) */
 	case TSTATE_BBB_SCLEAR: /* stall clear after status phase */
@@ -1303,7 +1299,22 @@ umass_bbb_state(struct usbd_xfer *xfer, void *priv, usbd_status err)
 			return;
 
 		} else {	/* success */
+			u_int32_t residue = UGETDW(sc->csw.dCSWDataResidue);
 			sc->transfer_state = TSTATE_IDLE;
+			if (sc->transfer_dir == DIR_IN) {
+				if (residue == sc->transfer_datalen) {
+					if (sc->cbw.CBWCDB[0] == INQUIRY)
+						SET(sc->sc_quirks,
+						    UMASS_QUIRK_IGNORE_RESIDUE);
+					if (ISSET(sc->sc_quirks,
+					    UMASS_QUIRK_IGNORE_RESIDUE))
+						USETDW(sc->csw.dCSWDataResidue, 0);
+				}
+				sc->transfer_actlen = sc->transfer_datalen -
+				    UGETDW(sc->csw.dCSWDataResidue);
+				memcpy(sc->transfer_data, sc->data_buffer,
+				    sc->transfer_actlen);
+			}
 			sc->transfer_cb(sc, sc->transfer_priv,
 					UGETDW(sc->csw.dCSWDataResidue),
 					STATUS_CMD_OK);

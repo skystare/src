@@ -1,4 +1,4 @@
-/*	$OpenBSD: uvmexp.h,v 1.3 2018/06/19 22:35:07 krw Exp $	*/
+/*	$OpenBSD: uvmexp.h,v 1.6 2020/12/01 13:56:22 mpi Exp $	*/
 
 #ifndef	_UVM_UVMEXP_
 #define	_UVM_UVMEXP_
@@ -17,7 +17,8 @@
 #define	VM_VNODEMIN	9
 #define	VM_MAXSLP	10
 #define	VM_USPACE	11
-#define	VM_MAXID	12		/* number of valid vm ids */
+#define	VM_MALLOC_CONF	12		/* config for userland malloc */
+#define	VM_MAXID	13		/* number of valid vm ids */
 
 #define	CTL_VM_NAMES { \
 	{ 0, 0 }, \
@@ -32,11 +33,16 @@
 	{ "vnodemin", CTLTYPE_INT }, \
 	{ "maxslp", CTLTYPE_INT }, \
 	{ "uspace", CTLTYPE_INT }, \
+	{ "malloc_conf", CTLTYPE_STRING }, \
 }
 
 /*
  * uvmexp: global data structures that are exported to parts of the kernel
  * other than the vm system.
+ *
+ *  Locks used to protect struct members in this file:
+ *	I	immutable after creation
+ *	F	uvm_lock_fpageq
  */
 struct uvmexp {
 	/* vm_page constants */
@@ -45,16 +51,16 @@ struct uvmexp {
 	int pageshift;  /* page shift */
 
 	/* vm_page counters */
-	int npages;     /* number of pages we manage */
-	int free;       /* number of free pages */
+	int npages;     /* [I] number of pages we manage */
+	int free;       /* [F] number of free pages */
 	int active;     /* number of active pages */
 	int inactive;   /* number of pages that we free'd but may want back */
 	int paging;	/* number of pages in the process of being paged out */
 	int wired;      /* number of wired pages */
 
-	int zeropages;		/* number of zero'd pages */
-	int reserve_pagedaemon; /* number of pages reserved for pagedaemon */
-	int reserve_kernel;	/* number of pages reserved for kernel */
+	int zeropages;		/* [F] number of zero'd pages */
+	int reserve_pagedaemon; /* [I] # of pages reserved for pagedaemon */
+	int reserve_kernel;	/* [I] # of pages reserved for kernel */
 	int unused01;		/* formerly anonpages */
 	int vnodepages;		/* XXX # of pages used by vnode page cache */
 	int vtextpages;		/* XXX # of pages used by vtext vnodes */
@@ -76,7 +82,7 @@ struct uvmexp {
 	int swpages;	/* number of PAGE_SIZE'ed swap pages */
 	int swpginuse;	/* number of swap pages in use */
 	int swpgonly;	/* number of swap pages in use, not also in RAM */
-	int nswget;	/* number of times fault calls uvm_swap_get() */
+	int nswget;	/* number of swap pages moved from disk to RAM */
 	int nanon;	/* XXX number total of anon's in system */
 	int unused05;	/* formerly nanonneeded */
 	int unused06;	/* formerly nfreeanon */

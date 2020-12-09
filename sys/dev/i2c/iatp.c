@@ -1,4 +1,4 @@
-/* $OpenBSD: iatp.c,v 1.6 2018/07/30 15:56:30 jcs Exp $ */
+/* $OpenBSD: iatp.c,v 1.8 2020/08/26 03:29:06 visa Exp $ */
 /*
  * Atmel maXTouch i2c touchscreen/touchpad driver
  * Copyright (c) 2016 joshua stein <jcs@openbsd.org>
@@ -212,9 +212,6 @@ void	iatp_t19_proc_msg(struct iatp_softc *, uint8_t *);
 int	iatp_t44_read_count(struct iatp_softc *);
 void	iatp_t100_proc_msg(struct iatp_softc *, uint8_t *);
 
-/* for gpio pin mapping */
-extern char *hw_vendor, *hw_prod;
-
 const struct wsmouse_accessops iatp_accessops = {
 	iatp_enable,
 	iatp_ioctl,
@@ -347,7 +344,8 @@ iatp_enable(void *v)
 {
 	struct iatp_softc *sc = v;
 
-	if (sc->sc_busy && tsleep(&sc->sc_busy, PRIBIO, "iatp", hz) != 0) {
+	if (sc->sc_busy &&
+	    tsleep_nsec(&sc->sc_busy, PRIBIO, "iatp", SEC_TO_NSEC(1)) != 0) {
 		printf("%s: trying to enable but we're busy\n",
 		    sc->sc_dev.dv_xname);
 		return 1;

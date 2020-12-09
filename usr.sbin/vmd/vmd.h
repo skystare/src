@@ -1,4 +1,4 @@
-/*	$OpenBSD: vmd.h,v 1.79 2018/09/09 04:09:32 ccardenas Exp $	*/
+/*	$OpenBSD: vmd.h,v 1.101 2020/09/23 19:18:18 martijn Exp $	*/
 
 /*
  * Copyright (c) 2015 Mike Larkin <mlarkin@openbsd.org>
@@ -25,6 +25,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
+#include <netinet6/in6_var.h>
 
 #include <limits.h>
 #include <stdio.h>
@@ -38,6 +39,7 @@
 #define SET(_v, _m)		((_v) |= (_m))
 #define CLR(_v, _m)		((_v) &= ~(_m))
 #define ISSET(_v, _m)		((_v) & (_m))
+#define NELEM(a) (sizeof(a) / sizeof((a)[0]))
 
 #define VMD_USER		"_vmd"
 #define VMD_CONF		"/etc/vm.conf"
@@ -48,11 +50,18 @@
 #define VM_DEFAULT_DEVICE	"hd0a"
 #define VM_BOOT_CONF		"/etc/boot.conf"
 #define VM_NAME_MAX		64
+#define VM_MAX_BASE_PER_DISK	4
 #define VM_TTYNAME_MAX		16
 #define MAX_TAP			256
 #define NR_BACKLOG		5
 #define VMD_SWITCH_TYPE		"bridge"
 #define VM_DEFAULT_MEMORY	512
+
+#define VMD_DEFAULT_STAGGERED_START_DELAY 30
+
+/* Rate-limit fast reboots */
+#define VM_START_RATE_SEC	6	/* min. seconds since last reboot */
+#define VM_START_RATE_LIMIT	3	/* max. number of fast reboots */
 
 /* default user instance limits */
 #define VM_DEFAULT_USER_MAXCPU	4
@@ -62,13 +71,20 @@
 /* vmd -> vmctl error codes */
 #define VMD_BIOS_MISSING	1001
 #define VMD_DISK_MISSING	1002
-#define VMD_DISK_INVALID	1003
+					/* 1003 is obsolete VMD_DISK_INVALID */
 #define VMD_VM_STOP_INVALID	1004
 #define VMD_CDROM_MISSING	1005
 #define VMD_CDROM_INVALID	1006
+#define VMD_PARENT_INVALID	1007
+
+/* Image file signatures */
+#define VM_MAGIC_QCOW		"QFI\xfb"
 
 /* 100.64.0.0/10 from rfc6598 (IPv4 Prefix for Shared Address Space) */
 #define VMD_DHCP_PREFIX		"100.64.0.0/10"
+
+/* Unique local address for IPv6 */
+#define VMD_ULA_PREFIX		"fd00::/8"
 
 enum imsg_type {
 	IMSG_VMDOP_START_VM_REQUEST = IMSG_PROC_MAX,
@@ -86,6 +102,7 @@ enum imsg_type {
 	IMSG_VMDOP_RECEIVE_VM_REQUEST,
 	IMSG_VMDOP_RECEIVE_VM_RESPONSE,
 	IMSG_VMDOP_RECEIVE_VM_END,
+	IMSG_VMDOP_WAIT_VM_REQUEST,
 	IMSG_VMDOP_TERMINATE_VM_REQUEST,
 	IMSG_VMDOP_TERMINATE_VM_RESPONSE,
 	IMSG_VMDOP_TERMINATE_VM_EVENT,
@@ -101,6 +118,7 @@ enum imsg_type {
 	IMSG_VMDOP_PRIV_IFDOWN,
 	IMSG_VMDOP_PRIV_IFGROUP,
 	IMSG_VMDOP_PRIV_IFADDR,
+	IMSG_VMDOP_PRIV_IFADDR6,
 	IMSG_VMDOP_PRIV_IFRDOMAIN,
 	IMSG_VMDOP_VM_SHUTDOWN,
 	IMSG_VMDOP_VM_REBOOT,
@@ -120,6 +138,7 @@ struct vmop_info_result {
 	char			 vir_ttyname[VM_TTYNAME_MAX];
 	uid_t			 vir_uid;
 	int64_t			 vir_gid;
+	unsigned int		 vir_state;
 };
 
 struct vmop_id {
@@ -132,10 +151,11 @@ struct vmop_id {
 };
 
 struct vmop_ifreq {
-	uint32_t		 vfr_id;
-	char			 vfr_name[IF_NAMESIZE];
-	char			 vfr_value[VM_NAME_MAX];
-	struct ifaliasreq	 vfr_ifra;
+	uint32_t			 vfr_id;
+	char				 vfr_name[IF_NAMESIZE];
+	char				 vfr_value[VM_NAME_MAX];
+	struct sockaddr_storage		 vfr_addr;
+	struct sockaddr_storage		 vfr_mask;
 };
 
 struct vmop_owner {
@@ -158,6 +178,11 @@ struct vmop_create_params {
 	unsigned int		 vmc_checkaccess;
 
 	/* userland-only part of the create params */
+	unsigned int		 vmc_bootdevice;
+#define VMBOOTDEV_AUTO		0
+#define VMBOOTDEV_DISK		1
+#define VMBOOTDEV_CDROM		2
+#define VMBOOTDEV_NET		3
 	unsigned int		 vmc_ifflags[VMM_MAX_NICS_PER_VM];
 #define VMIFF_UP		0x01
 #define VMIFF_LOCKED		0x02
@@ -166,6 +191,7 @@ struct vmop_create_params {
 #define VMIFF_OPTMASK		(VMIFF_LOCKED|VMIFF_LOCAL|VMIFF_RDOMAIN)
 
 	unsigned int		 vmc_disktypes[VMM_MAX_DISKS_PER_VM];
+	unsigned int		 vmc_diskbases[VMM_MAX_DISKS_PER_VM];
 #define VMDF_RAW		0x01
 #define VMDF_QCOW2		0x02
 
@@ -193,19 +219,20 @@ struct vm_dump_header {
 #define VM_DUMP_SIGNATURE	 VMM_HV_SIGNATURE
 	uint8_t			 vmh_pad[3];
 	uint8_t			 vmh_version;
-#define VM_DUMP_VERSION		 4
+#define VM_DUMP_VERSION		 7
 	struct			 vm_dump_header_cpuid
 	    vmh_cpuids[VM_DUMP_HEADER_CPUID_COUNT];
 } __packed;
 
 struct vmboot_params {
-	int			 vbp_fd;
 	off_t			 vbp_partoff;
 	char			 vbp_device[PATH_MAX];
 	char			 vbp_image[PATH_MAX];
 	uint32_t		 vbp_bootdev;
 	uint32_t		 vbp_howto;
-	char			*vbp_arg;
+	unsigned int		 vbp_type;
+	void			*vbp_arg;
+	char			*vbp_buf;
 };
 
 struct vmd_if {
@@ -236,24 +263,31 @@ struct vmd_vm {
 	uint32_t		 vm_vmid;
 	int			 vm_kernel;
 	int			 vm_cdrom;
-	int			 vm_disks[VMM_MAX_DISKS_PER_VM];
+	int			 vm_disks[VMM_MAX_DISKS_PER_VM][VM_MAX_BASE_PER_DISK];
 	struct vmd_if		 vm_ifs[VMM_MAX_NICS_PER_VM];
 	char			*vm_ttyname;
 	int			 vm_tty;
 	uint32_t		 vm_peerid;
-	/* When set, VM is running now (PROC_PARENT only) */
-	int			 vm_running;
-	/* When set, VM is not started by default (PROC_PARENT only) */
-	int			 vm_disabled;
 	/* When set, VM was defined in a config file */
 	int			 vm_from_config;
 	struct imsgev		 vm_iev;
-	int			 vm_shutdown;
 	uid_t			 vm_uid;
-	int			 vm_received;
-	int			 vm_paused;
 	int			 vm_receive_fd;
 	struct vmd_user		*vm_user;
+	unsigned int		 vm_state;
+/* When set, VM is running now (PROC_PARENT only) */
+#define VM_STATE_RUNNING	0x01
+/* When set, VM is not started by default (PROC_PARENT only) */
+#define VM_STATE_DISABLED	0x02
+/* When set, VM is marked to be shut down */
+#define VM_STATE_SHUTDOWN	0x04
+#define VM_STATE_RECEIVED	0x08
+#define VM_STATE_PAUSED		0x10
+#define VM_STATE_WAITING	0x20
+
+	/* For rate-limiting */
+	struct timeval		 vm_start_tv;
+	int			 vm_start_limit;
 
 	TAILQ_ENTRY(vmd_vm)	 vm_entry;
 };
@@ -270,6 +304,14 @@ struct vmd_user {
 };
 TAILQ_HEAD(userlist, vmd_user);
 
+struct name2id {
+	char			name[VMM_MAX_NAME_LEN];
+	int			uid;
+	int32_t			id;
+	TAILQ_ENTRY(name2id)	entry;
+};
+TAILQ_HEAD(name2idlist, name2id);
+
 struct address {
 	struct sockaddr_storage	 ss;
 	int			 prefixlen;
@@ -278,7 +320,15 @@ struct address {
 TAILQ_HEAD(addresslist, address);
 
 struct vmd_config {
+	unsigned int		 cfg_flags;
+#define VMD_CFG_INET6		0x01
+#define VMD_CFG_AUTOINET6	0x02
+#define VMD_CFG_STAGGERED_START	0x04
+
+	struct timeval		 delay;
+	int			 parallelism;
 	struct address		 cfg_localprefix;
+	struct address		 cfg_localprefix6;
 };
 
 struct vmd {
@@ -294,12 +344,29 @@ struct vmd {
 
 	uint32_t		 vmd_nvm;
 	struct vmlist		*vmd_vms;
+	struct name2idlist	*vmd_known;
 	uint32_t		 vmd_nswitches;
 	struct switchlist	*vmd_switches;
 	struct userlist		*vmd_users;
 
 	int			 vmd_fd;
+	int			 vmd_fd6;
 	int			 vmd_ptmfd;
+};
+
+struct vm_dev_pipe {
+	int			 read;
+	int			 write;
+	struct event		 read_ev;
+};
+
+enum pipe_msg_type {
+	I8253_RESET_CHAN_0 = 0,
+	I8253_RESET_CHAN_1 = 1,
+	I8253_RESET_CHAN_2 = 2,
+	NS8250_ZERO_READ,
+	NS8250_RATELIMIT,
+	MC146818_RESCHEDULE_PER
 };
 
 static inline struct sockaddr_in *
@@ -358,6 +425,8 @@ void	 user_inc(struct vm_create_params *, struct vmd_user *, int);
 int	 user_checklimit(struct vmd_user *, struct vm_create_params *);
 char	*get_string(uint8_t *, size_t);
 uint32_t prefixlen2mask(uint8_t);
+void	 prefixlen2mask6(u_int8_t, struct in6_addr *);
+void	 getmonotime(struct timeval *);
 
 /* priv.c */
 void	 priv(struct privsep *, struct privsep_proc *);
@@ -366,7 +435,9 @@ int	 priv_findname(const char *, const char **);
 int	 priv_validgroup(const char *);
 int	 vm_priv_ifconfig(struct privsep *, struct vmd_vm *);
 int	 vm_priv_brconfig(struct privsep *, struct vmd_switch *);
-uint32_t vm_priv_addr(struct address *, uint32_t, int, int);
+uint32_t vm_priv_addr(struct vmd_config *, uint32_t, int, int);
+int	 vm_priv_addr6(struct vmd_config *, uint32_t, int, int,
+	    struct in6_addr *);
 
 /* vmm.c */
 struct iovec;
@@ -385,8 +456,10 @@ int	 vmm_pipe(struct vmd_vm *, int, void (*)(int, short, void *));
 
 /* vm.c */
 int	 start_vm(struct vmd_vm *, int);
-int receive_vm(struct vmd_vm *, int, int);
 __dead void vm_shutdown(unsigned int);
+void	 vm_pipe_init(struct vm_dev_pipe *, void (*)(int, short, void *));
+void	 vm_pipe_send(struct vm_dev_pipe *, enum pipe_msg_type);
+enum pipe_msg_type vm_pipe_recv(struct vm_dev_pipe *);
 
 /* control.c */
 int	 config_init(struct vmd *);
@@ -402,12 +475,15 @@ int	 config_getif(struct privsep *, struct imsg *);
 int	 config_getcdrom(struct privsep *, struct imsg *);
 
 /* vmboot.c */
-FILE	*vmboot_open(int, int, struct vmboot_params *);
+FILE	*vmboot_open(int, int *, int, unsigned int, struct vmboot_params *);
 void	 vmboot_close(FILE *, struct vmboot_params *);
 
 /* parse.y */
 int	 parse_config(const char *);
 int	 cmdline_symset(char *);
 int	 host(const char *, struct address *);
+
+/* virtio.c */
+int	 virtio_get_base(int, char *, size_t, int, const char *);
 
 #endif /* VMD_H */

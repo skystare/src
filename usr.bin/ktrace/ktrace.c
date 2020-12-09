@@ -1,4 +1,4 @@
-/*	$OpenBSD: ktrace.c,v 1.34 2017/06/11 17:32:19 awolk Exp $	*/
+/*	$OpenBSD: ktrace.c,v 1.37 2020/07/16 17:47:41 tedu Exp $	*/
 /*	$NetBSD: ktrace.c,v 1.4 1995/08/31 23:01:44 jtc Exp $	*/
 
 /*-
@@ -100,7 +100,7 @@ main(int argc, char *argv[])
 				usage();
 			}
 	} else {
-		while ((ch = getopt(argc, argv, "aBCcdf:g:ip:t:")) != -1)
+		while ((ch = getopt(argc, argv, "aBCcdf:g:ip:t:T")) != -1)
 			switch ((char)ch) {
 			case 'a':
 				append = 1;
@@ -110,6 +110,7 @@ main(int argc, char *argv[])
 				break;
 			case 'C':
 				clear = CLEARALL;
+				tracefile = NULL;
 				pidset = 1;
 				break;
 			case 'c':
@@ -139,6 +140,9 @@ main(int argc, char *argv[])
 					usage();
 				}
 				break;
+			case 'T':
+				putenv("LIBC_NOUSERTC=");
+				break;
 			default:
 				usage();
 			}
@@ -162,7 +166,7 @@ main(int argc, char *argv[])
 		} else
 			ops |= pid ? KTROP_CLEAR : KTROP_CLEARFILE;
 
-		if (ktrace(tracefile, ops, trpoints, pid) < 0) {
+		if (ktrace(tracefile, ops, trpoints, pid) == -1) {
 			if (errno == ESRCH)
 				err(1, "%d", pid);
 			err(1, "%s", tracefile);
@@ -172,7 +176,7 @@ main(int argc, char *argv[])
 
 	omask = umask(S_IRWXG|S_IRWXO);
 	if (append) {
-		if ((fd = open(tracefile, O_CREAT | O_WRONLY, DEFFILEMODE)) < 0)
+		if ((fd = open(tracefile, O_CREAT | O_WRONLY, DEFFILEMODE)) == -1)
 			err(1, "%s", tracefile);
 		if (fstat(fd, &sb) != 0 || sb.st_uid != getuid())
 			errx(1, "Refuse to append to %s: not owned by you.",
@@ -181,7 +185,7 @@ main(int argc, char *argv[])
 		if (unlink(tracefile) == -1 && errno != ENOENT)
 			err(1, "unlink %s", tracefile);
 		if ((fd = open(tracefile, O_CREAT | O_EXCL | O_WRONLY,
-		    DEFFILEMODE)) < 0)
+		    DEFFILEMODE)) == -1)
 			err(1, "%s", tracefile);
 	}
 	(void)umask(omask);
@@ -195,12 +199,12 @@ main(int argc, char *argv[])
 			    setenv("LD_TRACE_PLTSPEC", tracespec, 1) < 0)
 				err(1, "setenv(LD_TRACE_PLTSPEC)");
 		}
-		if (ktrace(tracefile, ops, trpoints, getpid()) < 0)
+		if (ktrace(tracefile, ops, trpoints, getpid()) == -1)
 			err(1, "%s", tracefile);
 		execvp(argv[0], &argv[0]);
 		err(1, "exec of '%s' failed", argv[0]);
 	}
-	else if (ktrace(tracefile, ops, trpoints, pid) < 0) {
+	else if (ktrace(tracefile, ops, trpoints, pid) == -1) {
 		if (errno == ESRCH)
 			err(1, "%d", pid);
 		err(1, "%s", tracefile);
@@ -239,9 +243,9 @@ usage(void)
 		    " [-u trspec] command\n",
 		    __progname);
 	else
-		fprintf(stderr, "usage: %s [-aBCcdi] [-f trfile] [-g pgid]"
+		fprintf(stderr, "usage: %s [-aCcdi] [-f trfile] [-g pgid]"
 		    " [-p pid] [-t trstr]\n"
-		    "       %s [-adi] [-f trfile] [-t trstr] command\n",
+		    "       %s [-aBdiT] [-f trfile] [-t trstr] command\n",
 		    __progname, __progname);
 	exit(1);
 }

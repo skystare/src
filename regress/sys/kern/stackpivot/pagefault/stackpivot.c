@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 #include "../pivot.h"
 
@@ -30,21 +32,20 @@ size_t dowork() {
     size_t i;
     for (i = 0; i < scansize; ++i)
         b += *scan++;
+
+    // We should be killed before we get here
+    pivot(realstack);
     return b;
 }
 
 void doexit() {
-    exit(0);
-}
-
-void unpivot() {
-    pivot(realstack);
+    _exit(0);
 }
 
 int main() {
 
     /* allocate some memory to scan */
-    scan = malloc(scansize);
+    scan = mmap(NULL, scansize, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
 
     /* set up a rop chain on the real stack for syscalls */
     size_t stack[10];
@@ -53,8 +54,8 @@ int main() {
 
     /* set up a basic alt stack on the heap that does some work */
     size_t *newstack = calloc(10, sizeof(size_t));
+    printf("non-MAP_STACK stack at %p\n", newstack);
     newstack[0] = (size_t)dowork;
-    newstack[1] = (size_t)unpivot;
     pivot(newstack);
     return 0;
 }

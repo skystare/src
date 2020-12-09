@@ -1,8 +1,8 @@
-/*	$OpenBSD: md5.c,v 1.93 2018/09/07 14:54:49 cheloha Exp $	*/
+/*	$OpenBSD: md5.c,v 1.97 2020/10/19 18:15:18 millert Exp $	*/
 
 /*
  * Copyright (c) 2001,2003,2005-2007,2010,2013,2014
- *	Todd C. Miller <Todd.Miller@courtesan.com>
+ *	Todd C. Miller <millert@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -421,7 +421,7 @@ digest_end(const struct hash_function *hf, void *ctx, char *buf, size_t bsize,
 		hf->final(digest, ctx);
 		if (b64_ntop(digest, hf->digestlen, buf, bsize) == -1)
 			errx(1, "error encoding base64");
-		freezero(digest, hf->digestlen);
+		free(digest);
 	} else {
 		hf->end(ctx, buf);
 	}
@@ -505,7 +505,8 @@ digest_file(const char *file, struct hash_list *hl, int echo)
 	while ((nread = fread(data, 1UL, sizeof(data), fp)) != 0) {
 		if (echo) {
 			(void)fwrite(data, nread, 1UL, stdout);
-			if (fflush(stdout) != 0)
+			(void)fflush(stdout);
+			if (ferror(stdout))
 				err(1, "stdout: write error");
 		}
 		TAILQ_FOREACH(hf, hl, tailq)
@@ -777,7 +778,7 @@ digest_time(struct hash_list *hl, int times)
 		digest_end(hf, &context, digest, sizeof(digest), hf->base64);
 		getrusage(RUSAGE_SELF, &stop);
 		timersub(&stop.ru_utime, &start.ru_utime, &res);
-		elapsed = res.tv_sec + res.tv_usec / 1000000.0;
+		elapsed = (double)res.tv_sec + (double)res.tv_usec / 1000000.0;
 
 		(void)printf("\nDigest = %s\n", digest);
 		(void)printf("Time   = %f seconds\n", elapsed);

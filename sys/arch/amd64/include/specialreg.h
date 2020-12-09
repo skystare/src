@@ -1,4 +1,4 @@
-/*	$OpenBSD: specialreg.h,v 1.81 2018/09/11 07:13:23 jsg Exp $	*/
+/*	$OpenBSD: specialreg.h,v 1.88 2020/09/13 05:57:28 jsg Exp $	*/
 /*	$NetBSD: specialreg.h,v 1.1 2003/04/26 18:39:48 fvdl Exp $	*/
 /*	$NetBSD: x86/specialreg.h,v 1.2 2003/04/25 21:54:30 fvdl Exp $	*/
 
@@ -185,6 +185,7 @@
  * EBX bits
  */
 #define	SEFF0EBX_FSGSBASE	0x00000001 /* {RD,WR}[FG]SBASE instructions */
+#define	SEFF0EBX_TSC_ADJUST	0x00000002 /* Has IA32_TSC_ADJUST MSR */
 #define	SEFF0EBX_SGX		0x00000004 /* Software Guard Extensions */
 #define	SEFF0EBX_BMI1		0x00000008 /* advanced bit manipulation */
 #define	SEFF0EBX_HLE		0x00000010 /* Hardware Lock Elision */
@@ -220,6 +221,9 @@
 /* SEFF EDX bits */
 #define SEFF0EDX_AVX512_4FNNIW	0x00000004 /* AVX-512 neural network insns */
 #define SEFF0EDX_AVX512_4FMAPS	0x00000008 /* AVX-512 mult accum single prec */
+#define SEFF0EDX_SRBDS_CTRL	0x00000200 /* MCU_OPT_CTRL MSR */
+#define SEFF0EDX_MD_CLEAR	0x00000400 /* Microarch Data Clear */
+#define SEFF0EDX_TSXFA		0x00002000 /* TSX Forced Abort */
 #define SEFF0EDX_IBRS		0x04000000 /* IBRS / IBPB Speculation Control */
 #define SEFF0EDX_STIBP		0x08000000 /* STIBP Speculation Control */
 #define SEFF0EDX_L1DF		0x10000000 /* L1D_FLUSH */
@@ -359,6 +363,8 @@
 #define	MSR_BBL_CR_D1		0x089	/* PII+ only */
 #define	MSR_BBL_CR_D2		0x08a	/* PII+ only */
 #define MSR_BIOS_SIGN		0x08b
+#define MSR_SMM_MONITOR_CTL	0x09b
+#define MSR_SMBASE		0x09e
 #define MSR_PERFCTR0		0x0c1
 #define MSR_PERFCTR1		0x0c2
 #define MSR_FSB_FREQ		0x0cd	/* Core Duo/Solo only */
@@ -372,14 +378,23 @@
 #define ARCH_CAPABILITIES_RSBA		(1 << 2)	/* RSB Alternate */
 #define ARCH_CAPABILITIES_SKIP_L1DFL_VMENTRY	(1 << 3)
 #define ARCH_CAPABILITIES_SSB_NO	(1 << 4)	/* Spec St Byp safe */
+#define ARCH_CAPABILITIES_MDS_NO	(1 << 5) /* microarch data-sampling */
+#define ARCH_CAPABILITIES_IF_PSCHANGE_MC_NO	(1 << 6) /* PS MCE safe */
+#define ARCH_CAPABILITIES_TSX_CTRL	(1 << 7)	/* has TSX_CTRL MSR */
+#define ARCH_CAPABILITIES_TAA_NO	(1 << 8)	/* TSX AA safe */
 #define MSR_FLUSH_CMD		0x10b
-#define FLUSH_CMD_L1D_FLUSH	(1ULL << 0)
+#define FLUSH_CMD_L1D_FLUSH	0x1	/* (1ULL << 0) */
 #define	MSR_BBL_CR_ADDR		0x116	/* PII+ only */
 #define	MSR_BBL_CR_DECC		0x118	/* PII+ only */
 #define	MSR_BBL_CR_CTL		0x119	/* PII+ only */
 #define	MSR_BBL_CR_TRIG		0x11a	/* PII+ only */
 #define	MSR_BBL_CR_BUSY		0x11b	/* PII+ only */
 #define	MSR_BBL_CR_CTR3		0x11e	/* PII+ only */
+#define	MSR_TSX_CTRL		0x122
+#define TSX_CTRL_RTM_DISABLE		(1ULL << 0)
+#define TSX_CTRL_TSX_CPUID_CLEAR	(1ULL << 1)
+#define	MSR_MCU_OPT_CTRL	0x123
+#define RNGDS_MITG_DIS			(1ULL << 0)
 #define	MSR_SYSENTER_CS		0x174 	/* PII+ only */
 #define	MSR_SYSENTER_ESP	0x175 	/* PII+ only */
 #define	MSR_SYSENTER_EIP	0x176   /* PII+ only */
@@ -942,9 +957,10 @@
 #define IA32_VMX_TRUE_ENTRY_CTLS	0x490
 #define IA32_VMX_VMFUNC			0x491
 
-#define IA32_EPT_VPID_CAP_PAGE_WALK_4	(1ULL << 6)
-#define IA32_EPT_VPID_CAP_WB		(1ULL << 14)
-#define IA32_EPT_VPID_CAP_AD_BITS	(1ULL << 21)
+#define IA32_EPT_VPID_CAP_XO_TRANSLATIONS	0x0
+#define IA32_EPT_VPID_CAP_PAGE_WALK_4		(1ULL << 6)
+#define IA32_EPT_VPID_CAP_WB			(1ULL << 14)
+#define IA32_EPT_VPID_CAP_AD_BITS		(1ULL << 21)
 
 #define IA32_EPT_PAGING_CACHE_TYPE_UC	0x0
 #define IA32_EPT_PAGING_CACHE_TYPE_WB	0x6

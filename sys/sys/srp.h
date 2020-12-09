@@ -1,4 +1,4 @@
-/*	$OpenBSD: srp.h,v 1.13 2016/11/20 11:40:58 mpi Exp $ */
+/*	$OpenBSD: srp.h,v 1.15 2020/05/09 10:18:27 jca Exp $ */
 
 /*
  * Copyright (c) 2014 Jonathan Matthew <jmatthew@openbsd.org>
@@ -70,6 +70,13 @@ struct srpl {
 	struct srp		sl_head;
 };
 
+#define SRPL_HEAD(name, type)		struct srpl
+
+#define SRPL_ENTRY(type)						\
+struct {								\
+	struct srp		se_next;				\
+}
+
 #ifdef _KERNEL
 
 void		 srp_startup(void);
@@ -89,11 +96,18 @@ void		*srp_enter(struct srp_ref *, struct srp *);
 void		*srp_follow(struct srp_ref *, struct srp *);
 void		 srp_leave(struct srp_ref *);
 #else /* MULTIPROCESSOR */
+
+static inline void *
+srp_enter(struct srp_ref *sr, struct srp *srp)
+{
+	sr->hz = NULL;
+	return srp->ref;
+}
+
 #define srp_swap(_srp, _v)		srp_swap_locked((_srp), (_v))
 #define srp_update(_gc, _srp, _v)	srp_update_locked((_gc), (_srp), (_v))
 #define srp_finalize(_v, _wchan)	((void)0)
-#define srp_enter(_sr, _srp)		((_srp)->ref)
-#define srp_follow(_sr, _srp)		((_srp)->ref)
+#define srp_follow(_sr, _srp)		srp_enter(_sr, _srp)
 #define srp_leave(_sr)			do { } while (0)
 #endif /* MULTIPROCESSOR */
 
@@ -102,13 +116,6 @@ void		srpl_rc_init(struct srpl_rc *, void (*)(void *, void *),
 		    void (*)(void *, void *), void *);
 
 #define SRPL_INIT(_sl)			srp_init(&(_sl)->sl_head)
-
-#define SRPL_HEAD(name, type)		struct srpl
-
-#define SRPL_ENTRY(type)						\
-struct {								\
-	struct srp		se_next;				\
-}
 
 #define SRPL_FIRST(_sr, _sl)		srp_enter((_sr), &(_sl)->sl_head)
 #define SRPL_NEXT(_sr, _e, _ENTRY)	srp_enter((_sr), &(_e)->_ENTRY.se_next)

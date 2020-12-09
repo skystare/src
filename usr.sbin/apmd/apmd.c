@@ -1,4 +1,4 @@
-/*	$OpenBSD: apmd.c,v 1.81 2017/10/15 15:14:49 jca Exp $	*/
+/*	$OpenBSD: apmd.c,v 1.99 2020/09/28 21:35:14 jca Exp $	*/
 
 /*
  *  Copyright (c) 1995, 1996 John T. Kohl
@@ -36,8 +36,9 @@
 #include <sys/wait.h>
 #include <sys/event.h>
 #include <sys/time.h>
-#include <sys/sched.h>
 #include <sys/sysctl.h>
+#include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <syslog.h>
 #include <fcntl.h>
@@ -56,12 +57,7 @@
 #define AUTO_SUSPEND 1
 #define AUTO_HIBERNATE 2
 
-const char apmdev[] = _PATH_APM_CTLDEV;
-const char sockfile[] = _PATH_APM_SOCKET;
-
 int debug = 0;
-
-int doperf = PERF_NONE;
 
 extern char *__progname;
 
@@ -69,12 +65,10 @@ void usage(void);
 int power_status(int fd, int force, struct apm_power_info *pinfo);
 int bind_socket(const char *sn);
 enum apm_state handle_client(int sock_fd, int ctl_fd);
-int  get_avg_idle_mp(int ncpu);
-int  get_avg_idle_up(void);
-void perf_status(struct apm_power_info *pinfo, int ncpu);
 void suspend(int ctl_fd);
 void stand_by(int ctl_fd);
 void hibernate(int ctl_fd);
+void resumed(int ctl_fd);
 void setperfpolicy(char *policy);
 void sigexit(int signo);
 void do_etc_file(const char *file);
@@ -88,6 +82,21 @@ sigexit(int signo)
 {
 	sockunlink();
 	_exit(1);
+}
+
+void
+logmsg(int prio, const char *msg, ...)
+{
+	va_list ap;
+
+	va_start(ap, msg);
+	if (debug) {
+		vfprintf(stderr, msg, ap);
+		fprintf(stderr, "\n");
+	} else {
+		vsyslog(prio, msg, ap);
+	}
+	va_end(ap);
 }
 
 void
@@ -122,7 +131,8 @@ void
 set_driver_messages(int fd, int mode)
 {
 	if (ioctl(fd, APM_IOC_PRN_CTL, &mode) == -1)
-		syslog(LOG_DEBUG, "can't disable driver messages, error: %m");
+		logmsg(LOG_DEBUG, "can't disable driver messages, error: %s",
+		    strerror(errno));
 }
 
 int
@@ -130,7 +140,7 @@ power_status(int fd, int force, struct apm_power_info *pinfo)
 {
 	struct apm_power_info bstate;
 	static struct apm_power_info last;
-	int acon = 0;
+	int acon = 0, priority = LOG_NOTICE;
 
 	if (fd == -1) {
 		if (pinfo) {
@@ -149,6 +159,9 @@ power_status(int fd, int force, struct apm_power_info *pinfo)
 	 * enough since last report, or asked to force a print */
 		if (bstate.ac_state == APM_AC_ON)
 			acon = 1;
+		if (bstate.battery_state == APM_BATT_CRITICAL &&
+		    bstate.battery_state != last.battery_state)
+			priority = LOG_EMERG;
 		if (force ||
 		    bstate.ac_state != last.ac_state ||
 		    bstate.battery_state != last.battery_state ||
@@ -167,7 +180,7 @@ power_status(int fd, int force, struct apm_power_info *pinfo)
 #else
 			if ((int)bstate.minutes_left > 0)
 #endif
-				syslog(LOG_NOTICE, "battery status: %s. "
+				logmsg(priority, "battery status: %s. "
 				    "external power status: %s. "
 				    "estimated battery life %d%% (%u minutes)",
 				    battstate(bstate.battery_state),
@@ -175,7 +188,7 @@ power_status(int fd, int force, struct apm_power_info *pinfo)
 				    bstate.battery_life,
 				    bstate.minutes_left);
 			else
-				syslog(LOG_NOTICE, "battery status: %s. "
+				logmsg(priority, "battery status: %s. "
 				    "external power status: %s. "
 				    "estimated battery life %d%%",
 				    battstate(bstate.battery_state),
@@ -186,7 +199,7 @@ power_status(int fd, int force, struct apm_power_info *pinfo)
 		if (pinfo)
 			*pinfo = bstate;
 	} else
-		syslog(LOG_ERR, "cannot fetch power status: %m");
+		logmsg(LOG_ERR, "cannot fetch power status: %s", strerror(errno));
 
 	return acon;
 }
@@ -240,20 +253,23 @@ handle_client(int sock_fd, int ctl_fd)
 	socklen_t fromlen;
 	struct apm_command cmd;
 	struct apm_reply reply;
-	int cpuspeed_mib[] = {CTL_HW, HW_CPUSPEED};
+	int perfpol_mib[] = { CTL_HW, HW_PERFPOLICY };
+	char perfpol[32];
+	size_t perfpol_sz = sizeof(perfpol);
+	int cpuspeed_mib[] = { CTL_HW, HW_CPUSPEED };
 	int cpuspeed = 0;
 	size_t cpuspeed_sz = sizeof(cpuspeed);
 
 	fromlen = sizeof(from);
 	cli_fd = accept(sock_fd, (struct sockaddr *)&from, &fromlen);
 	if (cli_fd == -1) {
-		syslog(LOG_INFO, "client accept failure: %m");
+		logmsg(LOG_INFO, "client accept failure: %s", strerror(errno));
 		return NORMAL;
 	}
 
 	if (recv(cli_fd, &cmd, sizeof(cmd), 0) != sizeof(cmd)) {
 		(void) close(cli_fd);
-		syslog(LOG_INFO, "client size botch");
+		logmsg(LOG_INFO, "client size botch");
 		return NORMAL;
 	}
 
@@ -275,22 +291,18 @@ handle_client(int sock_fd, int ctl_fd)
 		reply.newstate = HIBERNATING;
 		break;
 	case SETPERF_LOW:
-		doperf = PERF_MANUAL;
 		reply.newstate = NORMAL;
-		syslog(LOG_NOTICE, "setting hw.perfpolicy to low");
+		logmsg(LOG_NOTICE, "setting hw.perfpolicy to low");
 		setperfpolicy("low");
 		break;
 	case SETPERF_HIGH:
-		doperf = PERF_MANUAL;
 		reply.newstate = NORMAL;
-		syslog(LOG_NOTICE, "setting hw.perfpolicy to high");
+		logmsg(LOG_NOTICE, "setting hw.perfpolicy to high");
 		setperfpolicy("high");
 		break;
 	case SETPERF_AUTO:
-	case SETPERF_COOL:
-		doperf = PERF_AUTO;
 		reply.newstate = NORMAL;
-		syslog(LOG_NOTICE, "setting hw.perfpolicy to auto");
+		logmsg(LOG_NOTICE, "setting hw.perfpolicy to auto");
 		setperfpolicy("auto");
 		break;
 	default:
@@ -298,14 +310,25 @@ handle_client(int sock_fd, int ctl_fd)
 		break;
 	}
 
-	if (sysctl(cpuspeed_mib, 2, &cpuspeed, &cpuspeed_sz, NULL, 0) < 0)
-		syslog(LOG_INFO, "cannot read hw.cpuspeed");
+	reply.perfmode = PERF_NONE;
+	if (sysctl(perfpol_mib, 2, perfpol, &perfpol_sz, NULL, 0) == -1)
+		logmsg(LOG_INFO, "cannot read hw.perfpolicy");
+	else {
+		if (strcmp(perfpol, "manual") == 0 ||
+		    strcmp(perfpol, "high") == 0) {
+			reply.perfmode = PERF_MANUAL;
+		} else if (strcmp(perfpol, "auto") == 0)
+			reply.perfmode = PERF_AUTO;
+	}
 
+	if (sysctl(cpuspeed_mib, 2, &cpuspeed, &cpuspeed_sz, NULL, 0) == -1) {
+		logmsg(LOG_INFO, "cannot read hw.cpuspeed");
+		cpuspeed = 0;
+	}
 	reply.cpuspeed = cpuspeed;
-	reply.perfmode = doperf;
 	reply.vno = APMD_VNO;
 	if (send(cli_fd, &reply, sizeof(reply), 0) != sizeof(reply))
-		syslog(LOG_INFO, "reply to client botched");
+		logmsg(LOG_INFO, "reply to client botched");
 	close(cli_fd);
 
 	return reply.newstate;
@@ -314,7 +337,8 @@ handle_client(int sock_fd, int ctl_fd)
 void
 suspend(int ctl_fd)
 {
-	syslog(LOG_NOTICE, "system suspending");
+	logmsg(LOG_NOTICE, "system suspending");
+	power_status(ctl_fd, 1, NULL);
 	do_etc_file(_PATH_APM_ETC_SUSPEND);
 	sync();
 	sleep(1);
@@ -324,7 +348,8 @@ suspend(int ctl_fd)
 void
 stand_by(int ctl_fd)
 {
-	syslog(LOG_NOTICE, "system entering standby");
+	logmsg(LOG_NOTICE, "system entering standby");
+	power_status(ctl_fd, 1, NULL);
 	do_etc_file(_PATH_APM_ETC_STANDBY);
 	sync();
 	sleep(1);
@@ -334,35 +359,43 @@ stand_by(int ctl_fd)
 void
 hibernate(int ctl_fd)
 {
-	syslog(LOG_NOTICE, "system hibernating");
+	logmsg(LOG_NOTICE, "system hibernating");
+	power_status(ctl_fd, 1, NULL);
 	do_etc_file(_PATH_APM_ETC_HIBERNATE);
 	sync();
 	sleep(1);
 	ioctl(ctl_fd, APM_IOC_HIBERNATE, 0);
 }
 
+void
+resumed(int ctl_fd)
+{
+	do_etc_file(_PATH_APM_ETC_RESUME);
+	logmsg(LOG_NOTICE, "system resumed from sleep");
+	power_status(ctl_fd, 1, NULL);
+}
+
 #define TIMO (10*60)			/* 10 minutes */
+#define AUTOACTION_GRACE_PERIOD (60)	/* 1mn after resume */
 
 int
 main(int argc, char *argv[])
 {
-	const char *fname = apmdev;
+	const char *fname = _PATH_APM_CTLDEV;
 	int ctl_fd, sock_fd, ch, suspends, standbys, hibernates, resumes;
-	int autoaction = 0;
+	int autoaction = 0, autoaction_inflight = 0;
 	int autolimit = 0;
 	int statonly = 0;
 	int powerstatus = 0, powerbak = 0, powerchange = 0;
 	int noacsleep = 0;
 	struct timespec ts = {TIMO, 0}, sts = {0, 0};
+	struct timespec last_resume = { 0, 0 };
 	struct apm_power_info pinfo;
-	time_t apmtimeout = 0;
-	const char *sockname = sockfile;
+	const char *sockname = _PATH_APM_SOCKET;
 	const char *errstr;
 	int kq, nchanges;
 	struct kevent ev[2];
-	int ncpu_mib[2] = { CTL_HW, HW_NCPU };
-	int ncpu;
-	size_t ncpu_sz = sizeof(ncpu);
+	int doperf = PERF_NONE;
 
 	while ((ch = getopt(argc, argv, "aACdHLsf:t:S:z:Z:")) != -1)
 		switch(ch) {
@@ -379,9 +412,10 @@ main(int argc, char *argv[])
 			sockname = optarg;
 			break;
 		case 't':
-			ts.tv_sec = strtoul(optarg, NULL, 0);
-			if (ts.tv_sec == 0)
-				usage();
+			ts.tv_sec = strtonum(optarg, 1, LLONG_MAX, &errstr);
+			if (errstr != NULL)
+				errx(1, "number of seconds is %s: %s", errstr,
+				    optarg);
 			break;
 		case 's':	/* status only */
 			statonly = 1;
@@ -409,14 +443,14 @@ main(int argc, char *argv[])
 			autoaction = AUTO_HIBERNATE;
 			autolimit = strtonum(optarg, 1, 100, &errstr);
 			if (errstr != NULL)
-				errc(1, EINVAL, "%s percentage: %s", errstr,
+				errx(1, "battery percentage is %s: %s", errstr,
 				    optarg);
 			break;
 		case 'z':
 			autoaction = AUTO_SUSPEND;
 			autolimit = strtonum(optarg, 1, 100, &errstr);
 			if (errstr != NULL)
-				errc(1, EINVAL, "%s percentage: %s", errstr,
+				errx(1, "battery percentage is %s: %s", errstr,
 				    optarg);
 			break;
 		case '?':
@@ -433,10 +467,8 @@ main(int argc, char *argv[])
 	if (doperf == PERF_NONE)
 		doperf = PERF_MANUAL;
 
-	if (debug)
-		openlog(__progname, LOG_CONS, LOG_LOCAL1);
-	else {
-		if (daemon(0, 0) < 0)
+	if (debug == 0) {
+		if (daemon(0, 0) == -1)
 			error("failed to daemonize", NULL);
 		openlog(__progname, LOG_CONS, LOG_DAEMON);
 		setlogmask(LOG_UPTO(LOG_NOTICE));
@@ -473,120 +505,18 @@ main(int argc, char *argv[])
 		    EV_CLEAR, 0, 0, NULL);
 		nchanges = 2;
 	}
-	if (kevent(kq, ev, nchanges, NULL, 0, &sts) < 0)
+	if (kevent(kq, ev, nchanges, NULL, 0, &sts) == -1)
 		error("kevent", NULL);
 
-	if (sysctl(ncpu_mib, 2, &ncpu, &ncpu_sz, NULL, 0) < 0)
-		error("cannot read hw.ncpu", NULL);
-
 	for (;;) {
-		int rv;
+		int rv, event, index;
 
 		sts = ts;
 
-		apmtimeout += 1;
-		if ((rv = kevent(kq, NULL, 0, ev, 1, &sts)) < 0)
+		if ((rv = kevent(kq, NULL, 0, ev, 1, &sts)) == -1)
 			break;
 
-		if (apmtimeout >= ts.tv_sec) {
-			apmtimeout = 0;
-
-			/* wakeup for timeout: take status */
-			powerbak = power_status(ctl_fd, 0, &pinfo);
-			if (powerstatus != powerbak) {
-				powerstatus = powerbak;
-				powerchange = 1;
-			}
-
-			if (!powerstatus && autoaction &&
-			    autolimit > (int)pinfo.battery_life) {
-				syslog(LOG_NOTICE,
-				    "estimated battery life %d%%, "
-				    "autoaction limit set to %d%% .",
-				    pinfo.battery_life,
-				    autolimit
-				);
-
-				if (autoaction == AUTO_SUSPEND)
-					suspend(ctl_fd);
-				else
-					hibernate(ctl_fd);
-			}
-		}
-
-		if (!rv)
-			continue;
-
-		if (ev->ident == ctl_fd) {
-			suspends = standbys = hibernates = resumes = 0;
-			syslog(LOG_DEBUG, "apmevent %04x index %d",
-			    (int)APM_EVENT_TYPE(ev->data),
-			    (int)APM_EVENT_INDEX(ev->data));
-
-			switch (APM_EVENT_TYPE(ev->data)) {
-			case APM_SUSPEND_REQ:
-			case APM_USER_SUSPEND_REQ:
-			case APM_CRIT_SUSPEND_REQ:
-			case APM_BATTERY_LOW:
-				suspends++;
-				break;
-			case APM_USER_STANDBY_REQ:
-			case APM_STANDBY_REQ:
-				standbys++;
-				break;
-			case APM_USER_HIBERNATE_REQ:
-				hibernates++;
-				break;
-#if 0
-			case APM_CANCEL:
-				suspends = standbys = 0;
-				break;
-#endif
-			case APM_NORMAL_RESUME:
-			case APM_CRIT_RESUME:
-			case APM_SYS_STANDBY_RESUME:
-				powerbak = power_status(ctl_fd, 0, &pinfo);
-				if (powerstatus != powerbak) {
-					powerstatus = powerbak;
-					powerchange = 1;
-				}
-				resumes++;
-				break;
-			case APM_POWER_CHANGE:
-				powerbak = power_status(ctl_fd, 0, &pinfo);
-				if (powerstatus != powerbak) {
-					powerstatus = powerbak;
-					powerchange = 1;
-				}
-				break;
-			default:
-				;
-			}
-
-			if ((standbys || suspends) && noacsleep &&
-			    power_status(ctl_fd, 0, &pinfo))
-				syslog(LOG_DEBUG, "no! sleep! till brooklyn!");
-			else if (suspends)
-				suspend(ctl_fd);
-			else if (standbys)
-				stand_by(ctl_fd);
-			else if (hibernates)
-				hibernate(ctl_fd);
-			else if (resumes) {
-				do_etc_file(_PATH_APM_ETC_RESUME);
-				syslog(LOG_NOTICE,
-				    "system resumed from sleep");
-			}
-
-			if (powerchange) {
-				if (powerstatus)
-					do_etc_file(_PATH_APM_ETC_POWERUP);
-				else
-					do_etc_file(_PATH_APM_ETC_POWERDOWN);
-				powerchange = 0;
-			}
-
-		} else if (ev->ident == sock_fd)
+		if (rv == 1 && ev->ident == sock_fd) {
 			switch (handle_client(sock_fd, ctl_fd)) {
 			case NORMAL:
 				break;
@@ -600,6 +530,116 @@ main(int argc, char *argv[])
 				hibernate(ctl_fd);
 				break;
 			}
+			continue;
+		}
+
+		suspends = standbys = hibernates = resumes = 0;
+
+		if (rv == 0 && ctl_fd == -1) {
+			/* timeout and no way to query status */
+			continue;
+		} else if (rv == 0) {
+			/* wakeup for timeout: take status */
+			event = APM_POWER_CHANGE;
+			index = -1;
+		} else {
+			assert(rv == 1 && ev->ident == ctl_fd);
+			event = APM_EVENT_TYPE(ev->data);
+			index = APM_EVENT_INDEX(ev->data);
+		}
+
+		logmsg(LOG_DEBUG, "apmevent %04x index %d", event, index);
+
+		switch (event) {
+		case APM_SUSPEND_REQ:
+		case APM_USER_SUSPEND_REQ:
+		case APM_CRIT_SUSPEND_REQ:
+		case APM_BATTERY_LOW:
+			suspends++;
+			break;
+		case APM_USER_STANDBY_REQ:
+		case APM_STANDBY_REQ:
+			standbys++;
+			break;
+		case APM_USER_HIBERNATE_REQ:
+			hibernates++;
+			break;
+#if 0
+		case APM_CANCEL:
+			suspends = standbys = 0;
+			break;
+#endif
+		case APM_NORMAL_RESUME:
+		case APM_CRIT_RESUME:
+		case APM_SYS_STANDBY_RESUME:
+			powerbak = power_status(ctl_fd, 0, &pinfo);
+			if (powerstatus != powerbak) {
+				powerstatus = powerbak;
+				powerchange = 1;
+			}
+			clock_gettime(CLOCK_MONOTONIC, &last_resume);
+			autoaction_inflight = 0;
+			resumes++;
+			break;
+		case APM_POWER_CHANGE:
+			powerbak = power_status(ctl_fd, 0, &pinfo);
+			if (powerstatus != powerbak) {
+				powerstatus = powerbak;
+				powerchange = 1;
+			}
+
+			if (!powerstatus && autoaction &&
+			    autolimit > (int)pinfo.battery_life) {
+				struct timespec graceperiod, now;
+
+				graceperiod = last_resume;
+				graceperiod.tv_sec += AUTOACTION_GRACE_PERIOD;
+				clock_gettime(CLOCK_MONOTONIC, &now);
+
+				logmsg(LOG_NOTICE,
+				    "estimated battery life %d%%"
+				    " below configured limit %d%%%s%s",
+				    pinfo.battery_life, autolimit,
+				    !autoaction_inflight ? "" : ", in flight",
+				    timespeccmp(&now, &graceperiod, >) ?
+				        "" : ", grace period"
+				);
+
+				if (!autoaction_inflight &&
+				    timespeccmp(&now, &graceperiod, >)) {
+					if (autoaction == AUTO_SUSPEND)
+						suspends++;
+					else
+						hibernates++;
+					/* Block autoaction until next resume */
+					autoaction_inflight = 1;
+				}
+			}
+			break;
+		default:
+			;
+		}
+
+		if ((standbys || suspends) && noacsleep &&
+		    power_status(ctl_fd, 0, &pinfo))
+			logmsg(LOG_DEBUG, "no! sleep! till brooklyn!");
+		else if (suspends)
+			suspend(ctl_fd);
+		else if (standbys)
+			stand_by(ctl_fd);
+		else if (hibernates)
+			hibernate(ctl_fd);
+		else if (resumes) {
+			resumed(ctl_fd);
+		}
+
+		if (powerchange) {
+			if (powerstatus)
+				do_etc_file(_PATH_APM_ETC_POWERUP);
+			else
+				do_etc_file(_PATH_APM_ETC_POWERDOWN);
+			powerchange = 0;
+		}
 	}
 	error("kevent loop", NULL);
 
@@ -610,26 +650,27 @@ void
 setperfpolicy(char *policy)
 {
 	int hw_perfpol_mib[] = { CTL_HW, HW_PERFPOLICY };
-	char oldpolicy[32];
-	size_t oldsz = sizeof(oldpolicy);
-	int setlo = 0;
+	int hw_perf_mib[] = { CTL_HW, HW_SETPERF };
+	int new_perf = -1;
 
 	if (strcmp(policy, "low") == 0) {
 		policy = "manual";
-		setlo = 1;
+		new_perf = 0;
+	} else if (strcmp(policy, "high") == 0) {
+		policy = "manual";
+		new_perf = 100;
 	}
 
-	if (sysctl(hw_perfpol_mib, 2, oldpolicy, &oldsz, policy, strlen(policy) + 1) < 0)
-		syslog(LOG_INFO, "cannot set hw.perfpolicy");
+	if (sysctl(hw_perfpol_mib, 2, NULL, NULL,
+	    policy, strlen(policy) + 1) == -1)
+		logmsg(LOG_INFO, "cannot set hw.perfpolicy");
 
-	if (setlo == 1) {
-		int hw_perf_mib[] = {CTL_HW, HW_SETPERF};
-		int perf;
-		int new_perf = 0;
-		size_t perf_sz = sizeof(perf);
-		if (sysctl(hw_perf_mib, 2, &perf, &perf_sz, &new_perf, perf_sz) < 0)
-			syslog(LOG_INFO, "cannot set hw.setperf");
-	}
+	if (new_perf == -1)
+		return;
+
+	if (sysctl(hw_perf_mib, 2, NULL, NULL,
+	    &new_perf, sizeof(new_perf)) == -1)
+		logmsg(LOG_INFO, "cannot set hw.setperf");
 }
 
 void
@@ -641,7 +682,7 @@ do_etc_file(const char *file)
 
 	/* If file doesn't exist, do nothing. */
 	if (access(file, X_OK|R_OK)) {
-		syslog(LOG_DEBUG, "do_etc_file(): cannot access file %s", file);
+		logmsg(LOG_DEBUG, "do_etc_file(): cannot access file %s", file);
 		return;
 	}
 
@@ -654,21 +695,21 @@ do_etc_file(const char *file)
 	pid = fork();
 	switch (pid) {
 	case -1:
-		syslog(LOG_ERR, "failed to fork(): %m");
+		logmsg(LOG_ERR, "failed to fork(): %s", strerror(errno));
 		return;
 	case 0:
 		/* We are the child. */
 		execl(file, prog, (char *)NULL);
-		syslog(LOG_ERR, "failed to exec %s: %m", file);
+		logmsg(LOG_ERR, "failed to exec %s: %s", file, strerror(errno));
 		_exit(1);
 		/* NOTREACHED */
 	default:
 		/* We are the parent. */
 		wait4(pid, &status, 0, 0);
 		if (WIFEXITED(status))
-			syslog(LOG_DEBUG, "%s exited with status %d", file,
+			logmsg(LOG_DEBUG, "%s exited with status %d", file,
 			    WEXITSTATUS(status));
 		else
-			syslog(LOG_ERR, "%s exited abnormally.", file);
+			logmsg(LOG_ERR, "%s exited abnormally.", file);
 	}
 }

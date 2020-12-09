@@ -1,4 +1,4 @@
-# $OpenBSD: Makefile,v 1.3 2017/10/04 20:57:10 patrick Exp $
+# $OpenBSD: Makefile,v 1.6 2020/08/03 14:45:29 patrick Exp $
 
 LIB=	clangFrontend
 NOPIC=
@@ -10,10 +10,8 @@ CPPFLAGS+=	${CLANG_INCLUDES}
 SRCS=	ASTConsumers.cpp \
 	ASTMerge.cpp \
 	ASTUnit.cpp \
-	CacheTokens.cpp \
 	ChainedDiagnosticConsumer.cpp \
 	ChainedIncludesSource.cpp \
-	CodeGenOptions.cpp \
 	CompilerInstance.cpp \
 	CompilerInvocation.cpp \
 	CreateInvocationFromCommandLine.cpp \
@@ -23,15 +21,15 @@ SRCS=	ASTConsumers.cpp \
 	FrontendAction.cpp \
 	FrontendActions.cpp \
 	FrontendOptions.cpp \
+	FrontendTiming.cpp \
 	HeaderIncludeGen.cpp \
 	InitHeaderSearch.cpp \
 	InitPreprocessor.cpp \
-	LangStandards.cpp \
+	InterfaceStubFunctionsConsumer.cpp \
 	LayoutOverrideSource.cpp \
 	LogDiagnosticPrinter.cpp \
 	ModuleDependencyCollector.cpp \
 	MultiplexConsumer.cpp \
-	PCHContainerOperations.cpp \
 	PrecompiledPreamble.cpp \
 	PrintPreprocessedOutput.cpp \
 	SerializedDiagnosticPrinter.cpp \
@@ -42,7 +40,7 @@ SRCS=	ASTConsumers.cpp \
 	TextDiagnosticPrinter.cpp \
 	VerifyDiagnosticConsumer.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/tools/clang/lib/Frontend
+.PATH:	${.CURDIR}/../../../llvm/clang/lib/Frontend
 
 install:
 	@# Nothing here so far ...

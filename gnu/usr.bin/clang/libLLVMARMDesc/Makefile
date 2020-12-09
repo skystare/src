@@ -1,15 +1,14 @@
-# $OpenBSD: Makefile,v 1.2 2017/07/09 15:28:34 espie Exp $
+# $OpenBSD: Makefile,v 1.4 2020/08/03 14:45:24 patrick Exp $
 
 LIB=	LLVMARMDesc
-NOPIC=
 NOPROFILE=
 
 CPPFLAGS+=	-I${.OBJDIR}/../include/llvm/ARM -I${LLVM_SRCS}/lib/Target/ARM
 
-.include <bsd.own.mk>
-SRCS=	ARMAsmBackend.cpp \
+SRCS+=	ARMAsmBackend.cpp \
 	ARMELFObjectWriter.cpp \
 	ARMELFStreamer.cpp \
+	ARMInstPrinter.cpp \
 	ARMMachObjectWriter.cpp \
 	ARMMachORelocationInfo.cpp \
 	ARMMCAsmInfo.cpp \
@@ -21,9 +20,4 @@ SRCS=	ARMAsmBackend.cpp \
 	ARMWinCOFFObjectWriter.cpp \
 	ARMWinCOFFStreamer.cpp
 
-.PATH:	${.CURDIR}/../../../llvm/lib/Target/ARM/MCTargetDesc
-
-install:
-	@# Nothing here so far ...
-
-.include <bsd.lib.mk>
+.PATH:	${.CURDIR}/../../../llvm/llvm/lib/Target/ARM/MCTargetDesc

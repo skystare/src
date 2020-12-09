@@ -1,4 +1,4 @@
-/*	$OpenBSD: machdep.c,v 1.184 2018/07/10 04:19:59 guenther Exp $	*/
+/*	$OpenBSD: machdep.c,v 1.193 2020/11/08 20:37:23 mpi Exp $	*/
 /*	$NetBSD: machdep.c,v 1.4 1996/10/16 19:33:11 ws Exp $	*/
 
 /*
@@ -134,9 +134,7 @@ struct extent *devio_ex;
 void initppc(u_int startkernel, u_int endkernel, char *args);
 
 void
-initppc(startkernel, endkernel, args)
-	u_int startkernel, endkernel;
-	char *args;
+initppc(u_int startkernel, u_int endkernel, char *args)
 {
 	extern void *trapcode; extern int trapsize;
 	extern void *dsitrap; extern int dsisize;
@@ -265,6 +263,9 @@ initppc(startkernel, endkernel, args)
 			case 'c':
 				boothowto |= RB_CONFIG;
 				break;
+			case 'R':
+				boothowto |= RB_GOODRANDOM;
+				break;
 			default:
 				break;
 			}
@@ -359,7 +360,7 @@ int   safepri = 0;
  * Machine dependent startup code.
  */
 void
-cpu_startup()
+cpu_startup(void)
 {
 	vaddr_t minaddr, maxaddr;
 
@@ -400,7 +401,7 @@ cpu_startup()
  * Initialize system console.
  */
 void
-consinit()
+consinit(void)
 {
 	static int cons_initted = 0;
 
@@ -441,7 +442,7 @@ setregs(struct proc *p, struct exec_package *pack, u_long stack,
 /*
  * Send a signal to process.
  */
-void
+int
 sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 {
 	struct proc *p = curproc;
@@ -479,7 +480,7 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 	}
 	frame.sf_sc.sc_cookie = (long)&fp->sf_sc ^ p->p_p->ps_sigcookie;
 	if (copyout(&frame, fp, sizeof frame) != 0)
-		sigexit(p, SIGILL);
+		return 1;
 
 	tf->fixreg[1] = (int)fp;
 	tf->lr = (int)catcher;
@@ -493,6 +494,8 @@ sendsig(sig_t catcher, int sig, sigset_t mask, const siginfo_t *ksip)
 	syncicache(pa, (p->p_p->ps_emul->e_esigcode -
 	    p->p_p->ps_emul->e_sigcode));
 #endif
+
+	return 0;
 }
 
 /*
@@ -622,7 +625,7 @@ reserve_dumppages(caddr_t p)
  */
 int cpu_dump(void);
 int
-cpu_dump()
+cpu_dump(void)
 {
 	int (*dump) (dev_t, daddr_t, caddr_t, size_t);
 	long buf[dbtob(1) / sizeof (long)];
@@ -642,7 +645,7 @@ cpu_dump()
 }
 
 void
-dumpsys()
+dumpsys(void)
 {
 #if 0
 	u_int npg;
@@ -733,6 +736,9 @@ boot(int howto)
 {
 	static int syncing;
 
+	if ((howto & RB_RESET) != 0)
+		goto doreset;
+
 	if (cold) {
 		if ((howto & RB_USERREQ) == 0)
 			howto |= RB_HALT;
@@ -775,6 +781,7 @@ haltsys:
 		printf("halted\n\n");
 		OF_exit();
 	}
+doreset:
 	printf("rebooting\n\n");
 
 #if NADB > 0
@@ -797,7 +804,7 @@ void_f *pending_int_f = NULL;
  * instead of being in each of the specific handler code
  */
 void
-do_pending_int()
+do_pending_int(void)
 {
 	if (pending_int_f != NULL) {
 		(*pending_int_f)();
